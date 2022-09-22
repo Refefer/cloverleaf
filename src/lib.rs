@@ -7,8 +7,10 @@ use float_ord::FloatOrd;
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 
-use graph::{CSR,CDFGraph,CumCSR,Graph};
+use graph::{CSR,CDFGraph,CumCSR,Graph,NodeID};
+use algos::rwr::{Steps,RWR};
 use vocab::Vocab;
+use sampler::Weighted;
 
 const SEED: u64 = 20222022;
 
@@ -34,6 +36,22 @@ struct RwrGraph {
     vocab: Vocab
 }
 
+impl RwrGraph {
+    fn convert_scores(&self, scores: impl Iterator<Item=(NodeID, f32)>, k: Option<usize>) -> Vec<(String, f32)> {
+        let mut scores: Vec<_> = scores.collect();
+        scores.sort_by_key(|(_k, v)| FloatOrd(-*v));
+
+        // Convert the list to named
+        let k = k.unwrap_or(scores.len());
+        scores.into_iter().take(k)
+            .map(|(node_id, w)| {
+                let name = self.vocab.get_name(node_id).unwrap();
+                ((*name).clone(), w)
+            })
+            .collect()
+    }
+}
+
 #[pymethods]
 impl RwrGraph {
     #[new]
@@ -46,30 +64,24 @@ impl RwrGraph {
         }
     }
 
+    
     pub fn compute(&self, name: String, alpha: f32, walks: usize, seed: Option<u64>, k: Option<usize>) -> PyResult<Vec<(String, f32)>> {
         if let Some(node_id) = self.vocab.get_node_id(name) {
-            let rwr = algos::rwr::RWR {
-                alpha: alpha,
+            let steps = if alpha >= 1. {
+                Steps::Fixed(alpha as usize)
+            } else if alpha > 0. {
+                Steps::Probability(alpha)
+            } else {
+                return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
+            };
+
+            let rwr = RWR {
+                steps: steps,
                 walks: walks,
                 seed: seed.unwrap_or(SEED)
             };
 
-            // Run RWR, sort the values descending by score
-            let mut scores: Vec<_> = rwr.weighted(&self.graph, node_id)
-                .into_iter()
-                .collect();
-
-            scores.sort_by_key(|(_k, v)| FloatOrd(-*v));
-
-            // Convert the list to named
-            let k = k.unwrap_or(scores.len());
-            let ret = scores.into_iter().take(k)
-                .map(|(node_id, w)| {
-                    let name = self.vocab.get_name(node_id).unwrap();
-                    ((*name).clone(), w)
-                })
-                .collect();
-            Ok(ret)
+            Ok(self.convert_scores(rwr.sample(&self.graph, &Weighted, node_id).into_iter(), k))
         } else {
             Err(PyValueError::new_err("Node does not exist!"))
         }

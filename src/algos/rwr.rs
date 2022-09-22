@@ -4,36 +4,50 @@ use rand_distr::{Distribution,Uniform,Normal};
 use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
 
-use crate::graph::{CDFGraph,CumCSR,NodeID};
-use crate::sampler::{UniformSample};
+use crate::graph::{Graph,NodeID};
+use crate::sampler::Sampler;
+
+pub enum Steps {
+    Fixed(usize),
+    Probability(f32)
+}
 
 pub struct RWR {
-    pub alpha: f32,
+    pub steps: Steps,
     pub walks: usize,
     pub seed: u64
 }
 
 impl RWR {
 
-    pub fn weighted<G: CDFGraph + Send + Sync>(
+    pub fn sample<G: Graph + Send + Sync>(
         &self, 
         graph: &G, 
+        sampler: &impl Sampler<G>,
         start_node: NodeID
     ) -> HashMap<NodeID, f32> {
        let mut ret = (0..self.walks).into_par_iter()
            .map(|idx| {
                let mut rng = XorShiftRng::seed_from_u64(self.seed + idx as u64);
                let mut cur_node = start_node;
-               loop {
-                   // Sample the next edge
-                   cur_node = UniformSample::sample(graph, cur_node, &mut rng)
-                       .unwrap_or(start_node);
+               match self.steps {
+                   Steps::Probability(alpha) => loop {
+                       // Sample the next edge
+                       cur_node = sampler.sample(graph, cur_node, &mut rng)
+                           .unwrap_or(start_node);
 
-                   if rng.gen::<f32>() < self.alpha {
-                       break;
+                       if rng.gen::<f32>() < alpha {
+                           break;
+                       }
+                   },
+                   Steps::Fixed(steps) => for _ in 0..steps {
+                       // Sample the next edge
+                       cur_node = sampler.sample(graph, cur_node, &mut rng)
+                           .unwrap_or(start_node);
                    }
-               }
+               };
                cur_node
+
            }).fold(|| HashMap::new(), |mut acc, node_id| {
                *acc.entry(node_id).or_insert(0f32) += 1.; 
                acc
@@ -58,7 +72,8 @@ impl RWR {
 #[cfg(test)]
 mod rwr_tests {
     use super::*;
-    use crate::graph::CSR;
+    use crate::graph::{CumCSR,CSR};
+    use crate::sampler::Unweighted;
     use float_ord::FloatOrd;
 
     fn build_edges() -> Vec<(usize, usize, f32)> {
@@ -78,12 +93,12 @@ mod rwr_tests {
         let csr = CSR::construct_from_edges(edges);
         let ccsr = CumCSR::convert(csr);
         let rwr = RWR {
-            alpha: 0.1,
+            steps: Steps::Probability(0.1),
             walks: 10_000,
             seed: 20222022
         };
 
-        let map = rwr.weighted(&ccsr, 0);
+        let map = rwr.sample(&ccsr, &Unweighted, 0);
         println!("{:?}", map);
         let mut v: Vec<_> = map.into_iter().collect();
         v.sort_by_key(|(_idx, w)| FloatOrd(*w));
