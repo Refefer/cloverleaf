@@ -4,6 +4,9 @@ pub type NodeID = usize;
 pub trait Graph {
     /// Get number of nodes in graph
     fn len(&self) -> usize;
+    
+    /// Get number of edges in graph
+    fn edges(&self) -> usize;
 
     /// Get degree of node in graph
     fn degree(&self, idx: NodeID) -> usize;
@@ -67,39 +70,17 @@ impl CSR {
         CSR { rows, columns, weights: data }
     }
 
-    /// Converts each nodes edges to a transition matrix.  It does _not_
-    /// check to see if any of the weights are negative.
-    fn convert_to_markov_chain(&mut self) {
-        for start_stop in self.rows.windows(2) {
-            let (start, stop) = (start_stop[0], start_stop[1]);
-            let slice = &mut self.weights[start..stop];
-            let denom = slice.iter().sum::<f32>();
-            slice.iter_mut().for_each(|w| *w /= denom);
-        }
-    }
-
-    /// Converts the CSR to CDF format, making it more efficient to run
-    /// certain types of algorithms such as random walks.
-    fn convert_to_cdf(&mut self) {
-        for start_stop in self.rows.windows(2) {
-            let (start, stop) = (start_stop[0], start_stop[1]);
-            let slice = &mut self.weights[start..stop];
-            let denom = slice.iter().sum::<f32>();
-            let mut acc = 0.;
-            slice.iter_mut().for_each(|w| {
-                acc += *w;
-                *w = acc / denom;
-            });
-            slice[slice.len() - 1] = 1.;
-        }
-    }
-
 }
 
 impl Graph for CSR {
     // Get number of nodes in graph
     fn len(&self) -> usize {
         self.rows.len() - 1
+    }
+    
+    // Get number of nodes in graph
+    fn edges(&self) -> usize {
+        self.weights.len()
     }
 
     // Get degree of node in graph
@@ -142,6 +123,11 @@ impl Graph for NormalizedCSR {
     fn len(&self) -> usize {
         self.0.len()
     }
+    
+    /// Get number of nodes in graph
+    fn edges(&self) -> usize {
+        self.0.edges()
+    }
 
     /// Get degree of node in graph
     fn degree(&self, idx: NodeID) -> usize {
@@ -159,6 +145,57 @@ impl Graph for NormalizedCSR {
     }
  
 }
+
+impl NormalizedGraph for NormalizedCSR {}
+
+pub struct CumCSR(CSR);
+
+impl CumCSR {
+    pub fn convert(mut csr: CSR) -> Self {
+        for start_stop in csr.rows.windows(2) {
+            let (start, stop) = (start_stop[0], start_stop[1]);
+            let slice = &mut csr.weights[start..stop];
+            let denom = slice.iter().sum::<f32>();
+            let mut acc = 0.;
+            slice.iter_mut().for_each(|w| {
+                acc += *w;
+                *w = acc / denom;
+            });
+            slice[slice.len() - 1] = 1.;
+        }
+        CumCSR(csr)
+    }
+}
+
+impl Graph for CumCSR {
+    /// Get number of nodes in graph
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Get number of nodes in graph
+    fn edges(&self) -> usize {
+        self.0.edges()
+    }
+
+    /// Get degree of node in graph
+    fn degree(&self, idx: NodeID) -> usize {
+        self.0.degree(idx)
+    }
+
+    /// Get edges and corresponding weights
+    fn get_edges(&self, idx: NodeID) -> (&[NodeID], &[f32]) {
+        self.0.get_edges(idx)
+    }
+    
+    /// Get edges and corresponding weights
+    fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]) {
+        self.0.modify_edges(idx)
+    }
+ 
+}
+
+impl CDFGraph for CumCSR {}
 
 #[cfg(test)]
 mod csr_tests {
@@ -208,7 +245,7 @@ mod csr_tests {
     fn construct_mk() {
         let edges = build_edges();
 
-        let mut csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges);
         let mk = NormalizedCSR::convert(csr);
 
         assert_eq!(mk.get_edges(0), (vec![1].as_slice(), vec![1.].as_slice()));
@@ -221,12 +258,12 @@ mod csr_tests {
     fn construct_cdf() {
         let edges = build_edges();
 
-        let mut csr = CSR::construct_from_edges(edges);
-        csr.convert_to_cdf();
+        let csr = CSR::construct_from_edges(edges);
+        let ccsr = CumCSR::convert(csr);
 
-        assert_eq!(csr.rows, vec![0, 1, 4, 5]);
-        assert_eq!(csr.columns, vec![1, 1, 2, 0, 0]);
-        assert_eq!(csr.weights, vec![1., 3./15., 5./15., 15./15., 1.]);
+        assert_eq!(ccsr.0.rows, vec![0, 1, 4, 5]);
+        assert_eq!(ccsr.0.columns, vec![1, 1, 2, 0, 0]);
+        assert_eq!(ccsr.0.weights, vec![1., 3./15., 5./15., 15./15., 1.]);
 
     }
 

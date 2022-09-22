@@ -4,18 +4,18 @@ use rand_distr::{Distribution,Uniform,Normal};
 use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
 
-use crate::graph::{Graph,NodeID};
+use crate::graph::{CDFGraph,CumCSR,NodeID};
 use crate::sampler::{UniformSample};
 
-struct RWR {
-    alpha: f32,
-    walks: usize,
-    seed: u64
+pub struct RWR {
+    pub alpha: f32,
+    pub walks: usize,
+    pub seed: u64
 }
 
 impl RWR {
 
-    pub fn unweighted<G: Graph + Send + Sync>(
+    pub fn weighted<G: CDFGraph + Send + Sync>(
         &self, 
         graph: &G, 
         start_node: NodeID
@@ -25,6 +25,7 @@ impl RWR {
                let mut rng = XorShiftRng::seed_from_u64(self.seed + idx as u64);
                let mut cur_node = start_node;
                loop {
+                   // Sample the next edge
                    cur_node = UniformSample::sample(graph, cur_node, &mut rng)
                        .unwrap_or(start_node);
 
@@ -44,7 +45,11 @@ impl RWR {
                hm1
            });
 
-       ret.par_iter_mut().for_each(|(_, v)| *v /= self.walks as f32);
+       ret.par_iter_mut()
+           .for_each(|(k, v)| {
+               let d = (graph.degree(*k) as f32).powf(0.5);
+               *v /= (self.walks as f32) * d;
+           });
        ret
     }
 
@@ -71,12 +76,14 @@ mod rwr_tests {
         let edges = build_edges();
 
         let csr = CSR::construct_from_edges(edges);
+        let ccsr = CumCSR::convert(csr);
         let rwr = RWR {
             alpha: 0.1,
             walks: 10_000,
             seed: 20222022
         };
-        let map = rwr.unweighted(&csr, 0);
+
+        let map = rwr.weighted(&ccsr, 0);
         println!("{:?}", map);
         let mut v: Vec<_> = map.into_iter().collect();
         v.sort_by_key(|(_idx, w)| FloatOrd(*w));
