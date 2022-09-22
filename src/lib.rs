@@ -1,4 +1,6 @@
 mod graph;
+mod algos;
+mod sampler;
 
 pub fn add(left: usize, right: usize) -> usize {
     left + right

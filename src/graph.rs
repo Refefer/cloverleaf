@@ -1,27 +1,39 @@
 
-trait Graph {
+pub type NodeID = usize;
+
+pub trait Graph {
     /// Get number of nodes in graph
     fn len(&self) -> usize;
 
     /// Get degree of node in graph
-    fn degree(&self, idx: usize) -> usize;
+    fn degree(&self, idx: NodeID) -> usize;
 
     /// Get edges and corresponding weights
-    fn get_edges(&self, idx: usize) -> (&[usize], &[f32]);
+    fn get_edges(&self, idx: NodeID) -> (&[NodeID], &[f32]);
     
     /// Get edges and corresponding weights
-    fn modify_edges(&mut self, idx: usize) -> (&mut [usize], &mut [f32]);
+    fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]);
 
 }
 
+/// Used for trait bounds.  Confirms the underlying weights for each node
+/// sum to 1, as in a transition matrix.
+pub trait NormalizedGraph: Graph {}
+
+/// Used for trait bounds.  Confirms the weights are normalized transition
+/// matrix, optimized in cumulative distribution function.
+pub trait CDFGraph: Graph {}
+
+/// Compressed Sparse Row Format.  We use this for graphs since adjancency
+/// lists tend to use more memory.
 pub struct CSR {
-    rows: Vec<usize>,
-    columns: Vec<usize>,
+    rows: Vec<NodeID>,
+    columns: Vec<NodeID>,
     weights: Vec<f32>
 }
 
 impl CSR {
-    pub fn construct_from_edges(edges: Vec<(usize, usize, f32)>) -> Self {
+    pub fn construct_from_edges(edges: Vec<(NodeID, NodeID, f32)>) -> Self {
 
         // Determine the number of rows in the adjacency graph
         let max_node = edges.iter().map(|(from_node, to_node, _)| {
@@ -55,6 +67,8 @@ impl CSR {
         CSR { rows, columns, weights: data }
     }
 
+    /// Converts each nodes edges to a transition matrix.  It does _not_
+    /// check to see if any of the weights are negative.
     fn convert_to_markov_chain(&mut self) {
         for start_stop in self.rows.windows(2) {
             let (start, stop) = (start_stop[0], start_stop[1]);
@@ -64,6 +78,8 @@ impl CSR {
         }
     }
 
+    /// Converts the CSR to CDF format, making it more efficient to run
+    /// certain types of algorithms such as random walks.
     fn convert_to_cdf(&mut self) {
         for start_stop in self.rows.windows(2) {
             let (start, stop) = (start_stop[0], start_stop[1]);
@@ -87,24 +103,61 @@ impl Graph for CSR {
     }
 
     // Get degree of node in graph
-    fn degree(&self, idx: usize) -> usize {
+    fn degree(&self, idx: NodeID) -> usize {
         self.rows[idx+1] - self.rows[idx]
     }
 
     // Get edges and corresponding weights
-    fn get_edges(&self, idx: usize) -> (&[usize], &[f32]) {
+    fn get_edges(&self, idx: NodeID) -> (&[NodeID], &[f32]) {
         let start = self.rows[idx];
         let stop  = self.rows[idx+1];
         (&self.columns[start..stop], &self.weights[start..stop])
     }
     
     // Get edges and corresponding weights
-    fn modify_edges(&mut self, idx: usize) -> (&mut [usize], &mut [f32]) {
+    fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]) {
         let start = self.rows[idx];
         let stop  = self.rows[idx+1];
         (&mut self.columns[start..stop], &mut self.weights[start..stop])
     }
     
+}
+
+pub struct NormalizedCSR(CSR);
+
+impl NormalizedCSR {
+    pub fn convert(mut csr: CSR) -> Self {
+        for start_stop in csr.rows.windows(2) {
+            let (start, stop) = (start_stop[0], start_stop[1]);
+            let slice = &mut csr.weights[start..stop];
+            let denom = slice.iter().sum::<f32>();
+            slice.iter_mut().for_each(|w| *w /= denom);
+        }
+        NormalizedCSR(csr)
+    }
+}
+
+impl Graph for NormalizedCSR {
+    /// Get number of nodes in graph
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Get degree of node in graph
+    fn degree(&self, idx: NodeID) -> usize {
+        self.0.degree(idx)
+    }
+
+    /// Get edges and corresponding weights
+    fn get_edges(&self, idx: NodeID) -> (&[NodeID], &[f32]) {
+        self.0.get_edges(idx)
+    }
+    
+    /// Get edges and corresponding weights
+    fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]) {
+        self.0.modify_edges(idx)
+    }
+ 
 }
 
 #[cfg(test)]
@@ -156,11 +209,11 @@ mod csr_tests {
         let edges = build_edges();
 
         let mut csr = CSR::construct_from_edges(edges);
-        csr.convert_to_markov_chain();
+        let mk = NormalizedCSR::convert(csr);
 
-        assert_eq!(csr.rows, vec![0, 1, 4, 5]);
-        assert_eq!(csr.columns, vec![1, 1, 2, 0, 0]);
-        assert_eq!(csr.weights, vec![1., 3./15., 2./15., 10./15., 1.]);
+        assert_eq!(mk.get_edges(0), (vec![1].as_slice(), vec![1.].as_slice()));
+        assert_eq!(mk.get_edges(1), (vec![1,2,0].as_slice(), vec![3./15., 2./15., 10./15.].as_slice()));
+        assert_eq!(mk.get_edges(2), (vec![0].as_slice(), vec![1.].as_slice()));
 
     }
 
