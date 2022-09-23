@@ -10,6 +10,7 @@ use pyo3::exceptions::PyValueError;
 
 use crate::graph::{CSR,CDFGraph,CumCSR,Graph,NodeID};
 use crate::algos::rwr::{Steps,RWR};
+use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
 use crate::vocab::Vocab;
 use crate::sampler::Weighted;
@@ -62,6 +63,24 @@ struct RwrGraph {
     embeddings: Option<EmbeddingStore>
 }
 
+impl RwrGraph {
+    fn get_node_id(&self, node: String) -> PyResult<NodeID> {
+        if let Some(node_id) = self.vocab.get_node_id(node.clone()) {
+            Ok(node_id)
+        } else {
+            Err(PyValueError::new_err(format!(" Node '{}' does not exist!", node)))
+        }
+    }
+
+    fn get_embeddings(&self) -> PyResult<&EmbeddingStore> {
+        if let Some(es) = &self.embeddings {
+            Ok(es)
+        } else {
+            Err(PyValueError::new_err("Embedding store wasn't initialized!"))
+        }
+    }
+}
+
 #[pymethods]
 impl RwrGraph {
     #[new]
@@ -75,21 +94,43 @@ impl RwrGraph {
         }
     }
 
-    pub fn compute(
+        pub fn compute(
         &self, 
         name: String, 
-        alpha: f32, 
+        restarts: f32, 
         walks: usize, 
         seed: Option<u64>, 
         k: Option<usize>, 
-        context: Option<String>,
+        guided_context: Option<String>,
+        rerank_context: Option<String>,
         blend: Option<f32>
     ) -> PyResult<Vec<(String, f32)>> {
-        if let Some(node_id) = self.vocab.get_node_id(name) {
-            let steps = if alpha >= 1. {
-                Steps::Fixed(alpha as usize)
-            } else if alpha > 0. {
-                Steps::Probability(alpha)
+        let node_id = self.get_node_id(name)?;
+
+        
+        let mut results = if let Some(guided_node) = guided_context {
+            let g_node_id = self.get_node_id(guided_node)?;
+            let steps = if restarts >= 1. {
+                GSteps::Fixed(restarts as usize)
+            } else if restarts > 0. {
+                GSteps::Probability(restarts, (1. / restarts).ceil() as usize)
+            } else {
+                return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
+            };
+
+            let grwr = GuidedRWR {
+               steps: steps,
+               walks: walks,
+               alpha: blend.unwrap_or(0.5),
+               seed: seed.unwrap_or(SEED)
+            };
+            let embeddings = self.get_embeddings()?;
+            grwr.sample(&self.graph, &Weighted, embeddings, node_id, g_node_id)
+        } else {
+            let steps = if restarts >= 1. {
+                Steps::Fixed(restarts as usize)
+            } else if restarts > 0. {
+                Steps::Probability(restarts)
             } else {
                 return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
             };
@@ -100,24 +141,18 @@ impl RwrGraph {
                 seed: seed.unwrap_or(SEED)
             };
 
-            let mut results = rwr.sample(&self.graph, &Weighted, node_id);
-            // Reweight results if requested
-            if let Some(cn) = context {
-                if let Some(c_node_id) = self.vocab.get_node_id(cn) {
-                    if let Some(es) = &self.embeddings {
-                        Reweighter::new(blend.unwrap_or(0.5))
-                            .reweight(&mut results, es, c_node_id);
-                    } else {
-                        return Err(PyValueError::new_err("No embeddings added for graph!"))
-                    }
-                } else {
-                    return Err(PyValueError::new_err("Context Node does not exist!"))
-                }
-            }
-            Ok(convert_scores(&self.vocab, results.into_iter(), k))
-        } else {
-            Err(PyValueError::new_err("Node does not exist!"))
+            rwr.sample(&self.graph, &Weighted, node_id)
+        };
+
+        // Reweight results if requested
+        if let Some(cn) = rerank_context {
+            let c_node_id = self.get_node_id(cn)?;
+            let embeddings = self.get_embeddings()?;
+            Reweighter::new(blend.unwrap_or(0.5))
+                .reweight(&mut results, embeddings, c_node_id);
         }
+
+        Ok(convert_scores(&self.vocab, results.into_iter(), k))
     }
 
     pub fn initialize_embeddings(&mut self, dims: usize, distance: Distance) -> PyResult<()>{
