@@ -1,7 +1,6 @@
 use rand::prelude::*;
 use rand::distributions::WeightedIndex;
 use rand_distr::{Distribution,Uniform};
-use rand_xorshift::XorShiftRng;
 use float_ord::FloatOrd;
 
 use crate::graph::{CDFGraph,Graph,NodeID,CSR,NormalizedCSR};

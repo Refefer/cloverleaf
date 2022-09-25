@@ -1,6 +1,6 @@
 use hashbrown::HashMap;
 use rand::prelude::*;
-use rand_distr::{Distribution,Uniform,Normal};
+use rand_distr::Distribution;
 use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
 
@@ -106,6 +106,7 @@ impl GuidedRWR {
     }
 }
 
+/*
 #[cfg(test)]
 mod grwr_tests {
     use super::*;
@@ -128,3 +129,4 @@ mod grwr_tests {
     }
 
 }
+*/

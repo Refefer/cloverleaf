@@ -3,6 +3,7 @@ mod algos;
 mod sampler;
 mod vocab;
 mod embeddings;
+mod bitset;
 
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
@@ -79,6 +80,15 @@ impl RwrGraph {
             Err(PyValueError::new_err("Embedding store wasn't initialized!"))
         }
     }
+
+    fn get_embeddings_mut(&mut self) -> PyResult<&mut EmbeddingStore> {
+        if let Some(es) = &mut self.embeddings {
+            Ok(es)
+        } else {
+            Err(PyValueError::new_err("Embedding store wasn't initialized!"))
+        }
+    }
+
 }
 
 #[pymethods]
@@ -94,7 +104,7 @@ impl RwrGraph {
         }
     }
 
-        pub fn compute(
+    pub fn compute(
         &self, 
         name: String, 
         restarts: f32, 
@@ -146,6 +156,7 @@ impl RwrGraph {
 
         // Reweight results if requested
         if let Some(cn) = rerank_context {
+            println!("Reranking...");
             let c_node_id = self.get_node_id(cn)?;
             let embeddings = self.get_embeddings()?;
             Reweighter::new(blend.unwrap_or(0.5))
@@ -165,17 +176,32 @@ impl RwrGraph {
         Ok(())
     }
 
-    pub fn set_embedding(&mut self, name: String, embedding: Vec<f32>) -> PyResult<()> {
-        if let Some(node_id) = self.vocab.get_node_id(name) {
-            if let Some(es) = &mut self.embeddings {
-                es.set_embedding(node_id, &embedding);
-                Ok(())
-            } else {
-                Err(PyValueError::new_err("Embedding store wasn't initialized!"))
-            }
+    pub fn create_distance_embeddings(&mut self, landmarks: usize, seed: Option<u64>) -> PyResult<()> {
+        let ls = if let Some(seed) = seed {
+            algos::dist::LandmarkSelection::Random(seed)
         } else {
-            Err(PyValueError::new_err("Node does not exist!"))
-        }
+            algos::dist::LandmarkSelection::Degree
+        };
+        let es = crate::algos::dist::construct_walk_distances(&self.graph, landmarks, ls);
+        self.embeddings = Some(es);
+        Ok(())
+    }
+
+    pub fn contains_node(&self, name: String) -> bool {
+        self.vocab.get_node_id(name).is_some()
+    }
+
+    pub fn get_embedding(&mut self, name: String) -> PyResult<Vec<f32>> {
+        let node_id = self.get_node_id(name)?;
+        let es = self.get_embeddings()?;
+        Ok(es.get_embedding(node_id).to_vec())
+    }
+
+    pub fn set_embedding(&mut self, name: String, embedding: Vec<f32>) -> PyResult<()> {
+        let node_id = self.get_node_id(name)?;
+        let mut es = self.get_embeddings_mut()?;
+        es.set_embedding(node_id, &embedding);
+        Ok(())
     }
 
     pub fn nodes(&self) -> usize {

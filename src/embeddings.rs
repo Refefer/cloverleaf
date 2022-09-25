@@ -1,6 +1,7 @@
 
 use float_ord::FloatOrd;
 use crate::graph::NodeID;
+use crate::bitset::BitSet;
 
 pub enum Distance {
     ALT,
@@ -39,7 +40,7 @@ pub struct EmbeddingStore {
     nodes: usize,
     dims: usize,
     embeddings: Vec<f32>,
-    bitfield: Vec<u32>,
+    bitfield: BitSet,
     distance: Distance
 }
 
@@ -49,37 +50,30 @@ impl EmbeddingStore {
             nodes,
             dims,
             distance,
-            bitfield: vec![0; (nodes / 4) + 1],
+            bitfield: BitSet::new(nodes),
             embeddings: vec![0.; nodes * dims]
         }
     }
 
-    fn get_bit_idx(&self, node_id: &NodeID) -> (usize, u32) {
-        let field_offset = node_id / 32;
-        let bit_offset = node_id % 32;
-        (field_offset, 1u32 << bit_offset)
-    }
-
     pub fn is_set(&self, node_id: NodeID) -> bool {
-        let (fo, bm) = self.get_bit_idx(&node_id);
-        (self.bitfield[fo] & bm) > 0
+        self.bitfield.is_set(node_id)
     }
 
     pub fn set_embedding(&mut self, node_id: NodeID, embedding: &[f32]) {
         self.get_embedding_mut(node_id).iter_mut().zip(embedding.iter()).for_each(|(ei, wi)| {
             *ei = *wi;
         });
-        let (fo, bm) = self.get_bit_idx(&node_id);
-        self.bitfield[fo] |= bm
+        self.bitfield.set_bit(node_id);
     }
 
-    fn get_embedding(&self, node_id: NodeID) -> &[f32] {
+    pub fn get_embedding(&self, node_id: NodeID) -> &[f32] {
         let start = node_id * self.dims;
         &self.embeddings[start..start+self.dims]
     }
 
-    fn get_embedding_mut(&mut self, node_id: NodeID) -> &mut [f32] {
+    pub fn get_embedding_mut(&mut self, node_id: NodeID) -> &mut [f32] {
         let start = node_id * self.dims;
+        self.bitfield.set_bit(node_id);
         &mut self.embeddings[start..start+self.dims]
     }
 
@@ -115,6 +109,17 @@ mod embedding_tests {
 
         assert_eq!(es.compute_distance(0, 1), 2f32.sqrt());
         assert_eq!(es.compute_distance(0, 35), 8f32.sqrt());
+    }
+
+    fn test_distances() {
+        let alt_d = Distance::ALT.compute(&[1., 2., 1.], &[3., 2., 4.]);
+        assert_eq!(alt_d, 3.);
+
+        let cosine_d = Distance::Cosine.compute(&[1., 2., 1.], &[3., 2., 4.]);
+        assert_eq!(alt_d, (3. + 4. + 4.) / ((1. + 4. + 1.) * (9. + 4. + 16.)));
+
+        let euclidean_d = Distance::Euclidean.compute(&[1., 2., 1.], &[3., 2., 4.]);
+        assert_eq!(alt_d, (4f32 + 0. + 9.).sqrt());
     }
 
 }
