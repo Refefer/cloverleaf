@@ -1,5 +1,5 @@
-mod graph;
-mod algos;
+pub mod graph;
+pub mod algos;
 mod sampler;
 mod vocab;
 mod embeddings;

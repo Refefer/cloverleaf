@@ -25,7 +25,7 @@ impl Distance {
                     d2 += ej.powf(2.);
                     ei * ej
                 }).sum::<f32>();
-                let cosine_score = (dot / (d1.sqrt() * d2.sqrt()));
+                let cosine_score = dot / (d1.sqrt() * d2.sqrt());
                 -cosine_score + 1.
             },
 
@@ -47,7 +47,6 @@ impl Distance {
 }
 
 pub struct EmbeddingStore {
-    nodes: usize,
     dims: usize,
     embeddings: Vec<f32>,
     bitfield: BitSet,
@@ -57,7 +56,6 @@ pub struct EmbeddingStore {
 impl EmbeddingStore {
     pub fn new(nodes: usize, dims: usize, distance: Distance) -> Self {
         EmbeddingStore {
-            nodes,
             dims,
             distance,
             bitfield: BitSet::new(nodes),
