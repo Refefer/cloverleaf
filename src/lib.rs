@@ -91,8 +91,10 @@ impl RwrGraph {
 
 }
 
+
 #[pymethods]
 impl RwrGraph {
+
     #[new]
     fn new(edges: Vec<(String,String,f32)>) -> Self {
         let (graph, vocab) = build_csr(edges.into_iter());
@@ -216,16 +218,67 @@ impl RwrGraph {
     }
 
     pub fn edges(&self) -> usize {
-        self.graph.len()
+        self.graph.edges()
     }
 
 }
+
+#[pyclass]
+#[derive(Clone)]
+enum EdgeType {
+    Directed,
+    Undirected
+}
+
+#[pyclass]
+struct GraphBuilder {
+    vocab: Vocab,
+    edges: Vec<(NodeID, NodeID, f32)>
+}
+
+#[pymethods]
+impl GraphBuilder {
+    #[new]
+    pub fn new() -> Self {
+        GraphBuilder {
+            vocab: Vocab::new(),
+            edges: Vec::new()
+        }
+    }
+
+    pub fn add_edge(&mut self, from_node: String, to_node: String, weight: f32, node_type: EdgeType) {
+        let f_id = self.vocab.get_or_insert(from_node);
+        let t_id = self.vocab.get_or_insert(to_node);
+        self.edges.push((f_id, t_id, weight));
+        if matches!(node_type, EdgeType::Undirected) {
+            self.edges.push((t_id, f_id, weight));
+        }
+    }
+
+    pub fn build_graph(&mut self) -> RwrGraph {
+        let mut vocab = Vocab::new(); 
+        std::mem::swap(&mut vocab, &mut self.vocab);
+        let mut edges = Vec::new();
+        std::mem::swap(&mut edges, &mut self.edges);
+        let graph = CSR::construct_from_edges(edges);
+
+        RwrGraph {
+            graph: CumCSR::convert(graph),
+            vocab: vocab,
+            embeddings: None
+        }
+    }
+
+}
+
 
 #[pymodule]
 fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     //m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
     m.add_class::<RwrGraph>()?;
     m.add_class::<Distance>()?;
+    m.add_class::<GraphBuilder>()?;
+    m.add_class::<EdgeType>()?;
     Ok(())
 }
 
