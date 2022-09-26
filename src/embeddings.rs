@@ -6,7 +6,8 @@ use crate::bitset::BitSet;
 pub enum Distance {
     ALT,
     Cosine,
-    Euclidean
+    Euclidean,
+    Hamming
 }
 
 impl Distance {
@@ -24,14 +25,23 @@ impl Distance {
                     d2 += ej.powf(2.);
                     ei * ej
                 }).sum::<f32>();
-                -(dot / (d1*d2)) + 1.
+                let cosine_score = (dot / (d1.sqrt() * d2.sqrt()));
+                -cosine_score + 1.
             },
 
             Distance::Euclidean => {
                 e1.iter().zip(e2.iter()).map(|(ei, ej)| {
                     (*ei - *ej).powf(2.)
                 }).sum::<f32>().sqrt()
+            },
+
+            Distance::Hamming => {
+                let not_matches = e1.iter().zip(e2.iter()).map(|(ei, ej)| {
+                    if *ei != *ej { 1f32 } else {0f32}
+                }).sum::<f32>();
+                not_matches / e1.len() as f32
             }
+
         }
     }
 }
@@ -111,15 +121,23 @@ mod embedding_tests {
         assert_eq!(es.compute_distance(0, 35), 8f32.sqrt());
     }
 
+    #[test]
     fn test_distances() {
         let alt_d = Distance::ALT.compute(&[1., 2., 1.], &[3., 2., 4.]);
         assert_eq!(alt_d, 3.);
 
         let cosine_d = Distance::Cosine.compute(&[1., 2., 1.], &[3., 2., 4.]);
-        assert_eq!(alt_d, (3. + 4. + 4.) / ((1. + 4. + 1.) * (9. + 4. + 16.)));
+        let dot = 3. + 4. + 4.;
+        let n1 = (1f32 + 4. + 1.).sqrt();
+        let n2 = (9f32 + 4. + 16.).sqrt();
+        let cosine_score = dot / (n1 * n2);
+        assert_eq!(cosine_d, -cosine_score + 1.);
 
         let euclidean_d = Distance::Euclidean.compute(&[1., 2., 1.], &[3., 2., 4.]);
-        assert_eq!(alt_d, (4f32 + 0. + 9.).sqrt());
+        assert_eq!(euclidean_d, (4f32 + 0. + 9.).sqrt());
+
+        let hamming_d = Distance::Hamming.compute(&[1., 2., 1.], &[3., 2., 4.]);
+        assert_eq!(hamming_d, 2./3.);
     }
 
 }

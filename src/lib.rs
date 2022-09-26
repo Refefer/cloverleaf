@@ -187,6 +187,13 @@ impl RwrGraph {
         Ok(())
     }
 
+    pub fn create_cluster_embeddings(&mut self, k: usize, passes: usize, seed: Option<u64>) -> PyResult<()> {
+        let seed = seed.unwrap_or(SEED);
+        let es = crate::algos::lpa::construct_lpa_embedding(&self.graph, k, passes, seed);
+        self.embeddings = Some(es);
+        Ok(())
+    }
+
     pub fn contains_node(&self, name: String) -> bool {
         self.vocab.get_node_id(name).is_some()
     }
