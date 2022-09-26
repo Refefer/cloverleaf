@@ -196,6 +196,13 @@ impl RwrGraph {
         Ok(())
     }
 
+    pub fn create_slpa_embeddings(&mut self, k: usize, threshold: f32, seed: Option<u64>) -> PyResult<()> {
+        let seed = seed.unwrap_or(SEED);
+        let es = crate::algos::slpa::construct_slpa_embedding(&self.graph, k, threshold, seed);
+        self.embeddings = Some(es);
+        Ok(())
+    }
+
     pub fn contains_node(&self, name: String) -> bool {
         self.vocab.get_node_id(name).is_some()
     }

@@ -7,7 +7,8 @@ pub enum Distance {
     ALT,
     Cosine,
     Euclidean,
-    Hamming
+    Hamming,
+    SetOverlap
 }
 
 impl Distance {
@@ -40,8 +41,27 @@ impl Distance {
                     if *ei != *ej { 1f32 } else {0f32}
                 }).sum::<f32>();
                 not_matches / e1.len() as f32
+            },
+            Distance::SetOverlap => {
+                let mut idx1 = 0;
+                let mut idx2 = 0;
+                let mut matches = 0;
+                while idx1 < e1.len() && idx2 < e2.len() && e1[idx1] >= 0. && e2[idx2] >= 0. {
+                    let v1 = e1[idx1];
+                    let v2 = e2[idx2];
+                    if v1 == v2 {
+                        matches += 1;
+                        idx1 += 1;
+                        idx2 += 1;
+                    } else if v1 < v2 {
+                        idx1 += 1;
+                    } else {
+                        idx2 += 1;
+                    }
+                }
+                (e1.len() - matches) as f32 / e1.len() as f32
+                
             }
-
         }
     }
 }
@@ -136,6 +156,9 @@ mod embedding_tests {
 
         let hamming_d = Distance::Hamming.compute(&[1., 2., 1.], &[3., 2., 4.]);
         assert_eq!(hamming_d, 2./3.);
+
+        let overlap_d = Distance::SetOverlap.compute(&[1., 2., -1.], &[2., 4., 5.]);
+        assert_eq!(overlap_d, 2./3.);
     }
 
 }
