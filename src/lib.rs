@@ -54,7 +54,9 @@ fn convert_scores(vocab: &Vocab, scores: impl Iterator<Item=(NodeID, f32)>, k: O
 enum Distance {
     Cosine,
     Euclidean,
-    ALT
+    ALT,
+    Jaccard,
+    Hamming
 }
 
 #[pyclass]
@@ -172,7 +174,9 @@ impl RwrGraph {
         let dist = match distance {
             Distance::Cosine => EDist::Cosine,
             Distance::Euclidean => EDist::Euclidean,
-            Distance::ALT => EDist::ALT
+            Distance::ALT => EDist::ALT,
+            Distance::Hamming => EDist::Hamming,
+            Distance::Jaccard => EDist::Jaccard
         };
         self.embeddings = Some(EmbeddingStore::new(self.graph.len(), dims, dist));
         Ok(())

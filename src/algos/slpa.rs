@@ -16,7 +16,7 @@ pub fn construct_slpa_embedding(
     seed: u64
 ) -> EmbeddingStore {
     let dims = (k / (k as f32 * threshold).ceil() as usize) + 1;
-    let mut es = EmbeddingStore::new(graph.len(), dims, Distance::SetOverlap);
+    let mut es = EmbeddingStore::new(graph.len(), dims, Distance::Jaccard);
 
     let mut clusters = vec![0usize; graph.len() * k];
     for i in 0..graph.len() {
@@ -24,18 +24,18 @@ pub fn construct_slpa_embedding(
     }
 
     let mut rng = XorShiftRng::seed_from_u64(seed);
-    let mut idxs: Vec<_> = (0..graph.len()).collect();
 
     let mut buffer = vec![0; graph.len()];
     for pass in 1..k {
         eprintln!("Pass {}/{}", pass, k);
 
         // Select a node, look at its 
-        idxs.par_iter().zip(buffer.par_iter_mut()).for_each(|(node_id, new_cluster)| {
-            let mut rng = XorShiftRng::seed_from_u64(seed + pass as u64 + *node_id as u64);
+        (0..graph.len()).into_par_iter().zip(buffer.par_iter_mut()).for_each(|(node_id, new_cluster)| {
+
+            let mut rng = XorShiftRng::seed_from_u64(seed + pass as u64 + node_id as u64);
             
             // Collect a cluster from each of its reports
-            let edges = &graph.get_edges(*node_id).0;
+            let edges = &graph.get_edges(node_id).0;
             let mut proposed_clusters: Vec<_> = edges.iter().map(|idx| {
                 let offset = idx * k;
                 
@@ -45,18 +45,19 @@ pub fn construct_slpa_embedding(
             }).collect();
             
             // Select the "best" cluster
-            proposed_clusters.sort_unstable();
+            proposed_clusters.par_sort_unstable();
             *new_cluster = get_best_count(&proposed_clusters, &mut rng);
         });
 
         // Update entry
-        idxs.iter().zip(buffer.iter()).for_each(|(node_id, cluster_id)| {
-            clusters[node_id * k + pass] = *cluster_id;
+        buffer.par_iter().zip(clusters.par_iter_mut().chunks(k)).for_each(|(cluster_id, mut emb)| {
+            *emb[pass] = *cluster_id;
         });
     }
 
     // Threshold is the l1norm score
     let min_count = (threshold * k as f32).ceil() as usize;
+    println!("Min Count: {}", min_count);
     clusters.chunks_mut(k).enumerate().for_each(|(node_id, node_clusters)| {
         let embedding = es.get_embedding_mut(node_id);
         embedding.iter_mut().for_each(|v| *v = -1.);

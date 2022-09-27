@@ -8,7 +8,7 @@ pub enum Distance {
     Cosine,
     Euclidean,
     Hamming,
-    SetOverlap
+    Jaccard
 }
 
 impl Distance {
@@ -42,7 +42,7 @@ impl Distance {
                 }).sum::<f32>();
                 not_matches / e1.len() as f32
             },
-            Distance::SetOverlap => {
+            Distance::Jaccard => {
                 let mut idx1 = 0;
                 let mut idx2 = 0;
                 let mut matches = 0;
@@ -59,8 +59,16 @@ impl Distance {
                         idx2 += 1;
                     }
                 }
-                (e1.len() - matches) as f32 / e1.len() as f32
-                
+                while idx1 < e1.len() && e1[idx1] >= 0. {
+                    idx1 +=1;
+                }
+                while idx2 < e2.len() && e2[idx2] >= 0. {
+                    idx2 +=1;
+                }
+
+                let total_sets = matches + (idx1 - matches) + (idx2 - matches);
+                1. - matches as f32 / total_sets as f32
+                //( - matches) as f32 / e1.len() as f32
             }
         }
     }
@@ -157,8 +165,10 @@ mod embedding_tests {
         let hamming_d = Distance::Hamming.compute(&[1., 2., 1.], &[3., 2., 4.]);
         assert_eq!(hamming_d, 2./3.);
 
-        let overlap_d = Distance::SetOverlap.compute(&[1., 2., -1.], &[2., 4., 5.]);
-        assert_eq!(overlap_d, 2./3.);
+        let overlap_d = Distance::Jaccard.compute(&[1., 2., -1.], &[2., 4., 5.]);
+        let num = 1.;
+        let denom = 4.;
+        assert_eq!(overlap_d, 1. - 1. / 4.);
     }
 
 }
