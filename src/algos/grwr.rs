@@ -27,6 +27,7 @@ pub struct GuidedRWR {
     pub steps: Steps,
     pub walks: usize,
     pub alpha: f32,
+    pub beta: f32,
     pub seed: u64
 }
 
@@ -68,7 +69,7 @@ impl GuidedRWR {
         // Discount by node degree
         counts.par_iter_mut()
            .for_each(|(k, v)| {
-               let d = (graph.degree(*k) as f32).powf(0.5);
+               let d = (graph.degree(*k) as f32).powf(self.beta);
                *v /= (self.walks as f32) * d;
            });
         counts
@@ -84,10 +85,13 @@ impl GuidedRWR {
         rng: &mut R
     ) {
         // One pass of BFS
+        let base_seed: u64 = rng.gen();
         counts.iter().for_each(|(node, cnt)| {
+            // Make stable rng
+            let mut new_rng = XorShiftRng::seed_from_u64(base_seed + *node as u64);
             for _ in 0..(*cnt as usize) {
-                let node = sampler.sample(graph, *node, rng).unwrap_or(*start_node);
-                *next.entry(node).or_insert(0.) += 1.;
+                let next_node = sampler.sample(graph, *node, &mut new_rng).unwrap_or(*start_node);
+                *next.entry(next_node).or_insert(0.) += 1.;
             }
         });
 
@@ -106,12 +110,12 @@ impl GuidedRWR {
     }
 }
 
-/*
 #[cfg(test)]
 mod grwr_tests {
     use super::*;
     use crate::graph::{CumCSR,CSR};
-    use crate::sampler::Unweighted;
+    use crate::sampler::{Unweighted, Weighted};
+    use crate::embeddings::{EmbeddingStore,Distance};
     use float_ord::FloatOrd;
 
     fn build_edges() -> Vec<(usize, usize, f32)> {
@@ -125,8 +129,49 @@ mod grwr_tests {
     }
 
     #[test]
-    fn test_grwr() {
+    fn test_grwr_unweighted() {
+        let edges = build_edges();
+
+        let csr = CSR::construct_from_edges(edges);
+        let ccsr = CumCSR::convert(csr);
+        let rwr = GuidedRWR {
+            steps: Steps::Fixed(1),
+            walks: 10_000,
+            alpha: 0.,
+            beta: 0.5,
+            seed: 20222022
+        };
+
+        let es = EmbeddingStore::new(ccsr.len(), 1, Distance::Cosine);
+        let candidates = rwr.sample(&ccsr, &Unweighted, &es, 0, 0);
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates.contains_key(&1));
+    }
+
+    #[test]
+    fn test_grwr_weighted() {
+        let edges = build_edges();
+
+        let csr = CSR::construct_from_edges(edges);
+        let ccsr = CumCSR::convert(csr);
+        let rwr = GuidedRWR {
+            steps: Steps::Fixed(1),
+            walks: 10_000,
+            alpha: 0.,
+            beta: 0.0,
+            seed: 20222022
+        };
+
+        let es = EmbeddingStore::new(ccsr.len(), 1, Distance::Cosine);
+
+        let mut candidates: Vec<_> = rwr.sample(&ccsr, &Weighted, &es, 1, 1)
+            .into_iter().collect();
+        candidates.sort_by_key(|(node_id, weight)| FloatOrd(-*weight));
+
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].0, 0);
+        assert_eq!(candidates[1].0, 1);
+        assert_eq!(candidates[2].0, 2);
     }
 
 }
-*/

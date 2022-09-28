@@ -29,7 +29,7 @@ impl Reweighter {
             }).collect();
 
         if distances.len() > 2 {
-            self.reweight_by_distance(results, &distances);
+            Reweighter::reweight_by_distance(results, &distances, self.alpha);
         }
     }
 
@@ -38,7 +38,7 @@ impl Reweighter {
         1. / (1. + (-x).exp())
     }
 
-    fn reweight_by_distance(&self, results: &mut HashMap<NodeID, f32>, distances: &HashMap<NodeID,f32>) {
+    fn reweight_by_distance(results: &mut HashMap<NodeID, f32>, distances: &HashMap<NodeID,f32>, alpha: f32) {
         // Z Normalize the values to a unit Normal, then run it through a sigmoid
         // transform (pretending it's a logistic distribution) to convert to probabilities.
         // In cases where an embedding is missing, we set the distance to the expected value
@@ -52,7 +52,8 @@ impl Reweighter {
             } else {
                 0.5
             };
-            *wi *= p.powf(self.alpha);
+            //*wi = (1. - alpha) * *wi + alpha * p;
+            *wi *= (p).powf(alpha);
         });
 
     }
@@ -75,7 +76,7 @@ impl Reweighter {
 }
 
 #[cfg(test)]
-mod rwr_tests {
+mod reweighter_tests {
     use super::*;
     use float_ord::FloatOrd;
 
@@ -89,11 +90,43 @@ mod rwr_tests {
         ]
     }
 
-    #[test]
-    fn test_compute_stats() {
+    fn build_counts() -> HashMap<usize, f32>{
         let mut hm = HashMap::new();
         hm.insert(0, 1.);
         hm.insert(1, 2.);
+        hm
+    }
+
+    #[test]
+    fn test_compute_stats() {
+        let mut hm = build_counts();
+
+        let (mu, sigma) = Reweighter::compute_stats(&hm);
+        assert_eq!(mu, 1.5);
+        assert_eq!(sigma, (0.5 / 2f32).sqrt());
+    }
+
+    #[test]
+    fn test_reweight() {
+        let mut counts = build_counts();
+
+        let mut distances = HashMap::new();
+        distances.insert(0, 0.2);
+        distances.insert(1, 0.5);
+
+        // Distance doesn't matter
+        Reweighter::reweight_by_distance(&mut counts, &distances, 0.);
+        assert_eq!(counts[&0], 1.);
+        assert_eq!(counts[&1], 2.);
+        
+        // Distance only matters
+        Reweighter::reweight_by_distance(&mut counts, &distances, 1.);
+        let mut counts = counts.into_iter().collect::<Vec<_>>();
+        counts.sort_by_key(|(_, w) | FloatOrd(-*w));
+        println!("{:?}", counts);
+        assert_eq!(counts[0].0, 0);
+        assert_eq!(counts[1].0, 1);
+
     }
 
 }

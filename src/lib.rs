@@ -117,7 +117,8 @@ impl RwrGraph {
         k: Option<usize>, 
         guided_context: Option<String>,
         rerank_context: Option<String>,
-        blend: Option<f32>
+        blend: Option<f32>,
+        beta: Option<f32>
     ) -> PyResult<Vec<(String, f32)>> {
         let node_id = self.get_node_id(name)?;
 
@@ -133,10 +134,11 @@ impl RwrGraph {
             };
 
             let grwr = GuidedRWR {
-               steps: steps,
-               walks: walks,
-               alpha: blend.unwrap_or(0.5),
-               seed: seed.unwrap_or(SEED)
+                steps: steps,
+                walks: walks,
+                alpha: blend.unwrap_or(0.5),
+                beta: beta.unwrap_or(0.5),
+                seed: seed.unwrap_or(SEED)
             };
             let embeddings = self.get_embeddings()?;
             grwr.sample(&self.graph, &Weighted, embeddings, node_id, g_node_id)
@@ -152,6 +154,7 @@ impl RwrGraph {
             let rwr = RWR {
                 steps: steps,
                 walks: walks,
+                beta: beta.unwrap_or(0.5),
                 seed: seed.unwrap_or(SEED)
             };
 
@@ -232,6 +235,15 @@ impl RwrGraph {
         self.graph.edges()
     }
 
+    pub fn get_edges(&self, name: String) -> PyResult<(Vec<String>, Vec<f32>)> {
+        let node_id = self.get_node_id(name)?;
+        let (edges, weights) = self.graph.get_edges(node_id);
+        let names = edges.into_iter()
+            .map(|node_id| (*self.vocab.get_name(*node_id).unwrap()).clone())
+            .collect();
+        Ok((names, weights.to_vec()))
+    }
+
 }
 
 #[pyclass]
@@ -285,7 +297,6 @@ impl GraphBuilder {
 
 #[pymodule]
 fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
-    //m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
     m.add_class::<RwrGraph>()?;
     m.add_class::<Distance>()?;
     m.add_class::<GraphBuilder>()?;

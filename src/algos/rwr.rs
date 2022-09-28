@@ -15,6 +15,7 @@ pub enum Steps {
 pub struct RWR {
     pub steps: Steps,
     pub walks: usize,
+    pub beta: f32,
     pub seed: u64
 }
 
@@ -61,7 +62,7 @@ impl RWR {
 
        ret.par_iter_mut()
            .for_each(|(k, v)| {
-               let d = (graph.degree(*k) as f32).powf(0.5);
+               let d = (graph.degree(*k) as f32).powf(self.beta);
                *v /= (self.walks as f32) * d;
            });
        ret
@@ -95,6 +96,7 @@ mod rwr_tests {
         let rwr = RWR {
             steps: Steps::Probability(0.1),
             walks: 10_000,
+            beta: 0.5,
             seed: 20222022
         };
 

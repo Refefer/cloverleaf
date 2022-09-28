@@ -27,8 +27,6 @@ pub fn construct_slpa_embedding(
 
     let mut buffer = vec![0; graph.len()];
     for pass in 1..k {
-        eprintln!("Pass {}/{}", pass, k);
-
         // Select a node, look at its 
         (0..graph.len()).into_par_iter().zip(buffer.par_iter_mut()).for_each(|(node_id, new_cluster)| {
 
@@ -57,7 +55,6 @@ pub fn construct_slpa_embedding(
 
     // Threshold is the l1norm score
     let min_count = (threshold * k as f32).ceil() as usize;
-    println!("Min Count: {}", min_count);
     clusters.chunks_mut(k).enumerate().for_each(|(node_id, node_clusters)| {
         let embedding = es.get_embedding_mut(node_id);
         embedding.iter_mut().for_each(|v| *v = -1.);
