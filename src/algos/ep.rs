@@ -117,7 +117,6 @@ impl EmbeddingPropagation {
                 // h(u)
                 let (hu_vars, hu) = construct_node_embedding(neg_node, features, &feature_embeddings);
 
-
                 // Compute error
                 let loss = margin_loss(thv, hv, hu, self.gamma);
 
