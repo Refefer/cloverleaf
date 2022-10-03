@@ -32,15 +32,15 @@ impl FeatureStore {
             .collect()
     }
 
-    fn get_features(&self, node: NodeID) -> &[usize] {
+    pub fn get_features(&self, node: NodeID) -> &[usize] {
         &self.features[node]
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.feature_vocab.len() + self.empty_nodes
     }
 
-    fn fill_missing_nodes(&mut self) {
+    pub fn fill_missing_nodes(&mut self) {
         let mut idxs = self.feature_vocab.len();
         self.features.iter_mut().for_each(|f| {
             if f.len() == 0 {
@@ -69,11 +69,16 @@ impl EmbeddingPropagation {
         graph: &G, 
         features: &mut FeatureStore
     ) -> EmbeddingStore {
-        let es = EmbeddingStore::new(graph.len(), self.dims, Distance::Cosine);
         let mut rng = XorShiftRng::seed_from_u64(self.seed);
         let mut agraph = Graph::new();
+        let feat_embeds = self.learn_feature_embeddings(graph, &mut agraph, features, &mut rng);
+        let mut es = EmbeddingStore::new(graph.len(), self.dims, Distance::Cosine);
+        for node in 0..graph.len() {
+            let node_embedding = construct_node_embedding(node, features, &feat_embeds).1;
+            let embedding = es.get_embedding_mut(node);
+            embedding.clone_from_slice(node_embedding.value());
+        }
         es
-        
     }
 
     fn learn_feature_embeddings<G: CGraph + Send + Sync, R: Rng>(
@@ -89,9 +94,10 @@ impl EmbeddingPropagation {
 
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
         let dist = Uniform::new(0, node_idxs.len());
-        for _ in 0..self.passes {
+        for pass in 0..self.passes {
             // Shuffle for SGD
             node_idxs.shuffle(rng);
+            let mut error = 0f32;
             for node in node_idxs.iter() {
                 // Empty gradients
                 agraph.zero_grads();
@@ -105,15 +111,17 @@ impl EmbeddingPropagation {
                 // h(v)
                 let (hv_vars, hv) = construct_node_embedding(*node, features, &feature_embeddings);
                 
+                // ~h(v)
+                let (thv_vars, thv) = reconstruct_node_embedding(graph, *node, features, &feature_embeddings, Some(10));
+                
                 // h(u)
                 let (hu_vars, hu) = construct_node_embedding(neg_node, features, &feature_embeddings);
 
-                // ~h(v)
-                let (thv_vars, thv) = reconstruct_node_embedding(graph, *node, features, &feature_embeddings, Some(10));
 
                 // Compute error
                 let loss = margin_loss(thv, hv, hu, self.gamma);
-                println!("Error:{:.3}", loss.value()[0]);
+
+                error += loss.value()[0];
 
                 // Back propagate and SGD
                 agraph.backward(&loss);
@@ -121,6 +129,7 @@ impl EmbeddingPropagation {
                 sgd(agraph, &mut feature_embeddings, hv_vars, hu_vars, thv_vars, self.alpha);
 
             }
+            println!("Pass: {}, Error: {:.3}", pass, error / node_idxs.len() as f32);
         }
         feature_embeddings
     }
@@ -148,15 +157,15 @@ fn sgd(
         let grad = graph.get_grad(&var)
             .expect("Should have a gradient!");
         let emb = feature_embeddings.get_embedding_mut(feat_id);
-        println!("Feat: {}", feat_id);
-        println!("Embedding: {:?}", emb);
-        println!("Grad: {:?}", emb);
-        
-        // SGD
-        emb.iter_mut().zip(grad.iter()).for_each(|(ei, gi)| {
-            *ei -= alpha * *gi;
-        });
-        println!("Embedding New: {:?}", emb);
+
+        if grad.iter().all(|gi| !gi.is_nan()) {
+            // Can get some nans in weird cases, such as the distance between
+            // a node and it's reconstruction when it shares all features.
+            // SGD
+            emb.iter_mut().zip(grad.iter()).for_each(|(ei, gi)| {
+                *ei -= alpha * *gi;
+            });
+        }
     }
 
 }
@@ -214,7 +223,7 @@ fn mean_embeddings<'a,I: Iterator<Item=&'a (ANode, usize)>>(items: I) -> ANode {
     let mut n = 0;
     items.for_each(|(emb, count)| {
         vs.push(emb * *count as f32);
-        n += 1
+        n += *count;
     });
     vs.sum_all() / n as f32
 }
@@ -226,7 +235,7 @@ fn euclidean_distance(e1: ANode, e2: ANode) -> ANode {
 fn margin_loss(thv: ANode, hv: ANode, hu: ANode, gamma: f32) -> ANode {
     let d1 = euclidean_distance(thv.clone(), hv);
     let d2 = euclidean_distance(thv, hu);
-    (gamma + d1 - d2).maximum(0f32).sum()
+    (gamma + d1 - d2).maximum(0f32)
 }
 
 fn randomize_embedding_store(es: &mut EmbeddingStore, rng: &mut impl Rng) {
@@ -241,16 +250,17 @@ mod ep_tests {
     use super::*;
     use crate::graph::{CumCSR,CSR};
 
-    fn build_edges() -> Vec<(usize, usize, f32)> {
-        vec![
-            (0, 1, 1.),
-            (1, 1, 3.),
-            (1, 2, 2.),
-            (2, 1, 0.5),
-            (1, 0, 10.),
-        ]
+    fn build_star_edges() -> Vec<(usize, usize, f32)> {
+        let mut edges = Vec::new();
+        let max = 10;
+        for ni in 0..max {
+            for no in (ni+1)..max {
+                edges.push((ni, no, 1f32));
+                edges.push((no, ni, 1f32));
+            }
+        }
+        edges
     }
-
 
     #[test]
     fn test_euclidean_dist() {
@@ -262,7 +272,7 @@ mod ep_tests {
 
     #[test]
     fn test_simple_learn_dist() {
-        let edges = build_edges();
+        let edges = build_star_edges();
         let csr = CSR::construct_from_edges(edges);
         let ccsr = CumCSR::convert(csr);
         
@@ -273,11 +283,11 @@ mod ep_tests {
         let mut agraph = Graph::new();
 
         let ep = EmbeddingPropagation {
-            alpha: 1e-4,
+            alpha: 1e-2,
             gamma: 1f32,
             batch_size: 1,
             dims: 5,
-            passes: 10,
+            passes: 50,
             seed: 202220222
         };
 
@@ -286,8 +296,6 @@ mod ep_tests {
             let e = embeddings.get_embedding(idx);
             println!("{:?} -> {:?}", idx, e);
         }
-        panic!();
-
     }
 
 }

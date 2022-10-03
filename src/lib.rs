@@ -13,6 +13,7 @@ use crate::graph::{CSR,CumCSR,Graph,NodeID};
 use crate::algos::rwr::{Steps,RWR};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
+use crate::algos::ep::{FeatureStore,EmbeddingPropagation};
 use crate::vocab::Vocab;
 use crate::sampler::Weighted;
 use crate::embeddings::{EmbeddingStore,Distance as EDist};
@@ -121,7 +122,6 @@ impl RwrGraph {
         beta: Option<f32>
     ) -> PyResult<Vec<(String, f32)>> {
         let node_id = self.get_node_id(name)?;
-
         
         let mut results = if let Some(guided_node) = guided_context {
             let g_node_id = self.get_node_id(guided_node)?;
@@ -294,6 +294,61 @@ impl GraphBuilder {
 
 }
 
+#[pyclass]
+struct FeatureEmbeddingBuilder {
+    features: FeatureStore
+}
+
+#[pymethods]
+impl FeatureEmbeddingBuilder {
+    #[new]
+    pub fn new(graph: &RwrGraph) -> Self {
+        FeatureEmbeddingBuilder {
+            features: FeatureStore::new(graph.graph.len())
+        }
+    }
+
+    fn get_node_id(&self, graph: &RwrGraph, node: String) -> PyResult<NodeID> {
+        if let Some(node_id) = graph.vocab.get_node_id(node.clone()) {
+            Ok(node_id)
+        } else {
+            Err(PyValueError::new_err(format!(" Node '{}' does not exist!", node)))
+        }
+    }
+
+    pub fn add_features(&mut self, graph: &RwrGraph, node: String, features: Vec<String>) -> PyResult<()> {
+        let node_id = self.get_node_id(graph, node)?;
+        self.features.set_features(node_id, features);
+        Ok(())
+    }
+
+    pub fn fit(
+        &mut self, 
+        graph: &mut RwrGraph, 
+        alpha: f32, 
+        gamma: f32, 
+        batch_size: usize, 
+        dims: usize,
+        passes: usize,
+        seed: Option<u64>
+    ) {
+        let ep = EmbeddingPropagation {
+            alpha,
+            gamma,
+            batch_size,
+            dims,
+            passes,
+            seed: seed.unwrap_or(SEED)
+        };
+
+        self.features.fill_missing_nodes();
+        let embeddings = ep.learn(&graph.graph, &mut self.features);
+        graph.embeddings = Some(embeddings);
+    }
+
+}
+
+
 
 #[pymodule]
 fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
@@ -301,6 +356,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Distance>()?;
     m.add_class::<GraphBuilder>()?;
     m.add_class::<EdgeType>()?;
+    m.add_class::<FeatureEmbeddingBuilder>()?;
     Ok(())
 }
 
