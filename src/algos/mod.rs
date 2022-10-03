@@ -4,4 +4,5 @@ pub mod reweighter;
 pub mod dist;
 pub mod lpa;
 pub mod slpa;
+pub mod ep;
 mod utils;

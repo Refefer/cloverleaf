@@ -1,14 +1,11 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hashbrown::HashMap;
 use rand::prelude::*;
-use rand_distr::{Distribution,Uniform};
 use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
 
-use crate::graph::{Graph,NodeID};
-use crate::bitset::BitSet;
+use crate::graph::Graph;
 use crate::embeddings::{EmbeddingStore,Distance};
 use crate::algos::utils::get_best_count;
 
@@ -26,7 +23,7 @@ pub fn lpa(
         .unwrap_or(1);
 
     let mut counts = vec![0; max_degree];
-    for i_pass in 0..passes {
+    for _i_pass in 0..passes {
         idxs.shuffle(&mut rng);
         for idx in idxs.iter() {
             // Count neighbors
@@ -36,7 +33,7 @@ pub fn lpa(
                 *count = clusters[*t_node];
             }
 
-            let mut slice = &mut counts[0..n];
+            let slice = &mut counts[0..n];
             slice.sort_unstable();
             clusters[*idx] = get_best_count(&slice, &mut rng);
         }
@@ -50,7 +47,7 @@ pub fn construct_lpa_embedding(
     passes: usize,
     seed: u64
 ) -> EmbeddingStore {
-    let mut es = EmbeddingStore::new(graph.len(), k, Distance::Hamming);
+    let es = EmbeddingStore::new(graph.len(), k, Distance::Hamming);
     let mes = Mutex::new(es);
 
     println!("k={},passes={},seed={}", k, passes, seed);

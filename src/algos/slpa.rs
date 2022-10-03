@@ -1,10 +1,9 @@
-use hashbrown::HashMap;
 use rand::prelude::*;
 use rand_distr::{Distribution,Uniform};
 use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
 
-use crate::graph::{Graph,NodeID};
+use crate::graph::Graph;
 
 use crate::embeddings::{EmbeddingStore, Distance};
 use crate::algos::utils::{get_best_count,Counter};
@@ -22,8 +21,6 @@ pub fn construct_slpa_embedding(
     for i in 0..graph.len() {
         clusters[i*k] = i;
     }
-
-    let mut rng = XorShiftRng::seed_from_u64(seed);
 
     let mut buffer = vec![0; graph.len()];
     for pass in 1..k {
@@ -63,7 +60,7 @@ pub fn construct_slpa_embedding(
         node_clusters.sort_unstable();
 
         Counter::new(node_clusters)
-            .filter(|(cluster, cnt)| *cnt >= min_count)
+            .filter(|(_cluster, cnt)| *cnt >= min_count)
             .enumerate()
             .for_each(|(idx, (cluster, _))| {
                 embedding[idx] = cluster as f32;

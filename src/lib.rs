@@ -9,7 +9,7 @@ use float_ord::FloatOrd;
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 
-use crate::graph::{CSR,CDFGraph,CumCSR,Graph,NodeID};
+use crate::graph::{CSR,CumCSR,Graph,NodeID};
 use crate::algos::rwr::{Steps,RWR};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
@@ -222,7 +222,7 @@ impl RwrGraph {
 
     pub fn set_embedding(&mut self, name: String, embedding: Vec<f32>) -> PyResult<()> {
         let node_id = self.get_node_id(name)?;
-        let mut es = self.get_embeddings_mut()?;
+        let es = self.get_embeddings_mut()?;
         es.set_embedding(node_id, &embedding);
         Ok(())
     }
@@ -304,8 +304,3 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     Ok(())
 }
 
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}

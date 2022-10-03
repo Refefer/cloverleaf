@@ -21,7 +21,7 @@ impl Reweighter {
     ) {
 
         // Compute distances for each item
-        let mut distances: HashMap<_,_> = results.par_keys()
+        let distances: HashMap<_,_> = results.par_keys()
             .filter(|node| embeddings.is_set(**node))
             .map(|node| {
                 let distance = embeddings.compute_distance(context_node, *node);
@@ -80,16 +80,6 @@ mod reweighter_tests {
     use super::*;
     use float_ord::FloatOrd;
 
-    fn build_edges() -> Vec<(usize, usize, f32)> {
-        vec![
-            (0, 1, 1.),
-            (1, 1, 3.),
-            (1, 2, 2.),
-            (2, 1, 0.5),
-            (1, 0, 10.),
-        ]
-    }
-
     fn build_counts() -> HashMap<usize, f32>{
         let mut hm = HashMap::new();
         hm.insert(0, 1.);
@@ -99,7 +89,7 @@ mod reweighter_tests {
 
     #[test]
     fn test_compute_stats() {
-        let mut hm = build_counts();
+        let hm = build_counts();
 
         let (mu, sigma) = Reweighter::compute_stats(&hm);
         assert_eq!(mu, 1.5);

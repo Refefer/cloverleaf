@@ -1,11 +1,9 @@
-use std::collections::HashMap;
 use std::collections::{VecDeque,BinaryHeap};
 use std::cmp::Reverse;
 use std::sync::Mutex;
 
 use rayon::prelude::*;
 use rand::prelude::*;
-use rand_distr::{Distribution,Uniform};
 use rand_xorshift::XorShiftRng;
 
 use crate::graph::{Graph,NodeID};
@@ -72,7 +70,7 @@ pub fn construct_walk_distances(
     k: usize,
     ls: LandmarkSelection
 ) -> EmbeddingStore {
-    let mut es = EmbeddingStore::new(graph.len(), k, Distance::ALT);
+    let es = EmbeddingStore::new(graph.len(), k, Distance::ALT);
     let mut top_nodes = match ls {
         LandmarkSelection::Degree => top_k_nodes(graph, k),
         LandmarkSelection::Random(seed) => rand_k_nodes(graph, k, seed)

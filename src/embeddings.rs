@@ -1,4 +1,3 @@
-
 use float_ord::FloatOrd;
 use crate::graph::NodeID;
 use crate::bitset::BitSet;
@@ -78,7 +77,8 @@ pub struct EmbeddingStore {
     dims: usize,
     embeddings: Vec<f32>,
     bitfield: BitSet,
-    distance: Distance
+    distance: Distance,
+    nodes: usize
 }
 
 impl EmbeddingStore {
@@ -87,12 +87,17 @@ impl EmbeddingStore {
             dims,
             distance,
             bitfield: BitSet::new(nodes),
-            embeddings: vec![0.; nodes * dims]
+            embeddings: vec![0.; nodes * dims],
+            nodes
         }
     }
 
     pub fn is_set(&self, node_id: NodeID) -> bool {
         self.bitfield.is_set(node_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes
     }
 
     pub fn set_embedding(&mut self, node_id: NodeID, embedding: &[f32]) {
@@ -123,7 +128,6 @@ impl EmbeddingStore {
 #[cfg(test)]
 mod embedding_tests {
     use super::*;
-    use float_ord::FloatOrd;
 
     #[test]
     fn test_embeddings() {
@@ -166,8 +170,6 @@ mod embedding_tests {
         assert_eq!(hamming_d, 2./3.);
 
         let overlap_d = Distance::Jaccard.compute(&[1., 2., -1.], &[2., 4., 5.]);
-        let num = 1.;
-        let denom = 4.;
         assert_eq!(overlap_d, 1. - 1. / 4.);
     }
 

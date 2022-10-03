@@ -1,6 +1,5 @@
 use hashbrown::HashMap;
 use rand::prelude::*;
-use rand_distr::Distribution;
 use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
 
@@ -166,7 +165,7 @@ mod grwr_tests {
 
         let mut candidates: Vec<_> = rwr.sample(&ccsr, &Weighted, &es, 1, 1)
             .into_iter().collect();
-        candidates.sort_by_key(|(node_id, weight)| FloatOrd(-*weight));
+        candidates.sort_by_key(|(_node_id, weight)| FloatOrd(-*weight));
 
         assert_eq!(candidates.len(), 3);
         assert_eq!(candidates[0].0, 0);

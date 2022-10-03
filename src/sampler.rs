@@ -54,7 +54,7 @@ pub struct Unweighted;
 
 impl <G: Graph> Sampler<G> for Unweighted {
     fn sample<R:Rng>(&self, g: &G, node: NodeID, rng: &mut R) -> Option<NodeID> {
-        let (edges, weights) = g.get_edges(node);
+        let edges = g.get_edges(node).0;
         if edges.len() == 0 {
             return None
         }

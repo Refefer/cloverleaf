@@ -62,16 +62,6 @@ mod utils_tests {
     use super::*;
     use rand_xorshift::XorShiftRng;
 
-    fn build_edges() -> Vec<(usize, usize, f32)> {
-        vec![
-            (0, 1, 1.),
-            (1, 1, 3.),
-            (1, 2, 2.),
-            (2, 0, 2.5),
-            (1, 0, 10.),
-        ]
-    }
-
     #[test]
     fn test_choose_best() {
         let counts = vec![0, 0, 1, 1, 1, 2];

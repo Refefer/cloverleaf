@@ -2,6 +2,7 @@ use hashbrown::HashMap;
 use crate::graph::NodeID;
 use std::sync::Arc;
 
+#[derive(Debug)]
 pub struct Vocab {
     vocab_to_idx: HashMap<Arc<String>, NodeID>,
     idx_to_vocab: Vec<Arc<String>>
@@ -34,5 +35,9 @@ impl Vocab {
 
     pub fn get_name(&self, node: NodeID) -> Option<Arc<String>> {
         self.idx_to_vocab.get(node).map(|v| v.clone())
+    }
+
+    pub fn len(&self) -> usize {
+        self.idx_to_vocab.len()
     }
 }
