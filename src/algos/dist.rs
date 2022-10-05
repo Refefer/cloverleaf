@@ -10,6 +10,7 @@ use crate::graph::{Graph,NodeID};
 use crate::bitset::BitSet;
 use crate::embeddings::{EmbeddingStore,Distance};
 
+#[derive(Copy,Clone)]
 pub enum LandmarkSelection {
     Random(u64),
     Degree

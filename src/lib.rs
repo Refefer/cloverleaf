@@ -5,6 +5,8 @@ mod vocab;
 mod embeddings;
 mod bitset;
 
+use std::sync::Arc;
+
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
@@ -62,9 +64,8 @@ enum Distance {
 
 #[pyclass]
 struct RwrGraph {
-    graph: CumCSR,
-    vocab: Vocab,
-    embeddings: Option<EmbeddingStore>
+    graph: Arc<CumCSR>,
+    vocab: Arc<Vocab>
 }
 
 impl RwrGraph {
@@ -73,22 +74,6 @@ impl RwrGraph {
             Ok(node_id)
         } else {
             Err(PyValueError::new_err(format!(" Node '{}' does not exist!", node)))
-        }
-    }
-
-    fn get_embeddings(&self) -> PyResult<&EmbeddingStore> {
-        if let Some(es) = &self.embeddings {
-            Ok(es)
-        } else {
-            Err(PyValueError::new_err("Embedding store wasn't initialized!"))
-        }
-    }
-
-    fn get_embeddings_mut(&mut self) -> PyResult<&mut EmbeddingStore> {
-        if let Some(es) = &mut self.embeddings {
-            Ok(es)
-        } else {
-            Err(PyValueError::new_err("Embedding store wasn't initialized!"))
         }
     }
 
@@ -103,69 +88,82 @@ impl RwrGraph {
         let (graph, vocab) = build_csr(edges.into_iter());
         eprintln!("Converting to CDF format...");
         RwrGraph {
-            graph: CumCSR::convert(graph),
-            vocab: vocab,
-            embeddings: None
+            graph: Arc::new(CumCSR::convert(graph)),
+            vocab: Arc::new(vocab)
         }
     }
 
-    pub fn compute(
+    pub fn walk(
         &self, 
         name: String, 
         restarts: f32, 
         walks: usize, 
         seed: Option<u64>, 
+        beta: Option<f32>,
         k: Option<usize>, 
-        guided_context: Option<String>,
-        rerank_context: Option<String>,
-        blend: Option<f32>,
-        beta: Option<f32>
     ) -> PyResult<Vec<(String, f32)>> {
         let node_id = self.get_node_id(name)?;
         
-        let mut results = if let Some(guided_node) = guided_context {
-            let g_node_id = self.get_node_id(guided_node)?;
-            let steps = if restarts >= 1. {
-                GSteps::Fixed(restarts as usize)
-            } else if restarts > 0. {
-                GSteps::Probability(restarts, (1. / restarts).ceil() as usize)
-            } else {
-                return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
-            };
-
-            let grwr = GuidedRWR {
-                steps: steps,
-                walks: walks,
-                alpha: blend.unwrap_or(0.5),
-                beta: beta.unwrap_or(0.5),
-                seed: seed.unwrap_or(SEED)
-            };
-            let embeddings = self.get_embeddings()?;
-            grwr.sample(&self.graph, &Weighted, embeddings, node_id, g_node_id)
+        let steps = if restarts >= 1. {
+            Steps::Fixed(restarts as usize)
+        } else if restarts > 0. {
+            Steps::Probability(restarts)
         } else {
-            let steps = if restarts >= 1. {
-                Steps::Fixed(restarts as usize)
-            } else if restarts > 0. {
-                Steps::Probability(restarts)
-            } else {
-                return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
-            };
-
-            let rwr = RWR {
-                steps: steps,
-                walks: walks,
-                beta: beta.unwrap_or(0.5),
-                seed: seed.unwrap_or(SEED)
-            };
-
-            rwr.sample(&self.graph, &Weighted, node_id)
+            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
         };
 
+        let rwr = RWR {
+            steps: steps,
+            walks: walks,
+            beta: beta.unwrap_or(0.5),
+            seed: seed.unwrap_or(SEED)
+        };
+
+        let results = rwr.sample(self.graph.as_ref(), &Weighted, node_id);
+
+        Ok(convert_scores(&self.vocab, results.into_iter(), k))
+    }
+
+    pub fn biased_walk(
+        &self, 
+        embeddings: &NodeEmbeddings,
+        name: String, 
+        biased_context: String,
+        restarts: f32, 
+        walks: usize, 
+        blend: Option<f32>,
+        beta: Option<f32>,
+        k: Option<usize>, 
+        seed: Option<u64>, 
+        rerank_context: Option<String>,
+    ) -> PyResult<Vec<(String, f32)>> {
+        let node_id = self.get_node_id(name)?;
+        
+        let g_node_id = self.get_node_id(biased_context)?;
+        let steps = if restarts >= 1. {
+            GSteps::Fixed(restarts as usize)
+        } else if restarts > 0. {
+            GSteps::Probability(restarts, (1. / restarts).ceil() as usize)
+        } else {
+            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
+        };
+
+        let grwr = GuidedRWR {
+            steps: steps,
+            walks: walks,
+            alpha: blend.unwrap_or(0.5),
+            beta: beta.unwrap_or(0.5),
+            seed: seed.unwrap_or(SEED)
+        };
+
+        let embeddings = &embeddings.embeddings;
+        let mut results = grwr.sample(self.graph.as_ref(), 
+                                  &Weighted, embeddings, node_id, g_node_id);
+        
         // Reweight results if requested
         if let Some(cn) = rerank_context {
             println!("Reranking...");
             let c_node_id = self.get_node_id(cn)?;
-            let embeddings = self.get_embeddings()?;
             Reweighter::new(blend.unwrap_or(0.5))
                 .reweight(&mut results, embeddings, c_node_id);
         }
@@ -173,58 +171,8 @@ impl RwrGraph {
         Ok(convert_scores(&self.vocab, results.into_iter(), k))
     }
 
-    pub fn initialize_embeddings(&mut self, dims: usize, distance: Distance) -> PyResult<()>{
-        let dist = match distance {
-            Distance::Cosine => EDist::Cosine,
-            Distance::Euclidean => EDist::Euclidean,
-            Distance::ALT => EDist::ALT,
-            Distance::Hamming => EDist::Hamming,
-            Distance::Jaccard => EDist::Jaccard
-        };
-        self.embeddings = Some(EmbeddingStore::new(self.graph.len(), dims, dist));
-        Ok(())
-    }
-
-    pub fn create_distance_embeddings(&mut self, landmarks: usize, seed: Option<u64>) -> PyResult<()> {
-        let ls = if let Some(seed) = seed {
-            algos::dist::LandmarkSelection::Random(seed)
-        } else {
-            algos::dist::LandmarkSelection::Degree
-        };
-        let es = crate::algos::dist::construct_walk_distances(&self.graph, landmarks, ls);
-        self.embeddings = Some(es);
-        Ok(())
-    }
-
-    pub fn create_cluster_embeddings(&mut self, k: usize, passes: usize, seed: Option<u64>) -> PyResult<()> {
-        let seed = seed.unwrap_or(SEED);
-        let es = crate::algos::lpa::construct_lpa_embedding(&self.graph, k, passes, seed);
-        self.embeddings = Some(es);
-        Ok(())
-    }
-
-    pub fn create_slpa_embeddings(&mut self, k: usize, threshold: f32, seed: Option<u64>) -> PyResult<()> {
-        let seed = seed.unwrap_or(SEED);
-        let es = crate::algos::slpa::construct_slpa_embedding(&self.graph, k, threshold, seed);
-        self.embeddings = Some(es);
-        Ok(())
-    }
-
     pub fn contains_node(&self, name: String) -> bool {
         self.vocab.get_node_id(name).is_some()
-    }
-
-    pub fn get_embedding(&mut self, name: String) -> PyResult<Vec<f32>> {
-        let node_id = self.get_node_id(name)?;
-        let es = self.get_embeddings()?;
-        Ok(es.get_embedding(node_id).to_vec())
-    }
-
-    pub fn set_embedding(&mut self, name: String, embedding: Vec<f32>) -> PyResult<()> {
-        let node_id = self.get_node_id(name)?;
-        let es = self.get_embeddings_mut()?;
-        es.set_embedding(node_id, &embedding);
-        Ok(())
     }
 
     pub fn nodes(&self) -> usize {
@@ -286,43 +234,44 @@ impl GraphBuilder {
         let graph = CSR::construct_from_edges(edges);
 
         RwrGraph {
-            graph: CumCSR::convert(graph),
-            vocab: vocab,
-            embeddings: None
+            graph: Arc::new(CumCSR::convert(graph)),
+            vocab: Arc::new(vocab)
         }
     }
 
 }
 
 #[pyclass]
-struct FeatureEmbeddingBuilder {
+struct EmbeddingPropagator {
+    vocab: Arc<Vocab>,
     features: FeatureStore
 }
 
 #[pymethods]
-impl FeatureEmbeddingBuilder {
+impl EmbeddingPropagator {
     #[new]
     pub fn new(graph: &RwrGraph) -> Self {
-        FeatureEmbeddingBuilder {
-            features: FeatureStore::new(graph.graph.len())
+        EmbeddingPropagator {
+            features: FeatureStore::new(graph.graph.len()),
+            vocab: graph.vocab.clone()
         }
     }
 
-    fn get_node_id(&self, graph: &RwrGraph, node: String) -> PyResult<NodeID> {
-        if let Some(node_id) = graph.vocab.get_node_id(node.clone()) {
+    fn get_node_id(&self, node: String) -> PyResult<NodeID> {
+        if let Some(node_id) = self.vocab.get_node_id(node.clone()) {
             Ok(node_id)
         } else {
             Err(PyValueError::new_err(format!(" Node '{}' does not exist!", node)))
         }
     }
 
-    pub fn add_features(&mut self, graph: &RwrGraph, node: String, features: Vec<String>) -> PyResult<()> {
-        let node_id = self.get_node_id(graph, node)?;
+    pub fn add_features(&mut self, node: String, features: Vec<String>) -> PyResult<()> {
+        let node_id = self.get_node_id(node)?;
         self.features.set_features(node_id, features);
         Ok(())
     }
 
-    pub fn fit(
+    pub fn learn(
         &mut self, 
         graph: &mut RwrGraph, 
         alpha: f32, 
@@ -331,7 +280,7 @@ impl FeatureEmbeddingBuilder {
         dims: usize,
         passes: usize,
         seed: Option<u64>
-    ) {
+    ) -> NodeEmbeddings{
         let ep = EmbeddingPropagation {
             alpha,
             gamma,
@@ -342,13 +291,145 @@ impl FeatureEmbeddingBuilder {
         };
 
         self.features.fill_missing_nodes();
-        let (embeddings, feat_embeds) = ep.learn(&graph.graph, &mut self.features);
-        graph.embeddings = Some(embeddings);
+        let (embeddings, _feat_embeds) = ep.learn(graph.graph.as_ref(), &mut self.features);
+        NodeEmbeddings {
+            vocab: self.vocab.clone(),
+            embeddings
+        }
     }
 
 }
 
+#[pyclass]
+struct DistanceEmbedder {
+    landmarks: algos::dist::LandmarkSelection,
+    n_landmarks: usize
+}
 
+#[pymethods]
+impl DistanceEmbedder {
+    #[new]
+    pub fn new(n_landmarks: usize, seed: Option<u64>) -> Self {
+        let ls = if let Some(seed) = seed {
+            algos::dist::LandmarkSelection::Random(seed)
+        } else {
+            algos::dist::LandmarkSelection::Degree
+        };
+        DistanceEmbedder {
+            landmarks: ls,
+            n_landmarks
+        }
+
+    }
+
+    pub fn learn(&self, graph: &RwrGraph) -> NodeEmbeddings {
+        let es = crate::algos::dist::construct_walk_distances(graph.graph.as_ref(), self.n_landmarks, self.landmarks);
+        NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings: es
+        }
+    }
+}
+
+#[pyclass]
+struct ClusterLPAEmbedder{
+    k: usize, 
+    passes: usize, 
+    seed: Option<u64>
+}
+
+#[pymethods]
+impl ClusterLPAEmbedder {
+    #[new]
+    pub fn new(k: usize, passes: usize, seed: Option<u64>) -> Self {
+        ClusterLPAEmbedder {
+            k, passes, seed
+        }
+    }
+
+    pub fn learn(&self, graph: &RwrGraph) -> NodeEmbeddings {
+        let seed = self.seed.unwrap_or(SEED);
+        let es = crate::algos::lpa::construct_lpa_embedding(graph.graph.as_ref(), self.k, self.passes, seed);
+        NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings: es
+        }
+    }
+}
+
+#[pyclass]
+struct SLPAEmbedder {
+    k: usize, 
+    threshold: f32, 
+    seed: Option<u64>
+}
+
+#[pymethods]
+impl SLPAEmbedder {
+    #[new]
+    pub fn new(k: usize, threshold: f32, seed: Option<u64>) -> Self {
+        SLPAEmbedder {
+            k, threshold, seed
+        }
+    }
+
+    pub fn learn(&self, graph: &RwrGraph) -> NodeEmbeddings {
+        let seed = self.seed.unwrap_or(SEED);
+        let es = crate::algos::slpa::construct_slpa_embedding(graph.graph.as_ref(), self.k, self.threshold, seed);
+        NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings: es
+        }
+    }
+
+}
+
+#[pyclass]
+struct NodeEmbeddings {
+    vocab: Arc<Vocab>,
+    embeddings: EmbeddingStore
+}
+
+#[pymethods]
+impl NodeEmbeddings {
+    #[new]
+    pub fn new(graph: &RwrGraph, dims: usize, distance: Distance) -> Self {
+        let dist = match distance {
+            Distance::Cosine => EDist::Cosine,
+            Distance::Euclidean => EDist::Euclidean,
+            Distance::ALT => EDist::ALT,
+            Distance::Hamming => EDist::Hamming,
+            Distance::Jaccard => EDist::Jaccard
+        };
+
+        let es = EmbeddingStore::new(graph.graph.len(), dims, dist);
+        NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings: es
+        }
+    }
+
+    fn get_node_id(&self, node: String) -> PyResult<NodeID> {
+        if let Some(node_id) = self.vocab.get_node_id(node.clone()) {
+            Ok(node_id)
+        } else {
+            Err(PyValueError::new_err(format!(" Node '{}' does not exist!", node)))
+        }
+    }
+
+    pub fn get_embedding(&mut self, name: String) -> PyResult<Vec<f32>> {
+        let node_id = self.get_node_id(name)?;
+        Ok(self.embeddings.get_embedding(node_id).to_vec())
+    }
+
+    pub fn set_embedding(&mut self, name: String, embedding: Vec<f32>) -> PyResult<()> {
+        let node_id = self.get_node_id(name)?;
+        let mut es = &mut self.embeddings;
+        es.set_embedding(node_id, &embedding);
+        Ok(())
+    }
+
+}
 
 #[pymodule]
 fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
@@ -356,7 +437,11 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Distance>()?;
     m.add_class::<GraphBuilder>()?;
     m.add_class::<EdgeType>()?;
-    m.add_class::<FeatureEmbeddingBuilder>()?;
+    m.add_class::<EmbeddingPropagator>()?;
+    m.add_class::<DistanceEmbedder>()?;
+    m.add_class::<ClusterLPAEmbedder>()?;
+    m.add_class::<SLPAEmbedder>()?;
+    m.add_class::<NodeEmbeddings>()?;
     Ok(())
 }
 
