@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use hashbrown::{HashMap,HashSet};
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
@@ -68,64 +69,58 @@ impl EmbeddingPropagation {
         &self, 
         graph: &G, 
         features: &mut FeatureStore
-    ) -> EmbeddingStore {
-        let mut rng = XorShiftRng::seed_from_u64(self.seed);
+    ) -> (EmbeddingStore, EmbeddingStore) {
         let mut agraph = Graph::new();
-        let feat_embeds = self.learn_feature_embeddings(graph, &mut agraph, features, &mut rng);
+        let feat_embeds = self.learn_feature_embeddings(graph, &mut agraph, features);
         let mut es = EmbeddingStore::new(graph.len(), self.dims, Distance::Cosine);
         for node in 0..graph.len() {
             let node_embedding = construct_node_embedding(node, features, &feat_embeds).1;
             let embedding = es.get_embedding_mut(node);
             embedding.clone_from_slice(node_embedding.value());
         }
-        es
+        (es, feat_embeds)
     }
 
-    fn learn_feature_embeddings<G: CGraph + Send + Sync, R: Rng>(
+    fn learn_feature_embeddings<G: CGraph + Send + Sync>(
         &self,
         graph: &G,
         agraph: &mut Graph,
         features: &FeatureStore,
-        rng: &mut R
     ) -> EmbeddingStore {
 
         let mut feature_embeddings = EmbeddingStore::new(features.len(), self.dims, Distance::Cosine);
-        randomize_embedding_store(&mut feature_embeddings, rng);
+        let mut rng = XorShiftRng::seed_from_u64(self.seed);
+        randomize_embedding_store(&mut feature_embeddings, &mut rng);
 
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
         let dist = Uniform::new(0, node_idxs.len());
+        // Enable/disable shared memory pool
+        //use_shared_pool(self.batch_size > 1);
+
         for pass in 0..self.passes {
             // Shuffle for SGD
-            node_idxs.shuffle(rng);
+            node_idxs.shuffle(&mut rng);
             let mut error = 0f32;
-            for node in node_idxs.iter() {
-                // Empty gradients
-                agraph.zero_grads();
-                
-                // Get negative v
-                let neg_node = loop {
-                    let neg_node = dist.sample(rng);
-                    if neg_node != *node { break neg_node }
-                };
-
-                // h(v)
-                let (hv_vars, hv) = construct_node_embedding(*node, features, &feature_embeddings);
-                
-                // ~h(v)
-                let (thv_vars, thv) = reconstruct_node_embedding(graph, *node, features, &feature_embeddings, Some(10));
-                
-                // h(u)
-                let (hu_vars, hu) = construct_node_embedding(neg_node, features, &feature_embeddings);
-
-                // Compute error
-                let loss = margin_loss(thv, hv, hu, self.gamma);
-
-                error += loss.value()[0];
+            let mut cnt = 0usize;
+            for (i, nodes) in node_idxs.chunks(self.batch_size).enumerate() {
+                // Compute grads for batch
+                let grads:Vec<_> = nodes.par_iter().map(|node_id| {
+                    let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + node_id) as u64);
+                    let (loss, grads) = self.run_pass(graph, *node_id, &features, &feature_embeddings, &mut rng) ;
+                    (loss, grads)
+                }).collect();
 
                 // Back propagate and SGD
-                agraph.backward(&loss);
-
-                sgd(agraph, &mut feature_embeddings, hv_vars, hu_vars, thv_vars, self.alpha);
+                let mut all_grads = HashMap::new();
+                for (err, grad_set) in grads.into_iter() {
+                    for (feat, grad) in grad_set.into_iter() {
+                        let e = all_grads.entry(feat).or_insert_with(|| vec![0.; grad.len()]);
+                        e.iter_mut().zip(grad.iter()).for_each(|(ei, gi)| *ei += *gi);
+                    }
+                    error += err;
+                    cnt += 1;
+                }
+                sgd(&mut feature_embeddings, all_grads, self.alpha);
 
             }
             println!("Pass: {}, Error: {:.3}", pass, error / node_idxs.len() as f32);
@@ -133,28 +128,77 @@ impl EmbeddingPropagation {
         feature_embeddings
     }
 
+    fn run_pass<G: CGraph + Send + Sync, R: Rng>(
+        &self, 
+        graph: &G,
+        node: NodeID,
+        features: &FeatureStore,
+        feature_embeddings: &EmbeddingStore,
+        rng: &mut R
+    ) -> (f32, HashMap<usize, Vec<f32>>) {
+
+        let dist = Uniform::new(0, graph.len());
+
+        // Get negative v
+        let neg_node = loop {
+            let neg_node = dist.sample(rng);
+            if neg_node != node { break neg_node }
+        };
+
+        // h(v)
+        let (hv_vars, hv) = construct_node_embedding(node, features, &feature_embeddings);
+        
+        // ~h(v)
+        let (thv_vars, thv) = reconstruct_node_embedding(graph, node, features, &feature_embeddings, Some(10));
+        
+        // h(u)
+        let (hu_vars, hu) = construct_node_embedding(neg_node, features, &feature_embeddings);
+
+        // Compute error
+        let loss = margin_loss(thv, hv, hu, self.gamma);
+
+        let mut agraph = Graph::new();
+        agraph.backward(&loss);
+
+        let mut grads = HashMap::new();
+        extract_grads(&agraph, &mut grads, hv_vars.into_iter());
+        extract_grads(&agraph, &mut grads, thv_vars.into_iter());
+        extract_grads(&agraph, &mut grads, hu_vars.into_iter());
+
+        (loss.value()[0], grads)
+
+    }
+
+}
+
+fn extract_grads(
+    graph: &Graph, 
+    grads: &mut HashMap<usize, Vec<f32>>, 
+    vars: impl Iterator<Item=(usize, (ANode, usize))>
+) {
+    for (feat_id, (var, _)) in vars {
+        if grads.contains_key(&feat_id) { continue }
+
+        let grad = graph.get_grad(&var)
+            .expect("Should have a gradient!");
+
+        if grad.iter().all(|gi| !gi.is_nan()) {
+            // Can get some nans in weird cases, such as the distance between
+            // a node and it's reconstruction when it shares all features.
+            // SGD
+            grads.insert(feat_id, grad.to_vec());
+        }
+    }
 }
 
 type NodeCounts = HashMap<usize, (ANode, usize)>;
 fn sgd(
-    graph: &Graph, 
     feature_embeddings: &mut EmbeddingStore,
-    hv_vars: NodeCounts, 
-    hu_vars: NodeCounts, 
-    thv_vars: NodeCounts, 
+    grads: HashMap<usize, Vec<f32>>,
     alpha: f32
 ) {
-    let mut seen = HashSet::new();
-    let mut it = hv_vars.into_iter().chain(
-             hu_vars.into_iter()).chain(
-             thv_vars.into_iter());
+    for (feat_id, grad) in grads.into_iter() {
 
-    for (feat_id, (var, _)) in it {
-        if seen.contains(&feat_id) { continue }
-
-        seen.insert(feat_id);
-        let grad = graph.get_grad(&var)
-            .expect("Should have a gradient!");
         let emb = feature_embeddings.get_embedding_mut(feat_id);
 
         if grad.iter().all(|gi| !gi.is_nan()) {
@@ -290,7 +334,7 @@ mod ep_tests {
             seed: 202220222
         };
 
-        let embeddings = ep.learn_feature_embeddings(&ccsr, &mut agraph, &feature_store, &mut rng);
+        let embeddings = ep.learn_feature_embeddings(&ccsr, &mut agraph, &feature_store);
         for idx in 0..embeddings.len() {
             let e = embeddings.get_embedding(idx);
             println!("{:?} -> {:?}", idx, e);

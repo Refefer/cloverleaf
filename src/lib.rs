@@ -342,7 +342,7 @@ impl FeatureEmbeddingBuilder {
         };
 
         self.features.fill_missing_nodes();
-        let embeddings = ep.learn(&graph.graph, &mut self.features);
+        let (embeddings, feat_embeds) = ep.learn(&graph.graph, &mut self.features);
         graph.embeddings = Some(embeddings);
     }
 
