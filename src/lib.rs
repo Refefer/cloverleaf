@@ -271,7 +271,6 @@ impl EmbeddingPropagator {
         }
     }
 
-
     pub fn add_features(&mut self, node: (String,String), features: Vec<String>) -> PyResult<()> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         self.features.set_features(node_id, features);
@@ -287,7 +286,7 @@ impl EmbeddingPropagator {
         dims: usize,
         passes: usize,
         seed: Option<u64>
-    ) -> NodeEmbeddings{
+    ) -> (NodeEmbeddings, NodeEmbeddings) {
         let ep = EmbeddingPropagation {
             alpha,
             gamma,
@@ -298,13 +297,21 @@ impl EmbeddingPropagator {
         };
 
         self.features.fill_missing_nodes();
-        let (embeddings, _feat_embeds) = ep.learn(graph.graph.as_ref(), &mut self.features);
-        NodeEmbeddings {
+        let (embeddings, feat_embeds) = ep.learn(graph.graph.as_ref(), &mut self.features);
+        let node_embeddings = NodeEmbeddings {
             vocab: self.vocab.clone(),
-            embeddings
-        }
-    }
+            embeddings};
 
+        let mut fs = FeatureStore::new(graph.graph.len());
+        std::mem::swap(&mut fs, &mut self.features);
+
+        let feature_embeddings = NodeEmbeddings {
+            vocab: Arc::new(fs.get_vocab()),
+            embeddings: feat_embeds};
+
+        (node_embeddings, feature_embeddings)
+
+    }
 }
 
 #[pyclass]

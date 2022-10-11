@@ -50,6 +50,9 @@ impl FeatureStore {
         });
     }
 
+    pub fn get_vocab(self) -> Vocab {
+        self.feature_vocab
+    }
 }
 
 pub struct EmbeddingPropagation {
