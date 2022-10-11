@@ -1,9 +1,9 @@
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
+//#[cfg(not(target_env = "msvc"))]
+//use tikv_jemallocator::Jemalloc;
+//
+//#[cfg(not(target_env = "msvc"))]
+//#[global_allocator]
+//static GLOBAL: Jemalloc = Jemalloc;
 
 pub mod graph;
 pub mod algos;
@@ -13,6 +13,7 @@ mod embeddings;
 mod bitset;
 
 use std::sync::Arc;
+use std::ops::Deref;
 
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
@@ -29,14 +30,14 @@ use crate::embeddings::{EmbeddingStore,Distance as EDist};
 
 const SEED: u64 = 20222022;
 
-fn build_csr(edges: impl Iterator<Item=(String,String,f32)>) -> (CSR, Vocab) {
+fn build_csr(edges: impl Iterator<Item=((String,String),(String,String),f32)>) -> (CSR, Vocab) {
     
     // Convert to NodeIDs
     let mut vocab = Vocab::new();
     eprintln!("Constructing vocab...");
-    let edges: Vec<_> = edges.map(|(f_n, t_n, w)| {
-        let f_id = vocab.get_or_insert(f_n);
-        let t_id = vocab.get_or_insert(t_n);
+    let edges: Vec<_> = edges.map(|((f_nt, f_n), (t_nt, t_n), w)| {
+        let f_id = vocab.get_or_insert(f_nt, f_n);
+        let t_id = vocab.get_or_insert(t_nt, t_n);
         (f_id, t_id, w)
     }).collect();
 
@@ -45,7 +46,7 @@ fn build_csr(edges: impl Iterator<Item=(String,String,f32)>) -> (CSR, Vocab) {
     (csr, vocab)
 }
 
-fn convert_scores(vocab: &Vocab, scores: impl Iterator<Item=(NodeID, f32)>, k: Option<usize>) -> Vec<(String, f32)> {
+fn convert_scores(vocab: &Vocab, scores: impl Iterator<Item=(NodeID, f32)>, k: Option<usize>) -> Vec<((String,String), f32)> {
     let mut scores: Vec<_> = scores.collect();
     scores.sort_by_key(|(_k, v)| FloatOrd(-*v));
 
@@ -53,11 +54,20 @@ fn convert_scores(vocab: &Vocab, scores: impl Iterator<Item=(NodeID, f32)>, k: O
     let k = k.unwrap_or(scores.len());
     scores.into_iter().take(k)
         .map(|(node_id, w)| {
-            let name = vocab.get_name(node_id).unwrap();
-            ((*name).clone(), w)
+            let (node_type, name) = vocab.get_name(node_id).unwrap();
+            (((*node_type).clone(), (*name).clone()), w)
         })
         .collect()
 }
+
+fn get_node_id(vocab: &Vocab, node_type: String, node: String) -> PyResult<NodeID> {
+    if let Some(node_id) = vocab.get_node_id(node_type.clone(), node.clone()) {
+        Ok(node_id)
+    } else {
+        Err(PyValueError::new_err(format!(" Node '{}:{}' does not exist!", node_type, node)))
+    }
+}
+
 
 #[pyclass]
 #[derive(Clone)]
@@ -75,23 +85,11 @@ struct RwrGraph {
     vocab: Arc<Vocab>
 }
 
-impl RwrGraph {
-    fn get_node_id(&self, node: String) -> PyResult<NodeID> {
-        if let Some(node_id) = self.vocab.get_node_id(node.clone()) {
-            Ok(node_id)
-        } else {
-            Err(PyValueError::new_err(format!(" Node '{}' does not exist!", node)))
-        }
-    }
-
-}
-
-
 #[pymethods]
 impl RwrGraph {
 
     #[new]
-    fn new(edges: Vec<(String,String,f32)>) -> Self {
+    fn new(edges: Vec<((String,String),(String,String),f32)>) -> Self {
         let (graph, vocab) = build_csr(edges.into_iter());
         eprintln!("Converting to CDF format...");
         RwrGraph {
@@ -102,14 +100,15 @@ impl RwrGraph {
 
     pub fn walk(
         &self, 
-        name: String, 
+        name: (String, String), 
         restarts: f32, 
         walks: usize, 
         seed: Option<u64>, 
         beta: Option<f32>,
         k: Option<usize>, 
-    ) -> PyResult<Vec<(String, f32)>> {
-        let node_id = self.get_node_id(name)?;
+    ) -> PyResult<Vec<((String,String), f32)>> {
+
+        let node_id = get_node_id(self.vocab.deref(), name.0, name.1)?;
         
         let steps = if restarts >= 1. {
             Steps::Fixed(restarts as usize)
@@ -134,19 +133,19 @@ impl RwrGraph {
     pub fn biased_walk(
         &self, 
         embeddings: &NodeEmbeddings,
-        name: String, 
-        biased_context: String,
+        name: (String,String), 
+        biased_context: (String,String),
         restarts: f32, 
         walks: usize, 
         blend: Option<f32>,
         beta: Option<f32>,
         k: Option<usize>, 
         seed: Option<u64>, 
-        rerank_context: Option<String>,
-    ) -> PyResult<Vec<(String, f32)>> {
-        let node_id = self.get_node_id(name)?;
+        rerank_context: Option<(String,String)>,
+    ) -> PyResult<Vec<((String,String), f32)>> {
+        let node_id = get_node_id(self.vocab.deref(), name.0, name.1)?;
+        let g_node_id = get_node_id(self.vocab.deref(), biased_context.0, biased_context.1)?;
         
-        let g_node_id = self.get_node_id(biased_context)?;
         let steps = if restarts >= 1. {
             GSteps::Fixed(restarts as usize)
         } else if restarts > 0. {
@@ -170,7 +169,7 @@ impl RwrGraph {
         // Reweight results if requested
         if let Some(cn) = rerank_context {
             println!("Reranking...");
-            let c_node_id = self.get_node_id(cn)?;
+            let c_node_id = get_node_id(self.vocab.deref(), cn.0, cn.1)?;
             Reweighter::new(blend.unwrap_or(0.5))
                 .reweight(&mut results, embeddings, c_node_id);
         }
@@ -178,8 +177,8 @@ impl RwrGraph {
         Ok(convert_scores(&self.vocab, results.into_iter(), k))
     }
 
-    pub fn contains_node(&self, name: String) -> bool {
-        self.vocab.get_node_id(name).is_some()
+    pub fn contains_node(&self, name: (String, String)) -> bool {
+        get_node_id(self.vocab.deref(), name.0, name.1).is_ok()
     }
 
     pub fn nodes(&self) -> usize {
@@ -190,12 +189,14 @@ impl RwrGraph {
         self.graph.edges()
     }
 
-    pub fn get_edges(&self, name: String) -> PyResult<(Vec<String>, Vec<f32>)> {
-        let node_id = self.get_node_id(name)?;
+    pub fn get_edges(&self, node: (String,String)) -> PyResult<(Vec<(String, String)>, Vec<f32>)> {
+        let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         let (edges, weights) = self.graph.get_edges(node_id);
         let names = edges.into_iter()
-            .map(|node_id| (*self.vocab.get_name(*node_id).unwrap()).clone())
-            .collect();
+            .map(|node_id| {
+                let (nt, n) = self.vocab.get_name(*node_id).unwrap();
+                ((*nt).clone(), (*n).clone())
+            }).collect();
         Ok((names, weights.to_vec()))
     }
 
@@ -224,9 +225,15 @@ impl GraphBuilder {
         }
     }
 
-    pub fn add_edge(&mut self, from_node: String, to_node: String, weight: f32, node_type: EdgeType) {
-        let f_id = self.vocab.get_or_insert(from_node);
-        let t_id = self.vocab.get_or_insert(to_node);
+    pub fn add_edge(
+        &mut self, 
+        from_node: (String, String), 
+        to_node: (String,String),
+        weight: f32, 
+        node_type: EdgeType
+    ) {
+        let f_id = self.vocab.get_or_insert(from_node.0, from_node.1);
+        let t_id = self.vocab.get_or_insert(to_node.0, to_node.1);
         self.edges.push((f_id, t_id, weight));
         if matches!(node_type, EdgeType::Undirected) {
             self.edges.push((t_id, f_id, weight));
@@ -264,16 +271,9 @@ impl EmbeddingPropagator {
         }
     }
 
-    fn get_node_id(&self, node: String) -> PyResult<NodeID> {
-        if let Some(node_id) = self.vocab.get_node_id(node.clone()) {
-            Ok(node_id)
-        } else {
-            Err(PyValueError::new_err(format!(" Node '{}' does not exist!", node)))
-        }
-    }
 
-    pub fn add_features(&mut self, node: String, features: Vec<String>) -> PyResult<()> {
-        let node_id = self.get_node_id(node)?;
+    pub fn add_features(&mut self, node: (String,String), features: Vec<String>) -> PyResult<()> {
+        let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         self.features.set_features(node_id, features);
         Ok(())
     }
@@ -416,21 +416,21 @@ impl NodeEmbeddings {
         }
     }
 
-    fn get_node_id(&self, node: String) -> PyResult<NodeID> {
-        if let Some(node_id) = self.vocab.get_node_id(node.clone()) {
+    fn get_node_id(&self, node_type: String, node: String) -> PyResult<NodeID> {
+        if let Some(node_id) = self.vocab.get_node_id(node_type.clone(), node.clone()) {
             Ok(node_id)
         } else {
-            Err(PyValueError::new_err(format!(" Node '{}' does not exist!", node)))
+            Err(PyValueError::new_err(format!(" Node '{}:{}' does not exist!", node_type, node)))
         }
     }
 
-    pub fn get_embedding(&mut self, name: String) -> PyResult<Vec<f32>> {
-        let node_id = self.get_node_id(name)?;
+    pub fn get_embedding(&mut self, node: (String,String)) -> PyResult<Vec<f32>> {
+        let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         Ok(self.embeddings.get_embedding(node_id).to_vec())
     }
 
-    pub fn set_embedding(&mut self, name: String, embedding: Vec<f32>) -> PyResult<()> {
-        let node_id = self.get_node_id(name)?;
+    pub fn set_embedding(&mut self, node: (String,String), embedding: Vec<f32>) -> PyResult<()> {
+        let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         let mut es = &mut self.embeddings;
         es.set_embedding(node_id, &embedding);
         Ok(())

@@ -27,7 +27,7 @@ impl FeatureStore {
 
     pub fn set_features(&mut self, node: NodeID, node_features: Vec<String>) {
         self.features[node] = node_features.into_iter()
-            .map(|f| self.feature_vocab.get_or_insert(f))
+            .map(|f| self.feature_vocab.get_or_insert("feat".to_string(), f))
             .collect()
     }
 
@@ -125,7 +125,7 @@ impl EmbeddingPropagation {
                 sgd(&mut feature_embeddings, &mut all_grads, self.alpha);
 
             }
-            //println!("Pass: {}, Error: {:.3}", pass, error / node_idxs.len() as f32);
+            println!("Pass: {}, Error: {:.3}", pass, error / node_idxs.len() as f32);
         }
         feature_embeddings
     }
