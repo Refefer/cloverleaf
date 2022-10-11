@@ -1,7 +1,5 @@
-use std::sync::Arc;
-
 use rayon::prelude::*;
-use hashbrown::{HashMap,HashSet};
+use hashbrown::HashMap;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use rand_distr::{Distribution,Uniform};
@@ -68,7 +66,7 @@ impl EmbeddingPropagation {
     pub fn learn<G: CGraph + Send + Sync>(
         &self, 
         graph: &G, 
-        features: &mut FeatureStore
+        features: &FeatureStore
     ) -> (EmbeddingStore, EmbeddingStore) {
         let mut agraph = Graph::new();
         let feat_embeds = self.learn_feature_embeddings(graph, &mut agraph, features);
@@ -95,24 +93,28 @@ impl EmbeddingPropagation {
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
         let dist = Uniform::new(0, node_idxs.len());
         // Enable/disable shared memory pool
+        use_shared_pool(true);
         //use_shared_pool(self.batch_size > 1);
 
+        let mut grads = Vec::with_capacity(self.batch_size);
+        let mut all_grads = HashMap::new();
         for pass in 0..self.passes {
             // Shuffle for SGD
             node_idxs.shuffle(&mut rng);
             let mut error = 0f32;
             let mut cnt = 0usize;
             for (i, nodes) in node_idxs.chunks(self.batch_size).enumerate() {
+                
                 // Compute grads for batch
-                let grads:Vec<_> = nodes.par_iter().map(|node_id| {
+                nodes.par_iter().map(|node_id| {
                     let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + node_id) as u64);
                     let (loss, grads) = self.run_pass(graph, *node_id, &features, &feature_embeddings, &mut rng) ;
                     (loss, grads)
-                }).collect();
+                }).collect_into_vec(&mut grads);
 
                 // Back propagate and SGD
-                let mut all_grads = HashMap::new();
-                for (err, grad_set) in grads.into_iter() {
+                all_grads.clear();
+                for (err, grad_set) in grads.drain(..nodes.len()) {
                     for (feat, grad) in grad_set.into_iter() {
                         let e = all_grads.entry(feat).or_insert_with(|| vec![0.; grad.len()]);
                         e.iter_mut().zip(grad.iter()).for_each(|(ei, gi)| *ei += *gi);
@@ -120,10 +122,10 @@ impl EmbeddingPropagation {
                     error += err;
                     cnt += 1;
                 }
-                sgd(&mut feature_embeddings, all_grads, self.alpha);
+                sgd(&mut feature_embeddings, &mut all_grads, self.alpha);
 
             }
-            println!("Pass: {}, Error: {:.3}", pass, error / node_idxs.len() as f32);
+            //println!("Pass: {}, Error: {:.3}", pass, error / node_idxs.len() as f32);
         }
         feature_embeddings
     }
@@ -194,10 +196,10 @@ fn extract_grads(
 type NodeCounts = HashMap<usize, (ANode, usize)>;
 fn sgd(
     feature_embeddings: &mut EmbeddingStore,
-    grads: HashMap<usize, Vec<f32>>,
+    grads: &mut HashMap<usize, Vec<f32>>,
     alpha: f32
 ) {
-    for (feat_id, grad) in grads.into_iter() {
+    for (feat_id, grad) in grads.drain() {
 
         let emb = feature_embeddings.get_embedding_mut(feat_id);
 
@@ -295,7 +297,7 @@ mod ep_tests {
 
     fn build_star_edges() -> Vec<(usize, usize, f32)> {
         let mut edges = Vec::new();
-        let max = 10;
+        let max = 100;
         for ni in 0..max {
             for no in (ni+1)..max {
                 edges.push((ni, no, 1f32));
@@ -328,7 +330,7 @@ mod ep_tests {
         let ep = EmbeddingPropagation {
             alpha: 1e-2,
             gamma: 1f32,
-            batch_size: 1,
+            batch_size: 32,
             dims: 5,
             passes: 50,
             seed: 202220222
