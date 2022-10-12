@@ -11,6 +11,7 @@ mod sampler;
 mod vocab;
 mod embeddings;
 mod bitset;
+mod hogwild;
 
 use std::sync::Arc;
 use std::ops::Deref;

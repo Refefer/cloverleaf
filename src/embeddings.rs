@@ -1,6 +1,7 @@
 use float_ord::FloatOrd;
 use crate::graph::NodeID;
 use crate::bitset::BitSet;
+use crate::hogwild::Hogwild;
 
 pub enum Distance {
     ALT,
@@ -75,7 +76,7 @@ impl Distance {
 
 pub struct EmbeddingStore {
     dims: usize,
-    embeddings: Vec<f32>,
+    embeddings: Hogwild<Vec<f32>>,
     bitfield: BitSet,
     distance: Distance,
     nodes: usize
@@ -87,7 +88,7 @@ impl EmbeddingStore {
             dims,
             distance,
             bitfield: BitSet::new(nodes),
-            embeddings: vec![0.; nodes * dims],
+            embeddings: Hogwild::new(vec![0.; nodes * dims]),
             nodes
         }
     }
@@ -116,6 +117,11 @@ impl EmbeddingStore {
         let start = node_id * self.dims;
         self.bitfield.set_bit(node_id);
         &mut self.embeddings[start..start+self.dims]
+    }
+
+    pub fn get_embedding_mut_unsafe(&self, node_id: NodeID) -> &mut [f32] {
+        let start = node_id * self.dims;
+        &mut self.embeddings.get()[start..start+self.dims]
     }
 
     pub fn compute_distance(&self, n1: NodeID, n2: NodeID) -> f32 {
