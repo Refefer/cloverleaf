@@ -68,7 +68,6 @@ fn get_node_id(vocab: &Vocab, node_type: String, node: String) -> PyResult<NodeI
     }
 }
 
-
 #[pyclass]
 #[derive(Clone)]
 enum Distance {
@@ -443,6 +442,46 @@ impl NodeEmbeddings {
         Ok(())
     }
 
+    pub fn vocab(&self) -> VocabIterator {
+        VocabIterator::new(self.vocab.clone())
+    }
+
+}
+
+#[pyclass]
+struct VocabIterator {
+    vocab: Arc<Vocab>,
+    cur_idx: usize
+}
+
+impl VocabIterator {
+    fn new(vocab: Arc<Vocab>) -> Self {
+        VocabIterator {
+            vocab, cur_idx: 0
+        }
+    }
+}
+
+#[pymethods]
+impl VocabIterator {
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
+        Python::with_gil(|py| -> Option<PyObject> {
+            if slf.cur_idx < slf.vocab.len() {
+                let (node_type, name) = slf.vocab.get_name(slf.cur_idx).unwrap();
+                let node_type = (*node_type).clone().into_py(py);
+                let name = (*name).clone().into_py(py);
+                slf.cur_idx += 1;
+                Some((node_type, name).into_py(py))
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[pymodule]
@@ -456,6 +495,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<ClusterLPAEmbedder>()?;
     m.add_class::<SLPAEmbedder>()?;
     m.add_class::<NodeEmbeddings>()?;
+    m.add_class::<VocabIterator>()?;
     Ok(())
 }
 

@@ -128,7 +128,7 @@ impl EmbeddingPropagation {
                 sgd(&mut feature_embeddings, &mut all_grads, self.alpha);
 
             }
-            println!("Pass: {}, Error: {:.3}", pass, error / node_idxs.len() as f32);
+            eprintln!("Pass: {}, Error: {:.3}", pass, error / node_idxs.len() as f32);
         }
         feature_embeddings
     }
