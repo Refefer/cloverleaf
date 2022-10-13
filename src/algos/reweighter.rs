@@ -2,7 +2,7 @@ use hashbrown::HashMap;
 use rayon::prelude::*;
 
 use crate::graph::NodeID;
-use crate::embeddings::EmbeddingStore;
+use crate::embeddings::{EmbeddingStore,Entity};
 
 pub struct Reweighter {
     pub alpha: f32
@@ -21,10 +21,12 @@ impl Reweighter {
     ) {
 
         // Compute distances for each item
+        let context_node = Entity::Node(context_node);
         let distances: HashMap<_,_> = results.par_keys()
             .filter(|node| embeddings.is_set(**node))
             .map(|node| {
-                let distance = embeddings.compute_distance(context_node, *node);
+                let n = Entity::Node(*node);
+                let distance = embeddings.compute_distance(&context_node, &n);
                 (*node, distance)
             }).collect();
 

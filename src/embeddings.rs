@@ -3,6 +3,12 @@ use crate::graph::NodeID;
 use crate::bitset::BitSet;
 use crate::hogwild::Hogwild;
 
+#[derive(Clone,Debug)]
+pub enum Entity<'a> {
+    Node(NodeID),
+    Embedding(&'a [f32])
+}
+
 pub enum Distance {
     ALT,
     Cosine,
@@ -128,11 +134,19 @@ impl EmbeddingStore {
         self.bitfield.set_bit(node_id);
     }
 
-    pub fn compute_distance(&self, n1: NodeID, n2: NodeID) -> f32 {
-        let e1 = self.get_embedding(n1);
-        let e2 = self.get_embedding(n2);
+    pub fn compute_distance<'a>(&self, n1: &Entity<'a>, n2: &Entity<'a>) -> f32 {
+        let e1 = match n1 {
+            Entity::Node(node_id) => self.get_embedding(*node_id),
+            Entity::Embedding(vec) => vec
+        };
+        let e2 = match n2 {
+            Entity::Node(node_id) => self.get_embedding(*node_id),
+            Entity::Embedding(vec) => vec
+        };
+
         self.distance.compute(e1, e2)
     }
+
 }
 
 #[cfg(test)]
@@ -157,8 +171,8 @@ mod embedding_tests {
         assert_eq!(es.get_embedding(1), &[1., 2.]);
         assert_eq!(es.get_embedding(35), &[2., 3.]);
 
-        assert_eq!(es.compute_distance(0, 1), 2f32.sqrt());
-        assert_eq!(es.compute_distance(0, 35), 8f32.sqrt());
+        assert_eq!(es.compute_distance(&Entity::Node(0), &Entity::Node(1)), 2f32.sqrt());
+        assert_eq!(es.compute_distance(&Entity::Node(0), &Entity::Node(35)), 8f32.sqrt());
     }
 
     #[test]

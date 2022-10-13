@@ -488,6 +488,45 @@ impl VocabIterator {
     }
 }
 
+#[pyclass]
+struct Ann {
+    graph: Arc<CumCSR>,
+    vocab: Arc<Vocab>,
+    max_steps: usize
+}
+
+#[pymethods]
+impl Ann {
+    #[new]
+    pub fn new(graph: &RwrGraph, max_steps: Option<usize>) -> Self {
+        Ann {
+            graph: graph.graph.clone(),
+            vocab: graph.vocab.clone(),
+            max_steps: max_steps.unwrap_or(1000),
+        }
+
+    }
+
+    pub fn find(
+        &self, 
+        query: Vec<f32>,
+        embeddings: &NodeEmbeddings, 
+        k: usize, 
+        seed: Option<u64>
+    ) -> Vec<((String, String), f32)> {
+        let seed = seed.unwrap_or(SEED + 10);
+        let ann = algos::ann::Ann::new(k, self.max_steps + k, seed);
+        let nodes = ann.find(query.as_slice(), &(*self.graph), &embeddings.embeddings);
+        nodes.into_iter()
+            .map(|n| {
+                let (node_id, dist) = n.to_tup();
+                let (node_type, name) = self.vocab.get_name(node_id)
+                    .expect("Can't find node id in graph!");
+                (((*node_type).clone(), (*name).clone()), dist)
+            }).collect()
+    }
+}
+
 #[pymodule]
 fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<RwrGraph>()?;
@@ -500,6 +539,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<SLPAEmbedder>()?;
     m.add_class::<NodeEmbeddings>()?;
     m.add_class::<VocabIterator>()?;
+    m.add_class::<Ann>()?;
     Ok(())
 }
 
