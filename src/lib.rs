@@ -12,6 +12,7 @@ mod vocab;
 mod embeddings;
 mod bitset;
 mod hogwild;
+mod progress;
 
 use std::sync::Arc;
 use std::ops::Deref;
@@ -285,7 +286,8 @@ impl EmbeddingPropagator {
         batch_size: usize, 
         dims: usize,
         passes: usize,
-        seed: Option<u64>
+        seed: Option<u64>,
+        indicator: Option<bool>
     ) -> (NodeEmbeddings, NodeEmbeddings) {
         let ep = EmbeddingPropagation {
             alpha,
@@ -293,7 +295,8 @@ impl EmbeddingPropagator {
             batch_size,
             dims,
             passes,
-            seed: seed.unwrap_or(SEED)
+            seed: seed.unwrap_or(SEED),
+            indicator: indicator.unwrap_or(true)
         };
 
         self.features.fill_missing_nodes();

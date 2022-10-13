@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use rayon::prelude::*;
 use hashbrown::HashMap;
 use rand::prelude::*;
@@ -8,6 +10,7 @@ use simple_grad::*;
 use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::{EmbeddingStore,Distance};
 use crate::vocab::Vocab;
+use crate::progress::CLProgressBar;
 
 #[derive(Debug)]
 pub struct FeatureStore {
@@ -17,6 +20,7 @@ pub struct FeatureStore {
 }
 
 impl FeatureStore {
+
     pub fn new(size: usize) -> Self {
         FeatureStore {
             features: vec![Vec::with_capacity(0); size],
@@ -61,7 +65,8 @@ pub struct EmbeddingPropagation {
     pub batch_size: usize,
     pub dims: usize,
     pub passes: usize,
-    pub seed: u64
+    pub seed: u64,
+    pub indicator: bool
 }
 
 impl EmbeddingPropagation {
@@ -73,13 +78,24 @@ impl EmbeddingPropagation {
     ) -> (EmbeddingStore, EmbeddingStore) {
         let mut agraph = Graph::new();
         let feat_embeds = self.learn_feature_embeddings(graph, &mut agraph, features);
-        let mut es = EmbeddingStore::new(graph.len(), self.dims, Distance::Cosine);
-        for node in 0..graph.len() {
-            let node_embedding = construct_node_embedding(node, features, &feat_embeds).1;
-            let embedding = es.get_embedding_mut(node);
-            embedding.clone_from_slice(node_embedding.value());
-        }
+        let es = self.construct_node_embeddings(graph.len(), features, &feat_embeds);
         (es, feat_embeds)
+    }
+
+    fn construct_node_embeddings(
+        &self, 
+        num_nodes: usize, 
+        features: &FeatureStore, 
+        feat_embeds: &EmbeddingStore
+    ) -> EmbeddingStore {
+        let mut es = EmbeddingStore::new(num_nodes, self.dims, Distance::Cosine);
+        (0..num_nodes).into_par_iter().for_each(|node| {
+            let node_embedding = construct_node_embedding(node, features, &feat_embeds).1;
+            // Safe to access in parallel
+            let embedding = es.get_embedding_mut_hogwild(node);
+            embedding.clone_from_slice(node_embedding.value());
+        });
+        es
     }
 
     fn learn_feature_embeddings<G: CGraph + Send + Sync>(
@@ -95,41 +111,54 @@ impl EmbeddingPropagation {
 
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
         let dist = Uniform::new(0, node_idxs.len());
+        let pb = CLProgressBar::new((self.passes * graph.len()) as u64, self.indicator);
+        
         // Enable/disable shared memory pool
         use_shared_pool(true);
-        //use_shared_pool(self.batch_size > 1);
 
-        let mut grads = Vec::with_capacity(self.batch_size);
-        let mut all_grads = HashMap::new();
+        let mut current_error = std::f32::INFINITY;
         for pass in 0..self.passes {
+            pb.update_message(|msg| {
+                msg.clear();
+                write!(msg, "Pass {}/{}, Error: {}", pass + 1, self.passes, current_error)
+                    .expect("Error writing out indicator message!");
+            });
+
             // Shuffle for SGD
             node_idxs.shuffle(&mut rng);
-            let mut error = 0f32;
-            let mut cnt = 0usize;
-            for (i, nodes) in node_idxs.chunks(self.batch_size).enumerate() {
+            let err: Vec<_> = node_idxs.par_iter().chunks(self.batch_size).enumerate().map(|(i, nodes)| {
+                let mut grads = Vec::with_capacity(self.batch_size);
+                let mut all_grads = HashMap::new();
                 
                 // Compute grads for batch
                 nodes.par_iter().map(|node_id| {
-                    let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + node_id) as u64);
-                    let (loss, grads) = self.run_pass(graph, *node_id, &features, &feature_embeddings, &mut rng) ;
+                    let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + **node_id) as u64);
+                    let (loss, grads) = self.run_pass(graph, **node_id, &features, &feature_embeddings, &mut rng) ;
                     (loss, grads)
                 }).collect_into_vec(&mut grads);
 
                 // Back propagate and SGD
-                all_grads.clear();
+                let mut error = 0f32;
+                let mut cnt = 0f32;
                 for (err, grad_set) in grads.drain(..nodes.len()) {
                     for (feat, grad) in grad_set.into_iter() {
                         let e = all_grads.entry(feat).or_insert_with(|| vec![0.; grad.len()]);
                         e.iter_mut().zip(grad.iter()).for_each(|(ei, gi)| *ei += *gi);
                     }
                     error += err;
-                    cnt += 1;
+                    cnt += 1f32;
                 }
-                sgd(&mut feature_embeddings, &mut all_grads, self.alpha);
+                
+                // Backpropagate embeddings
+                sgd(&feature_embeddings, &mut all_grads, self.alpha);
+                // Update progress bar
+                pb.inc(nodes.len() as u64);
+                error / cnt
+            }).collect();
 
-            }
-            eprintln!("Pass: {}, Error: {:.3}", pass, error / node_idxs.len() as f32);
+            current_error = err.iter().sum::<f32>() / err.len() as f32;
         }
+        pb.finish();
         feature_embeddings
     }
 
@@ -198,13 +227,13 @@ fn extract_grads(
 
 type NodeCounts = HashMap<usize, (ANode, usize)>;
 fn sgd(
-    feature_embeddings: &mut EmbeddingStore,
+    feature_embeddings: &EmbeddingStore,
     grads: &mut HashMap<usize, Vec<f32>>,
     alpha: f32
 ) {
     for (feat_id, grad) in grads.drain() {
 
-        let emb = feature_embeddings.get_embedding_mut(feat_id);
+        let emb = feature_embeddings.get_embedding_mut_hogwild(feat_id);
 
         if grad.iter().all(|gi| !gi.is_nan()) {
             // Can get some nans in weird cases, such as the distance between
@@ -336,7 +365,8 @@ mod ep_tests {
             batch_size: 32,
             dims: 5,
             passes: 50,
-            seed: 202220222
+            seed: 202220222,
+            indicator: false
         };
 
         let embeddings = ep.learn_feature_embeddings(&ccsr, &mut agraph, &feature_store);

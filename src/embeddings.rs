@@ -119,9 +119,13 @@ impl EmbeddingStore {
         &mut self.embeddings[start..start+self.dims]
     }
 
-    pub fn get_embedding_mut_unsafe(&self, node_id: NodeID) -> &mut [f32] {
+    pub fn get_embedding_mut_hogwild(&self, node_id: NodeID) -> &mut [f32] {
         let start = node_id * self.dims;
         &mut self.embeddings.get()[start..start+self.dims]
+    }
+
+    pub fn set_bit(&mut self, node_id: NodeID) {
+        self.bitfield.set_bit(node_id);
     }
 
     pub fn compute_distance(&self, n1: NodeID, n2: NodeID) -> f32 {
