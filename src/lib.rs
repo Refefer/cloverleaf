@@ -16,10 +16,13 @@ mod progress;
 
 use std::sync::Arc;
 use std::ops::Deref;
+use std::fs::File;
+use std::io::{Write,BufWriter,Read,BufReader,BufRead};
+use std::fmt::Write as FmtWrite;
 
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyValueError,PyIOError};
 
 use crate::graph::{CSR,CumCSR,Graph,NodeID};
 use crate::algos::rwr::{Steps,RWR};
@@ -78,6 +81,18 @@ enum Distance {
     ALT,
     Jaccard,
     Hamming
+}
+
+impl Distance {
+    fn to_edist(&self) -> EDist {
+        match self {
+            Distance::Cosine => EDist::Cosine,
+            Distance::Euclidean => EDist::Euclidean,
+            Distance::ALT => EDist::ALT,
+            Distance::Hamming => EDist::Hamming,
+            Distance::Jaccard => EDist::Jaccard
+        }
+    }
 }
 
 #[pyclass]
@@ -200,6 +215,67 @@ impl RwrGraph {
             }).collect();
         Ok((names, weights.to_vec()))
     }
+
+    /// Saves a graph to disk
+    pub fn save(&self, path: &str) -> PyResult<()> {
+        let f = File::create(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let mut bw = BufWriter::new(f);
+        for node in 0..self.graph.len() {
+            let (f_node_type, f_name) = self.vocab.get_name(node)
+                .expect("Programming error!");
+
+            let (edges, weights) = self.graph.get_edges(node);
+            for (out_node, weight) in edges.iter().zip(weights.iter()) {
+
+                let (t_node_type, t_name) = self.vocab.get_name(*out_node)
+                    .expect("Programming error!");
+                writeln!(&mut bw, "{}\t{}\t{}\t{}\t{}", f_node_type, f_name, t_node_type, t_name, weight)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+            }
+        }
+        Ok(())
+    }
+    
+    /// Loads a graph from disk
+    #[staticmethod]
+    pub fn load(path: &str, edge_type: EdgeType) -> PyResult<Self> {
+        let f = File::open(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let mut br = BufReader::new(f);
+        let mut vocab = Vocab::new();
+        let mut edges = Vec::new();
+        for line in br.lines() {
+            let line = line.unwrap();
+            let pieces: Vec<_> = line.split('\t').collect();
+            if pieces.len() != 5 {
+                return Err(PyValueError::new_err("Malformed graph file!"))
+            }
+            let f_id = vocab.get_or_insert(pieces[0].to_string(), pieces[1].to_string());
+            let t_id = vocab.get_or_insert(pieces[2].to_string(), pieces[3].to_string());
+            let w: f32 = pieces[4].parse()
+                .map_err(|e| PyValueError::new_err(format!("Malformed graph file! {}", e)))?;
+
+            edges.push((f_id, t_id, w));
+            if matches!(edge_type, EdgeType::Undirected) {
+                edges.push((t_id, f_id, w));
+            }
+        }
+        eprintln!("Read {} nodes, {} edges...", vocab.len(), edges.len());
+
+        let csr = CSR::construct_from_edges(edges);
+
+        let g = RwrGraph {
+            graph: Arc::new(CumCSR::convert(csr)),
+            vocab: Arc::new(vocab)
+        };
+
+        Ok(g)
+
+    }
+
 
 }
 
@@ -338,7 +414,8 @@ impl EmbeddingPropagator {
         (node_embeddings, feature_embeddings)
 
     }
-}
+
+ }
 
 #[pyclass]
 struct DistanceEmbedder {
@@ -434,13 +511,7 @@ struct NodeEmbeddings {
 impl NodeEmbeddings {
     #[new]
     pub fn new(graph: &RwrGraph, dims: usize, distance: Distance) -> Self {
-        let dist = match distance {
-            Distance::Cosine => EDist::Cosine,
-            Distance::Euclidean => EDist::Euclidean,
-            Distance::ALT => EDist::ALT,
-            Distance::Hamming => EDist::Hamming,
-            Distance::Jaccard => EDist::Jaccard
-        };
+        let dist = distance.to_edist();
 
         let es = EmbeddingStore::new(graph.graph.len(), dims, dist);
         NodeEmbeddings {
@@ -472,7 +543,80 @@ impl NodeEmbeddings {
     pub fn vocab(&self) -> VocabIterator {
         VocabIterator::new(self.vocab.clone())
     }
+    
+    /// Saves to disk
+    pub fn save(&self, path: &str) -> PyResult<()> {
+        let f = File::create(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
+        let mut bw = BufWriter::new(f);
+        let mut s = String::new();
+        for node_id in 0..self.vocab.len() {
+            let (node_type, name) = self.vocab.get_name(node_id)
+                .expect("Programming error!");
+
+            // Build the embedding to string
+            s.clear();
+            for (idx, wi) in self.embeddings.get_embedding(node_id).iter().enumerate() {
+                if idx > 0 {
+                    s.push_str(",");
+                }
+                write!(&mut s, "{}", wi).expect("Shouldn't error writing to a string");
+            }
+
+            writeln!(&mut bw, "{}\t{}\t[{}]", node_type, name, s)
+                .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    #[staticmethod]
+    pub fn load(path: &str, distance: Distance) -> PyResult<Self> {
+        let f = File::open(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let mut br = BufReader::new(f);
+        let mut vocab = Vocab::new();
+        let mut embeddings = Vec::new();
+        for line in br.lines() {
+            let line = line.unwrap();
+            let (node_type, node_name, emb) = line_to_embedding(line)
+                .ok_or_else(|| PyValueError::new_err("Error parsing line"))?;
+
+            let node_id = vocab.get_or_insert(node_type, node_name);
+            embeddings.push(emb);
+        }
+
+        let mut es = EmbeddingStore::new(embeddings.len(), embeddings[0].len(), distance.to_edist());
+        for (i, emb) in embeddings.into_iter().enumerate() {
+            let m = es.get_embedding_mut(i);
+            if m.len() != emb.len() {
+                return Err(PyValueError::new_err("Embeddings have different sizes!"));
+            }
+            m.copy_from_slice(&emb);
+        }
+
+        let ne = NodeEmbeddings {
+            vocab: Arc::new(vocab),
+            embeddings: es
+        };
+        Ok(ne)
+    }
+}
+
+fn line_to_embedding(line: String) -> Option<(String,String,Vec<f32>)> {
+    let pieces:Vec<_> = line.split('\t').collect();
+    if pieces.len() != 3 {
+        return None
+    }
+
+    let node_type = pieces[0];
+    let name = pieces[1];
+    let e = pieces[2];
+    let emb: Result<Vec<f32>,_> = e[1..e.len() - 1].split(',')
+        .map(|wi| wi.trim().parse()).collect();
+
+    emb.ok().map(|e| (node_type.to_string(), name.to_string(), e))
 }
 
 #[pyclass]

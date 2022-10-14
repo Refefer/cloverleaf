@@ -154,14 +154,16 @@ impl CumCSR {
     pub fn convert(mut csr: CSR) -> Self {
         for start_stop in csr.rows.windows(2) {
             let (start, stop) = (start_stop[0], start_stop[1]);
-            let slice = &mut csr.weights[start..stop];
-            let denom = slice.iter().sum::<f32>();
-            let mut acc = 0.;
-            slice.iter_mut().for_each(|w| {
-                acc += *w;
-                *w = acc / denom;
-            });
-            slice[slice.len() - 1] = 1.;
+            if start < stop {
+                let slice = &mut csr.weights[start..stop];
+                let denom = slice.iter().sum::<f32>();
+                let mut acc = 0.;
+                slice.iter_mut().for_each(|w| {
+                    acc += *w;
+                    *w = acc / denom;
+                });
+                slice[slice.len() - 1] = 1.;
+            }
         }
         CumCSR(csr)
     }
