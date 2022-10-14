@@ -25,7 +25,7 @@ use crate::graph::{CSR,CumCSR,Graph,NodeID};
 use crate::algos::rwr::{Steps,RWR};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
-use crate::algos::ep::{FeatureStore,EmbeddingPropagation};
+use crate::algos::ep::{FeatureStore,EmbeddingPropagation,Loss};
 use crate::vocab::Vocab;
 use crate::sampler::Weighted;
 use crate::embeddings::{EmbeddingStore,Distance as EDist};
@@ -257,6 +257,27 @@ impl GraphBuilder {
 }
 
 #[pyclass]
+#[derive(Clone)]
+struct EPLoss {
+    loss: Loss
+}
+
+#[pymethods]
+impl EPLoss {
+
+    #[staticmethod]
+    pub fn margin(gamma: f32) -> Self {
+        EPLoss { loss: Loss::MarginLoss(gamma) }
+    }
+
+    #[staticmethod]
+    pub fn contrastive(temp: f32) -> Self {
+        EPLoss { loss: Loss::Contrastive(temp) }
+    }
+
+}
+
+#[pyclass]
 struct EmbeddingPropagator {
     vocab: Arc<Vocab>,
     features: FeatureStore
@@ -282,7 +303,7 @@ impl EmbeddingPropagator {
         &mut self, 
         graph: &mut RwrGraph, 
         alpha: f32, 
-        gamma: f32, 
+        loss: EPLoss,
         batch_size: usize, 
         dims: usize,
         passes: usize,
@@ -291,10 +312,10 @@ impl EmbeddingPropagator {
     ) -> (NodeEmbeddings, NodeEmbeddings) {
         let ep = EmbeddingPropagation {
             alpha,
-            gamma,
             batch_size,
             dims,
             passes,
+            loss: loss.loss,
             seed: seed.unwrap_or(SEED),
             indicator: indicator.unwrap_or(true)
         };
@@ -539,6 +560,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<SLPAEmbedder>()?;
     m.add_class::<NodeEmbeddings>()?;
     m.add_class::<VocabIterator>()?;
+    m.add_class::<EPLoss>()?;
     m.add_class::<Ann>()?;
     Ok(())
 }

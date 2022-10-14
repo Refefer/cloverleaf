@@ -12,6 +12,7 @@ use crate::embeddings::{EmbeddingStore,Distance};
 use crate::vocab::Vocab;
 use crate::progress::CLProgressBar;
 
+
 #[derive(Debug)]
 pub struct FeatureStore {
     features: Vec<Vec<usize>>,
@@ -61,7 +62,7 @@ impl FeatureStore {
 
 pub struct EmbeddingPropagation {
     pub alpha: f32,
-    pub gamma: f32,
+    pub loss: Loss,
     pub batch_size: usize,
     pub dims: usize,
     pub passes: usize,
@@ -189,7 +190,7 @@ impl EmbeddingPropagation {
         let (hu_vars, hu) = construct_node_embedding(neg_node, features, &feature_embeddings);
 
         // Compute error
-        let loss = margin_loss(thv, hv, hu, self.gamma);
+        let loss = self.loss.compute(thv, hv, hu);
 
         let mut agraph = Graph::new();
         agraph.backward(&loss);
@@ -309,6 +310,44 @@ fn euclidean_distance(e1: ANode, e2: ANode) -> ANode {
     (e1 - e2).pow(2f32).sum().pow(0.5)
 }
 
+#[derive(Copy,Clone)]
+pub enum Loss {
+    MarginLoss(f32),
+    Contrastive(f32)
+}
+
+impl Loss {
+    fn compute(&self, thv: ANode, hv: ANode, hu: ANode) -> ANode {
+        match self {
+            Loss::MarginLoss(gamma) => {
+                let d1 = euclidean_distance(thv.clone(), hv);
+                let d2 = euclidean_distance(thv, hu);
+                (gamma + d1 - d2).maximum(0f32)
+            },
+            Loss::Contrastive(tau) => {
+                let thv_norm = l2norm(thv);
+                let hv_norm  = l2norm(hv);
+                let hu_norm  = l2norm(hu);
+
+                let d1 = cosine(thv_norm.clone(), hv_norm) / *tau;
+                let d2 = cosine(thv_norm, hu_norm) / *tau;
+
+                let d1_exp = d1.exp();
+
+                -(d1_exp.clone() / (d1_exp + d2.exp())).ln()
+            }
+        }
+    }
+}
+
+fn l2norm(v: ANode) -> ANode {
+    &v / (&v).pow(2f32).sum().pow(0.5)
+}
+
+fn cosine(x1: ANode, x2: ANode) -> ANode {
+    x1.dot(&x2)
+}
+
 fn margin_loss(thv: ANode, hv: ANode, hu: ANode, gamma: f32) -> ANode {
     let d1 = euclidean_distance(thv.clone(), hv);
     let d2 = euclidean_distance(thv, hu);
@@ -348,6 +387,14 @@ mod ep_tests {
     }
 
     #[test]
+    fn test_l2norm() {
+        let x = Variable::new(vec![1f32, 3f32]);
+        let norm = l2norm(x);
+        let denom = 10f32.powf(0.5);
+        assert_eq!(norm.value(), &[1f32 / denom, 3f32 / denom]);
+    }
+
+    #[test]
     fn test_simple_learn_dist() {
         let edges = build_star_edges();
         let csr = CSR::construct_from_edges(edges);
@@ -361,7 +408,7 @@ mod ep_tests {
 
         let ep = EmbeddingPropagation {
             alpha: 1e-2,
-            gamma: 1f32,
+            loss: Loss::MarginLoss(1f32),
             batch_size: 32,
             dims: 5,
             passes: 50,
