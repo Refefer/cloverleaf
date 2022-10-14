@@ -120,10 +120,11 @@ impl EmbeddingPropagation {
         use_shared_pool(true);
 
         let mut current_error = std::f32::INFINITY;
+        let mut alpha = self.alpha;
         for pass in 0..self.passes {
             pb.update_message(|msg| {
                 msg.clear();
-                write!(msg, "Pass {}/{}, Error: {}", pass + 1, self.passes, current_error)
+                write!(msg, "Pass {}/{}, Error: {:.3}, alpha: {:.5}", pass + 1, self.passes, current_error, alpha)
                     .expect("Error writing out indicator message!");
             });
 
@@ -153,13 +154,18 @@ impl EmbeddingPropagation {
                 }
                 
                 // Backpropagate embeddings
-                sgd(&feature_embeddings, &momentum, self.gamma, &mut all_grads, self.alpha);
+                sgd(&feature_embeddings, &momentum, self.gamma, &mut all_grads, alpha);
                 // Update progress bar
                 pb.inc(nodes.len() as u64);
                 error / cnt
             }).collect();
 
-            current_error = err.iter().sum::<f32>() / err.len() as f32;
+            let error = err.iter().sum::<f32>() / err.len() as f32;
+            // Decay alpha when we plateau
+            if error > current_error {
+                alpha = (alpha * 0.99).max(self.alpha / 100.);
+            }
+            current_error = error;
         }
         pb.finish();
         feature_embeddings
