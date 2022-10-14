@@ -307,6 +307,7 @@ impl EmbeddingPropagator {
         batch_size: usize, 
         dims: usize,
         passes: usize,
+        gamma: Option<f32>,
         seed: Option<u64>,
         indicator: Option<bool>
     ) -> (NodeEmbeddings, NodeEmbeddings) {
@@ -315,6 +316,7 @@ impl EmbeddingPropagator {
             batch_size,
             dims,
             passes,
+            gamma: gamma.unwrap_or(0f32),
             loss: loss.loss,
             seed: seed.unwrap_or(SEED),
             indicator: indicator.unwrap_or(true)

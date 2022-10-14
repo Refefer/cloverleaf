@@ -62,6 +62,7 @@ impl FeatureStore {
 
 pub struct EmbeddingPropagation {
     pub alpha: f32,
+    pub gamma: f32,
     pub loss: Loss,
     pub batch_size: usize,
     pub dims: usize,
@@ -107,6 +108,7 @@ impl EmbeddingPropagation {
     ) -> EmbeddingStore {
 
         let mut feature_embeddings = EmbeddingStore::new(features.len(), self.dims, Distance::Cosine);
+        let momentum = EmbeddingStore::new(features.len(), self.dims, Distance::Cosine);
         let mut rng = XorShiftRng::seed_from_u64(self.seed);
         randomize_embedding_store(&mut feature_embeddings, &mut rng);
 
@@ -151,7 +153,7 @@ impl EmbeddingPropagation {
                 }
                 
                 // Backpropagate embeddings
-                sgd(&feature_embeddings, &mut all_grads, self.alpha);
+                sgd(&feature_embeddings, &momentum, self.gamma, &mut all_grads, self.alpha);
                 // Update progress bar
                 pb.inc(nodes.len() as u64);
                 error / cnt
@@ -213,7 +215,6 @@ impl EmbeddingPropagation {
             extract_grads(&agraph, &mut grads, hu_var.into_iter());
         });
 
-        println!("loss:{:?}", loss.value());
         (loss.value()[0], grads)
 
     }
@@ -240,27 +241,32 @@ fn extract_grads(
     }
 }
 
-type NodeCounts = HashMap<usize, (ANode, usize)>;
 fn sgd(
     feature_embeddings: &EmbeddingStore,
+    momentum: &EmbeddingStore,
+    gamma: f32,
     grads: &mut HashMap<usize, Vec<f32>>,
     alpha: f32
 ) {
     for (feat_id, grad) in grads.drain() {
 
         let emb = feature_embeddings.get_embedding_mut_hogwild(feat_id);
+        let mom = momentum.get_embedding_mut_hogwild(feat_id);
 
         if grad.iter().all(|gi| !gi.is_nan()) {
             // Can get some nans in weird cases, such as the distance between
             // a node and it's reconstruction when it shares all features.
             // SGD
-            emb.iter_mut().zip(grad.iter()).for_each(|(ei, gi)| {
-                *ei -= alpha * *gi;
+            emb.iter_mut().zip(grad.iter().zip(mom.iter_mut())).for_each(|(ei, (gi, mi))| {
+                *mi = gamma * *mi + *gi;
+                *ei -= alpha * *mi;
             });
         }
     }
 
 }
+
+type NodeCounts = HashMap<usize, (ANode, usize)>;
 
 fn collect_embeddings_from_node(
     node: NodeID,
@@ -432,6 +438,7 @@ mod ep_tests {
 
         let ep = EmbeddingPropagation {
             alpha: 1e-2,
+            gamma: 0.1,
             loss: Loss::MarginLoss(1f32),
             batch_size: 32,
             dims: 5,
