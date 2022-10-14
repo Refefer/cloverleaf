@@ -271,8 +271,8 @@ impl EPLoss {
     }
 
     #[staticmethod]
-    pub fn contrastive(temp: f32) -> Self {
-        EPLoss { loss: Loss::Contrastive(temp) }
+    pub fn contrastive(temp: f32, negatives: usize) -> Self {
+        EPLoss { loss: Loss::Contrastive(temp, negatives.max(1)) }
     }
 
 }

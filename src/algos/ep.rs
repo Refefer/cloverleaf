@@ -175,10 +175,15 @@ impl EmbeddingPropagation {
         let dist = Uniform::new(0, graph.len());
 
         // Get negative v
-        let neg_node = loop {
+        let num_negs = self.loss.negatives();
+        let mut negatives = Vec::with_capacity(num_negs);
+        loop {
             let neg_node = dist.sample(rng);
-            if neg_node != node { break neg_node }
-        };
+            if neg_node != node { 
+                negatives.push(neg_node) ;
+                if negatives.len() == num_negs { break }
+            }
+        }
 
         // h(v)
         let (hv_vars, hv) = construct_node_embedding(node, features, &feature_embeddings);
@@ -187,10 +192,16 @@ impl EmbeddingPropagation {
         let (thv_vars, thv) = reconstruct_node_embedding(graph, node, features, &feature_embeddings, Some(10));
         
         // h(u)
-        let (hu_vars, hu) = construct_node_embedding(neg_node, features, &feature_embeddings);
+        let mut hu_vars = Vec::with_capacity(num_negs);
+        let mut hus = Vec::with_capacity(num_negs);
+        negatives.into_iter().for_each(|neg_node| {
+            let (hu_var, hu) = construct_node_embedding(neg_node, features, &feature_embeddings);
+            hu_vars.push(hu_var);
+            hus.push(hu);
+        });
 
         // Compute error
-        let loss = self.loss.compute(thv, hv, hu);
+        let loss = self.loss.compute(thv, hv, hus);
 
         let mut agraph = Graph::new();
         agraph.backward(&loss);
@@ -198,8 +209,11 @@ impl EmbeddingPropagation {
         let mut grads = HashMap::new();
         extract_grads(&agraph, &mut grads, hv_vars.into_iter());
         extract_grads(&agraph, &mut grads, thv_vars.into_iter());
-        extract_grads(&agraph, &mut grads, hu_vars.into_iter());
+        hu_vars.into_iter().for_each(|hu_var| {
+            extract_grads(&agraph, &mut grads, hu_var.into_iter());
+        });
 
+        println!("loss:{:?}", loss.value());
         (loss.value()[0], grads)
 
     }
@@ -313,28 +327,38 @@ fn euclidean_distance(e1: ANode, e2: ANode) -> ANode {
 #[derive(Copy,Clone)]
 pub enum Loss {
     MarginLoss(f32),
-    Contrastive(f32)
+    Contrastive(f32, usize)
 }
 
 impl Loss {
-    fn compute(&self, thv: ANode, hv: ANode, hu: ANode) -> ANode {
+    fn negatives(&self) -> usize {
+        if let Loss::Contrastive(_, negs) = self {
+            *negs
+        } else {
+            1
+        }
+    }
+
+    fn compute(&self, thv: ANode, hv: ANode, mut hus: Vec<ANode>) -> ANode {
         match self {
             Loss::MarginLoss(gamma) => {
                 let d1 = euclidean_distance(thv.clone(), hv);
-                let d2 = euclidean_distance(thv, hu);
+                let d2 = euclidean_distance(thv, hus.pop().unwrap());
                 (gamma + d1 - d2).maximum(0f32)
             },
-            Loss::Contrastive(tau) => {
+            Loss::Contrastive(tau, _) => {
                 let thv_norm = l2norm(thv);
                 let hv_norm  = l2norm(hv);
-                let hu_norm  = l2norm(hu);
 
-                let d1 = cosine(thv_norm.clone(), hv_norm) / *tau;
-                let d2 = cosine(thv_norm, hu_norm) / *tau;
+                let mut ds: Vec<_> = hus.into_iter().map(|hu| {
+                    let hu_norm = l2norm(hu);
+                    (cosine(thv_norm.clone(), hu_norm) / *tau).exp()
+                }).collect();
 
+                let d1 = cosine(thv_norm, hv_norm) / *tau;
                 let d1_exp = d1.exp();
-
-                -(d1_exp.clone() / (d1_exp + d2.exp())).ln()
+                ds.push(d1_exp.clone());
+                -(d1_exp / ds.sum_all()).ln()
             }
         }
     }
