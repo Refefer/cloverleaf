@@ -16,29 +16,43 @@ use crate::progress::CLProgressBar;
 #[derive(Debug)]
 pub struct FeatureStore {
     features: Vec<Vec<usize>>,
+    namespace: String,
     feature_vocab: Vocab,
     empty_nodes: usize
 }
 
 impl FeatureStore {
 
-    pub fn new(size: usize) -> Self {
+    pub fn new(size: usize, namespace: String) -> Self {
         FeatureStore {
             features: vec![Vec::with_capacity(0); size],
+            namespace: namespace,
             feature_vocab: Vocab::new(),
             empty_nodes: 0
         }
     }
 
+    pub fn get_ns(&self) -> &String {
+        &self.namespace
+    }
+
     pub fn set_features(&mut self, node: NodeID, node_features: Vec<String>) {
         self.features[node] = node_features.into_iter()
-            .map(|f| self.feature_vocab.get_or_insert("feat".to_string(), f))
+            .map(|f| self.feature_vocab.get_or_insert(self.namespace.clone(), f))
             .collect()
     }
 
     pub fn get_features(&self, node: NodeID) -> &[usize] {
         &self.features[node]
     }
+
+    pub fn get_pretty_features(&self, node: NodeID) -> Vec<String> {
+        self.features[node].iter().map(|v_id| {
+            let (_nt, name) = self.feature_vocab.get_name(*v_id).unwrap();
+            (*name).clone()
+        }).collect()
+    }
+
 
     pub fn len(&self) -> usize {
         self.feature_vocab.len() + self.empty_nodes
@@ -63,6 +77,7 @@ impl FeatureStore {
 pub struct EmbeddingPropagation {
     pub alpha: f32,
     pub gamma: f32,
+    pub wd: f32,
     pub loss: Loss,
     pub batch_size: usize,
     pub dims: usize,
@@ -155,6 +170,7 @@ impl EmbeddingPropagation {
                 
                 // Backpropagate embeddings
                 sgd(&feature_embeddings, &momentum, self.gamma, &mut all_grads, alpha);
+
                 // Update progress bar
                 pb.inc(nodes.len() as u64);
                 error / cnt
@@ -209,7 +225,18 @@ impl EmbeddingPropagation {
         });
 
         // Compute error
-        let loss = self.loss.compute(thv, hv, hus);
+        let mut loss = self.loss.compute(thv, hv.clone(), hus.clone());
+        // Extract it so we can add weight decay
+        let err = loss.value()[0];
+        
+        // Weight decay
+        if self.wd > 0f32 {
+            hus.push(hv);
+            let norms = hus.into_iter()
+                .map(|hu| (1f32 - l2norm(hu)).pow(2f32))
+                .collect::<Vec<_>>().sum_all();
+            loss = loss + self.wd * norms;
+        }
 
         let mut agraph = Graph::new();
         agraph.backward(&loss);
@@ -221,7 +248,7 @@ impl EmbeddingPropagation {
             extract_grads(&agraph, &mut grads, hu_var.into_iter());
         });
 
-        (loss.value()[0], grads)
+        (err, grads)
 
     }
 
@@ -353,17 +380,19 @@ impl Loss {
 
     fn compute(&self, thv: ANode, hv: ANode, mut hus: Vec<ANode>) -> ANode {
         match self {
+
             Loss::MarginLoss(gamma) => {
                 let d1 = euclidean_distance(thv.clone(), hv);
                 let d2 = euclidean_distance(thv, hus.pop().unwrap());
                 (gamma + d1 - d2).maximum(0f32)
             },
+
             Loss::Contrastive(tau, _) => {
-                let thv_norm = l2norm(thv);
-                let hv_norm  = l2norm(hv);
+                let thv_norm = il2norm(thv);
+                let hv_norm  = il2norm(hv);
 
                 let mut ds: Vec<_> = hus.into_iter().map(|hu| {
-                    let hu_norm = l2norm(hu);
+                    let hu_norm = il2norm(hu);
                     (cosine(thv_norm.clone(), hu_norm) / *tau).exp()
                 }).collect();
 
@@ -377,23 +406,32 @@ impl Loss {
 }
 
 fn l2norm(v: ANode) -> ANode {
-    &v / (&v).pow(2f32).sum().pow(0.5)
+    v.pow(2f32).sum().pow(0.5)
+}
+
+fn il2norm(v: ANode) -> ANode {
+    &v / l2norm(v.clone())
 }
 
 fn cosine(x1: ANode, x2: ANode) -> ANode {
     x1.dot(&x2)
 }
 
-fn margin_loss(thv: ANode, hv: ANode, hu: ANode, gamma: f32) -> ANode {
-    let d1 = euclidean_distance(thv.clone(), hv);
-    let d2 = euclidean_distance(thv, hu);
-    (gamma + d1 - d2).maximum(0f32)
+fn l2norm_vec(v: &mut [f32]) {
+    let norm = v.iter().map(|wi| wi.powf(2f32)).sum::<f32>().sqrt();
+    v.iter_mut().for_each(|wi| *wi /= norm)
 }
 
 fn randomize_embedding_store(es: &mut EmbeddingStore, rng: &mut impl Rng) {
     for idx in 0..es.len() {
         let e = es.get_embedding_mut(idx);
-        e.iter_mut().for_each(|ei| *ei = 2f32 * rng.gen::<f32>() - 1f32);
+        let mut norm = 0f32;
+        e.iter_mut().for_each(|ei| {
+            *ei = 2f32 * rng.gen::<f32>() - 1f32;
+            norm += ei.powf(2f32);
+        });
+        norm = norm.sqrt();
+        e.iter_mut().for_each(|ei| *ei /= norm);
     }
 }
 
@@ -425,7 +463,7 @@ mod ep_tests {
     #[test]
     fn test_l2norm() {
         let x = Variable::new(vec![1f32, 3f32]);
-        let norm = l2norm(x);
+        let norm = il2norm(x);
         let denom = 10f32.powf(0.5);
         assert_eq!(norm.value(), &[1f32 / denom, 3f32 / denom]);
     }
@@ -436,7 +474,7 @@ mod ep_tests {
         let csr = CSR::construct_from_edges(edges);
         let ccsr = CumCSR::convert(csr);
         
-        let mut feature_store = FeatureStore::new(ccsr.len());
+        let mut feature_store = FeatureStore::new(ccsr.len(), "feat".to_string());
         feature_store.fill_missing_nodes();
 
         let mut rng = XorShiftRng::seed_from_u64(202220222);
@@ -445,6 +483,7 @@ mod ep_tests {
         let ep = EmbeddingPropagation {
             alpha: 1e-2,
             gamma: 0.1,
+            wd: 0f32,
             loss: Loss::MarginLoss(1f32),
             batch_size: 32,
             dims: 5,

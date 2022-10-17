@@ -362,9 +362,10 @@ struct EmbeddingPropagator {
 #[pymethods]
 impl EmbeddingPropagator {
     #[new]
-    pub fn new(graph: &RwrGraph) -> Self {
+    pub fn new(graph: &RwrGraph, namespace: Option<String>) -> Self {
+        let ns = namespace.unwrap_or_else(|| "feat".to_string());
         EmbeddingPropagator {
-            features: FeatureStore::new(graph.graph.len()),
+            features: FeatureStore::new(graph.graph.len(), ns),
             vocab: graph.vocab.clone()
         }
     }
@@ -372,6 +373,30 @@ impl EmbeddingPropagator {
     pub fn add_features(&mut self, node: (String,String), features: Vec<String>) -> PyResult<()> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         self.features.set_features(node_id, features);
+        Ok(())
+    }
+
+    pub fn get_features(&self, node: (String,String)) -> PyResult<Vec<String>> {
+        let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
+        Ok(self.features.get_pretty_features(node_id))
+    }
+
+
+    pub fn load_features(&mut self, path: String) -> PyResult<()> {
+        let f = File::open(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let mut br = BufReader::new(f);
+        for line in br.lines() {
+            let line = line.unwrap();
+            let pieces: Vec<_> = line.split('\t').collect();
+            if pieces.len() != 3 {
+                return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ..."))
+            }
+            let bow = pieces[2].split_whitespace()
+                .map(|s| s.to_string()).collect();
+            self.add_features((pieces[0].to_string(), pieces[1].to_string()), bow)?;
+        }
         Ok(())
     }
 
@@ -383,6 +408,7 @@ impl EmbeddingPropagator {
         batch_size: usize, 
         dims: usize,
         passes: usize,
+        wd: Option<f32>,
         gamma: Option<f32>,
         seed: Option<u64>,
         indicator: Option<bool>
@@ -393,6 +419,7 @@ impl EmbeddingPropagator {
             dims,
             passes,
             gamma: gamma.unwrap_or(0f32),
+            wd: wd.unwrap_or(0f32),
             loss: loss.loss,
             seed: seed.unwrap_or(SEED),
             indicator: indicator.unwrap_or(true)
@@ -404,7 +431,7 @@ impl EmbeddingPropagator {
             vocab: self.vocab.clone(),
             embeddings};
 
-        let mut fs = FeatureStore::new(graph.graph.len());
+        let mut fs = FeatureStore::new(graph.graph.len(), (*self.features.get_ns()).clone());
         std::mem::swap(&mut fs, &mut self.features);
 
         let feature_embeddings = NodeEmbeddings {
