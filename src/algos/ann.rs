@@ -12,7 +12,7 @@ use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::{EmbeddingStore,Entity};
 use crate::progress::CLProgressBar;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct NodeDistance(f32, NodeID);
 
 impl NodeDistance {
@@ -38,6 +38,44 @@ impl PartialOrd for NodeDistance {
 impl PartialEq for NodeDistance {
     fn eq(&self, other: &Self) -> bool {
         FloatOrd(self.0) == FloatOrd(other.0) && self.1 == other.1
+    }
+}
+
+pub struct TopK {
+    heap: BinaryHeap<Reverse<NodeDistance>>,
+    k: usize
+}
+
+impl TopK {
+    pub fn new(k: usize) -> Self {
+        TopK {
+            k: k,
+            heap: BinaryHeap::with_capacity(k+1)
+        }
+    }
+
+    pub fn push(&mut self, node_id: NodeID, score: f32) {
+        self.push_nd(Reverse(NodeDistance(score, node_id)));
+    }
+
+    fn push_nd(&mut self, nd: Reverse<NodeDistance>) {
+        self.heap.push(nd);
+        if self.heap.len() > self.k {
+            self.heap.pop();
+        }
+    }
+
+    pub fn into_sorted(self) -> Vec<NodeDistance> {
+        let mut results: Vec<NodeDistance> = self.heap.into_iter()
+            .map(|n| n.0).collect();
+        results.sort_by_key(|n| FloatOrd(n.0));
+        results
+    }
+
+    pub fn extend(&mut self, other: TopK) {
+        other.heap.into_iter().for_each(|nd| {
+            self.push_nd(nd);
+        });
     }
 }
 
@@ -84,7 +122,7 @@ fn hill_climb<'a, G: CGraph>(
     mut max_steps: usize
 ) -> Vec<NodeDistance> {
     let mut heap = BinaryHeap::new();
-    let mut best = BinaryHeap::new();
+    let mut best = TopK::new(k);
     let mut seen = HashSet::new();
 
     seen.insert(start.clone());
@@ -94,12 +132,7 @@ fn hill_climb<'a, G: CGraph>(
 
     loop {
         let cur_node = heap.pop().expect("Shouldn't be empty!");
-        // Add to best, potentially
-        best.push(Reverse(cur_node.clone()));
-        if best.len() > k {
-            // throw away furthest away
-            best.pop();
-        }
+        best.push(cur_node.1, cur_node.0);
         // Get edges, compute distances between them and needle, add to the heap
         for edge in graph.get_edges(cur_node.1).0.iter() {
             if !seen.contains(edge) {
@@ -114,10 +147,7 @@ fn hill_climb<'a, G: CGraph>(
             break
         }
     }
-    let mut results: Vec<NodeDistance> = best.into_iter().map(|n| n.0).collect();
-    results.sort();
-    results.reverse();
-    results
+    best.into_sorted()
 }
 
 #[cfg(test)]
@@ -138,7 +168,19 @@ mod ann_tests {
     }
 
     #[test]
-    fn test_simple_learn_dist() {
-    }
+    fn test_top_k() {
+        let mut top_k = TopK::new(3);
+        top_k.push(1, 0.1);
+        top_k.push(2, 0.2);
+        top_k.push(3, 0.3);
+        top_k.push(4, 0.15);
+        top_k.push(5, 0.01);
 
+        let results = top_k.into_sorted();
+
+        println!("results: {:?}", results);
+        assert_eq!(results[0], NodeDistance(0.01, 5));
+        assert_eq!(results[1], NodeDistance(0.1, 1));
+        assert_eq!(results[2], NodeDistance(0.15, 4));
+    }
 }

@@ -1,7 +1,12 @@
+use std::collections::BinaryHeap;
+
 use float_ord::FloatOrd;
+use rayon::prelude::*;
+
 use crate::graph::NodeID;
 use crate::bitset::BitSet;
 use crate::hogwild::Hogwild;
+use crate::algos::ann::{TopK,NodeDistance};
 
 #[derive(Clone,Debug)]
 pub enum Entity<'a> {
@@ -134,17 +139,33 @@ impl EmbeddingStore {
         self.bitfield.set_bit(node_id);
     }
 
+    fn extract_vec<'a>(&'a self, n: &Entity<'a>) -> &'a [f32] {
+        match n {
+            Entity::Node(node_id) => self.get_embedding(*node_id),
+            Entity::Embedding(vec) => vec
+        }
+    }
+
     pub fn compute_distance<'a>(&self, n1: &Entity<'a>, n2: &Entity<'a>) -> f32 {
-        let e1 = match n1 {
-            Entity::Node(node_id) => self.get_embedding(*node_id),
-            Entity::Embedding(vec) => vec
-        };
-        let e2 = match n2 {
-            Entity::Node(node_id) => self.get_embedding(*node_id),
-            Entity::Embedding(vec) => vec
-        };
+        let e1 = self.extract_vec(n1);
+        let e2 = self.extract_vec(n2);
 
         self.distance.compute(e1, e2)
+    }
+
+    pub fn nearest_neighbor<'a>(&self, q: &Entity<'a>, k: usize) -> Vec<NodeDistance> {
+        let query_emb = self.extract_vec(q);
+        (0..self.len()).into_par_iter().map(|node_id| {
+            let node_emb = self.get_embedding(node_id);
+            let dist = self.distance.compute(query_emb, node_emb);
+            (node_id, dist)
+        }).fold(|| TopK::new(k), |mut acc, (node_id, dist)| {
+            acc.push(node_id, dist);
+            acc
+        }).reduce(|| TopK::new(k),|mut tk1, tk2| {
+            tk1.extend(tk2);
+            tk1
+        }).into_sorted()
     }
 
 }

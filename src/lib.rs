@@ -22,16 +22,17 @@ use std::fmt::Write as FmtWrite;
 
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyValueError,PyIOError};
+use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError};
 
 use crate::graph::{CSR,CumCSR,Graph,NodeID};
 use crate::algos::rwr::{Steps,RWR};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
 use crate::algos::ep::{FeatureStore,EmbeddingPropagation,Loss};
+use crate::algos::ann::NodeDistance;
 use crate::vocab::Vocab;
 use crate::sampler::Weighted;
-use crate::embeddings::{EmbeddingStore,Distance as EDist};
+use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
 
 const SEED: u64 = 20222022;
 
@@ -69,7 +70,7 @@ fn get_node_id(vocab: &Vocab, node_type: String, node: String) -> PyResult<NodeI
     if let Some(node_id) = vocab.get_node_id(node_type.clone(), node.clone()) {
         Ok(node_id)
     } else {
-        Err(PyValueError::new_err(format!(" Node '{}:{}' does not exist!", node_type, node)))
+        Err(PyKeyError::new_err(format!(" Node '{}:{}' does not exist!", node_type, node)))
     }
 }
 
@@ -382,11 +383,12 @@ impl EmbeddingPropagator {
     }
 
 
-    pub fn load_features(&mut self, path: String) -> PyResult<()> {
+    pub fn load_features(&mut self, path: String, error_on_missing: Option<bool>) -> PyResult<()> {
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
         let mut br = BufReader::new(f);
+        let strict = error_on_missing.unwrap_or(true);
         for line in br.lines() {
             let line = line.unwrap();
             let pieces: Vec<_> = line.split('\t').collect();
@@ -395,7 +397,10 @@ impl EmbeddingPropagator {
             }
             let bow = pieces[2].split_whitespace()
                 .map(|s| s.to_string()).collect();
-            self.add_features((pieces[0].to_string(), pieces[1].to_string()), bow)?;
+            let ret = self.add_features((pieces[0].to_string(), pieces[1].to_string()), bow);
+            if strict {
+                ret?
+            } 
         }
         Ok(())
     }
@@ -547,14 +552,6 @@ impl NodeEmbeddings {
         }
     }
 
-    fn get_node_id(&self, node_type: String, node: String) -> PyResult<NodeID> {
-        if let Some(node_id) = self.vocab.get_node_id(node_type.clone(), node.clone()) {
-            Ok(node_id)
-        } else {
-            Err(PyValueError::new_err(format!(" Node '{}:{}' does not exist!", node_type, node)))
-        }
-    }
-
     pub fn get_embedding(&mut self, node: (String,String)) -> PyResult<Vec<f32>> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         Ok(self.embeddings.get_embedding(node_id).to_vec())
@@ -570,8 +567,12 @@ impl NodeEmbeddings {
     pub fn vocab(&self) -> VocabIterator {
         VocabIterator::new(self.vocab.clone())
     }
+
+    pub fn nearest_neighbor(&self, emb: Vec<f32>, k: usize) -> Vec<((String,String), f32)> {
+        let dists = self.embeddings.nearest_neighbor(&Entity::Embedding(&emb), k);
+        convert_node_distance(&self.vocab, dists)
+    }
     
-    /// Saves to disk
     pub fn save(&self, path: &str) -> PyResult<()> {
         let f = File::create(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -711,14 +712,21 @@ impl Ann {
         let seed = seed.unwrap_or(SEED + 10);
         let ann = algos::ann::Ann::new(k, self.max_steps + k, seed);
         let nodes = ann.find(query.as_slice(), &(*self.graph), &embeddings.embeddings);
-        nodes.into_iter()
-            .map(|n| {
-                let (node_id, dist) = n.to_tup();
-                let (node_type, name) = self.vocab.get_name(node_id)
-                    .expect("Can't find node id in graph!");
-                (((*node_type).clone(), (*name).clone()), dist)
-            }).collect()
+        convert_node_distance(&self.vocab, nodes)
     }
+}
+
+fn convert_node_distance(
+    vocab: &Vocab, 
+    dists: Vec<NodeDistance>
+) -> Vec<((String, String), f32)> {
+    dists.into_iter()
+        .map(|n| {
+            let (node_id, dist) = n.to_tup();
+            let (node_type, name) = vocab.get_name(node_id)
+                .expect("Can't find node id in graph!");
+            (((*node_type).clone(), (*name).clone()), dist)
+        }).collect()
 }
 
 #[pymodule]

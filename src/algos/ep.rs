@@ -213,7 +213,7 @@ impl EmbeddingPropagation {
         let (hv_vars, hv) = construct_node_embedding(node, features, &feature_embeddings);
         
         // ~h(v)
-        let (thv_vars, thv) = reconstruct_node_embedding(graph, node, features, &feature_embeddings, Some(10));
+        let (thv_vars, thv) = reconstruct_node_embedding(graph, node, features, &feature_embeddings, Some(10), rng);
         
         // h(u)
         let mut hu_vars = Vec::with_capacity(num_negs);
@@ -312,7 +312,7 @@ fn collect_embeddings_from_node(
             *count += 1;
         } else {
             let emb = feature_embeddings.get_embedding(*feat);
-            let v = Variable::new(emb.to_vec());
+            let v = Variable::pooled(emb);
             feat_map.insert(*feat, (v, 1));
         }
     }
@@ -332,18 +332,28 @@ fn construct_node_embedding(
 }
 
 // ~H(n)
-fn reconstruct_node_embedding<G: CGraph>(
+fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     graph: &G,
     node: NodeID,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
-    max_nodes: Option<usize>
+    max_nodes: Option<usize>,
+    rng: &mut R
 ) -> (NodeCounts, ANode) {
     let edges = &graph.get_edges(node).0;
     let mut feature_map = HashMap::new();
-    for out_node in edges.iter().take(max_nodes.unwrap_or(edges.len())) {
-        collect_embeddings_from_node(*out_node, feature_store, 
-                                     feature_embeddings, &mut feature_map);
+    
+    if edges.len() <= max_nodes.unwrap_or(edges.len()) {
+        for out_node in edges.iter() {
+            collect_embeddings_from_node(*out_node, feature_store, 
+                                      feature_embeddings, &mut feature_map);
+        }
+
+    } else {
+        for out_node in edges.choose_multiple(rng, max_nodes.unwrap()) {
+            collect_embeddings_from_node(*out_node, feature_store, 
+                                         feature_embeddings, &mut feature_map);
+        }
     }
     let mean = mean_embeddings(feature_map.values());
     (feature_map, mean)
@@ -353,7 +363,11 @@ fn mean_embeddings<'a,I: Iterator<Item=&'a (ANode, usize)>>(items: I) -> ANode {
     let mut vs = Vec::new();
     let mut n = 0;
     items.for_each(|(emb, count)| {
-        vs.push(emb * *count as f32);
+        if *count > 1 {
+            vs.push(emb * *count as f32);
+        } else {
+            vs.push(emb.clone());
+        }
         n += *count;
     });
     vs.sum_all() / n as f32
