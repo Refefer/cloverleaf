@@ -1,4 +1,6 @@
 use rand::prelude::*;
+use crate::NodeID;
+use crate::vocab::Vocab;
 
 pub struct Counter<'a> {
     slice: &'a [usize],
@@ -55,6 +57,66 @@ pub fn get_best_count<R: Rng>(counts: &[usize], rng: &mut R) -> usize{
         ties[0]
     }
 
+}
+
+#[derive(Debug)]
+pub struct FeatureStore {
+    features: Vec<Vec<usize>>,
+    namespace: String,
+    feature_vocab: Vocab,
+    empty_nodes: usize
+}
+
+impl FeatureStore {
+
+    pub fn new(size: usize, namespace: String) -> Self {
+        FeatureStore {
+            features: vec![Vec::with_capacity(0); size],
+            namespace: namespace,
+            feature_vocab: Vocab::new(),
+            empty_nodes: 0
+        }
+    }
+
+    pub fn get_ns(&self) -> &String {
+        &self.namespace
+    }
+
+    pub fn set_features(&mut self, node: NodeID, node_features: Vec<String>) {
+        self.features[node] = node_features.into_iter()
+            .map(|f| self.feature_vocab.get_or_insert(self.namespace.clone(), f))
+            .collect()
+    }
+
+    pub fn get_features(&self, node: NodeID) -> &[usize] {
+        &self.features[node]
+    }
+
+    pub fn get_pretty_features(&self, node: NodeID) -> Vec<String> {
+        self.features[node].iter().map(|v_id| {
+            let (_nt, name) = self.feature_vocab.get_name(*v_id).unwrap();
+            (*name).clone()
+        }).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.feature_vocab.len() + self.empty_nodes
+    }
+
+    pub fn fill_missing_nodes(&mut self) {
+        let mut idxs = self.feature_vocab.len();
+        self.features.iter_mut().for_each(|f| {
+            if f.len() == 0 {
+                *f = vec![idxs];
+                idxs += 1;
+                self.empty_nodes += 1;
+            }
+        });
+    }
+
+    pub fn get_vocab(self) -> Vocab {
+        self.feature_vocab
+    }
 }
 
 #[cfg(test)]

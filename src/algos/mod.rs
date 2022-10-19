@@ -6,4 +6,5 @@ pub mod lpa;
 pub mod slpa;
 pub mod ep;
 pub mod ann;
-mod utils;
+pub mod utils;
+pub mod starspace;

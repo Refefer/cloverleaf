@@ -28,7 +28,8 @@ use crate::graph::{CSR,CumCSR,Graph,NodeID};
 use crate::algos::rwr::{Steps,RWR};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
-use crate::algos::ep::{FeatureStore,EmbeddingPropagation,Loss};
+use crate::algos::ep::{EmbeddingPropagation,Loss};
+use crate::algos::utils::FeatureStore;
 use crate::algos::ann::NodeDistance;
 use crate::vocab::Vocab;
 use crate::sampler::Weighted;
@@ -343,14 +344,20 @@ struct EPLoss {
 impl EPLoss {
 
     #[staticmethod]
-    pub fn margin(gamma: f32) -> Self {
-        EPLoss { loss: Loss::MarginLoss(gamma) }
+    pub fn margin(gamma: f32, negatives: Option<usize>) -> Self {
+        EPLoss { loss: Loss::MarginLoss(gamma, negatives.unwrap_or(1)) }
     }
 
     #[staticmethod]
-    pub fn contrastive(temp: f32, negatives: usize) -> Self {
-        EPLoss { loss: Loss::Contrastive(temp, negatives.max(1)) }
+    pub fn contrastive(temperature: f32, negatives: usize) -> Self {
+        EPLoss { loss: Loss::Contrastive(temperature, negatives.max(1)) }
     }
+
+    #[staticmethod]
+    pub fn starspace(gamma: f32, negatives: usize) -> Self {
+        EPLoss { loss: Loss::StarSpace(gamma, negatives.max(1)) }
+    }
+
 
 }
 

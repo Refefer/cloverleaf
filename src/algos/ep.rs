@@ -11,67 +11,7 @@ use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::{EmbeddingStore,Distance};
 use crate::vocab::Vocab;
 use crate::progress::CLProgressBar;
-
-
-#[derive(Debug)]
-pub struct FeatureStore {
-    features: Vec<Vec<usize>>,
-    namespace: String,
-    feature_vocab: Vocab,
-    empty_nodes: usize
-}
-
-impl FeatureStore {
-
-    pub fn new(size: usize, namespace: String) -> Self {
-        FeatureStore {
-            features: vec![Vec::with_capacity(0); size],
-            namespace: namespace,
-            feature_vocab: Vocab::new(),
-            empty_nodes: 0
-        }
-    }
-
-    pub fn get_ns(&self) -> &String {
-        &self.namespace
-    }
-
-    pub fn set_features(&mut self, node: NodeID, node_features: Vec<String>) {
-        self.features[node] = node_features.into_iter()
-            .map(|f| self.feature_vocab.get_or_insert(self.namespace.clone(), f))
-            .collect()
-    }
-
-    pub fn get_features(&self, node: NodeID) -> &[usize] {
-        &self.features[node]
-    }
-
-    pub fn get_pretty_features(&self, node: NodeID) -> Vec<String> {
-        self.features[node].iter().map(|v_id| {
-            let (_nt, name) = self.feature_vocab.get_name(*v_id).unwrap();
-            (*name).clone()
-        }).collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.feature_vocab.len() + self.empty_nodes
-    }
-
-    pub fn fill_missing_nodes(&mut self) {
-        let mut idxs = self.feature_vocab.len();
-        self.features.iter_mut().for_each(|f| {
-            if f.len() == 0 {
-                *f = vec![idxs];
-                idxs += 1;
-                self.empty_nodes += 1;
-            }
-        });
-    }
-
-    pub fn get_vocab(self) -> Vocab {
-        self.feature_vocab
-    }
-}
+use crate::algos::utils::FeatureStore;
 
 pub struct EmbeddingPropagation {
     pub alpha: f32,
@@ -147,7 +87,7 @@ impl EmbeddingPropagation {
         for pass in 0..self.passes {
             pb.update_message(|msg| {
                 msg.clear();
-                write!(msg, "Pass {}/{}, Error: {:.3}, alpha: {:.5}", pass + 1, self.passes, current_error, alpha)
+                write!(msg, "Pass {}/{}, Error: {:.5}, alpha: {:.5}", pass + 1, self.passes, current_error, alpha)
                     .expect("Error writing out indicator message!");
             });
 
@@ -196,6 +136,24 @@ impl EmbeddingPropagation {
         feature_embeddings
     }
 
+    fn sample_negatives<R: Rng>(&self, anchor: NodeID, n_nodes: usize, rng: &mut R) -> Vec<NodeID> {
+        let dist = Uniform::new(0, n_nodes);
+
+        // Get negative v
+        let num_negs = self.loss.negatives();
+        let mut negatives = Vec::with_capacity(num_negs);
+        // We make a good attempt to get the full negatives, but bail
+        // if it's computationally too expensive
+        for _ in 0..(num_negs*2) {
+            let neg_node = dist.sample(rng);
+            if neg_node != anchor { 
+                negatives.push(neg_node) ;
+                if negatives.len() == num_negs { break }
+            }
+        }
+        negatives
+    }
+
     fn run_pass<G: CGraph + Send + Sync, R: Rng>(
         &self, 
         graph: &G,
@@ -205,30 +163,18 @@ impl EmbeddingPropagation {
         rng: &mut R
     ) -> (f32, HashMap<usize, Vec<f32>>) {
 
-        let dist = Uniform::new(0, graph.len());
-
-        // Get negative v
-        let num_negs = self.loss.negatives();
-        let mut negatives = Vec::with_capacity(num_negs);
-        loop {
-            let neg_node = dist.sample(rng);
-            if neg_node != node { 
-                negatives.push(neg_node) ;
-                if negatives.len() == num_negs { break }
-            }
-        }
-
         // h(v)
         let (hv_vars, hv) = construct_node_embedding(
             node, features, &feature_embeddings, self.max_features, rng);
         
         // ~h(v)
-        let (thv_vars, thv) = reconstruct_node_embedding(
+        let (thv_vars, thv) = self.loss.construct_positive(
             graph, node, features, &feature_embeddings, self.max_nodes, self.max_features, rng);
         
         // h(u)
-        let mut hu_vars = Vec::with_capacity(num_negs);
-        let mut hus = Vec::with_capacity(num_negs);
+        let negatives = self.sample_negatives(node, graph.len(), rng);
+        let mut hu_vars = Vec::with_capacity(negatives.len());
+        let mut hus = Vec::with_capacity(negatives.len());
         negatives.into_iter().for_each(|neg_node| {
             let (hu_var, hu) = construct_node_embedding(neg_node, features, &feature_embeddings, self.max_features, rng);
             hu_vars.push(hu_var);
@@ -250,6 +196,7 @@ impl EmbeddingPropagation {
             loss = loss + self.wd * norms;
         }
 
+        // Compute gradients
         let mut agraph = Graph::new();
         agraph.backward(&loss);
 
@@ -286,6 +233,7 @@ fn extract_grads(
     }
 }
 
+// We use SGD with momentum as it's fast, cheap, and easy to implement.
 fn sgd(
     feature_embeddings: &EmbeddingStore,
     momentum: &EmbeddingStore,
@@ -301,7 +249,7 @@ fn sgd(
         if grad.iter().all(|gi| !gi.is_nan()) {
             // Can get some nans in weird cases, such as the distance between
             // a node and it's reconstruction when it shares all features.
-            // SGD
+            // We just skip over those weird ones.
             emb.iter_mut().zip(grad.iter().zip(mom.iter_mut())).for_each(|(ei, (gi, mi))| {
                 *mi = gamma * *mi + *gi;
                 *ei -= alpha * *mi;
@@ -335,6 +283,8 @@ fn collect_embeddings_from_node<R: Rng>(
 }
 
 // H(n)
+// Average the features associated with a node
+// to create the node embedding
 fn construct_node_embedding<R: Rng>(
     node: NodeID,
     feature_store: &FeatureStore,
@@ -354,6 +304,9 @@ fn construct_node_embedding<R: Rng>(
 }
 
 // ~H(n)
+// The Expensive function.  We grab a nodes neighbors
+// and use the average of their features to construct
+// an estimate of H(n)
 fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     graph: &G,
     node: NodeID,
@@ -408,25 +361,29 @@ fn euclidean_distance(e1: ANode, e2: ANode) -> ANode {
 
 #[derive(Copy,Clone)]
 pub enum Loss {
-    MarginLoss(f32),
-    Contrastive(f32, usize)
+    MarginLoss(f32, usize),
+    Contrastive(f32, usize),
+    StarSpace(f32, usize)
 }
 
 impl Loss {
     fn negatives(&self) -> usize {
-        if let Loss::Contrastive(_, negs) = self {
-            *negs
-        } else {
-            1
+        match self {
+            Loss::Contrastive(_, negs) => *negs,
+            Loss::MarginLoss(_, negs)  => *negs,
+            Loss::StarSpace(_, negs) => *negs
         }
     }
 
-    fn compute(&self, thv: ANode, hv: ANode, mut hus: Vec<ANode>) -> ANode {
+    fn compute(&self, thv: ANode, hv: ANode, hus: Vec<ANode>) -> ANode {
         match self {
 
-            Loss::MarginLoss(gamma) => {
+            Loss::MarginLoss(gamma, _) | Loss::StarSpace(gamma, _) => {
                 let d1 = euclidean_distance(thv.clone(), hv);
-                let d2 = euclidean_distance(thv, hus.pop().unwrap());
+                let d2 = hus.into_iter()
+                    .map(|hu| euclidean_distance(thv.clone(), hu))
+                    .collect::<Vec<_>>().sum_all();
+
                 (gamma + d1 - d2).maximum(0f32)
             },
 
@@ -446,6 +403,34 @@ impl Loss {
             }
         }
     }
+
+    fn construct_positive<G: CGraph, R: Rng>(
+        &self,
+        graph: &G,
+        node: NodeID,
+        feature_store: &FeatureStore,
+        feature_embeddings: &EmbeddingStore,
+        max_nodes: Option<usize>,
+        max_features: Option<usize>,
+        rng: &mut R
+    ) -> (NodeCounts,ANode) {
+        match self {
+            Loss::Contrastive(_,_) | Loss::MarginLoss(_,_) => {
+                reconstruct_node_embedding(
+                    graph, node, feature_store, feature_embeddings, max_nodes, max_features, rng)
+            },
+            Loss::StarSpace(_,_) => {
+                // Select random out edge
+                let edges = graph.get_edges(node).0;
+                // If it has no out edges, nothing to really do.  We can't build a comparison.
+                let choice = *edges.choose(rng).unwrap_or(&node);
+                construct_node_embedding(
+                    node, feature_store, feature_embeddings, max_features, rng)
+            }
+        }
+
+    }
+
 }
 
 fn l2norm(v: ANode) -> ANode {
@@ -515,14 +500,13 @@ mod ep_tests {
         let mut feature_store = FeatureStore::new(ccsr.len(), "feat".to_string());
         feature_store.fill_missing_nodes();
 
-        let mut rng = XorShiftRng::seed_from_u64(202220222);
         let mut agraph = Graph::new();
 
         let ep = EmbeddingPropagation {
             alpha: 1e-2,
             gamma: 0.1,
             wd: 0f32,
-            loss: Loss::MarginLoss(1f32),
+            loss: Loss::MarginLoss(1f32, 1usize),
             batch_size: 32,
             dims: 5,
             passes: 50,
