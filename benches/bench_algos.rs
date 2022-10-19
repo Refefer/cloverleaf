@@ -5,7 +5,8 @@ use rand_distr::{Distribution,Uniform};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use cloverleaf::graph::{Graph,CSR,CumCSR};
 use cloverleaf::algos::lpa::lpa;
-use cloverleaf::algos::ep::{EmbeddingPropagation,FeatureStore,Loss};
+use cloverleaf::algos::ep::{EmbeddingPropagation,Loss};
+use cloverleaf::algos::utils::FeatureStore;
 
 const SEED: u64 = 2022341;
 
@@ -70,8 +71,10 @@ fn embedding_propagation(c: &mut Criterion) {
             passes: 50,
             seed: 202220222,
             indicator: false,
+            max_nodes: Some(10),
+            max_features: None,
             wd: 0f32,
-            loss: Loss::MarginLoss(10f32)
+            loss: Loss::MarginLoss(10f32, 1)
         };
 
         let label = format!("ep:{}", num_feats);

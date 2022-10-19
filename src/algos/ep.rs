@@ -221,14 +221,13 @@ fn extract_grads(
     for (feat_id, (var, _)) in vars {
         if grads.contains_key(&feat_id) { continue }
 
-        let grad = graph.get_grad(&var)
-            .expect("Should have a gradient!");
-
-        if grad.iter().all(|gi| !gi.is_nan()) {
-            // Can get some nans in weird cases, such as the distance between
-            // a node and it's reconstruction when it shares all features.
-            // Since that's not all that helpful anyways, we simply ignore it and move on
-            grads.insert(feat_id, grad.to_vec());
+        if let Some(grad) = graph.get_grad(&var) {
+            if grad.iter().all(|gi| !gi.is_nan()) {
+                // Can get some nans in weird cases, such as the distance between
+                // a node and it's reconstruction when it shares all features.
+                // Since that's not all that helpful anyways, we simply ignore it and move on
+                grads.insert(feat_id, grad.to_vec());
+            }
         }
     }
 }
@@ -378,13 +377,42 @@ impl Loss {
     fn compute(&self, thv: ANode, hv: ANode, hus: Vec<ANode>) -> ANode {
         match self {
 
-            Loss::MarginLoss(gamma, _) | Loss::StarSpace(gamma, _) => {
+            Loss::MarginLoss(gamma, _) => {
                 let d1 = euclidean_distance(thv.clone(), hv);
                 let d2 = hus.into_iter()
                     .map(|hu| euclidean_distance(thv.clone(), hu))
                     .collect::<Vec<_>>().sum_all();
 
-                (gamma + d1 - d2).maximum(0f32)
+                let result = (gamma + d1 - d2).maximum(0f32);
+                if result.value()[0] > 0f32 {
+                    result
+                } else {
+                    Constant::scalar(0f32)
+                }
+            },
+
+            Loss::StarSpace(gamma, _) => {
+                let thv_norm = il2norm(thv);
+                let hv_norm  = il2norm(hv);
+
+                let d1 = gamma - cosine(thv_norm.clone(), hv_norm);
+                let negs = hus.len();
+                let pos_losses = hus.into_iter()
+                    .map(|hu| {
+                        let hu_norm = il2norm(hu);
+                        (d1.clone() + cosine(thv_norm.clone(), hu_norm)).maximum(0f32)
+                    })
+                    // Only collect losses which are not zero
+                    .filter(|l| l.value()[0] > 0f32)
+                    .collect::<Vec<_>>();
+
+                // Only return positive ones
+                if pos_losses.len() > 0 {
+                    let n_losses = pos_losses.len() as f32;
+                    pos_losses.sum_all() / n_losses
+                } else {
+                    Constant::scalar(0f32)
+                }
             },
 
             Loss::Contrastive(tau, _) => {
