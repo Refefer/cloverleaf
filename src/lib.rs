@@ -382,7 +382,6 @@ impl EmbeddingPropagator {
         Ok(self.features.get_pretty_features(node_id))
     }
 
-
     pub fn load_features(&mut self, path: String, error_on_missing: Option<bool>) -> PyResult<()> {
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -405,6 +404,10 @@ impl EmbeddingPropagator {
         Ok(())
     }
 
+    pub fn num_features(&self) -> usize {
+        self.features.len()
+    }
+
     pub fn learn(
         &mut self, 
         graph: &mut RwrGraph, 
@@ -416,6 +419,8 @@ impl EmbeddingPropagator {
         wd: Option<f32>,
         gamma: Option<f32>,
         seed: Option<u64>,
+        max_nodes: Option<usize>,
+        max_features: Option<usize>,
         indicator: Option<bool>
     ) -> (NodeEmbeddings, NodeEmbeddings) {
         let ep = EmbeddingPropagation {
@@ -427,6 +432,8 @@ impl EmbeddingPropagator {
             wd: wd.unwrap_or(0f32),
             loss: loss.loss,
             seed: seed.unwrap_or(SEED),
+            max_nodes: max_nodes,
+            max_features: max_features,
             indicator: indicator.unwrap_or(true)
         };
 

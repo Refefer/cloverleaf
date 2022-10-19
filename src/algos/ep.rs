@@ -53,7 +53,6 @@ impl FeatureStore {
         }).collect()
     }
 
-
     pub fn len(&self) -> usize {
         self.feature_vocab.len() + self.empty_nodes
     }
@@ -83,6 +82,8 @@ pub struct EmbeddingPropagation {
     pub dims: usize,
     pub passes: usize,
     pub seed: u64,
+    pub max_features: Option<usize>,
+    pub max_nodes: Option<usize>,
     pub indicator: bool
 }
 
@@ -107,7 +108,10 @@ impl EmbeddingPropagation {
     ) -> EmbeddingStore {
         let mut es = EmbeddingStore::new(num_nodes, self.dims, Distance::Cosine);
         (0..num_nodes).into_par_iter().for_each(|node| {
-            let node_embedding = construct_node_embedding(node, features, &feat_embeds).1;
+            // We don't use rng in this case, but need it to satisfy random selection
+            let mut rng = XorShiftRng::seed_from_u64(node as u64);
+            let node_embedding = construct_node_embedding(node, features, &feat_embeds, None, &mut rng).1;
+            
             // Safe to access in parallel
             let embedding = es.get_embedding_mut_hogwild(node);
             embedding.clone_from_slice(node_embedding.value());
@@ -115,6 +119,7 @@ impl EmbeddingPropagation {
         es
     }
 
+    // The uber expensive function
     fn learn_feature_embeddings<G: CGraph + Send + Sync>(
         &self,
         graph: &G,
@@ -122,13 +127,16 @@ impl EmbeddingPropagation {
         features: &FeatureStore,
     ) -> EmbeddingStore {
 
+        // We create separate embeddings for momentum and feature_embeddings.
         let mut feature_embeddings = EmbeddingStore::new(features.len(), self.dims, Distance::Cosine);
         let momentum = EmbeddingStore::new(features.len(), self.dims, Distance::Cosine);
+
         let mut rng = XorShiftRng::seed_from_u64(self.seed);
+        
+        // Initialize embeddings as random
         randomize_embedding_store(&mut feature_embeddings, &mut rng);
 
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
-        let dist = Uniform::new(0, node_idxs.len());
         let pb = CLProgressBar::new((self.passes * graph.len()) as u64, self.indicator);
         
         // Enable/disable shared memory pool
@@ -156,9 +164,10 @@ impl EmbeddingPropagation {
                     (loss, grads)
                 }).collect_into_vec(&mut grads);
 
-                // Back propagate and SGD
                 let mut error = 0f32;
                 let mut cnt = 0f32;
+                // Since we're dealing with multiple reconstructions with likely shared features,
+                // we aggregate all the gradients
                 for (err, grad_set) in grads.drain(..nodes.len()) {
                     for (feat, grad) in grad_set.into_iter() {
                         let e = all_grads.entry(feat).or_insert_with(|| vec![0.; grad.len()]);
@@ -210,22 +219,25 @@ impl EmbeddingPropagation {
         }
 
         // h(v)
-        let (hv_vars, hv) = construct_node_embedding(node, features, &feature_embeddings);
+        let (hv_vars, hv) = construct_node_embedding(
+            node, features, &feature_embeddings, self.max_features, rng);
         
         // ~h(v)
-        let (thv_vars, thv) = reconstruct_node_embedding(graph, node, features, &feature_embeddings, Some(10), rng);
+        let (thv_vars, thv) = reconstruct_node_embedding(
+            graph, node, features, &feature_embeddings, self.max_nodes, self.max_features, rng);
         
         // h(u)
         let mut hu_vars = Vec::with_capacity(num_negs);
         let mut hus = Vec::with_capacity(num_negs);
         negatives.into_iter().for_each(|neg_node| {
-            let (hu_var, hu) = construct_node_embedding(neg_node, features, &feature_embeddings);
+            let (hu_var, hu) = construct_node_embedding(neg_node, features, &feature_embeddings, self.max_features, rng);
             hu_vars.push(hu_var);
             hus.push(hu);
         });
 
         // Compute error
         let mut loss = self.loss.compute(thv, hv.clone(), hus.clone());
+        
         // Extract it so we can add weight decay
         let err = loss.value()[0];
         
@@ -268,7 +280,7 @@ fn extract_grads(
         if grad.iter().all(|gi| !gi.is_nan()) {
             // Can get some nans in weird cases, such as the distance between
             // a node and it's reconstruction when it shares all features.
-            // SGD
+            // Since that's not all that helpful anyways, we simply ignore it and move on
             grads.insert(feat_id, grad.to_vec());
         }
     }
@@ -301,13 +313,17 @@ fn sgd(
 
 type NodeCounts = HashMap<usize, (ANode, usize)>;
 
-fn collect_embeddings_from_node(
+fn collect_embeddings_from_node<R: Rng>(
     node: NodeID,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
-    feat_map: &mut NodeCounts  
+    feat_map: &mut NodeCounts,
+    max_features: Option<usize>,
+    rng: &mut R
 ) {
-   for feat in feature_store.get_features(node).iter() {
+    let feats = feature_store.get_features(node);
+    let max_features = max_features.unwrap_or(feats.len());
+    for feat in feats.choose_multiple(rng, max_features) {
         if let Some((_emb, count)) = feat_map.get_mut(feat) {
             *count += 1;
         } else {
@@ -319,14 +335,20 @@ fn collect_embeddings_from_node(
 }
 
 // H(n)
-fn construct_node_embedding(
+fn construct_node_embedding<R: Rng>(
     node: NodeID,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
+    max_features: Option<usize>,
+    rng: &mut R
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
     collect_embeddings_from_node(node, feature_store, 
-                                 feature_embeddings, &mut feature_map);
+                                 feature_embeddings, 
+                                 &mut feature_map,
+                                 max_features,
+                                 rng);
+
     let mean = mean_embeddings(feature_map.values());
     (feature_map, mean)
 }
@@ -338,6 +360,7 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     max_nodes: Option<usize>,
+    max_features: Option<usize>,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
     let edges = &graph.get_edges(node).0;
@@ -346,13 +369,19 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     if edges.len() <= max_nodes.unwrap_or(edges.len()) {
         for out_node in edges.iter() {
             collect_embeddings_from_node(*out_node, feature_store, 
-                                      feature_embeddings, &mut feature_map);
+                                      feature_embeddings, 
+                                      &mut feature_map,
+                                      max_features,
+                                      rng);
         }
 
     } else {
         for out_node in edges.choose_multiple(rng, max_nodes.unwrap()) {
             collect_embeddings_from_node(*out_node, feature_store, 
-                                         feature_embeddings, &mut feature_map);
+                                         feature_embeddings, 
+                                         &mut feature_map,
+                                         max_features,
+                                         rng);
         }
     }
     let mean = mean_embeddings(feature_map.values());
@@ -431,11 +460,6 @@ fn cosine(x1: ANode, x2: ANode) -> ANode {
     x1.dot(&x2)
 }
 
-fn l2norm_vec(v: &mut [f32]) {
-    let norm = v.iter().map(|wi| wi.powf(2f32)).sum::<f32>().sqrt();
-    v.iter_mut().for_each(|wi| *wi /= norm)
-}
-
 fn randomize_embedding_store(es: &mut EmbeddingStore, rng: &mut impl Rng) {
     for idx in 0..es.len() {
         let e = es.get_embedding_mut(idx);
@@ -502,6 +526,8 @@ mod ep_tests {
             batch_size: 32,
             dims: 5,
             passes: 50,
+            max_features: None,
+            max_nodes: None,
             seed: 202220222,
             indicator: false
         };
