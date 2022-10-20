@@ -463,6 +463,19 @@ impl EmbeddingPropagator {
 
  }
 
+fn count_lines(path: &str) -> std::io::Result<usize> {
+    let f = File::open(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+    let mut br = BufReader::new(f);
+    let mut count = 0;
+    for line in br.lines() {
+        line?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 #[pyclass]
 struct DistanceEmbedder {
     landmarks: algos::dist::LandmarkSelection,
@@ -614,24 +627,28 @@ impl NodeEmbeddings {
 
     #[staticmethod]
     pub fn load(path: &str, distance: Distance) -> PyResult<Self> {
+        let num_embeddings = count_lines(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
         let mut br = BufReader::new(f);
         let mut vocab = Vocab::new();
-        let mut embeddings = Vec::new();
-        for line in br.lines() {
+        
+        // Place holder
+        let mut es = EmbeddingStore::new(0, 0, EDist::Cosine);
+        for (i, line) in br.lines().enumerate() {
             let line = line.unwrap();
             let (node_type, node_name, emb) = line_to_embedding(line)
                 .ok_or_else(|| PyValueError::new_err("Error parsing line"))?;
 
-            let node_id = vocab.get_or_insert(node_type, node_name);
-            embeddings.push(emb);
-        }
+            if i == 0 {
+                es = EmbeddingStore::new(num_embeddings, emb.len(), distance.to_edist());
+            }
 
-        let mut es = EmbeddingStore::new(embeddings.len(), embeddings[0].len(), distance.to_edist());
-        for (i, emb) in embeddings.into_iter().enumerate() {
-            let m = es.get_embedding_mut(i);
+            let node_id = vocab.get_or_insert(node_type, node_name);
+            let m = es.get_embedding_mut(node_id);
             if m.len() != emb.len() {
                 return Err(PyValueError::new_err("Embeddings have different sizes!"));
             }

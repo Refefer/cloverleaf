@@ -365,6 +365,8 @@ pub enum Loss {
     StarSpace(f32, usize)
 }
 
+
+
 impl Loss {
     fn negatives(&self) -> usize {
         match self {
@@ -378,14 +380,16 @@ impl Loss {
         match self {
 
             Loss::MarginLoss(gamma, _) => {
-                let d1 = euclidean_distance(thv.clone(), hv);
-                let d2 = hus.into_iter()
-                    .map(|hu| euclidean_distance(thv.clone(), hu))
-                    .collect::<Vec<_>>().sum_all();
+                let d1 = gamma + euclidean_distance(thv.clone(), hv);
+                let pos_losses = hus.into_iter()
+                    .map(|hu| &d1 - euclidean_distance(thv.clone(), hu))
+                    .filter(|loss| loss.value()[0] > 0f32)
+                    .collect::<Vec<_>>();
 
-                let result = (gamma + d1 - d2).maximum(0f32);
-                if result.value()[0] > 0f32 {
-                    result
+                // Only return positive ones
+                if pos_losses.len() > 0 {
+                    let n_losses = pos_losses.len() as f32;
+                    pos_losses.sum_all() / n_losses
                 } else {
                     Constant::scalar(0f32)
                 }
