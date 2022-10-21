@@ -7,3 +7,4 @@ pub mod slpa;
 pub mod ep;
 pub mod ann;
 pub mod utils;
+pub mod aggregator;

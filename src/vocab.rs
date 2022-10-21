@@ -2,7 +2,7 @@ use hashbrown::HashMap;
 use crate::graph::NodeID;
 use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Clone,Debug)]
 pub struct Vocab {
     vocab_to_idx: HashMap<(usize, Arc<String>), NodeID>,
     node_id_to_node: Vec<(usize,Arc<String>)>,

@@ -20,6 +20,7 @@ use std::fs::File;
 use std::io::{Write,BufWriter,Read,BufReader,BufRead};
 use std::fmt::Write as FmtWrite;
 
+use rayon::prelude::*;
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError};
@@ -34,6 +35,7 @@ use crate::algos::ann::NodeDistance;
 use crate::vocab::Vocab;
 use crate::sampler::Weighted;
 use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
+use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,EmbeddingBuilder};
 
 const SEED: u64 = 20222022;
 
@@ -77,7 +79,7 @@ fn get_node_id(vocab: &Vocab, node_type: String, node: String) -> PyResult<NodeI
 
 #[pyclass]
 #[derive(Clone)]
-enum Distance {
+pub enum Distance {
     Cosine,
     Euclidean,
     ALT,
@@ -98,7 +100,7 @@ impl Distance {
 }
 
 #[pyclass]
-struct RwrGraph {
+pub struct RwrGraph {
     graph: Arc<CumCSR>,
     vocab: Arc<Vocab>
 }
@@ -283,7 +285,7 @@ impl RwrGraph {
 
 #[pyclass]
 #[derive(Clone)]
-enum EdgeType {
+pub enum EdgeType {
     Directed,
     Undirected
 }
@@ -363,16 +365,74 @@ impl EPLoss {
 
 #[pyclass]
 struct EmbeddingPropagator {
-    vocab: Arc<Vocab>,
-    features: FeatureStore
+    ep: EmbeddingPropagation
 }
 
 #[pymethods]
 impl EmbeddingPropagator {
     #[new]
+    pub fn new(
+        alpha: Option<f32>, 
+        loss: Option<EPLoss>,
+        batch_size: Option<usize>, 
+        dims: Option<usize>,
+        passes: Option<usize>,
+        wd: Option<f32>,
+        gamma: Option<f32>,
+        seed: Option<u64>,
+        max_nodes: Option<usize>,
+        max_features: Option<usize>,
+        indicator: Option<bool>
+
+    ) -> Self {
+        let ep = EmbeddingPropagation {
+            alpha: alpha.unwrap_or(0.9),
+            batch_size: batch_size.unwrap_or(50),
+            dims: dims.unwrap_or(100),
+            passes: passes.unwrap_or(100),
+            gamma: gamma.unwrap_or(0f32),
+            wd: wd.unwrap_or(0f32),
+            loss: loss.map(|l|l.loss).unwrap_or(Loss::MarginLoss(1f32,1)),
+            seed: seed.unwrap_or(SEED),
+            max_nodes: max_nodes,
+            max_features: max_features,
+            indicator: indicator.unwrap_or(true)
+        };
+
+        EmbeddingPropagator{ ep }
+    }
+
+    pub fn learn_features(
+        &mut self, 
+        graph: &RwrGraph, 
+        features: &mut FeatureSet
+    ) -> NodeEmbeddings {
+        features.features.fill_missing_nodes();
+        let feat_embeds = self.ep.learn(graph.graph.as_ref(), &mut features.features);
+
+        let vocab = features.features.clone_vocab();
+
+        let feature_embeddings = NodeEmbeddings {
+            vocab: Arc::new(vocab),
+            embeddings: feat_embeds};
+
+        feature_embeddings
+
+    }
+}
+
+#[pyclass]
+pub struct FeatureSet {
+    vocab: Arc<Vocab>,
+    features: FeatureStore
+}
+
+#[pymethods]
+impl FeatureSet {
+    #[new]
     pub fn new(graph: &RwrGraph, namespace: Option<String>) -> Self {
         let ns = namespace.unwrap_or_else(|| "feat".to_string());
-        EmbeddingPropagator {
+        FeatureSet {
             features: FeatureStore::new(graph.graph.len(), ns),
             vocab: graph.vocab.clone()
         }
@@ -412,56 +472,85 @@ impl EmbeddingPropagator {
     }
 
     pub fn num_features(&self) -> usize {
-        self.features.len()
+        self.features.num_features()
     }
 
-    pub fn learn(
-        &mut self, 
-        graph: &mut RwrGraph, 
-        alpha: f32, 
-        loss: EPLoss,
-        batch_size: usize, 
-        dims: usize,
-        passes: usize,
-        wd: Option<f32>,
-        gamma: Option<f32>,
-        seed: Option<u64>,
-        max_nodes: Option<usize>,
-        max_features: Option<usize>,
-        indicator: Option<bool>
-    ) -> (NodeEmbeddings, NodeEmbeddings) {
-        let ep = EmbeddingPropagation {
-            alpha,
-            batch_size,
-            dims,
-            passes,
-            gamma: gamma.unwrap_or(0f32),
-            wd: wd.unwrap_or(0f32),
-            loss: loss.loss,
-            seed: seed.unwrap_or(SEED),
-            max_nodes: max_nodes,
-            max_features: max_features,
-            indicator: indicator.unwrap_or(true)
-        };
+}
 
-        self.features.fill_missing_nodes();
-        let (embeddings, feat_embeds) = ep.learn(graph.graph.as_ref(), &mut self.features);
-        let node_embeddings = NodeEmbeddings {
-            vocab: self.vocab.clone(),
-            embeddings};
+#[pyclass]
+pub struct FeatureEmbeddingAggregator {
+    vocab: Arc<Vocab>,
+    unigrams: UnigramProbability
+}
 
-        let mut fs = FeatureStore::new(graph.graph.len(), (*self.features.get_ns()).clone());
-        std::mem::swap(&mut fs, &mut self.features);
+impl FeatureEmbeddingAggregator {
 
-        let feature_embeddings = NodeEmbeddings {
-            vocab: Arc::new(fs.get_vocab()),
-            embeddings: feat_embeds};
-
-        (node_embeddings, feature_embeddings)
-
+    fn get_aggregator<'a>(
+        &'a self, 
+        es: &'a EmbeddingStore, 
+        alpha: Option<f32>
+    ) -> Box<dyn EmbeddingBuilder + Send + Sync + 'a> {
+        if let Some(alpha) = alpha {
+            Box::new(WeightedAggregator::new(es, &self.unigrams, alpha))
+        } else {
+            Box::new(AvgAggregator::new(es))
+        }
     }
 
- }
+}
+
+#[pymethods]
+impl FeatureEmbeddingAggregator {
+    #[new]
+    pub fn new(fs: &FeatureSet) -> Self {
+        let up = UnigramProbability::new(&fs.features);
+        FeatureEmbeddingAggregator {
+            unigrams: up,
+            vocab: fs.vocab.clone()
+        }
+    }
+
+    pub fn embed_graph(
+        &self, 
+        graph: &RwrGraph,
+        feat_set: &FeatureSet, 
+        feature_embeddings: &NodeEmbeddings,
+        alpha: Option<f32>
+    ) -> NodeEmbeddings {
+
+        let num_nodes = graph.nodes();
+        let mut es = EmbeddingStore::new(num_nodes, feature_embeddings.dims(), EDist::Cosine);
+        let agg = self.get_aggregator(&feature_embeddings.embeddings, alpha);
+        (0..num_nodes).into_par_iter().for_each(|node| {
+            // Safe to access in parallel
+            let embedding = es.get_embedding_mut_hogwild(node);
+            agg.construct(feat_set.features.get_features(node), embedding);
+        });
+
+        NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings: es
+        }
+    }
+
+    pub fn embed_adhoc(
+        &self, 
+        features: Vec<(String, String)>,
+        feature_embeddings: &NodeEmbeddings,
+        alpha: Option<f32>
+    ) -> PyResult<Vec<f32>> {
+        let v = feature_embeddings.vocab.deref();
+        let ids: PyResult<Vec<usize>> = features.into_iter().map(|(node_type, node_name)| {
+            get_node_id(v, node_type, node_name)
+        }).collect();
+
+        let mut embedding = vec![0.; feature_embeddings.embeddings.dims()];
+        let agg = self.get_aggregator(&feature_embeddings.embeddings, alpha);
+        agg.construct(&(ids?), &mut embedding);
+        Ok(embedding)
+    }
+
+}
 
 fn count_lines(path: &str) -> std::io::Result<usize> {
     let f = File::open(path)
@@ -561,7 +650,7 @@ impl SLPAEmbedder {
 }
 
 #[pyclass]
-struct NodeEmbeddings {
+pub struct NodeEmbeddings {
     vocab: Arc<Vocab>,
     embeddings: EmbeddingStore
 }
@@ -598,6 +687,10 @@ impl NodeEmbeddings {
     pub fn nearest_neighbor(&self, emb: Vec<f32>, k: usize) -> Vec<((String,String), f32)> {
         let dists = self.embeddings.nearest_neighbor(&Entity::Embedding(&emb), k);
         convert_node_distance(&self.vocab, dists)
+    }
+
+    pub fn dims(&self) -> usize {
+        self.embeddings.dims()
     }
     
     pub fn save(&self, path: &str) -> PyResult<()> {
@@ -679,7 +772,7 @@ fn line_to_embedding(line: String) -> Option<(String,String,Vec<f32>)> {
 }
 
 #[pyclass]
-struct VocabIterator {
+pub struct VocabIterator {
     vocab: Arc<Vocab>,
     cur_idx: usize
 }
@@ -774,6 +867,8 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<VocabIterator>()?;
     m.add_class::<EPLoss>()?;
     m.add_class::<Ann>()?;
+    m.add_class::<FeatureSet>()?;
+    m.add_class::<FeatureEmbeddingAggregator>()?;
     Ok(())
 }
 

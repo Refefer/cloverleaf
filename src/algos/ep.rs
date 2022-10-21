@@ -33,32 +33,13 @@ impl EmbeddingPropagation {
         &self, 
         graph: &G, 
         features: &FeatureStore
-    ) -> (EmbeddingStore, EmbeddingStore) {
+    ) -> EmbeddingStore {
         let mut agraph = Graph::new();
         let feat_embeds = self.learn_feature_embeddings(graph, &mut agraph, features);
-        let es = self.construct_node_embeddings(graph.len(), features, &feat_embeds);
-        (es, feat_embeds)
+        feat_embeds
     }
 
-    fn construct_node_embeddings(
-        &self, 
-        num_nodes: usize, 
-        features: &FeatureStore, 
-        feat_embeds: &EmbeddingStore
-    ) -> EmbeddingStore {
-        let mut es = EmbeddingStore::new(num_nodes, self.dims, Distance::Cosine);
-        (0..num_nodes).into_par_iter().for_each(|node| {
-            // We don't use rng in this case, but need it to satisfy random selection
-            let mut rng = XorShiftRng::seed_from_u64(node as u64);
-            let node_embedding = construct_node_embedding(node, features, &feat_embeds, None, &mut rng).1;
-            
-            // Safe to access in parallel
-            let embedding = es.get_embedding_mut_hogwild(node);
-            embedding.clone_from_slice(node_embedding.value());
-        });
-        es
-    }
-
+    
     // The uber expensive function
     fn learn_feature_embeddings<G: CGraph + Send + Sync>(
         &self,
@@ -68,8 +49,8 @@ impl EmbeddingPropagation {
     ) -> EmbeddingStore {
 
         // We create separate embeddings for momentum and feature_embeddings.
-        let mut feature_embeddings = EmbeddingStore::new(features.len(), self.dims, Distance::Cosine);
-        let momentum = EmbeddingStore::new(features.len(), self.dims, Distance::Cosine);
+        let mut feature_embeddings = EmbeddingStore::new(features.num_features(), self.dims, Distance::Cosine);
+        let momentum = EmbeddingStore::new(features.num_features(), self.dims, Distance::Cosine);
 
         let mut rng = XorShiftRng::seed_from_u64(self.seed);
         

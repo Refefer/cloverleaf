@@ -99,8 +99,12 @@ impl FeatureStore {
         }).collect()
     }
 
-    pub fn len(&self) -> usize {
+    pub fn num_features(&self) -> usize {
         self.feature_vocab.len() + self.empty_nodes
+    }
+
+    pub fn num_nodes(&self) -> usize {
+        self.features.len()
     }
 
     pub fn fill_missing_nodes(&mut self) {
@@ -116,6 +120,14 @@ impl FeatureStore {
 
     pub fn get_vocab(self) -> Vocab {
         self.feature_vocab
+    }
+
+    pub fn clone_vocab(&self) -> Vocab {
+        self.feature_vocab.clone()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item=&Vec<usize>> {
+        self.features.iter()
     }
 }
 

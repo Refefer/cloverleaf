@@ -104,6 +104,10 @@ impl EmbeddingStore {
         }
     }
 
+    pub fn dims(&self) -> usize {
+        self.dims
+    }
+
     pub fn is_set(&self, node_id: NodeID) -> bool {
         self.bitfield.is_set(node_id)
     }
