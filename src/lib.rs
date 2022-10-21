@@ -550,6 +550,51 @@ impl FeatureEmbeddingAggregator {
         Ok(embedding)
     }
 
+    pub fn save(&self, path: &str) -> PyResult<()> {
+        let f = File::create(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let mut bw = BufWriter::new(f);
+        for (node, p_wi) in self.unigrams.iter().enumerate() {
+            let (f_node_type, f_name) = self.vocab.get_name(node)
+                .expect("Programming error!");
+
+            writeln!(&mut bw, "{}\t{}\t{}", f_node_type, f_name, p_wi)
+                .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    #[staticmethod]
+    pub fn load(path: String) -> PyResult<Self> {
+        let f = File::open(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let mut br = BufReader::new(f);
+        let mut vocab = Vocab::new();
+        let mut p_w = Vec::new();
+        for line in br.lines() {
+            let line = line.unwrap();
+            let pieces: Vec<_> = line.split('\t').collect();
+            if pieces.len() != 3 {
+                return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>weight ..."))
+            }
+            let p_wi = pieces[0].parse::<f32>()
+                .map_err(|e| PyValueError::new_err("Tried to parse weight and failed!"))?;
+            let node_id = vocab.get_or_insert(pieces[0].into(), pieces[1].into());
+            if node_id < p_w.len() {
+                return Err(PyValueError::new_err(format!("Duplicate feature found:{} {}", pieces[0], pieces[1])))
+            }
+            p_w.push(p_wi);
+        }
+
+        Ok(FeatureEmbeddingAggregator { 
+            vocab: Arc::new(vocab),
+            unigrams: UnigramProbability::from_vec(p_w) 
+        })
+    }
+
+
 }
 
 fn count_lines(path: &str) -> std::io::Result<usize> {
