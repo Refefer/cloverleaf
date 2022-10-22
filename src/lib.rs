@@ -248,7 +248,7 @@ impl RwrGraph {
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-        let mut br = BufReader::new(f);
+        let br = BufReader::new(f);
         let mut vocab = Vocab::new();
         let mut edges = Vec::new();
         for line in br.lines() {
@@ -453,7 +453,7 @@ impl FeatureSet {
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-        let mut br = BufReader::new(f);
+        let br = BufReader::new(f);
         let strict = error_on_missing.unwrap_or(true);
         for line in br.lines() {
             let line = line.unwrap();
@@ -506,7 +506,7 @@ impl FeatureEmbeddingAggregator {
         let up = UnigramProbability::new(&fs.features);
         FeatureEmbeddingAggregator {
             unigrams: up,
-            vocab: fs.vocab.clone()
+            vocab: Arc::new(fs.features.clone_vocab())
         }
     }
 
@@ -519,7 +519,7 @@ impl FeatureEmbeddingAggregator {
     ) -> NodeEmbeddings {
 
         let num_nodes = graph.nodes();
-        let mut es = EmbeddingStore::new(num_nodes, feature_embeddings.dims(), EDist::Cosine);
+        let es = EmbeddingStore::new(num_nodes, feature_embeddings.dims(), EDist::Cosine);
         let agg = self.get_aggregator(&feature_embeddings.embeddings, alpha);
         (0..num_nodes).into_par_iter().for_each(|node| {
             // Safe to access in parallel
@@ -537,16 +537,22 @@ impl FeatureEmbeddingAggregator {
         &self, 
         features: Vec<(String, String)>,
         feature_embeddings: &NodeEmbeddings,
-        alpha: Option<f32>
+        alpha: Option<f32>,
+        strict: Option<bool>
     ) -> PyResult<Vec<f32>> {
         let v = feature_embeddings.vocab.deref();
-        let ids: PyResult<Vec<usize>> = features.into_iter().map(|(node_type, node_name)| {
-            get_node_id(v, node_type, node_name)
-        }).collect();
+        let mut ids = Vec::new();
+        for (node_type, node_name) in features.into_iter() {
+            if let Ok(feat_id) = get_node_id(v, node_type.clone(), node_name.clone()) {
+                ids.push(feat_id)
+            } else if strict.unwrap_or(true) {
+                return Err(PyKeyError::new_err(format!("Feature {} {} does not exist!", node_type, node_name)))
+            }
+        }
 
         let mut embedding = vec![0.; feature_embeddings.embeddings.dims()];
         let agg = self.get_aggregator(&feature_embeddings.embeddings, alpha);
-        agg.construct(&(ids?), &mut embedding);
+        agg.construct(&ids, &mut embedding);
         Ok(embedding)
     }
 
@@ -556,11 +562,13 @@ impl FeatureEmbeddingAggregator {
 
         let mut bw = BufWriter::new(f);
         for (node, p_wi) in self.unigrams.iter().enumerate() {
-            let (f_node_type, f_name) = self.vocab.get_name(node)
-                .expect("Programming error!");
-
-            writeln!(&mut bw, "{}\t{}\t{}", f_node_type, f_name, p_wi)
-                .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+            if let Some((f_node_type, f_name)) = self.vocab.get_name(node) {
+                writeln!(&mut bw, "{}\t{}\t{}", f_node_type, f_name, *p_wi as f64)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+            } else {
+                // We've moved to node individual embeddings
+                break
+            }
         }
         Ok(())
     }
@@ -570,7 +578,7 @@ impl FeatureEmbeddingAggregator {
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-        let mut br = BufReader::new(f);
+        let br = BufReader::new(f);
         let mut vocab = Vocab::new();
         let mut p_w = Vec::new();
         for line in br.lines() {
@@ -579,13 +587,13 @@ impl FeatureEmbeddingAggregator {
             if pieces.len() != 3 {
                 return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>weight ..."))
             }
-            let p_wi = pieces[0].parse::<f32>()
-                .map_err(|e| PyValueError::new_err("Tried to parse weight and failed!"))?;
+            let p_wi = pieces[2].parse::<f64>()
+                .map_err(|e| PyValueError::new_err(format!("Tried to parse weight and failed:{:?}", line)))?;
             let node_id = vocab.get_or_insert(pieces[0].into(), pieces[1].into());
             if node_id < p_w.len() {
                 return Err(PyValueError::new_err(format!("Duplicate feature found:{} {}", pieces[0], pieces[1])))
             }
-            p_w.push(p_wi);
+            p_w.push(p_wi as f32);
         }
 
         Ok(FeatureEmbeddingAggregator { 
@@ -601,7 +609,7 @@ fn count_lines(path: &str) -> std::io::Result<usize> {
     let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-    let mut br = BufReader::new(f);
+    let br = BufReader::new(f);
     let mut count = 0;
     for line in br.lines() {
         line?;
@@ -720,7 +728,7 @@ impl NodeEmbeddings {
 
     pub fn set_embedding(&mut self, node: (String,String), embedding: Vec<f32>) -> PyResult<()> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
-        let mut es = &mut self.embeddings;
+        let es = &mut self.embeddings;
         es.set_embedding(node_id, &embedding);
         Ok(())
     }
@@ -771,7 +779,7 @@ impl NodeEmbeddings {
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-        let mut br = BufReader::new(f);
+        let br = BufReader::new(f);
         let mut vocab = Vocab::new();
         
         // Place holder

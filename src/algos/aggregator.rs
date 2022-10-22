@@ -99,7 +99,7 @@ impl <'a> EmbeddingBuilder for WeightedAggregator<'a> {
             let w = self.alpha / (self.alpha + p_wi);
             weight += w;
             let e = self.embs.get_embedding(*feat_id); 
-            WeightedAggregator::imulsum(out, e, p_wi);
+            WeightedAggregator::imulsum(out, e, w);
         }
 
         out.iter_mut().for_each(|outi| *outi /= weight);
