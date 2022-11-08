@@ -251,16 +251,16 @@ impl RwrGraph {
         let br = BufReader::new(f);
         let mut vocab = Vocab::new();
         let mut edges = Vec::new();
-        for line in br.lines() {
+        for (i, line) in br.lines().enumerate() {
             let line = line.unwrap();
             let pieces: Vec<_> = line.split('\t').collect();
             if pieces.len() != 5 {
-                return Err(PyValueError::new_err("Malformed graph file!"))
+                return Err(PyValueError::new_err(format!("{}: Malformed graph file: Expected 5 fields!", i)))
             }
             let f_id = vocab.get_or_insert(pieces[0].to_string(), pieces[1].to_string());
             let t_id = vocab.get_or_insert(pieces[2].to_string(), pieces[3].to_string());
             let w: f32 = pieces[4].parse()
-                .map_err(|e| PyValueError::new_err(format!("Malformed graph file! {}", e)))?;
+                .map_err(|e| PyValueError::new_err(format!("{}: Malformed graph file! {} - {:?}", i, e, pieces[4])))?;
 
             edges.push((f_id, t_id, w));
             if matches!(edge_type, EdgeType::Undirected) {
