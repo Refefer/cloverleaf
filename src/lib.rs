@@ -154,17 +154,17 @@ impl RwrGraph {
         &self, 
         embeddings: &NodeEmbeddings,
         name: (String,String), 
-        biased_context: (String,String),
+        biased_context: &Query,
         restarts: f32, 
         walks: usize, 
         blend: Option<f32>,
         beta: Option<f32>,
         k: Option<usize>, 
         seed: Option<u64>, 
-        rerank_context: Option<(String,String)>,
+        rerank_context: Option<&Query>,
     ) -> PyResult<Vec<((String,String), f32)>> {
         let node_id = get_node_id(self.vocab.deref(), name.0, name.1)?;
-        let g_node_id = get_node_id(self.vocab.deref(), biased_context.0, biased_context.1)?;
+        let g_emb = lookup_embedding(biased_context, embeddings)?;
         
         let steps = if restarts >= 1. {
             GSteps::Fixed(restarts as usize)
@@ -182,16 +182,16 @@ impl RwrGraph {
             seed: seed.unwrap_or(SEED)
         };
 
-        let embeddings = &embeddings.embeddings;
+        let node_embeddings = &embeddings.embeddings;
         let mut results = grwr.sample(self.graph.as_ref(), 
-                                  &Weighted, embeddings, node_id, g_node_id);
+                                  &Weighted, node_embeddings, node_id, g_emb);
         
         // Reweight results if requested
         if let Some(cn) = rerank_context {
             println!("Reranking...");
-            let c_node_id = get_node_id(self.vocab.deref(), cn.0, cn.1)?;
+            let c_emb = lookup_embedding(biased_context, embeddings)?;
             Reweighter::new(blend.unwrap_or(0.5))
-                .reweight(&mut results, embeddings, c_node_id);
+                .reweight(&mut results, node_embeddings, c_emb);
         }
 
         Ok(convert_scores(&self.vocab, results.into_iter(), k))
@@ -881,16 +881,60 @@ impl Ann {
 
     pub fn find(
         &self, 
-        query: Vec<f32>,
+        query: &Query,
         embeddings: &NodeEmbeddings, 
         k: usize, 
         seed: Option<u64>
-    ) -> Vec<((String, String), f32)> {
+    ) -> PyResult<Vec<((String, String), f32)>> {
+        let query_embedding = lookup_embedding(query, embeddings)?;
         let seed = seed.unwrap_or(SEED + 10);
         let ann = algos::ann::Ann::new(k, self.max_steps + k, seed);
-        let nodes = ann.find(query.as_slice(), &(*self.graph), &embeddings.embeddings);
-        convert_node_distance(&self.vocab, nodes)
+        let nodes = ann.find(query_embedding, &(*self.graph), &embeddings.embeddings);
+        Ok(convert_node_distance(&self.vocab, nodes))
     }
+}
+
+fn lookup_embedding<'a>(
+    query: &'a Query, 
+    embeddings: &'a NodeEmbeddings
+) -> PyResult<&'a [f32]> {
+    match &query.qt {
+        QueryType::Node(nt, nn) => {
+            let node_id = get_node_id(embeddings.vocab.deref(), nt.clone(), nn.clone())?;
+            Ok(embeddings.embeddings.get_embedding(node_id))
+        },
+        QueryType::Embedding(ref emb) => Ok(emb)
+    }
+}
+
+enum QueryType {
+    Node(String, String),
+    Embedding(Vec<f32>)
+}
+
+#[pyclass]
+pub struct Query {
+    qt: QueryType
+}
+
+#[pymethods]
+impl Query {
+
+    #[staticmethod]
+    pub fn node(
+        node_type: String,
+        node_name: String
+    ) -> Self {
+        Query { qt: QueryType::Node(node_type, node_name) }
+    }
+
+    #[staticmethod]
+    pub fn embedding(
+        emb: Vec<f32>
+    ) -> Self {
+        Query { qt: QueryType::Embedding(emb) }
+    }
+
 }
 
 fn convert_node_distance(
@@ -922,6 +966,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Ann>()?;
     m.add_class::<FeatureSet>()?;
     m.add_class::<FeatureEmbeddingAggregator>()?;
+    m.add_class::<Query>()?;
     Ok(())
 }
 

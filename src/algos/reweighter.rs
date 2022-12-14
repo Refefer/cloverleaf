@@ -17,11 +17,11 @@ impl Reweighter {
         &self, 
         results: &mut HashMap<NodeID, f32>,
         embeddings: &EmbeddingStore,
-        context_node: NodeID
+        context_emb: &[f32]
     ) {
 
         // Compute distances for each item
-        let context_node = Entity::Node(context_node);
+        let context_node = Entity::Embedding(context_emb);
         let distances: HashMap<_,_> = results.par_keys()
             .filter(|node| embeddings.is_set(**node))
             .map(|node| {

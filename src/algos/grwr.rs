@@ -38,7 +38,7 @@ impl GuidedRWR {
         sampler: &impl Sampler<G>,
         embeddings: &EmbeddingStore,
         start_node: NodeID,
-        context_node: NodeID
+        context_emb: &[f32] 
     ) -> HashMap<NodeID, f32> {
         let mut counts = HashMap::new();
         let mut next = HashMap::new();
@@ -53,7 +53,7 @@ impl GuidedRWR {
 
             // Reweight counts
             let reweighter = Reweighter { alpha: self.alpha };
-            reweighter.reweight(&mut next, embeddings, context_node);
+            reweighter.reweight(&mut next, embeddings, context_emb);
 
             // Renormalize counts
             let denom = next.par_values().sum::<f32>();
