@@ -49,7 +49,7 @@ def build_arg_parser():
 
     parser.add_argument("--momentum",
         type=float,
-        default=1e-9,
+        default=9e-1,
         help="Nestrov Momentum rate.")
 
     parser.add_argument("--batch-size",

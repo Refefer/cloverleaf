@@ -9,7 +9,6 @@ use simple_grad::*;
 
 use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::{EmbeddingStore,Distance};
-use crate::vocab::Vocab;
 use crate::progress::CLProgressBar;
 use crate::algos::utils::FeatureStore;
 
@@ -34,8 +33,7 @@ impl EmbeddingPropagation {
         graph: &G, 
         features: &FeatureStore
     ) -> EmbeddingStore {
-        let mut agraph = Graph::new();
-        let feat_embeds = self.learn_feature_embeddings(graph, &mut agraph, features);
+        let feat_embeds = self.learn_feature_embeddings(graph, features);
         feat_embeds
     }
 
@@ -44,7 +42,6 @@ impl EmbeddingPropagation {
     fn learn_feature_embeddings<G: CGraph + Send + Sync>(
         &self,
         graph: &G,
-        agraph: &mut Graph,
         features: &FeatureStore,
     ) -> EmbeddingStore {
 
@@ -346,8 +343,6 @@ pub enum Loss {
     StarSpace(f32, usize)
 }
 
-
-
 impl Loss {
     fn negatives(&self) -> usize {
         match self {
@@ -357,6 +352,9 @@ impl Loss {
         }
     }
 
+    // thv is the reconstruction of v from its neighbor nodes
+    // hv is the embedding constructed from its features
+    // hu is a random negative node constructed via its neighbors
     fn compute(&self, thv: ANode, hv: ANode, hus: Vec<ANode>) -> ANode {
         match self {
 
@@ -376,25 +374,28 @@ impl Loss {
                 }
             },
 
+            // This isn't working particularly well yet - need to figure out why
             Loss::StarSpace(gamma, _) => {
                 let thv_norm = il2norm(thv);
                 let hv_norm  = il2norm(hv);
 
-                let d1 = gamma - cosine(thv_norm.clone(), hv_norm);
-                let negs = hus.len();
-                let pos_losses = hus.into_iter()
+                // margin between a positive node and its reconstruction
+                // The more correlated
+                let reconstruction_dist = cosine(thv_norm.clone(), hv_norm.clone());
+                let losses = hus.into_iter()
                     .map(|hu| {
                         let hu_norm = il2norm(hu);
-                        (d1.clone() + cosine(thv_norm.clone(), hu_norm)).maximum(0f32)
+                        // Margin loss
+                        (gamma - (&reconstruction_dist - cosine(hv_norm.clone(), hu_norm))).maximum(0f32)
                     })
                     // Only collect losses which are not zero
                     .filter(|l| l.value()[0] > 0f32)
                     .collect::<Vec<_>>();
 
                 // Only return positive ones
-                if pos_losses.len() > 0 {
-                    let n_losses = pos_losses.len() as f32;
-                    pos_losses.sum_all() / n_losses
+                if losses.len() > 0 {
+                    let n_losses = losses.len() as f32;
+                    losses.sum_all() / n_losses
                 } else {
                     Constant::scalar(0f32)
                 }

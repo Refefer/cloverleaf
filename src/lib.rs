@@ -118,85 +118,6 @@ impl RwrGraph {
         }
     }
 
-    pub fn walk(
-        &self, 
-        name: (String, String), 
-        restarts: f32, 
-        walks: usize, 
-        seed: Option<u64>, 
-        beta: Option<f32>,
-        k: Option<usize>, 
-    ) -> PyResult<Vec<((String,String), f32)>> {
-
-        let node_id = get_node_id(self.vocab.deref(), name.0, name.1)?;
-        
-        let steps = if restarts >= 1. {
-            Steps::Fixed(restarts as usize)
-        } else if restarts > 0. {
-            Steps::Probability(restarts)
-        } else {
-            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
-        };
-
-        let rwr = RWR {
-            steps: steps,
-            walks: walks,
-            beta: beta.unwrap_or(0.5),
-            seed: seed.unwrap_or(SEED)
-        };
-
-        let results = rwr.sample(self.graph.as_ref(), &Weighted, node_id);
-
-        Ok(convert_scores(&self.vocab, results.into_iter(), k))
-    }
-
-    pub fn biased_walk(
-        &self, 
-        embeddings: &NodeEmbeddings,
-        name: (String,String), 
-        biased_context: &Query,
-        restarts: f32, 
-        walks: usize, 
-        blend: Option<f32>,
-        beta: Option<f32>,
-        k: Option<usize>, 
-        seed: Option<u64>, 
-        rerank_context: Option<&Query>,
-    ) -> PyResult<Vec<((String,String), f32)>> {
-        let node_id = get_node_id(self.vocab.deref(), name.0, name.1)?;
-        let g_emb = lookup_embedding(biased_context, embeddings)?;
-        
-        let steps = if restarts >= 1. {
-            GSteps::Fixed(restarts as usize)
-        } else if restarts > 0. {
-            GSteps::Probability(restarts, (1. / restarts).ceil() as usize)
-        } else {
-            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
-        };
-
-        let grwr = GuidedRWR {
-            steps: steps,
-            walks: walks,
-            alpha: blend.unwrap_or(0.5),
-            beta: beta.unwrap_or(0.5),
-            seed: seed.unwrap_or(SEED)
-        };
-
-        let node_embeddings = &embeddings.embeddings;
-        let mut results = grwr.sample(self.graph.as_ref(), 
-                                  &Weighted, node_embeddings, node_id, g_emb);
-        
-        // Reweight results if requested
-        if let Some(cn) = rerank_context {
-            println!("Reranking...");
-            let c_emb = lookup_embedding(biased_context, embeddings)?;
-            Reweighter::new(blend.unwrap_or(0.5))
-                .reweight(&mut results, node_embeddings, c_emb);
-        }
-
-        Ok(convert_scores(&self.vocab, results.into_iter(), k))
-    }
-
     pub fn contains_node(&self, name: (String, String)) -> bool {
         get_node_id(self.vocab.deref(), name.0, name.1).is_ok()
     }
@@ -285,6 +206,118 @@ impl RwrGraph {
 
 #[pyclass]
 #[derive(Clone)]
+struct RandomWalker {
+    restarts: f32,
+    walks: usize,
+    beta: Option<f32>
+}
+
+#[pymethods]
+impl RandomWalker {
+
+    #[new]
+    fn new(restarts: f32, walks: usize, beta: Option<f32>) -> Self {
+        RandomWalker { restarts, walks, beta }
+    }
+
+    pub fn walk(
+        &self, 
+        graph: &RwrGraph,
+        node: (String, String), 
+        seed: Option<u64>, 
+        k: Option<usize>, 
+    ) -> PyResult<Vec<((String,String), f32)>> {
+
+        let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
+        
+        let steps = if self.restarts >= 1. {
+            Steps::Fixed(self.restarts as usize)
+        } else if self.restarts > 0. {
+            Steps::Probability(self.restarts)
+        } else {
+            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
+        };
+
+        let rwr = RWR {
+            steps: steps,
+            walks: self.walks,
+            beta: self.beta.unwrap_or(0.5),
+            seed: seed.unwrap_or(SEED)
+        };
+
+        let results = rwr.sample(graph.graph.as_ref(), &Weighted, node_id);
+
+        Ok(convert_scores(&graph.vocab, results.into_iter(), k))
+    }
+
+}
+
+#[pyclass]
+#[derive(Clone)]
+struct BiasedRandomWalker {
+    restarts: f32,
+    walks: usize,
+    beta: Option<f32>,
+    blend: Option<f32>,
+}
+
+#[pymethods]
+impl BiasedRandomWalker {
+
+    #[new]
+    fn new(restarts: f32, walks: usize, beta: Option<f32>, blend: Option<f32>) -> Self {
+        BiasedRandomWalker { restarts, walks, beta, blend }
+    }
+
+    pub fn walk(
+        &self, 
+        graph: &RwrGraph,
+        embeddings: &NodeEmbeddings,
+        node: (String,String), 
+        context: &Query,
+        k: Option<usize>, 
+        seed: Option<u64>, 
+        rerank_context: Option<&Query>,
+    ) -> PyResult<Vec<((String,String), f32)>> {
+        let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
+        let g_emb = lookup_embedding(context, embeddings)?;
+        
+        let steps = if self.restarts >= 1. {
+            GSteps::Fixed(self.restarts as usize)
+        } else if self.restarts > 0. {
+            GSteps::Probability(self.restarts, (1. / self.restarts).ceil() as usize)
+        } else {
+            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
+        };
+
+        let grwr = GuidedRWR {
+            steps: steps,
+            walks: self.walks,
+            alpha: self.blend.unwrap_or(0.5),
+            beta: self.beta.unwrap_or(0.5),
+            seed: seed.unwrap_or(SEED)
+        };
+
+        let node_embeddings = &embeddings.embeddings;
+        let mut results = grwr.sample(graph.graph.as_ref(), 
+                                  &Weighted, node_embeddings, node_id, g_emb);
+        
+        // Reweight results if requested
+        if let Some(cn) = rerank_context {
+            println!("Reranking...");
+            let c_emb = lookup_embedding(context, embeddings)?;
+            Reweighter::new(self.blend.unwrap_or(0.5))
+                .reweight(&mut results, node_embeddings, c_emb);
+        }
+
+        Ok(convert_scores(&graph.vocab, results.into_iter(), k))
+    }
+
+
+}
+
+#[pyclass]
+#[derive(Clone)]
 pub enum EdgeType {
     Directed,
     Undirected
@@ -359,7 +392,6 @@ impl EPLoss {
     pub fn starspace(gamma: f32, negatives: usize) -> Self {
         EPLoss { loss: Loss::StarSpace(gamma, negatives.max(1)) }
     }
-
 
 }
 
@@ -967,6 +999,8 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<FeatureSet>()?;
     m.add_class::<FeatureEmbeddingAggregator>()?;
     m.add_class::<Query>()?;
+    m.add_class::<RandomWalker>()?;
+    m.add_class::<BiasedRandomWalker>()?;
     Ok(())
 }
 
