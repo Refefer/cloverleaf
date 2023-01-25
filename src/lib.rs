@@ -55,17 +55,26 @@ fn build_csr(edges: impl Iterator<Item=((String,String),(String,String),f32)>) -
     (csr, vocab)
 }
 
-fn convert_scores(vocab: &Vocab, scores: impl Iterator<Item=(NodeID, f32)>, k: Option<usize>) -> Vec<((String,String), f32)> {
+fn convert_scores(
+    vocab: &Vocab, 
+    scores: impl Iterator<Item=(NodeID, f32)>, 
+    k: Option<usize>,
+    filtered_node_type: Option<String>
+) -> Vec<((String,String), f32)> {
     let mut scores: Vec<_> = scores.collect();
     scores.sort_by_key(|(_k, v)| FloatOrd(-*v));
 
     // Convert the list to named
     let k = k.unwrap_or(scores.len());
-    scores.into_iter().take(k)
+    scores.into_iter()
         .map(|(node_id, w)| {
             let (node_type, name) = vocab.get_name(node_id).unwrap();
             (((*node_type).clone(), (*name).clone()), w)
         })
+        .filter(|((node_type, _node_name), _w)| {
+            filtered_node_type.as_ref().map(|nt| nt == node_type).unwrap_or(true)
+        })
+        .take(k)
         .collect()
 }
 
@@ -226,6 +235,7 @@ impl RandomWalker {
         node: (String, String), 
         seed: Option<u64>, 
         k: Option<usize>, 
+        filter_type: Option<String>
     ) -> PyResult<Vec<((String,String), f32)>> {
 
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
@@ -247,7 +257,7 @@ impl RandomWalker {
 
         let results = rwr.sample(graph.graph.as_ref(), &Weighted, node_id);
 
-        Ok(convert_scores(&graph.vocab, results.into_iter(), k))
+        Ok(convert_scores(&graph.vocab, results.into_iter(), k, filter_type))
     }
 
 }
@@ -278,6 +288,7 @@ impl BiasedRandomWalker {
         k: Option<usize>, 
         seed: Option<u64>, 
         rerank_context: Option<&Query>,
+        filter_type: Option<String>
     ) -> PyResult<Vec<((String,String), f32)>> {
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
         let g_emb = lookup_embedding(context, embeddings)?;
@@ -310,7 +321,7 @@ impl BiasedRandomWalker {
                 .reweight(&mut results, node_embeddings, c_emb);
         }
 
-        Ok(convert_scores(&graph.vocab, results.into_iter(), k))
+        Ok(convert_scores(&graph.vocab, results.into_iter(), k, filter_type))
     }
 
 

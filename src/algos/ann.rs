@@ -100,52 +100,64 @@ impl Ann {
         embeddings: &EmbeddingStore,
     ) -> Vec<NodeDistance> {
         let mut rng = XorShiftRng::seed_from_u64(self.seed);
-        let distribution = Uniform::new(0, graph.len());
-        let start_node = distribution.sample(&mut rng);
         hill_climb(
             Entity::Embedding(query), 
-            start_node,
             graph,
             embeddings,
             self.k,
-            self.max_steps)
+            self.max_steps,
+            &mut rng)
     }
     
 }
 
-fn hill_climb<'a, G: CGraph>(
+fn hill_climb<'a, G: CGraph, R: Rng>(
     needle: Entity<'a>, 
-    start: NodeID, 
     graph: &G, 
     es: &EmbeddingStore,
     k: usize,
-    mut max_steps: usize
+    mut max_steps: usize,
+    rng: &mut R
 ) -> Vec<NodeDistance> {
+    let distribution = Uniform::new(0, graph.len());
+
     let mut heap = BinaryHeap::new();
     let mut best = TopK::new(k);
     let mut seen = HashSet::new();
 
-    seen.insert(start.clone());
-    let start_d = es.compute_distance(&needle, &Entity::Node(start.clone()));
-    let start = NodeDistance(start_d, start);
-    heap.push(start.clone());
+    while max_steps > 0 {
 
-    loop {
-        let cur_node = heap.pop().expect("Shouldn't be empty!");
-        best.push(cur_node.1, cur_node.0);
-        // Get edges, compute distances between them and needle, add to the heap
-        for edge in graph.get_edges(cur_node.1).0.iter() {
-            if !seen.contains(edge) {
-                seen.insert(*edge);
-                let dist = es.compute_distance(&needle, &Entity::Node(*edge));
-                heap.push(NodeDistance(dist, *edge));
+        // Find a starting node, randomly selected
+        heap.clear();
+        let start_node = distribution.sample(rng);
+        seen.insert(start_node.clone());
+        let start_d = es.compute_distance(&needle, &Entity::Node(start_node.clone()));
+        let start = NodeDistance(start_d, start_node);
+        heap.push(start.clone());
+
+        loop {
+            // Hardcoded restart rate for the time being
+            if rng.gen::<f32>() < 0.05f32 {
+                break
+            }
+
+            let cur_node = heap.pop().expect("Shouldn't be empty!");
+            best.push(cur_node.1, cur_node.0);
+            // Get edges, compute distances between them and needle, add to the heap
+            for edge in graph.get_edges(cur_node.1).0.iter() {
+                if !seen.contains(edge) {
+                    seen.insert(*edge);
+                    let dist = es.compute_distance(&needle, &Entity::Node(*edge));
+                    heap.push(NodeDistance(dist, *edge));
+                }
+            }
+
+            max_steps -= 1;
+            if max_steps == 0 || heap.len() == 0 {
+                break
             }
         }
 
-        max_steps -= 1;
-        if max_steps == 0 || heap.len() == 0 {
-            break
-        }
     }
     best.into_sorted()
 }
