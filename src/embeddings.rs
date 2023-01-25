@@ -157,11 +157,22 @@ impl EmbeddingStore {
         self.distance.compute(e1, e2)
     }
 
-    pub fn nearest_neighbor<'a>(&self, q: &Entity<'a>, k: usize) -> Vec<NodeDistance> {
+    pub fn nearest_neighbor<'a,F>(
+        &self, 
+        q: &Entity<'a>, 
+        k: usize,
+        filter: F
+    ) -> Vec<NodeDistance>  
+        where F: Sync + Fn(NodeID) -> bool 
+    {
         let query_emb = self.extract_vec(q);
         (0..self.len()).into_par_iter().map(|node_id| {
-            let node_emb = self.get_embedding(node_id);
-            let dist = self.distance.compute(query_emb, node_emb);
+            let dist = if filter(node_id) {
+                let node_emb = self.get_embedding(node_id);
+                self.distance.compute(query_emb, node_emb)
+            } else {
+                std::f32::MAX
+            };
             (node_id, dist)
         }).fold(|| TopK::new(k), |mut acc, (node_id, dist)| {
             acc.push(node_id, dist);

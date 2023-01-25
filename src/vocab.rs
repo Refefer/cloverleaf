@@ -28,6 +28,12 @@ impl Vocab {
         })
     }
 
+    pub fn get_node_type(&self, node: NodeID) -> Option<&Arc<String>> {
+        self.node_id_to_node.get(node).map(|(nt_id, name)| {
+            &self.id_to_node_type[*nt_id]
+        })
+    }
+
     fn get_or_insert_node_type(&mut self, node_type: Arc<String>) -> usize {
         if let Some(nt_id) = self.node_type_to_id.get(&node_type) {
             *nt_id

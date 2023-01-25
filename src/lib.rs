@@ -780,8 +780,23 @@ impl NodeEmbeddings {
         VocabIterator::new(self.vocab.clone())
     }
 
-    pub fn nearest_neighbor(&self, emb: Vec<f32>, k: usize) -> Vec<((String,String), f32)> {
-        let dists = self.embeddings.nearest_neighbor(&Entity::Embedding(&emb), k);
+    pub fn nearest_neighbor(
+        &self, 
+        emb: Vec<f32>, 
+        k: usize,
+        filter_type: Option<String>
+    ) -> Vec<((String,String), f32)> {
+        let emb = Entity::Embedding(&emb);
+        let dists = if let Some(node_type) = filter_type {
+            let ant = Arc::new(node_type);
+            let filter_type = Some(&ant);
+            self.embeddings.nearest_neighbor(&emb, k, |node_id| {
+                let nt = self.vocab.get_node_type(node_id);
+                nt == filter_type
+            })
+        } else {
+            self.embeddings.nearest_neighbor(&emb, k, |node_id| true)
+        };
         convert_node_distance(&self.vocab, dists)
     }
 
