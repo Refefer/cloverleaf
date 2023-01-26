@@ -14,7 +14,6 @@ use crate::algos::utils::FeatureStore;
 
 pub struct EmbeddingPropagation {
     pub alpha: f32,
-    pub gamma: f32,
     pub wd: f32,
     pub loss: Loss,
     pub batch_size: usize,
@@ -57,15 +56,9 @@ impl EmbeddingPropagation {
             fe
         };
 
-        // We create separate embeddings for momentum and feature_embeddings.
-        //let optimizer = MomentumOptimizer::new(self.gamma, 
-        //    feature_embeddings.dims(), 
-        //    feature_embeddings.len()); 
-
         let optimizer = AdamOptimizer::new(0.9, 0.999,
             feature_embeddings.dims(), 
             feature_embeddings.len()); 
-
 
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
         let pb = CLProgressBar::new((self.passes * graph.len()) as u64, self.indicator);

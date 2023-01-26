@@ -31,6 +31,12 @@ def build_arg_parser():
     parser.add_argument("output",
         help="Output namespace")
 
+    parser.add_argument("--warm-start",
+        dest="warm_start",
+        required=False,
+        default=None,
+        help="If provided, loads feature embeddings from a previous run.")
+
     parser.add_argument("--dims",
         dest="dims",
         type=int,
@@ -46,11 +52,6 @@ def build_arg_parser():
         type=float,
         default=9e-1,
         help="Learning Rate.")
-
-    parser.add_argument("--momentum",
-        type=float,
-        default=9e-1,
-        help="Nestrov Momentum rate.")
 
     parser.add_argument("--batch-size",
         type=int,
@@ -107,7 +108,9 @@ def main(args):
     print("Nodes={},Edges={}".format(graph.nodes(), graph.edges()), file=sys.stderr)
     print('Loading features...')
     features = cloverleaf.FeatureSet(graph)
-    features.load_features(f_name, error_on_missing=False)
+    if f_name != 'none':
+        features.load_features(f_name, error_on_missing=False)
+
     print("Unique Features found: {}".format(features.num_features()))
     sTime = time.time()
 
@@ -122,10 +125,15 @@ def main(args):
         loss = cloverleaf.EPLoss.contrastive(float(temp), int(negs))
 
     ep = cloverleaf.EmbeddingPropagator(
-        alpha=args.lr, gamma=args.momentum, loss=loss, batch_size=args.batch_size, dims=args.dims, 
+        alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
         passes=args.passes, wd=args.wd, max_nodes=args.max_neighbors, max_features=args.max_features)
 
-    feature_embeddings = ep.learn_features(graph, features)
+    if args.warm_start is not None:
+        feature_embeddings = cloverleaf.NodeEmbeddings.load(args.warm_start, cloverleaf.Distance.Cosine)
+    else:
+        feature_embeddings = None
+
+    feature_embeddings = ep.learn_features(graph, features, feature_embeddings)
     eTime = time.time() - sTime
 
     print("Time to learn:{}, Nodes/sec:{}".format(eTime, (graph.nodes() * 50) / eTime, file=sys.stderr))
@@ -133,7 +141,7 @@ def main(args):
 
     print("Constructing nodes...")
     embedder = cloverleaf.FeatureEmbeddingAggregator(features)
-    node_embeddings = embedder.embed_graph(graph, features, feature_embeddings, alpha=1e-3)
+    node_embeddings = embedder.embed_graph(graph, features, feature_embeddings, alpha=None)
     embedder.save(args.output + '.embedder')
     node_embeddings.save(args.output + '.node-embeddings')
 
