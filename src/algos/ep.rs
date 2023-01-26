@@ -31,28 +31,37 @@ impl EmbeddingPropagation {
     pub fn learn<G: CGraph + Send + Sync>(
         &self, 
         graph: &G, 
-        features: &FeatureStore
+        features: &FeatureStore,
+        feature_embeddings: Option<EmbeddingStore>
     ) -> EmbeddingStore {
-        let feat_embeds = self.learn_feature_embeddings(graph, features);
+        let feat_embeds = self.learn_feature_embeddings(graph, features, feature_embeddings);
         feat_embeds
     }
-
     
     // The uber expensive function
     fn learn_feature_embeddings<G: CGraph + Send + Sync>(
         &self,
         graph: &G,
         features: &FeatureStore,
+        feature_embeddings: Option<EmbeddingStore>
     ) -> EmbeddingStore {
 
-        // We create separate embeddings for momentum and feature_embeddings.
-        let mut feature_embeddings = EmbeddingStore::new(features.num_features(), self.dims, Distance::Cosine);
-        let momentum = EmbeddingStore::new(features.num_features(), self.dims, Distance::Cosine);
-
         let mut rng = XorShiftRng::seed_from_u64(self.seed);
-        
-        // Initialize embeddings as random
-        randomize_embedding_store(&mut feature_embeddings, &mut rng);
+
+        let mut feature_embeddings = if let Some(embs) = feature_embeddings {
+            embs
+        } else {
+            let mut fe = EmbeddingStore::new(features.num_features(), self.dims, Distance::Cosine);
+            // Initialize embeddings as random
+            randomize_embedding_store(&mut fe, &mut rng);
+            fe
+        };
+
+        // We create separate embeddings for momentum and feature_embeddings.
+        let momentum = EmbeddingStore::new(
+            feature_embeddings.len(), 
+            feature_embeddings.dims(), 
+            Distance::Cosine);
 
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
         let pb = CLProgressBar::new((self.passes * graph.len()) as u64, self.indicator);

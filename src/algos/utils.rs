@@ -64,7 +64,6 @@ pub struct FeatureStore {
     features: Vec<Vec<usize>>,
     namespace: String,
     feature_vocab: Vocab,
-    empty_nodes: usize
 }
 
 impl FeatureStore {
@@ -74,7 +73,6 @@ impl FeatureStore {
             features: vec![Vec::with_capacity(0); size],
             namespace: namespace,
             feature_vocab: Vocab::new(),
-            empty_nodes: 0
         }
     }
 
@@ -100,7 +98,7 @@ impl FeatureStore {
     }
 
     pub fn num_features(&self) -> usize {
-        self.feature_vocab.len() + self.empty_nodes
+        self.feature_vocab.len()
     }
 
     pub fn num_nodes(&self) -> usize {
@@ -109,13 +107,11 @@ impl FeatureStore {
 
     pub fn fill_missing_nodes(&mut self) {
         let mut idxs = self.feature_vocab.len();
-        self.features.iter_mut().for_each(|f| {
-            if f.len() == 0 {
-                *f = vec![idxs];
-                idxs += 1;
-                self.empty_nodes += 1;
+        for i in 0..self.features.len() {
+            if self.features[i].len() == 0 {
+                self.set_features(i, vec![format!("_node_{}", i)]);
             }
-        });
+        }
     }
 
     pub fn get_vocab(self) -> Vocab {

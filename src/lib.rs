@@ -448,10 +448,24 @@ impl EmbeddingPropagator {
     pub fn learn_features(
         &mut self, 
         graph: &RwrGraph, 
-        features: &mut FeatureSet
+        features: &mut FeatureSet,
+        feature_embeddings: Option<&mut NodeEmbeddings>
     ) -> NodeEmbeddings {
+
         features.features.fill_missing_nodes();
-        let feat_embeds = self.ep.learn(graph.graph.as_ref(), &mut features.features);
+
+        // Pull out the EmbeddingStore
+        let feature_embeddings = feature_embeddings.map(|fes| {
+           let mut sfes = EmbeddingStore::new(fes.vocab.len(), 0, EDist::Cosine);
+           std::mem::swap(&mut sfes, &mut fes.embeddings);
+           sfes
+        });
+
+        let feat_embeds = self.ep.learn(
+            graph.graph.as_ref(), 
+            &mut features.features,
+            feature_embeddings
+        );
 
         let vocab = features.features.clone_vocab();
 
