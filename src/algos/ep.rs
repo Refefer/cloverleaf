@@ -58,9 +58,14 @@ impl EmbeddingPropagation {
         };
 
         // We create separate embeddings for momentum and feature_embeddings.
-        let optimizer = MomentumOptimizer::new(self.gamma, 
+        //let optimizer = MomentumOptimizer::new(self.gamma, 
+        //    feature_embeddings.dims(), 
+        //    feature_embeddings.len()); 
+
+        let optimizer = AdamOptimizer::new(0.9, 0.999,
             feature_embeddings.dims(), 
             feature_embeddings.len()); 
+
 
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
         let pb = CLProgressBar::new((self.passes * graph.len()) as u64, self.indicator);
@@ -558,6 +563,7 @@ impl Optimizer for AdamOptimizer {
         alpha: f32,
         t: f32
     ) {
+        let t = t + 1.;
         for (feat_id, grad) in grads.drain() {
 
             // Can get some nans in weird cases, such as the distance between
@@ -568,20 +574,20 @@ impl Optimizer for AdamOptimizer {
                 // Update first order mean
                 let mom = self.mom.get_embedding_mut_hogwild(feat_id);
                 mom.iter_mut().zip(grad.iter()).for_each(|(m_i, g_i)| {
-                    let nm_i = self.beta_1 * *m_i + (1. - self.beta_1) * g_i;
-                    *m_i = nm_i / (1. - self.beta_1.powf(t));
+                    *m_i = self.beta_1 * *m_i + (1. - self.beta_1) * g_i;
                 });
 
                 // Update secord order variance 
                 let var = self.var.get_embedding_mut_hogwild(feat_id);
                 var.iter_mut().zip(grad.iter()).for_each(|(v_i, g_i)| {
-                    let nv_i = self.beta_2 * *v_i + (1. - self.beta_2) * g_i.powf(2.);
-                    *v_i = nv_i / (1. - self.beta_2.powf(t));
+                    *v_i = self.beta_2 * *v_i + (1. - self.beta_2) * g_i.powf(2.);
                 });
 
                 // Create the new grad and update
                 let emb = feature_embeddings.get_embedding_mut_hogwild(feat_id);
                 emb.iter_mut().zip(grad.iter()).zip(mom.iter().zip(var.iter())).for_each(|((e_i, g_i), (m_i, v_i))| {
+                    let m_i = m_i / (1. - self.beta_1.powf(t));
+                    let v_i = v_i / (1. - self.beta_2.powf(t));
                     let g_i = m_i / (v_i.sqrt() + self.eps);
                     *e_i -= alpha * g_i;
                 });
