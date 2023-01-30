@@ -660,15 +660,22 @@ impl FeatureEmbeddingAggregator {
 
 }
 
-fn count_lines(path: &str) -> std::io::Result<usize> {
+fn count_lines(path: &str, node_type: &Option<String>) -> std::io::Result<usize> {
     let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
     let br = BufReader::new(f);
     let mut count = 0;
+    let filter_node = node_type.as_ref();
     for line in br.lines() {
-        line?;
-        count += 1;
+        let line = line?;
+        if let Some(p) = filter_node {
+            if line.starts_with(p) {
+                count += 1;
+            }
+        } else {
+            count += 1;
+        }
     }
     Ok(count)
 }
@@ -776,6 +783,10 @@ impl NodeEmbeddings {
         }
     }
 
+    pub fn contains(&self, node: (String, String)) -> bool {
+        get_node_id(self.vocab.deref(), node.0, node.1).is_ok()
+    }
+
     pub fn get_embedding(&mut self, node: (String,String)) -> PyResult<Vec<f32>> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         Ok(self.embeddings.get_embedding(node_id).to_vec())
@@ -815,6 +826,11 @@ impl NodeEmbeddings {
     pub fn dims(&self) -> usize {
         self.embeddings.dims()
     }
+
+    pub fn len(&self) -> usize {
+        self.embeddings.len()
+    }
+
     
     pub fn save(&self, path: &str) -> PyResult<()> {
         let f = File::create(path)
@@ -842,8 +858,8 @@ impl NodeEmbeddings {
     }
 
     #[staticmethod]
-    pub fn load(path: &str, distance: Distance) -> PyResult<Self> {
-        let num_embeddings = count_lines(path)
+    pub fn load(path: &str, distance: Distance, node_type: Option<String>) -> PyResult<Self> {
+        let num_embeddings = count_lines(path, &node_type)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
         let f = File::open(path)
@@ -854,8 +870,18 @@ impl NodeEmbeddings {
         
         // Place holder
         let mut es = EmbeddingStore::new(0, 0, EDist::Cosine);
-        for (i, line) in br.lines().enumerate() {
+        let filter_node = node_type.as_ref();
+        let mut i = 0;
+        for line in br.lines() {
             let line = line.unwrap();
+
+            // If it doesn't match the pattern, move along
+            if let Some(node_type) = filter_node {
+                if !line.starts_with(node_type) {
+                    continue;
+                }
+            }
+
             let (node_type, node_name, emb) = line_to_embedding(line)
                 .ok_or_else(|| PyValueError::new_err("Error parsing line"))?;
 
@@ -869,6 +895,7 @@ impl NodeEmbeddings {
                 return Err(PyValueError::new_err("Embeddings have different sizes!"));
             }
             m.copy_from_slice(&emb);
+            i += 1;
         }
 
         let ne = NodeEmbeddings {
