@@ -66,12 +66,12 @@ impl EmbeddingPropagation {
         // Enable/disable shared memory pool
         use_shared_pool(true);
 
-        let mut current_error = std::f32::INFINITY;
+        let mut lr_tracker = LearningRateTracker::new(5);
         let mut alpha = self.alpha;
         for pass in 0..self.passes {
             pb.update_message(|msg| {
                 msg.clear();
-                write!(msg, "Pass {}/{}, Error: {:.5}, alpha: {:.5}", pass + 1, self.passes, current_error, alpha)
+                write!(msg, "Pass {}/{}, Error: {:.5}, alpha: {:.5}", pass + 1, self.passes, lr_tracker.last(), alpha)
                     .expect("Error writing out indicator message!");
             });
 
@@ -103,7 +103,6 @@ impl EmbeddingPropagation {
                 
                 // Backpropagate embeddings
                 optimizer.update(&feature_embeddings, &mut all_grads, alpha, pass as f32);
-                //sgd(&feature_embeddings, &momentum, self.gamma, &mut all_grads, alpha);
 
                 // Update progress bar
                 pb.inc(nodes.len() as u64);
@@ -111,11 +110,12 @@ impl EmbeddingPropagation {
             }).collect();
 
             let error = err.iter().sum::<f32>() / err.len() as f32;
+            lr_tracker.update(error, pass);
             // Decay alpha when we plateau
-            if error > current_error {
-                alpha = (alpha * 0.99).max(self.alpha / 100.);
+            if lr_tracker.stagnated(pass) {
+                alpha /= 2.;
+                lr_tracker.reset(error, pass);
             }
-            current_error = error;
         }
         pb.finish();
         feature_embeddings
@@ -215,32 +215,6 @@ fn extract_grads(
             }
         }
     }
-}
-
-// We use SGD with momentum as it's fast, cheap, and easy to implement.
-fn sgd(
-    feature_embeddings: &EmbeddingStore,
-    momentum: &EmbeddingStore,
-    gamma: f32,
-    grads: &mut HashMap<usize, Vec<f32>>,
-    alpha: f32
-) {
-    for (feat_id, grad) in grads.drain() {
-
-        let emb = feature_embeddings.get_embedding_mut_hogwild(feat_id);
-        let mom = momentum.get_embedding_mut_hogwild(feat_id);
-
-        if grad.iter().all(|gi| !gi.is_nan()) {
-            // Can get some nans in weird cases, such as the distance between
-            // a node and it's reconstruction when it shares all features.
-            // We just skip over those weird ones.
-            emb.iter_mut().zip(grad.iter().zip(mom.iter_mut())).for_each(|(ei, (gi, mi))| {
-                *mi = gamma * *mi + *gi;
-                *ei -= alpha * *mi;
-            });
-        }
-    }
-
 }
 
 type NodeCounts = HashMap<usize, (ANode, usize)>;
@@ -446,7 +420,7 @@ impl Loss {
                 // If it has no out edges, nothing to really do.  We can't build a comparison.
                 let choice = *edges.choose(rng).unwrap_or(&node);
                 construct_node_embedding(
-                    node, feature_store, feature_embeddings, max_features, rng)
+                    choice, feature_store, feature_embeddings, max_features, rng)
             }
         }
 
@@ -587,6 +561,40 @@ impl Optimizer for AdamOptimizer {
 
             }
         }
+    }
+}
+
+struct LearningRateTracker {
+    pass: usize,
+    best: f32,
+    last: f32,
+    delta: usize
+}
+
+impl LearningRateTracker {
+    fn new(delta: usize) -> Self {
+        LearningRateTracker {pass: 0, best: std::f32::MAX, delta, last: std::f32::MAX}
+    }
+
+    fn update(&mut self, next: f32, cur_pass: usize) {
+        if next < self.best {
+            self.best = next;
+            self.pass = cur_pass;
+        }
+        self.last = next;
+    }
+
+    fn stagnated(&self, cur_pass: usize) -> bool {
+        cur_pass - self.pass >= self.delta
+    }
+
+    fn reset(&mut self, error: f32, pass: usize) {
+        self.best = error;
+        self.pass = pass;
+    }
+
+    fn last(&self) -> f32 {
+        self.last
     }
 }
 
