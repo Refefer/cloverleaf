@@ -113,7 +113,7 @@ impl EmbeddingPropagation {
             lr_tracker.update(error, pass);
             // Decay alpha when we plateau
             if lr_tracker.stagnated(pass) {
-                alpha /= 2.;
+                alpha /= 3.;
                 lr_tracker.reset(error, pass);
             }
         }
@@ -573,7 +573,7 @@ struct LearningRateTracker {
 
 impl LearningRateTracker {
     fn new(delta: usize) -> Self {
-        LearningRateTracker {pass: 0, best: std::f32::MAX, delta, last: std::f32::MAX}
+        LearningRateTracker {pass: 0, best: std::f32::MAX, delta, last: std::f32::INFINITY}
     }
 
     fn update(&mut self, next: f32, cur_pass: usize) {

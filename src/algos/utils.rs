@@ -80,10 +80,14 @@ impl FeatureStore {
         &self.namespace
     }
 
-    pub fn set_features(&mut self, node: NodeID, node_features: Vec<String>) {
+    fn set_nt_features(&mut self, node: NodeID, namespace: String, node_features: Vec<String>) {
         self.features[node] = node_features.into_iter()
-            .map(|f| self.feature_vocab.get_or_insert(self.namespace.clone(), f))
+            .map(|f| self.feature_vocab.get_or_insert(namespace.clone(), f))
             .collect()
+    }
+
+    pub fn set_features(&mut self, node: NodeID, node_features: Vec<String>) {
+        self.set_nt_features(node, self.namespace.clone(), node_features);
     }
 
     pub fn get_features(&self, node: NodeID) -> &[usize] {
@@ -109,7 +113,7 @@ impl FeatureStore {
         let mut idxs = self.feature_vocab.len();
         for i in 0..self.features.len() {
             if self.features[i].len() == 0 {
-                self.set_features(i, vec![format!("_node_{}", i)]);
+                self.set_nt_features(i, "node".into(), vec![format!("{}", i)]);
             }
         }
     }
