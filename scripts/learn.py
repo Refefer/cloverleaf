@@ -70,6 +70,12 @@ def build_arg_parser():
         default=10,
         help="Samples MAX_NEIGHBORS nodes for node reconstruction.")
 
+    parser.add_argument("--hard-negatives",
+        dest="hard_negatives",
+        type=int,
+        default=0,
+        help="Number of hard negatives to use.")
+
     parser.add_argument("--weight-decay",
         dest="wd",
         type=float,
@@ -88,6 +94,12 @@ def build_arg_parser():
         nargs=2,
         metavar=('MARGIN', 'NEGATIVES'),
         help="Optimizes using Starspace embedding learning.")
+
+    group.add_argument("--ppr",
+        dest="ppr",
+        nargs=3,
+        metavar=('MARGIN', 'EXAMPLES', 'RESTART_PROB'),
+        help="Optimizes uses Personalized Page Rank Sampling")
 
     group.add_argument("--contrastive",
         dest="contrastive",
@@ -120,13 +132,17 @@ def main(args):
     elif args.starspace is not None:
         margin, negatives = args.starspace
         loss = cloverleaf.EPLoss.starspace(float(margin), int(negatives))
+    elif args.ppr is not None:
+        temp, negs, p = args.contrastive
+        loss = cloverleaf.EPLoss.ppr(float(temp), int(negs), float(p))
     else:
         temp, negs = args.contrastive
         loss = cloverleaf.EPLoss.contrastive(float(temp), int(negs))
 
     ep = cloverleaf.EmbeddingPropagator(
         alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
-        passes=args.passes, wd=args.wd, max_nodes=args.max_neighbors, max_features=args.max_features)
+        passes=args.passes, wd=args.wd, max_nodes=args.max_neighbors, 
+        hard_negatives=args.hard_negatives)
 
     if args.warm_start is not None:
         feature_embeddings = cloverleaf.NodeEmbeddings.load(args.warm_start, cloverleaf.Distance.Cosine)

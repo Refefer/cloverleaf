@@ -22,6 +22,7 @@ pub struct EmbeddingPropagation {
     pub seed: u64,
     pub max_features: Option<usize>,
     pub max_nodes: Option<usize>,
+    pub hard_negatives: usize,
     pub indicator: bool
 }
 
@@ -47,7 +48,7 @@ impl EmbeddingPropagation {
 
         let mut rng = XorShiftRng::seed_from_u64(self.seed);
 
-        let mut feature_embeddings = if let Some(embs) = feature_embeddings {
+        let feature_embeddings = if let Some(embs) = feature_embeddings {
             embs
         } else {
             let mut fe = EmbeddingStore::new(features.num_features(), self.dims, Distance::Cosine);
@@ -121,12 +122,15 @@ impl EmbeddingPropagation {
         feature_embeddings
     }
 
-    fn sample_negatives<R: Rng>(&self, anchor: NodeID, n_nodes: usize, rng: &mut R) -> Vec<NodeID> {
+    fn sample_negatives<R: Rng>(
+        &self, 
+        anchor: NodeID, 
+        n_nodes: usize, 
+        negatives: &mut Vec<NodeID>,
+        num_negs: usize,
+        rng: &mut R) {
         let dist = Uniform::new(0, n_nodes);
 
-        // Get negative v
-        let num_negs = self.loss.negatives();
-        let mut negatives = Vec::with_capacity(num_negs);
         // We make a good attempt to get the full negatives, but bail
         // if it's computationally too expensive
         for _ in 0..(num_negs*2) {
@@ -136,7 +140,42 @@ impl EmbeddingPropagation {
                 if negatives.len() == num_negs { break }
             }
         }
-        negatives
+    }
+
+    fn sample_hard_negatives<R: Rng, G: CGraph>(
+        &self, 
+        anchor: NodeID, 
+        graph: &G,
+        negatives: &mut Vec<NodeID>,
+        num_negs: usize,
+        rng: &mut R
+    ) {
+        
+        let s = negatives.len();
+        let anchor_edges = graph.get_edges(anchor).0;
+        for _ in 0..(num_negs*2) {
+            let mut neg_node = anchor;
+            let mut i = 0;
+            // Random walk
+            loop {
+                i += 1;
+                let edges = graph.get_edges(neg_node).0;
+                if edges.len() == 0 {
+                    break
+                }
+                let dist = Uniform::new(0, edges.len());
+                neg_node = edges[dist.sample(rng)];
+                // We want at least two steps in our walk
+                // before exiting since 1 step guarantees an anchor
+                // edge
+                if i > 1 && rng.gen::<f32>() < 0.2 { break }
+            }
+            
+            if neg_node != anchor && !anchor_edges.iter().any(|n| n == &neg_node) {
+                negatives.push(neg_node);
+                if negatives.len() -s == num_negs { break }
+            }
+        }
     }
 
     fn run_pass<G: CGraph + Send + Sync, R: Rng>(
@@ -157,7 +196,17 @@ impl EmbeddingPropagation {
             graph, node, features, &feature_embeddings, self.max_nodes, self.max_features, rng);
         
         // h(u)
-        let negatives = self.sample_negatives(node, graph.len(), rng);
+        let num_negs = self.loss.negatives();
+        let mut negatives = Vec::with_capacity(num_negs+self.hard_negatives);
+        
+        // Sample random negatives
+        self.sample_negatives(node, graph.len(), &mut negatives, num_negs, rng);
+        
+        // Sample one hard negative
+        if self.hard_negatives > 0 {
+            self.sample_hard_negatives(node, graph, &mut negatives, self.hard_negatives, rng);
+        }
+
         let mut hu_vars = Vec::with_capacity(negatives.len());
         let mut hus = Vec::with_capacity(negatives.len());
         negatives.into_iter().for_each(|neg_node| {
@@ -261,6 +310,7 @@ fn construct_node_embedding<R: Rng>(
     (feature_map, mean)
 }
 
+
 // ~H(n)
 // The Expensive function.  We grab a nodes neighbors
 // and use the average of their features to construct
@@ -275,25 +325,40 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     rng: &mut R
 ) -> (NodeCounts, ANode) {
     let edges = &graph.get_edges(node).0;
-    let mut feature_map = HashMap::new();
     
     if edges.len() <= max_nodes.unwrap_or(edges.len()) {
-        for out_node in edges.iter() {
-            collect_embeddings_from_node(*out_node, feature_store, 
-                                      feature_embeddings, 
-                                      &mut feature_map,
-                                      max_features,
-                                      rng);
-        }
-
+        construct_from_multiple_nodes(edges.iter().cloned(),
+            feature_store,
+            feature_embeddings,
+            max_nodes,
+            max_features,
+            rng)
     } else {
-        for out_node in edges.choose_multiple(rng, max_nodes.unwrap()) {
-            collect_embeddings_from_node(*out_node, feature_store, 
-                                         feature_embeddings, 
-                                         &mut feature_map,
-                                         max_features,
-                                         rng);
-        }
+        let it = edges.choose_multiple(rng, max_nodes.unwrap()).cloned();
+        construct_from_multiple_nodes(it,
+            feature_store,
+            feature_embeddings,
+            max_nodes,
+            max_features,
+            rng)
+    }
+}
+
+fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
+    nodes: I,
+    feature_store: &FeatureStore,
+    feature_embeddings: &EmbeddingStore,
+    max_nodes: Option<usize>,
+    max_features: Option<usize>,
+    rng: &mut R
+) -> (NodeCounts, ANode) {
+    let mut feature_map = HashMap::new();
+    for node in nodes {
+        collect_embeddings_from_node(node, feature_store, 
+                                     feature_embeddings, 
+                                     &mut feature_map,
+                                     max_features,
+                                     rng);
     }
     let mean = mean_embeddings(feature_map.values());
     (feature_map, mean)
@@ -321,7 +386,8 @@ fn euclidean_distance(e1: ANode, e2: ANode) -> ANode {
 pub enum Loss {
     MarginLoss(f32, usize),
     Contrastive(f32, usize),
-    StarSpace(f32, usize)
+    StarSpace(f32, usize),
+    PPR(f32, usize, f32)
 }
 
 impl Loss {
@@ -329,7 +395,8 @@ impl Loss {
         match self {
             Loss::Contrastive(_, negs) => *negs,
             Loss::MarginLoss(_, negs)  => *negs,
-            Loss::StarSpace(_, negs) => *negs
+            Loss::StarSpace(_, negs) => *negs,
+            Loss::PPR(_, negs, _) => *negs
         }
     }
 
@@ -339,7 +406,7 @@ impl Loss {
     fn compute(&self, thv: ANode, hv: ANode, hus: Vec<ANode>) -> ANode {
         match self {
 
-            Loss::MarginLoss(gamma, _) => {
+            Loss::MarginLoss(gamma, _) | Loss::PPR(gamma, _, _) => {
                 let d1 = gamma + euclidean_distance(thv.clone(), hv);
                 let pos_losses = hus.into_iter()
                     .map(|hu| &d1 - euclidean_distance(thv.clone(), hu))
@@ -356,7 +423,7 @@ impl Loss {
             },
 
             // This isn't working particularly well yet - need to figure out why
-            Loss::StarSpace(gamma, _) => {
+            Loss::StarSpace(gamma, _)  => {
                 let thv_norm = il2norm(thv);
                 let hv_norm  = il2norm(hv);
 
@@ -382,7 +449,7 @@ impl Loss {
                 }
             },
 
-            Loss::Contrastive(tau, _) => {
+            Loss::Contrastive(tau, _)  => {
                 let thv_norm = il2norm(thv);
                 let hv_norm  = il2norm(hv);
 
@@ -421,12 +488,61 @@ impl Loss {
                 let choice = *edges.choose(rng).unwrap_or(&node);
                 construct_node_embedding(
                     choice, feature_store, feature_embeddings, max_features, rng)
+            },
+            Loss::PPR(_, num, restart_p) => {
+                let mut nodes = Vec::with_capacity(*num);
+                for _ in 0..(*num) {
+                    if let Some(node) = random_walk(node, graph, rng, *restart_p, 10) {
+                        nodes.push(node);
+                    }
+                }
+                if nodes.len() == 0 {
+                    nodes.push(node);
+                }
+                construct_from_multiple_nodes(nodes.into_iter(),
+                        feature_store, feature_embeddings, max_nodes, max_features, rng)
             }
         }
 
     }
 
 }
+
+fn random_walk<R: Rng, G: CGraph>(
+    anchor: NodeID, 
+    graph: &G,
+    rng: &mut R,
+    restart_p: f32,
+    max_steps: usize
+) -> Option<NodeID> {
+    let anchor_edges = graph.get_edges(anchor).0;
+    let mut node = anchor;
+    let mut i = 0;
+    
+    // Random walk
+    loop {
+        i += 1;
+        let edges = graph.get_edges(node).0;
+        if edges.len() == 0 || i > max_steps {
+            break
+        }
+        let dist = Uniform::new(0, edges.len());
+        node = edges[dist.sample(rng)];
+        // We want at least two steps in our walk
+        // before exiting since 1 step guarantees an anchor
+        // edge
+        if i > 1 && rng.gen::<f32>() < restart_p && node != anchor { break }
+    }
+
+    if node != anchor {
+        Some(node)
+    } else if anchor_edges.len() > 0 {
+        Some(anchor_edges[Uniform::new(0, anchor_edges.len()).sample(rng)])
+    } else {
+        None
+    }
+}
+
 
 fn l2norm(v: ANode) -> ANode {
     v.pow(2f32).sum().pow(0.5)
@@ -652,6 +768,7 @@ mod ep_tests {
             passes: 50,
             max_features: None,
             max_nodes: None,
+            hard_negatives: 0,
             seed: 202220222,
             indicator: false
         };
