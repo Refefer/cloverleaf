@@ -82,6 +82,12 @@ def build_arg_parser():
         default=0,
         help="If provided, adds weight decay to the embeddings.")
 
+    parser.add_argument("--alpha",
+        dest="alpha",
+        type=float,
+        default=None,
+        help="If provided, uses weighted embeddings.")
+
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--embedding-propagation",
         dest="ep",
@@ -133,7 +139,7 @@ def main(args):
         margin, negatives = args.starspace
         loss = cloverleaf.EPLoss.starspace(float(margin), int(negatives))
     elif args.ppr is not None:
-        temp, negs, p = args.contrastive
+        temp, negs, p = args.ppr
         loss = cloverleaf.EPLoss.ppr(float(temp), int(negs), float(p))
     else:
         temp, negs = args.contrastive
@@ -157,7 +163,7 @@ def main(args):
 
     print("Constructing nodes...")
     embedder = cloverleaf.FeatureEmbeddingAggregator(features)
-    node_embeddings = embedder.embed_graph(graph, features, feature_embeddings, alpha=None)
+    node_embeddings = embedder.embed_graph(graph, features, feature_embeddings, alpha=args.alpha)
     embedder.save(args.output + '.embedder')
     node_embeddings.save(args.output + '.node-embeddings')
 

@@ -13,7 +13,10 @@ app.config.from_object(__name__)
 def query():
     query = request.args["query"]
     k     = int(request.args.get("k", 100))
-    alpha = float(request.args.get("alpha", 0))
+    alpha = request.args.get("alpha")
+    if alpha is not None:
+        alpha = float(alpha)
+
     filter_type = request.args.get("filter_node_type", None)
 
     emb = construct_adhoc_embedding(query, FE_EMBEDDINGS, AGGREGATOR, alpha=alpha)

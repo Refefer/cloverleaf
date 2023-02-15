@@ -33,6 +33,8 @@ impl <'a> EmbeddingBuilder for AvgAggregator<'a> {
             let e = self.embs.get_embedding(*feat_id); 
             AvgAggregator::isum(out, e);
         }
+
+        out.iter_mut().for_each(|outi| *outi /= (features.len() as f32));
     }
 }
 

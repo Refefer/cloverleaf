@@ -7,9 +7,9 @@ import tabulate
 import cloverleaf
 from sklearn.utils import murmurhash3_32
 
-K = 50
+K = 20
 CHAR_GRAMS = False
-ALPHA = 1e-3 
+ALPHA = None
 
 def char_grams(token, grams=(3,6), hash_space=50001):
     t = '^{}$'.format(token)
@@ -68,13 +68,18 @@ def build_embedding(queries, embeddings):
 
     return np.mean(np.array(e), axis=0)
 
-def main(ne_fname, fe_fname, agg_fname):
+def load(ne_fname, fe_fname, agg_fname):
     print("Loading Node Embeddings...")
     ne_embeddings = cloverleaf.NodeEmbeddings.load(ne_fname, cloverleaf.Distance.Cosine)
     print("Loading Feature Embeddings...")
     fe_embeddings = cloverleaf.NodeEmbeddings.load(fe_fname, cloverleaf.Distance.Cosine)
     print("Loading aggregator")
     aggregator = cloverleaf.FeatureEmbeddingAggregator.load(agg_fname)
+    
+    return ne_embeddings, fe_embeddings, aggregator
+
+def main(ne_fname, fe_fname, agg_fname):
+    ne_embeddings, fe_embeddings, aggregator = load(ne_fname, fe_fname, agg_fname)
 
     headers = ('type', 'Name', 'Score')
     while True:
@@ -100,7 +105,7 @@ def main(ne_fname, fe_fname, agg_fname):
             print()
             print(emb)
 
-            top_k = ne_embeddings.nearest_neighbor(emb, K)
+            top_k = ne_embeddings.nearest_neighbor(emb, K, 'query')
 
             rows = []
             for (node_type, node), score in reversed(top_k):
