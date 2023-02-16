@@ -22,7 +22,6 @@ pub struct EmbeddingPropagation {
     pub seed: u64,
     pub max_features: Option<usize>,
     pub max_nodes: Option<usize>,
-    pub hard_negatives: usize,
     pub indicator: bool
 }
 
@@ -142,42 +141,6 @@ impl EmbeddingPropagation {
         }
     }
 
-    fn sample_hard_negatives<R: Rng, G: CGraph>(
-        &self, 
-        anchor: NodeID, 
-        graph: &G,
-        negatives: &mut Vec<NodeID>,
-        num_negs: usize,
-        rng: &mut R
-    ) {
-        
-        let s = negatives.len();
-        let anchor_edges = graph.get_edges(anchor).0;
-        for _ in 0..(num_negs*2) {
-            let mut neg_node = anchor;
-            let mut i = 0;
-            // Random walk
-            loop {
-                i += 1;
-                let edges = graph.get_edges(neg_node).0;
-                if edges.len() == 0 {
-                    break
-                }
-                let dist = Uniform::new(0, edges.len());
-                neg_node = edges[dist.sample(rng)];
-                // We want at least two steps in our walk
-                // before exiting since 1 step guarantees an anchor
-                // edge
-                if i > 1 && rng.gen::<f32>() < 0.2 { break }
-            }
-            
-            if neg_node != anchor && !anchor_edges.iter().any(|n| n == &neg_node) {
-                negatives.push(neg_node);
-                if negatives.len() -s == num_negs { break }
-            }
-        }
-    }
-
     fn run_pass<G: CGraph + Send + Sync, R: Rng>(
         &self, 
         graph: &G,
@@ -197,16 +160,11 @@ impl EmbeddingPropagation {
         
         // h(u)
         let num_negs = self.loss.negatives();
-        let mut negatives = Vec::with_capacity(num_negs+self.hard_negatives);
+        let mut negatives = Vec::with_capacity(num_negs);
         
         // Sample random negatives
         self.sample_negatives(node, graph.len(), &mut negatives, num_negs, rng);
         
-        // Sample one hard negative
-        if self.hard_negatives > 0 {
-            self.sample_hard_negatives(node, graph, &mut negatives, self.hard_negatives, rng);
-        }
-
         let mut hu_vars = Vec::with_capacity(negatives.len());
         let mut hus = Vec::with_capacity(negatives.len());
         negatives.into_iter().for_each(|neg_node| {
@@ -768,7 +726,6 @@ mod ep_tests {
             passes: 50,
             max_features: None,
             max_nodes: None,
-            hard_negatives: 0,
             seed: 202220222,
             indicator: false
         };
