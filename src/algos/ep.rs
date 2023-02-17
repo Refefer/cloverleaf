@@ -6,6 +6,7 @@ use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use rand_distr::{Distribution,Uniform};
 use simple_grad::*;
+use float_ord::FloatOrd;
 
 use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::{EmbeddingStore,Distance};
@@ -61,6 +62,7 @@ impl EmbeddingPropagation {
             feature_embeddings.len()); 
 
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
+        let unigram_table = self.create_neg_sample_table(graph);
         let pb = CLProgressBar::new((self.passes * graph.len()) as u64, self.indicator);
         
         // Enable/disable shared memory pool
@@ -84,7 +86,7 @@ impl EmbeddingPropagation {
                 // Compute grads for batch
                 nodes.par_iter().map(|node_id| {
                     let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + **node_id) as u64);
-                    let (loss, grads) = self.run_pass(graph, **node_id, &features, &feature_embeddings, &mut rng) ;
+                    let (loss, grads) = self.run_pass(graph, **node_id, &features, &feature_embeddings, &unigram_table, &mut rng) ;
                     (loss, grads)
                 }).collect_into_vec(&mut grads);
 
@@ -121,19 +123,42 @@ impl EmbeddingPropagation {
         feature_embeddings
     }
 
+    fn create_neg_sample_table<G: CGraph>(
+        &self,
+        graph: &G
+    ) -> Vec<f32> {
+        let mut fast_biased = vec![0f32; graph.len()];
+        let denom = (0..graph.len())
+            .map(|idx| (graph.degree(idx) as f64).powf(0.75))
+            .sum::<f64>();
+
+        let mut acc = 0f64;
+        fast_biased.iter_mut().enumerate().for_each(|(i, w)| {
+            *w = (acc / denom) as f32;
+            acc += (graph.degree(i) as f64).powf(0.75);
+        });
+        fast_biased[graph.len()-1] = 1.;
+        fast_biased
+    }
+
     fn sample_negatives<R: Rng>(
         &self, 
         anchor: NodeID, 
-        n_nodes: usize, 
+        unigram_table: &[f32], 
         negatives: &mut Vec<NodeID>,
         num_negs: usize,
         rng: &mut R) {
-        let dist = Uniform::new(0, n_nodes);
+        let dist = Uniform::new(0, unigram_table.len());
 
         // We make a good attempt to get the full negatives, but bail
         // if it's computationally too expensive
         for _ in 0..(num_negs*2) {
-            let neg_node = dist.sample(rng);
+            let p: f32 = rng.gen();
+            let neg_node = match unigram_table.binary_search_by_key(&FloatOrd(p), |w| FloatOrd(*w)) {
+                Ok(idx) => idx,
+                Err(idx) => idx
+            };
+
             if neg_node != anchor { 
                 negatives.push(neg_node) ;
                 if negatives.len() == num_negs { break }
@@ -147,6 +172,7 @@ impl EmbeddingPropagation {
         node: NodeID,
         features: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
+        unigram_table: &[f32],
         rng: &mut R
     ) -> (f32, HashMap<usize, Vec<f32>>) {
 
@@ -163,7 +189,7 @@ impl EmbeddingPropagation {
         let mut negatives = Vec::with_capacity(num_negs);
         
         // Sample random negatives
-        self.sample_negatives(node, graph.len(), &mut negatives, num_negs, rng);
+        self.sample_negatives(node, unigram_table, &mut negatives, num_negs, rng);
         
         let mut hu_vars = Vec::with_capacity(negatives.len());
         let mut hus = Vec::with_capacity(negatives.len());
