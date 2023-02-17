@@ -105,7 +105,7 @@ def main(ne_fname, fe_fname, agg_fname):
             print()
             print(emb)
 
-            top_k = ne_embeddings.nearest_neighbor(emb, K, 'query')
+            top_k = ne_embeddings.nearest_neighbor(emb, K)
 
             rows = []
             for (node_type, node), score in reversed(top_k):
@@ -114,7 +114,7 @@ def main(ne_fname, fe_fname, agg_fname):
             print(tabulate.tabulate(rows, headers=headers))
 
         except Exception as e:
-            traceback.print_exception(e)
+            print('Unable to run!')
             continue
 
 if __name__ == '__main__':

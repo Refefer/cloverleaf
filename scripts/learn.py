@@ -70,12 +70,6 @@ def build_arg_parser():
         default=10,
         help="Samples MAX_NEIGHBORS nodes for node reconstruction.")
 
-    parser.add_argument("--hard-negatives",
-        dest="hard_negatives",
-        type=int,
-        default=0,
-        help="Number of hard negatives to use.")
-
     parser.add_argument("--weight-decay",
         dest="wd",
         type=float,
@@ -147,8 +141,7 @@ def main(args):
 
     ep = cloverleaf.EmbeddingPropagator(
         alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
-        passes=args.passes, wd=args.wd, max_nodes=args.max_neighbors, 
-        hard_negatives=args.hard_negatives)
+        passes=args.passes, wd=args.wd, max_nodes=args.max_neighbors)
 
     if args.warm_start is not None:
         feature_embeddings = cloverleaf.NodeEmbeddings.load(args.warm_start, cloverleaf.Distance.Cosine)
