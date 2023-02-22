@@ -429,6 +429,7 @@ impl EmbeddingPropagator {
         seed: Option<u64>,
         max_nodes: Option<usize>,
         max_features: Option<usize>,
+        weighted: Option<bool>,
         indicator: Option<bool>
 
     ) -> Self {
@@ -442,6 +443,7 @@ impl EmbeddingPropagator {
             seed: seed.unwrap_or(SEED),
             max_nodes: max_nodes,
             max_features: max_features,
+            weighted: weighted.unwrap_or(false),
             indicator: indicator.unwrap_or(true)
         };
 

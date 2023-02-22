@@ -70,6 +70,11 @@ def build_arg_parser():
         default=10,
         help="Samples MAX_NEIGHBORS nodes for node reconstruction.")
 
+    parser.add_argument("--weighted",
+        dest="weighted",
+        action="store_true",
+        help="Node Reconstructions from neighbors consider edge weights.")
+
     parser.add_argument("--weight-decay",
         dest="wd",
         type=float,
@@ -141,7 +146,7 @@ def main(args):
 
     ep = cloverleaf.EmbeddingPropagator(
         alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
-        passes=args.passes, wd=args.wd, max_nodes=args.max_neighbors)
+        passes=args.passes, wd=args.wd, max_nodes=args.max_neighbors, weighted=args.weighted)
 
     if args.warm_start is not None:
         feature_embeddings = cloverleaf.NodeEmbeddings.load(args.warm_start, cloverleaf.Distance.Cosine)

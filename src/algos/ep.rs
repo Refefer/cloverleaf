@@ -21,6 +21,7 @@ pub struct EmbeddingPropagation {
     pub dims: usize,
     pub passes: usize,
     pub seed: u64,
+    pub weighted: bool,
     pub max_features: Option<usize>,
     pub max_nodes: Option<usize>,
     pub indicator: bool
@@ -178,11 +179,12 @@ impl EmbeddingPropagation {
 
         // h(v)
         let (hv_vars, hv) = construct_node_embedding(
-            node, features, &feature_embeddings, self.max_features, rng);
+            node, features, &feature_embeddings, self.max_features, self.weighted, rng);
         
         // ~h(v)
         let (thv_vars, thv) = self.loss.construct_positive(
-            graph, node, features, &feature_embeddings, self.max_nodes, self.max_features, rng);
+            graph, node, features, &feature_embeddings, self.max_nodes, self.max_features, 
+            self.weighted, rng);
         
         // h(u)
         let num_negs = self.loss.negatives();
@@ -194,7 +196,7 @@ impl EmbeddingPropagation {
         let mut hu_vars = Vec::with_capacity(negatives.len());
         let mut hus = Vec::with_capacity(negatives.len());
         negatives.into_iter().for_each(|neg_node| {
-            let (hu_var, hu) = construct_node_embedding(neg_node, features, &feature_embeddings, self.max_features, rng);
+            let (hu_var, hu) = construct_node_embedding(neg_node, features, &feature_embeddings, self.max_features, self.weighted, rng);
             hu_vars.push(hu_var);
             hus.push(hu);
         });
@@ -234,7 +236,7 @@ impl EmbeddingPropagation {
 fn extract_grads(
     graph: &Graph, 
     grads: &mut HashMap<usize, Vec<f32>>, 
-    vars: impl Iterator<Item=(usize, (ANode, usize))>
+    vars: impl Iterator<Item=(usize, (ANode, f32))>
 ) {
     for (feat_id, (var, _)) in vars {
         if grads.contains_key(&feat_id) { continue }
@@ -250,10 +252,11 @@ fn extract_grads(
     }
 }
 
-type NodeCounts = HashMap<usize, (ANode, usize)>;
+type NodeCounts = HashMap<usize, (ANode, f32)>;
 
 fn collect_embeddings_from_node<R: Rng>(
     node: NodeID,
+    w: f32,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     feat_map: &mut NodeCounts,
@@ -264,11 +267,11 @@ fn collect_embeddings_from_node<R: Rng>(
     let max_features = max_features.unwrap_or(feats.len());
     for feat in feats.choose_multiple(rng, max_features) {
         if let Some((_emb, count)) = feat_map.get_mut(feat) {
-            *count += 1;
+            *count += w;
         } else {
             let emb = feature_embeddings.get_embedding(*feat);
             let v = Variable::pooled(emb);
-            feat_map.insert(*feat, (v, 1));
+            feat_map.insert(*feat, (v, w));
         }
     }
 }
@@ -281,10 +284,11 @@ fn construct_node_embedding<R: Rng>(
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     max_features: Option<usize>,
+    weighted: bool,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
-    collect_embeddings_from_node(node, feature_store, 
+    collect_embeddings_from_node(node, 1f32, feature_store, 
                                  feature_embeddings, 
                                  &mut feature_map,
                                  max_features,
@@ -294,6 +298,19 @@ fn construct_node_embedding<R: Rng>(
     (feature_map, mean)
 }
 
+fn unnorm(weights: &[f32]) -> Vec<f32> {
+    let n = weights.len() as f32;
+    let mut n_weights = vec![0.; weights.len()];
+    for (i, w) in weights.iter().enumerate() {
+        if i == 0 {
+            n_weights[i] = weights[i];
+        } else {
+            n_weights[i] = weights[i] - weights[i-1];
+        }
+        n_weights[i] *= n;
+    }
+    n_weights
+}
 
 // ~H(n)
 // The Expensive function.  We grab a nodes neighbors
@@ -306,39 +323,48 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     feature_embeddings: &EmbeddingStore,
     max_nodes: Option<usize>,
     max_features: Option<usize>,
+    weighted: bool,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
-    let edges = &graph.get_edges(node).0;
+    let (edges, weights) = &graph.get_edges(node);
+    let un_weights = unnorm(weights);
     
     if edges.len() <= max_nodes.unwrap_or(edges.len()) {
-        construct_from_multiple_nodes(edges.iter().cloned(),
+        construct_from_multiple_nodes(
+            edges.iter().zip(un_weights.iter()),
             feature_store,
             feature_embeddings,
             max_nodes,
             max_features,
+            weighted,
             rng)
     } else {
-        let it = edges.choose_multiple(rng, max_nodes.unwrap()).cloned();
-        construct_from_multiple_nodes(it,
+        let it = edges.iter().zip(un_weights.iter())
+            .choose_multiple(rng, max_nodes.unwrap());
+
+        construct_from_multiple_nodes(it.into_iter(),
             feature_store,
             feature_embeddings,
             max_nodes,
             max_features,
+            weighted,
             rng)
     }
 }
 
-fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
+fn construct_from_multiple_nodes<'a, I: Iterator<Item=(&'a NodeID, &'a f32)>, R: Rng>(
     nodes: I,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     max_nodes: Option<usize>,
     max_features: Option<usize>,
+    weighted: bool,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
-    for node in nodes {
-        collect_embeddings_from_node(node, feature_store, 
+    for (node, w) in nodes {
+        let w = if weighted { *w } else { 1.0 };
+        collect_embeddings_from_node(*node, w, feature_store, 
                                      feature_embeddings, 
                                      &mut feature_map,
                                      max_features,
@@ -348,12 +374,14 @@ fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
     (feature_map, mean)
 }
 
-fn mean_embeddings<'a,I: Iterator<Item=&'a (ANode, usize)>>(items: I) -> ANode {
+fn mean_embeddings<'a,I: Iterator<Item=&'a (ANode, f32)>>(
+    items: I
+) -> ANode {
     let mut vs = Vec::new();
-    let mut n = 0;
+    let mut n = 0f32;
     items.for_each(|(emb, count)| {
-        if *count > 1 {
-            vs.push(emb * *count as f32);
+        if *count != 1f32 {
+            vs.push(emb * *count);
         } else {
             vs.push(emb.clone());
         }
@@ -458,12 +486,14 @@ impl Loss {
         feature_embeddings: &EmbeddingStore,
         max_nodes: Option<usize>,
         max_features: Option<usize>,
+        weighted: bool, 
         rng: &mut R
     ) -> (NodeCounts,ANode) {
         match self {
             Loss::Contrastive(_,_) | Loss::MarginLoss(_,_) => {
                 reconstruct_node_embedding(
-                    graph, node, feature_store, feature_embeddings, max_nodes, max_features, rng)
+                    graph, node, feature_store, feature_embeddings, max_nodes, max_features, 
+                    weighted, rng)
             },
             Loss::StarSpace(_,_) => {
                 // Select random out edge
@@ -471,7 +501,7 @@ impl Loss {
                 // If it has no out edges, nothing to really do.  We can't build a comparison.
                 let choice = *edges.choose(rng).unwrap_or(&node);
                 construct_node_embedding(
-                    choice, feature_store, feature_embeddings, max_features, rng)
+                    choice, feature_store, feature_embeddings, max_features, weighted, rng)
             },
             Loss::PPR(_, num, restart_p) => {
                 let mut nodes = Vec::with_capacity(*num);
@@ -483,8 +513,11 @@ impl Loss {
                 if nodes.len() == 0 {
                     nodes.push(node);
                 }
-                construct_from_multiple_nodes(nodes.into_iter(),
-                        feature_store, feature_embeddings, max_nodes, max_features, rng)
+                let w = vec![1f32; nodes.len()];
+                let it = nodes.iter().zip(w.iter());
+                construct_from_multiple_nodes(it,
+                        feature_store, feature_embeddings, max_nodes, max_features, 
+                        weighted, rng)
             }
         }
 
@@ -752,6 +785,7 @@ mod ep_tests {
             passes: 50,
             max_features: None,
             max_nodes: None,
+            weighted: false,
             seed: 202220222,
             indicator: false
         };
