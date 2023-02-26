@@ -31,7 +31,13 @@ pub fn propagate_features(
             let (edges, weights) = graph.get_edges(node_id);
             working_map.clear();
             let mut all_propagated = true;
-            for (edge, weight) in edges.iter().zip(weights.iter()) {
+            // Reconstructs the probability distribution
+            let wit = weights.iter().scan(0f32, |state, &w| {
+                let p_x = w - *state;
+                *state = w;
+                Some(p_x)
+            });
+            for (edge, weight) in edges.iter().zip(wit) {
                 let feats = features.get_features(*edge);
                 
                 // If all the constituent nodes are propagated, we consider this

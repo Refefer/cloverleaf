@@ -118,7 +118,7 @@ def main(args):
     if f_name != 'none':
         features.load_features(f_name, error_on_missing=False)
         if args.feat_prop is not None:
-            fp = cloverleaf.FeaturePropagator(args.feat_prop, 0.05)
+            fp = cloverleaf.FeaturePropagator(args.feat_prop)
             fp.propagate(graph, features)
 
     print("Unique Features found: {}".format(features.num_features()))
