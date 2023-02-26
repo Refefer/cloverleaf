@@ -26,16 +26,18 @@ use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError};
 
 use crate::graph::{CSR,CumCSR,Graph,NodeID};
+use crate::vocab::Vocab;
+use crate::sampler::Weighted;
+use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
+
 use crate::algos::rwr::{Steps,RWR};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
 use crate::algos::ep::{EmbeddingPropagation,Loss};
 use crate::algos::utils::FeatureStore;
 use crate::algos::ann::NodeDistance;
-use crate::vocab::Vocab;
-use crate::sampler::Weighted;
-use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
 use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,EmbeddingBuilder};
+use crate::algos::feat_propagation::propagate_features;
 
 const SEED: u64 = 20222022;
 
@@ -148,6 +150,10 @@ impl RwrGraph {
                 ((*nt).clone(), (*n).clone())
             }).collect();
         Ok((names, weights.to_vec()))
+    }
+
+    pub fn vocab(&self) -> VocabIterator {
+        VocabIterator::new(self.vocab.clone())
     }
 
     /// Saves a graph to disk
@@ -533,6 +539,43 @@ impl FeatureSet {
 
     pub fn num_features(&self) -> usize {
         self.features.num_features()
+    }
+
+    pub fn vocab(&self) -> VocabIterator {
+        VocabIterator::new(self.vocab.clone())
+    }
+
+
+}
+
+#[pyclass]
+pub struct FeaturePropagator {
+    k: usize,
+    threshold: f32,
+    max_iters: usize
+}
+
+#[pymethods]
+impl FeaturePropagator {
+    #[new]
+    pub fn new(k: usize, threshold: Option<f32>, max_iters: Option<usize>) -> Self {
+        FeaturePropagator { 
+            k: k, 
+            threshold: threshold.unwrap_or(0.),
+            max_iters: max_iters.unwrap_or(20)
+        }
+    }
+
+    pub fn propagate(&self,
+        graph: &RwrGraph,
+        features: &mut FeatureSet
+    ) {
+        propagate_features(
+            graph.graph.deref(), 
+            &mut features.features, 
+            self.max_iters,
+            self.k,
+            self.threshold);
     }
 
 }
@@ -1067,6 +1110,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<EPLoss>()?;
     m.add_class::<Ann>()?;
     m.add_class::<FeatureSet>()?;
+    m.add_class::<FeaturePropagator>()?;
     m.add_class::<FeatureEmbeddingAggregator>()?;
     m.add_class::<Query>()?;
     m.add_class::<RandomWalker>()?;

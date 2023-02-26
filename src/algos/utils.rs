@@ -90,6 +90,10 @@ impl FeatureStore {
         self.set_nt_features(node, self.namespace.clone(), node_features);
     }
 
+    pub fn set_features_raw(&mut self, node: NodeID, node_features: impl Iterator<Item=usize>) {
+        self.features[node].extend(node_features);
+    }
+
     pub fn get_features(&self, node: NodeID) -> &[usize] {
         &self.features[node]
     }
