@@ -24,7 +24,7 @@ indicatif = "0.17.1"
 tikv-jemallocator = "0.5"
 
 [dependencies.hashbrown]
-version = "0.12"
+version = "0.13"
 features = ["rayon"]
 
 [dev-dependencies]

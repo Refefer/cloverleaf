@@ -2,6 +2,7 @@ use std::fmt::Write;
 
 use rayon::prelude::*;
 use hashbrown::HashMap;
+use std::collections::{HashMap as CHashMap};
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use rand_distr::{Distribution,Uniform};
@@ -81,7 +82,11 @@ impl EmbeddingPropagation {
             node_idxs.shuffle(&mut rng);
             let err: Vec<_> = node_idxs.par_iter().chunks(self.batch_size).enumerate().map(|(i, nodes)| {
                 let mut grads = Vec::with_capacity(self.batch_size);
-                let mut all_grads = HashMap::new();
+                // We are using std Hashmap instead of hashbrown due to a weird bug
+                // where the optimizer, for whatever reason, has troubles draining it
+                // on 0.13.  We'll keep testing it on subsequent fixes but until then
+                // std is the way to go.
+                let mut all_grads = CHashMap::new();
                 
                 // Compute grads for batch
                 nodes.par_iter().map(|node_id| {
@@ -104,7 +109,7 @@ impl EmbeddingPropagation {
                 }
                 
                 // Backpropagate embeddings
-                optimizer.update(&feature_embeddings, &mut all_grads, alpha, pass as f32);
+                optimizer.update(&feature_embeddings, all_grads, alpha, pass as f32);
 
                 // Update progress bar
                 pb.inc(nodes.len() as u64);
@@ -557,7 +562,7 @@ trait Optimizer {
     fn update(
         &self, 
         feature_embeddings: &EmbeddingStore,
-        grads: &mut HashMap<usize, Vec<f32>>,
+        grads: CHashMap<usize, Vec<f32>>,
         alpha: f32,
         t: f32
     );
@@ -582,11 +587,11 @@ impl Optimizer for MomentumOptimizer {
     fn update(
         &self, 
         feature_embeddings: &EmbeddingStore,
-        grads: &mut HashMap<usize, Vec<f32>>,
+        grads: CHashMap<usize, Vec<f32>>,
         alpha: f32,
         t: f32
     ) {
-        for (feat_id, grad) in grads.drain() {
+        for (feat_id, grad) in grads.into_iter() {
 
             let emb = feature_embeddings.get_embedding_mut_hogwild(feat_id);
             let mom = self.mom.get_embedding_mut_hogwild(feat_id);
@@ -626,12 +631,12 @@ impl Optimizer for AdamOptimizer {
     fn update(
         &self, 
         feature_embeddings: &EmbeddingStore,
-        grads: &mut HashMap<usize, Vec<f32>>,
+        grads: CHashMap<usize, Vec<f32>>,
         alpha: f32,
         t: f32
     ) {
         let t = t + 1.;
-        for (feat_id, grad) in grads.drain() {
+        for (feat_id, grad) in grads.into_iter() {
 
             // Can get some nans in weird cases, such as the distance between
             // a node and it's reconstruction when it shares all features.

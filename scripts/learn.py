@@ -5,18 +5,6 @@ import json
 import cloverleaf
 import numpy as np
 
-PASSES = 200
-BATCH_SIZE = 128
-ALPHA = 9e-1
-DIMS = 50
-MAX_FEATURES=None
-MAX_NODES=10
-WD = 0
-#loss = cloverleaf.EPLoss.contrastive(1, 5)
-    #loss = cloverleaf.EPLoss.starspace(0.5, 5)
-LOSS = cloverleaf.EPLoss.margin(10, 5)
-
-
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description='Plots embeddings',
@@ -36,6 +24,13 @@ def build_arg_parser():
         required=False,
         default=None,
         help="If provided, loads feature embeddings from a previous run.")
+
+    parser.add_argument("--propagate-features",
+        dest="feat_prop",
+        type=int,
+        default=None,
+        required=False,
+        help="Propagates feature instead of using anonymous features")
 
     parser.add_argument("--dims",
         dest="dims",
@@ -122,6 +117,10 @@ def main(args):
     features = cloverleaf.FeatureSet(graph)
     if f_name != 'none':
         features.load_features(f_name, error_on_missing=False)
+        if args.feat_prop is not None:
+            print("Propagating features")
+            fp = cloverleaf.FeaturePropagator(args.feat_prop)
+            fp.propagate(graph, features)
 
     print("Unique Features found: {}".format(features.num_features()))
     sTime = time.time()
