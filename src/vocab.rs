@@ -29,7 +29,7 @@ impl Vocab {
     }
 
     pub fn get_node_type(&self, node: NodeID) -> Option<&Arc<String>> {
-        self.node_id_to_node.get(node).map(|(nt_id, name)| {
+        self.node_id_to_node.get(node).map(|(nt_id, _name)| {
             &self.id_to_node_type[*nt_id]
         })
     }

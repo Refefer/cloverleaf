@@ -1,6 +1,5 @@
 use crate::algos::utils::FeatureStore;
 use crate::embeddings::EmbeddingStore;
-use crate::NodeID;
 
 pub trait EmbeddingBuilder {
     fn construct( &self, features: &[usize], out: &mut [f32]) -> ();
@@ -34,7 +33,8 @@ impl <'a> EmbeddingBuilder for AvgAggregator<'a> {
             AvgAggregator::isum(out, e);
         }
 
-        out.iter_mut().for_each(|outi| *outi /= (features.len() as f32));
+        let len = features.len() as f32;
+        out.iter_mut().for_each(|outi| *outi /= len);
     }
 }
 

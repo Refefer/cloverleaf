@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -43,12 +42,6 @@ impl CLProgressBar {
 
         if let Some(pb) = &self.pb {
             pb.set_message((*msg).clone());
-        }
-    }
-
-    pub fn tick(&self) {
-        if let Some(pb) = &self.pb {
-            pb.tick();
         }
     }
 

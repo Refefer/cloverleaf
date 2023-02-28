@@ -17,7 +17,7 @@ mod progress;
 use std::sync::Arc;
 use std::ops::Deref;
 use std::fs::File;
-use std::io::{Write,BufWriter,Read,BufReader,BufRead};
+use std::io::{Write,BufWriter,BufReader,BufRead};
 use std::fmt::Write as FmtWrite;
 
 use rayon::prelude::*;
@@ -25,7 +25,7 @@ use float_ord::FloatOrd;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError};
 
-use crate::graph::{CSR,CumCSR,Graph,NodeID};
+use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID};
 use crate::vocab::Vocab;
 use crate::sampler::Weighted;
 use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
@@ -111,19 +111,19 @@ impl Distance {
 }
 
 #[pyclass]
-pub struct RwrGraph {
+pub struct Graph {
     graph: Arc<CumCSR>,
     vocab: Arc<Vocab>
 }
 
 #[pymethods]
-impl RwrGraph {
+impl Graph {
 
     #[new]
     fn new(edges: Vec<((String,String),(String,String),f32)>) -> Self {
         let (graph, vocab) = build_csr(edges.into_iter());
         eprintln!("Converting to CDF format...");
-        RwrGraph {
+        Graph {
             graph: Arc::new(CumCSR::convert(graph)),
             vocab: Arc::new(vocab)
         }
@@ -207,7 +207,7 @@ impl RwrGraph {
 
         let csr = CSR::construct_from_edges(edges);
 
-        let g = RwrGraph {
+        let g = Graph {
             graph: Arc::new(CumCSR::convert(csr)),
             vocab: Arc::new(vocab)
         };
@@ -237,7 +237,7 @@ impl RandomWalker {
 
     pub fn walk(
         &self, 
-        graph: &RwrGraph,
+        graph: &Graph,
         node: (String, String), 
         seed: Option<u64>, 
         k: Option<usize>, 
@@ -287,7 +287,7 @@ impl BiasedRandomWalker {
 
     pub fn walk(
         &self, 
-        graph: &RwrGraph,
+        graph: &Graph,
         embeddings: &NodeEmbeddings,
         node: (String,String), 
         context: &Query,
@@ -322,7 +322,7 @@ impl BiasedRandomWalker {
         // Reweight results if requested
         if let Some(cn) = rerank_context {
             println!("Reranking...");
-            let c_emb = lookup_embedding(context, embeddings)?;
+            let c_emb = lookup_embedding(cn, embeddings)?;
             Reweighter::new(self.blend.unwrap_or(0.5))
                 .reweight(&mut results, node_embeddings, c_emb);
         }
@@ -371,14 +371,14 @@ impl GraphBuilder {
         }
     }
 
-    pub fn build_graph(&mut self) -> RwrGraph {
+    pub fn build_graph(&mut self) -> Graph {
         let mut vocab = Vocab::new(); 
         std::mem::swap(&mut vocab, &mut self.vocab);
         let mut edges = Vec::new();
         std::mem::swap(&mut edges, &mut self.edges);
         let graph = CSR::construct_from_edges(edges);
 
-        RwrGraph {
+        Graph {
             graph: Arc::new(CumCSR::convert(graph)),
             vocab: Arc::new(vocab)
         }
@@ -456,7 +456,7 @@ impl EmbeddingPropagator {
 
     pub fn learn_features(
         &mut self, 
-        graph: &RwrGraph, 
+        graph: &Graph, 
         features: &mut FeatureSet,
         feature_embeddings: Option<&mut NodeEmbeddings>
     ) -> NodeEmbeddings {
@@ -496,7 +496,7 @@ pub struct FeatureSet {
 #[pymethods]
 impl FeatureSet {
     #[new]
-    pub fn new(graph: &RwrGraph, namespace: Option<String>) -> Self {
+    pub fn new(graph: &Graph, namespace: Option<String>) -> Self {
         let ns = namespace.unwrap_or_else(|| "feat".to_string());
         FeatureSet {
             features: FeatureStore::new(graph.graph.len(), ns),
@@ -567,7 +567,7 @@ impl FeaturePropagator {
     }
 
     pub fn propagate(&self,
-        graph: &RwrGraph,
+        graph: &Graph,
         features: &mut FeatureSet
     ) {
         propagate_features(
@@ -615,7 +615,7 @@ impl FeatureEmbeddingAggregator {
 
     pub fn embed_graph(
         &self, 
-        graph: &RwrGraph,
+        graph: &Graph,
         feat_set: &FeatureSet, 
         feature_embeddings: &NodeEmbeddings,
         alpha: Option<f32>
@@ -691,7 +691,7 @@ impl FeatureEmbeddingAggregator {
                 return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>weight ..."))
             }
             let p_wi = pieces[2].parse::<f64>()
-                .map_err(|e| PyValueError::new_err(format!("Tried to parse weight and failed:{:?}", line)))?;
+                .map_err(|_e| PyValueError::new_err(format!("Tried to parse weight and failed:{:?}", line)))?;
             let node_id = vocab.get_or_insert(pieces[0].into(), pieces[1].into());
             if node_id < p_w.len() {
                 return Err(PyValueError::new_err(format!("Duplicate feature found:{} {}", pieces[0], pieces[1])))
@@ -750,7 +750,7 @@ impl DistanceEmbedder {
 
     }
 
-    pub fn learn(&self, graph: &RwrGraph) -> NodeEmbeddings {
+    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
         let es = crate::algos::dist::construct_walk_distances(graph.graph.as_ref(), self.n_landmarks, self.landmarks);
         NodeEmbeddings {
             vocab: graph.vocab.clone(),
@@ -775,7 +775,7 @@ impl ClusterLPAEmbedder {
         }
     }
 
-    pub fn learn(&self, graph: &RwrGraph) -> NodeEmbeddings {
+    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
         let seed = self.seed.unwrap_or(SEED);
         let es = crate::algos::lpa::construct_lpa_embedding(graph.graph.as_ref(), self.k, self.passes, seed);
         NodeEmbeddings {
@@ -801,7 +801,7 @@ impl SLPAEmbedder {
         }
     }
 
-    pub fn learn(&self, graph: &RwrGraph) -> NodeEmbeddings {
+    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
         let seed = self.seed.unwrap_or(SEED);
         let es = crate::algos::slpa::construct_slpa_embedding(graph.graph.as_ref(), self.k, self.threshold, seed);
         NodeEmbeddings {
@@ -821,7 +821,7 @@ pub struct NodeEmbeddings {
 #[pymethods]
 impl NodeEmbeddings {
     #[new]
-    pub fn new(graph: &RwrGraph, dims: usize, distance: Distance) -> Self {
+    pub fn new(graph: &Graph, dims: usize, distance: Distance) -> Self {
         let dist = distance.to_edist();
 
         let es = EmbeddingStore::new(graph.graph.len(), dims, dist);
@@ -866,7 +866,7 @@ impl NodeEmbeddings {
                 nt == filter_type
             })
         } else {
-            self.embeddings.nearest_neighbor(&emb, k, |node_id| true)
+            self.embeddings.nearest_neighbor(&emb, k, |_node_id| true)
         };
         convert_node_distance(&self.vocab, dists)
     }
@@ -879,7 +879,6 @@ impl NodeEmbeddings {
         self.embeddings.len()
     }
 
-    
     pub fn save(&self, path: &str) -> PyResult<()> {
         let f = File::create(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -1015,7 +1014,7 @@ struct Ann {
 #[pymethods]
 impl Ann {
     #[new]
-    pub fn new(graph: &RwrGraph, max_steps: Option<usize>) -> Self {
+    pub fn new(graph: &Graph, max_steps: Option<usize>) -> Self {
         Ann {
             graph: graph.graph.clone(),
             vocab: graph.vocab.clone(),
@@ -1097,7 +1096,7 @@ fn convert_node_distance(
 
 #[pymodule]
 fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
-    m.add_class::<RwrGraph>()?;
+    m.add_class::<Graph>()?;
     m.add_class::<Distance>()?;
     m.add_class::<GraphBuilder>()?;
     m.add_class::<EdgeType>()?;

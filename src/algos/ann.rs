@@ -1,7 +1,6 @@
 use std::cmp::{Eq,PartialEq,Ordering,Reverse};
 use std::collections::BinaryHeap;
 
-use rayon::prelude::*;
 use hashbrown::HashSet;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
@@ -10,7 +9,6 @@ use float_ord::FloatOrd;
 
 use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::{EmbeddingStore,Entity};
-use crate::progress::CLProgressBar;
 
 #[derive(Copy, Clone, Debug)]
 pub struct NodeDistance(f32, NodeID);

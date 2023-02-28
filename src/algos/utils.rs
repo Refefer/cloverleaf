@@ -114,7 +114,6 @@ impl FeatureStore {
     }
 
     pub fn fill_missing_nodes(&mut self) {
-        let mut idxs = self.feature_vocab.len();
         for i in 0..self.features.len() {
             if self.features[i].len() == 0 {
                 self.set_nt_features(i, "node".into(), vec![format!("{}", i)]);

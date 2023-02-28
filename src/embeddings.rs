@@ -1,5 +1,3 @@
-use std::collections::BinaryHeap;
-
 use float_ord::FloatOrd;
 use rayon::prelude::*;
 

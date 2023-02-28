@@ -1,7 +1,7 @@
 use hashbrown::HashMap;
 use float_ord::FloatOrd;
 
-use crate::graph::{Graph,NodeID};
+use crate::graph::Graph;
 use crate::algos::utils::FeatureStore;
 use crate::bitset::BitSet;
 
@@ -21,7 +21,7 @@ pub fn propagate_features(
         }
     }
 
-    for iter in 0..max_iters {
+    for _iter in 0..max_iters {
         let mut working_map = HashMap::new();
         let mut working_vec = Vec::new();
         let mut is_done = true;

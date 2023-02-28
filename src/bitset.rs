@@ -24,11 +24,6 @@ impl BitSet {
         self.bitfield[fo] |= bm;
     }
 
-    pub fn unset_bit(&mut self, idx: usize) {
-        let (fo, bm) = self.get_bit_idx(&idx);
-        self.bitfield[fo] &= bm ^ 0xffffff;
-    }
-
 }
 
 #[cfg(test)]

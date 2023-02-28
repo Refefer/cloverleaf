@@ -153,7 +153,6 @@ impl EmbeddingPropagation {
         negatives: &mut Vec<NodeID>,
         num_negs: usize,
         rng: &mut R) {
-        let dist = Uniform::new(0, unigram_table.len());
 
         // We make a good attempt to get the full negatives, but bail
         // if it's computationally too expensive
@@ -319,7 +318,6 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
         construct_from_multiple_nodes(edges.iter().cloned(),
             feature_store,
             feature_embeddings,
-            max_nodes,
             max_features,
             rng)
     } else {
@@ -327,7 +325,6 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
         construct_from_multiple_nodes(it,
             feature_store,
             feature_embeddings,
-            max_nodes,
             max_features,
             rng)
     }
@@ -337,7 +334,6 @@ fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
     nodes: I,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
-    max_nodes: Option<usize>,
     max_features: Option<usize>,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
@@ -489,7 +485,7 @@ impl Loss {
                     nodes.push(node);
                 }
                 construct_from_multiple_nodes(nodes.into_iter(),
-                        feature_store, feature_embeddings, max_nodes, max_features, rng)
+                        feature_store, feature_embeddings, max_features, rng)
             }
         }
 
@@ -569,6 +565,7 @@ trait Optimizer {
 
 }
 
+/*
 struct MomentumOptimizer {
     gamma: f32,
     mom: EmbeddingStore
@@ -589,7 +586,7 @@ impl Optimizer for MomentumOptimizer {
         feature_embeddings: &EmbeddingStore,
         grads: CHashMap<usize, Vec<f32>>,
         alpha: f32,
-        t: f32
+        _t: f32
     ) {
         for (feat_id, grad) in grads.into_iter() {
 
@@ -609,6 +606,7 @@ impl Optimizer for MomentumOptimizer {
     }
 
 }
+*/
 
 struct AdamOptimizer {
     beta_1: f32,
@@ -657,7 +655,7 @@ impl Optimizer for AdamOptimizer {
 
                 // Create the new grad and update
                 let emb = feature_embeddings.get_embedding_mut_hogwild(feat_id);
-                emb.iter_mut().zip(grad.iter()).zip(mom.iter().zip(var.iter())).for_each(|((e_i, g_i), (m_i, v_i))| {
+                emb.iter_mut().zip(mom.iter().zip(var.iter())).for_each(|(e_i, (m_i, v_i))| {
                     let m_i = m_i / (1. - self.beta_1.powf(t));
                     let v_i = v_i / (1. - self.beta_2.powf(t));
                     let g_i = m_i / (v_i.sqrt() + self.eps);

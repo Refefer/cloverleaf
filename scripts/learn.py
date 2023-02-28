@@ -111,7 +111,7 @@ def main(args):
     f_name = args.features
     
     print("Loading graph...")
-    graph = cloverleaf.RwrGraph.load(g_name, cloverleaf.EdgeType.Undirected)
+    graph = cloverleaf.Graph.load(g_name, cloverleaf.EdgeType.Undirected)
     print("Nodes={},Edges={}".format(graph.nodes(), graph.edges()), file=sys.stderr)
     print('Loading features...')
     features = cloverleaf.FeatureSet(graph)
