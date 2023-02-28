@@ -7,7 +7,7 @@ import numpy as np
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description='Plots embeddings',
+        description='Learn cloverleaf embeddings',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument("edges",
