@@ -13,6 +13,7 @@ mod embeddings;
 mod bitset;
 mod hogwild;
 mod progress;
+mod feature_store;
 
 use std::sync::Arc;
 use std::ops::Deref;
@@ -29,12 +30,12 @@ use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID};
 use crate::vocab::Vocab;
 use crate::sampler::Weighted;
 use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
+use crate::feature_store::FeatureStore;
 
 use crate::algos::rwr::{Steps,RWR};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
 use crate::algos::ep::{EmbeddingPropagation,Loss};
-use crate::algos::utils::FeatureStore;
 use crate::algos::ann::NodeDistance;
 use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
@@ -545,6 +546,12 @@ impl FeatureSet {
         VocabIterator::new(self.vocab.clone())
     }
 
+    pub fn prune_min_count(&self, count: usize) -> Self {
+        FeatureSet {
+            features: self.features.prune_min_count(count),
+            vocab: self.vocab.clone()
+        }
+    }
 
 }
 

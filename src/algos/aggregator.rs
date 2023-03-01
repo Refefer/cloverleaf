@@ -1,4 +1,4 @@
-use crate::algos::utils::FeatureStore;
+use crate::feature_store::FeatureStore;
 use crate::embeddings::EmbeddingStore;
 
 pub trait EmbeddingBuilder {

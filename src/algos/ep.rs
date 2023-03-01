@@ -12,7 +12,7 @@ use float_ord::FloatOrd;
 use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::{EmbeddingStore,Distance};
 use crate::progress::CLProgressBar;
-use crate::algos::utils::FeatureStore;
+use crate::feature_store::FeatureStore;
 
 pub struct EmbeddingPropagation {
     pub alpha: f32,

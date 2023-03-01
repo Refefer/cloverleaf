@@ -65,6 +65,12 @@ def build_arg_parser():
         default=10,
         help="Samples MAX_NEIGHBORS nodes for node reconstruction.")
 
+    parser.add_argument("--min-feature-count",
+        dest="min_feature_count",
+        type=int,
+        default=1,
+        help="If set, filters out features which have fewer than min_count.")
+
     parser.add_argument("--weight-decay",
         dest="wd",
         type=float,
@@ -117,6 +123,10 @@ def main(args):
     features = cloverleaf.FeatureSet(graph)
     if f_name != 'none':
         features.load_features(f_name, error_on_missing=False)
+        if args.min_feature_count > 1:
+            print("Pruning features")
+            features = features.prune_min_count(args.min_feature_count)
+
         if args.feat_prop is not None:
             print("Propagating features")
             fp = cloverleaf.FeaturePropagator(args.feat_prop)

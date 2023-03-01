@@ -2,7 +2,7 @@ use hashbrown::HashMap;
 use float_ord::FloatOrd;
 
 use crate::graph::Graph;
-use crate::algos::utils::FeatureStore;
+use crate::feature_store::FeatureStore;
 use crate::bitset::BitSet;
 
 pub fn propagate_features(
