@@ -37,6 +37,7 @@ use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
 use crate::algos::ep::EmbeddingPropagation;
 use crate::algos::ep::loss::Loss;
+use crate::algos::ep::model::StubModel;
 use crate::algos::ann::NodeDistance;
 use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
@@ -473,7 +474,8 @@ impl EmbeddingPropagator {
         let feat_embeds = self.ep.learn(
             graph.graph.as_ref(), 
             &mut features.features,
-            feature_embeddings
+            feature_embeddings,
+            &StubModel
         );
 
         let vocab = features.features.clone_vocab();
