@@ -91,28 +91,27 @@ impl Loss {
         }
     }
 
-    pub fn construct_positive<G: CGraph, R: Rng>(
+    pub fn construct_positive<G: CGraph, R: Rng, M: Model>(
         &self,
         graph: &G,
         node: NodeID,
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
-        max_nodes: Option<usize>,
-        max_features: Option<usize>,
+        model: &M,
         rng: &mut R
     ) -> (NodeCounts,ANode) {
         match self {
             Loss::Contrastive(_,_) | Loss::MarginLoss(_,_) => {
-                reconstruct_node_embedding(
-                    graph, node, feature_store, feature_embeddings, max_nodes, max_features, rng)
+                model.reconstruct_node_embedding(
+                    graph, node, feature_store, feature_embeddings, rng)
             },
             Loss::StarSpace(_,_) => {
                 // Select random out edge
                 let edges = graph.get_edges(node).0;
                 // If it has no out edges, nothing to really do.  We can't build a comparison.
                 let choice = *edges.choose(rng).unwrap_or(&node);
-                construct_node_embedding(
-                    choice, feature_store, feature_embeddings, max_features, rng)
+                model.construct_node_embedding(
+                    choice, feature_store, feature_embeddings, rng)
             },
             Loss::PPR(_, num, restart_p) => {
                 let mut nodes = Vec::with_capacity(*num);
@@ -124,8 +123,8 @@ impl Loss {
                 if nodes.len() == 0 {
                     nodes.push(node);
                 }
-                construct_from_multiple_nodes(nodes.into_iter(),
-                        feature_store, feature_embeddings, max_features, rng)
+                model.construct_from_multiple_nodes(nodes.into_iter(),
+                        feature_store, feature_embeddings, rng)
             }
         }
 

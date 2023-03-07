@@ -25,6 +25,14 @@ pub trait Model: Send + Sync {
         rng: &mut R
     ) -> (NodeCounts, ANode);
 
+    fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
+        &self,
+        nodes: I,
+        feature_store: &FeatureStore,
+        feature_embeddings: &EmbeddingStore,
+        rng: &mut R
+    ) -> (NodeCounts, ANode); 
+
     fn parameters(&self) -> Vec<ANode>;
 }
 
@@ -33,12 +41,79 @@ pub struct StubModel;
 impl Model for StubModel {
     fn construct_node_embedding<R: Rng>(
         &self,
+        _node: NodeID,
+        _feature_store: &FeatureStore,
+        _feature_embeddings: &EmbeddingStore,
+        _rng: &mut R
+    ) -> (NodeCounts, ANode) {
+        (HashMap::new(), Variable::pooled(&vec![0.;20]))
+    }
+
+    fn reconstruct_node_embedding<G: CGraph, R: Rng>(
+        &self,
+        _graph: &G,
+        _node: NodeID,
+        _feature_store: &FeatureStore,
+        _feature_embeddings: &EmbeddingStore,
+        _rng: &mut R
+    ) -> (NodeCounts, ANode){
+        (HashMap::new(), Variable::pooled(&vec![0.;20]))
+    }
+
+    fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
+        &self,
+        nodes: I,
+        feature_store: &FeatureStore,
+        feature_embeddings: &EmbeddingStore,
+        rng: &mut R
+    ) -> (NodeCounts, ANode) {
+        let mut feature_map = HashMap::new();
+        for node in nodes {
+            collect_embeddings_from_node(node, feature_store, 
+                                         feature_embeddings, 
+                                         &mut feature_map,
+                                         None,
+                                         rng);
+        }
+        let mean = mean_embeddings(feature_map.values());
+        (feature_map, mean)
+    }
+
+
+    fn parameters(&self) -> Vec<ANode> {
+        Vec::new()
+    }
+ 
+}
+
+pub struct AveragedFeatureModel {
+    max_features: Option<usize>,
+    max_neighbor_nodes: Option<usize>
+}
+
+impl AveragedFeatureModel {
+    pub fn new(
+        max_features: Option<usize>,
+        max_neighbor_nodes: Option<usize>
+    ) -> Self {
+        AveragedFeatureModel { max_features, max_neighbor_nodes }
+    }
+}
+
+impl Model for AveragedFeatureModel {
+    fn construct_node_embedding<R: Rng>(
+        &self,
         node: NodeID,
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
     ) -> (NodeCounts, ANode) {
-        (HashMap::new(), Variable::pooled(&vec![0.;20]))
+        construct_node_embedding(
+            node,
+            feature_store,
+            feature_embeddings,
+            self.max_features,
+            rng)
     }
 
     fn reconstruct_node_embedding<G: CGraph, R: Rng>(
@@ -49,11 +124,37 @@ impl Model for StubModel {
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
     ) -> (NodeCounts, ANode){
-        (HashMap::new(), Variable::pooled(&vec![0.;20]))
+        reconstruct_node_embedding(
+            graph,
+            node,
+            feature_store,
+            feature_embeddings,
+            self.max_neighbor_nodes,
+            self.max_features,
+            rng)
+    }
+
+    fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
+        &self,
+        nodes: I,
+        feature_store: &FeatureStore,
+        feature_embeddings: &EmbeddingStore,
+        rng: &mut R
+    ) -> (NodeCounts, ANode) { 
+        let mut feature_map = HashMap::new();
+        for node in nodes {
+            collect_embeddings_from_node(node, feature_store, 
+                                         feature_embeddings, 
+                                         &mut feature_map,
+                                         self.max_features,
+                                         rng);
+        }
+        let mean = mean_embeddings(feature_map.values());
+        (feature_map, mean)
     }
 
     fn parameters(&self) -> Vec<ANode> {
-        Vec::new()
+        Vec::with_capacity(0)
     }
  
 }

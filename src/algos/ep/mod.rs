@@ -29,8 +29,6 @@ pub struct EmbeddingPropagation {
     pub dims: usize,
     pub passes: usize,
     pub seed: u64,
-    pub max_features: Option<usize>,
-    pub max_nodes: Option<usize>,
     pub indicator: bool
 }
 
@@ -167,7 +165,7 @@ impl EmbeddingPropagation {
         
         // ~h(v)
         let (thv_vars, thv) = self.loss.construct_positive(
-            graph, node, features, &feature_embeddings, self.max_nodes, self.max_features, rng);
+            graph, node, features, &feature_embeddings, model, rng);
         
         // h(u)
         let num_negs = self.loss.negatives();
