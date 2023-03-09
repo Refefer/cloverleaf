@@ -46,9 +46,12 @@ impl Vocab {
     }
 
     pub fn get_or_insert(&mut self, node_type: String, name: String) -> NodeID {
-        let node = Arc::new(name);
-        let nt_id = self.get_or_insert_node_type(Arc::new(node_type));
-        let t = (nt_id, node);
+        self.get_or_insert_shared(Arc::new(node_type), Arc::new(name))
+    }
+
+    pub fn get_or_insert_shared(&mut self, node_type: Arc<String>, name: Arc<String>) -> NodeID {
+        let nt_id = self.get_or_insert_node_type(node_type);
+        let t = (nt_id, name);
         if let Some(node_id) = self.vocab_to_idx.get(&t) {
             node_id.clone()
         } else {
@@ -57,6 +60,7 @@ impl Vocab {
             self.node_id_to_node.push((t.0, t.1));
             new_idx
         }
+ 
     }
 
     pub fn get_name(&self, node: NodeID) -> Option<(Arc<String>, Arc<String>)> {

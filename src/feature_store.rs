@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use crate::NodeID;
 use crate::vocab::Vocab;
 
@@ -23,8 +24,18 @@ impl FeatureStore {
     }
 
     fn set_nt_features(&mut self, node: NodeID, namespace: String, node_features: Vec<String>) {
-        self.features[node] = node_features.into_iter()
-            .map(|f| self.feature_vocab.get_or_insert(namespace.clone(), f))
+        let ns = Arc::new(namespace);
+        let fs = node_features.into_iter().map(|f| Arc::new(f));
+        self.set_nt_features_shared(node, ns, fs);
+    }
+
+    fn set_nt_features_shared(&mut self, 
+        node: NodeID, 
+        namespace: Arc<String>, 
+        node_features: impl Iterator<Item=Arc<String>>
+    ) {
+        self.features[node] = node_features
+            .map(|f| self.feature_vocab.get_or_insert_shared(namespace.clone(), f))
             .collect()
     }
 
@@ -95,13 +106,17 @@ impl FeatureStore {
         let mut new_fs = FeatureStore::new(self.features.len(), self.namespace.clone());
         
         // Filter out features that don't meet the min_count
+        let ns = Arc::new(self.namespace.clone());
         self.features.iter().enumerate().for_each(|(node_id, feats)| {
             let new_feats = feats.iter()
                 .filter(|f_i| counts[**f_i] >= count)
-                .map(|f_i| self.get_pretty_feature(*f_i))
-                .collect();
+                .map(|f_i| {
+                    let (_nt, nn) = self.feature_vocab.get_name(*f_i)
+                        .expect("Should never be unavailable!");
+                    nn
+                });
 
-            new_fs.set_features(node_id, new_feats);
+            new_fs.set_nt_features_shared(node_id, ns.clone(), new_feats);
         });
         new_fs
     }
