@@ -108,6 +108,79 @@ impl Model for AveragedFeatureModel {
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
     ) -> (NodeCounts, ANode) {
+        attention_construct_node_embedding(
+            node,
+            feature_store,
+            feature_embeddings,
+            self.max_features,
+            rng)
+    }
+
+    fn reconstruct_node_embedding<G: CGraph, R: Rng>(
+        &self,
+        graph: &G,
+        node: NodeID,
+        feature_store: &FeatureStore,
+        feature_embeddings: &EmbeddingStore,
+        rng: &mut R
+    ) -> (NodeCounts, ANode){
+        reconstruct_node_embedding(
+            graph,
+            node,
+            feature_store,
+            feature_embeddings,
+            self.max_neighbor_nodes,
+            self.max_features,
+            rng)
+    }
+
+    fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
+        &self,
+        nodes: I,
+        feature_store: &FeatureStore,
+        feature_embeddings: &EmbeddingStore,
+        rng: &mut R
+    ) -> (NodeCounts, ANode) { 
+        let mut feature_map = HashMap::new();
+        for node in nodes {
+            collect_embeddings_from_node(node, feature_store, 
+                                         feature_embeddings, 
+                                         &mut feature_map,
+                                         self.max_features,
+                                         rng);
+        }
+        let mean = mean_embeddings(feature_map.values());
+        (feature_map, mean)
+    }
+
+    fn parameters(&self) -> Vec<ANode> {
+        Vec::with_capacity(0)
+    }
+ 
+}
+
+pub struct AttentionFeatureModel {
+    max_features: Option<usize>,
+    max_neighbor_nodes: Option<usize>
+}
+
+impl AttentionFeatureModel {
+    pub fn new(
+        max_features: Option<usize>,
+        max_neighbor_nodes: Option<usize>
+    ) -> Self {
+        AttentionFeatureModel { max_features, max_neighbor_nodes }
+    }
+}
+
+impl Model for AttentionFeatureModel {
+    fn construct_node_embedding<R: Rng>(
+        &self,
+        node: NodeID,
+        feature_store: &FeatureStore,
+        feature_embeddings: &EmbeddingStore,
+        rng: &mut R
+    ) -> (NodeCounts, ANode) {
         construct_node_embedding(
             node,
             feature_store,
@@ -203,6 +276,60 @@ pub fn construct_node_embedding<R: Rng>(
     (feature_map, mean)
 }
 
+// Attention H(n)
+// Use scaled attention between features associated with a node
+// to create the node embedding
+pub fn attention_construct_node_embedding<R: Rng>(
+    node: NodeID,
+    feature_store: &FeatureStore,
+    feature_embeddings: &EmbeddingStore,
+    max_features: Option<usize>,
+    rng: &mut R
+) -> (NodeCounts, ANode) {
+    let mut feature_map = HashMap::new();
+    collect_embeddings_from_node(node, feature_store, 
+                                 feature_embeddings, 
+                                 &mut feature_map,
+                                 max_features,
+                                 rng);
+
+    let mean = attention_mean(feature_map.values());
+    (feature_map, mean)
+}
+
+fn attention_mean<'a>(
+    it: impl Iterator<Item=&'a (ANode, usize)>
+) -> ANode {
+    let items: Vec<_> = it.collect();
+    if items.len() == 1 {
+        return items[0].0.clone()
+    }
+    
+    // Get the attention for each feature
+    let mut scaled = vec![Vec::with_capacity(items.len()); items.len()];
+    for i in 0..items.len() {
+        for j in (i+1)..items.len() {
+            let (iv, ic) = items[i];
+            let (jv, jc) = items[j];
+            let dot = (&iv).dot(&jv);
+            let sdot = dot * (ic * jc) as f32;
+            scaled[i].push(sdot.clone());
+            scaled[j].push(sdot);
+        }
+    }
+
+    // Compute softmax
+    let d_k = Constant::scalar((scaled[0][0].value().len() as f32).sqrt());
+    let exps: Vec<_> = scaled.into_iter()
+        .map(|dots| (dots.sum_all() / &d_k).exp())
+        .collect();
+
+    let denom = exps.clone().sum_all();
+    let softmax = exps.into_iter().map(|v| v / &denom);
+    items.into_iter().zip(softmax)
+        .map(|((feat, _c), attention)| feat * attention)
+        .collect::<Vec<_>>().sum_all()
+}
 
 // ~H(n)
 // The Expensive function.  We grab a nodes neighbors
