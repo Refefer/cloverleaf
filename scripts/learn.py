@@ -124,7 +124,7 @@ def main(args):
     if f_name != 'none':
         features.load_features(f_name, error_on_missing=False)
         if args.min_feature_count > 1:
-            print("Pruning features")
+            print("Pruning features: Original {}".format(features.num_features()))
             features = features.prune_min_count(args.min_feature_count)
 
         if args.feat_prop is not None:
