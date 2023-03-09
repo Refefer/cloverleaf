@@ -35,7 +35,9 @@ use crate::feature_store::FeatureStore;
 use crate::algos::rwr::{Steps,RWR};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
-use crate::algos::ep::{EmbeddingPropagation,Loss};
+use crate::algos::ep::EmbeddingPropagation;
+use crate::algos::ep::loss::Loss;
+use crate::algos::ep::model::AveragedFeatureModel;
 use crate::algos::ann::NodeDistance;
 use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
@@ -420,7 +422,8 @@ impl EPLoss {
 
 #[pyclass]
 struct EmbeddingPropagator {
-    ep: EmbeddingPropagation
+    ep: EmbeddingPropagation,
+    model: AveragedFeatureModel
 }
 
 #[pymethods]
@@ -432,7 +435,6 @@ impl EmbeddingPropagator {
         batch_size: Option<usize>, 
         dims: Option<usize>,
         passes: Option<usize>,
-        wd: Option<f32>,
         seed: Option<u64>,
         max_nodes: Option<usize>,
         max_features: Option<usize>,
@@ -444,15 +446,14 @@ impl EmbeddingPropagator {
             batch_size: batch_size.unwrap_or(50),
             dims: dims.unwrap_or(100),
             passes: passes.unwrap_or(100),
-            wd: wd.unwrap_or(0f32),
             loss: loss.map(|l|l.loss).unwrap_or(Loss::MarginLoss(1f32,1)),
             seed: seed.unwrap_or(SEED),
-            max_nodes: max_nodes,
-            max_features: max_features,
             indicator: indicator.unwrap_or(true)
         };
 
-        EmbeddingPropagator{ ep }
+        let model = AveragedFeatureModel::new(max_features, max_nodes);
+
+        EmbeddingPropagator{ ep, model }
     }
 
     pub fn learn_features(
@@ -474,7 +475,8 @@ impl EmbeddingPropagator {
         let feat_embeds = self.ep.learn(
             graph.graph.as_ref(), 
             &mut features.features,
-            feature_embeddings
+            feature_embeddings,
+            &self.model
         );
 
         let vocab = features.features.clone_vocab();

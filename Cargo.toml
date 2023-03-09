@@ -20,9 +20,6 @@ simple_grad = {git = "https://github.com/Refefer/SimpleGrad"}
 #simple_grad = {path = "/home/astanton/src/SimpleGrad"}
 indicatif = "0.17.1"
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.5"
-
 [dependencies.hashbrown]
 version = "0.13"
 features = ["rayon"]

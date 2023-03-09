@@ -71,12 +71,6 @@ def build_arg_parser():
         default=1,
         help="If set, filters out features which have fewer than min_count.")
 
-    parser.add_argument("--weight-decay",
-        dest="wd",
-        type=float,
-        default=0,
-        help="If provided, adds weight decay to the embeddings.")
-
     parser.add_argument("--alpha",
         dest="alpha",
         type=float,
@@ -150,7 +144,7 @@ def main(args):
 
     ep = cloverleaf.EmbeddingPropagator(
         alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
-        passes=args.passes, wd=args.wd, max_nodes=args.max_neighbors, 
+        passes=args.passes, max_nodes=args.max_neighbors, 
         max_features=args.max_features)
 
     if args.warm_start is not None:
