@@ -108,7 +108,7 @@ impl Model for AveragedFeatureModel {
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
     ) -> (NodeCounts, ANode) {
-        attention_construct_node_embedding(
+        construct_node_embedding(
             node,
             feature_store,
             feature_embeddings,
