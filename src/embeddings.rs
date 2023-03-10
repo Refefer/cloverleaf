@@ -12,6 +12,7 @@ pub enum Entity<'a> {
     Embedding(&'a [f32])
 }
 
+#[derive(Clone)]
 pub enum Distance {
     ALT,
     Cosine,
@@ -83,6 +84,7 @@ impl Distance {
     }
 }
 
+#[derive(Clone)]
 pub struct EmbeddingStore {
     dims: usize,
     embeddings: Hogwild<Vec<f32>>,

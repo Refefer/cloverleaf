@@ -1,4 +1,5 @@
 
+#[derive(Clone)]
 pub struct BitSet {
     bitfield: Vec<u32>
 }
