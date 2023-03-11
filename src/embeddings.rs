@@ -12,7 +12,7 @@ pub enum Entity<'a> {
     Embedding(&'a [f32])
 }
 
-#[derive(Clone)]
+#[derive(Copy,Clone)]
 pub enum Distance {
     ALT,
     Cosine,
@@ -114,6 +114,10 @@ impl EmbeddingStore {
 
     pub fn len(&self) -> usize {
         self.nodes
+    }
+
+    pub fn distance(&self) -> Distance {
+        self.distance
     }
 
     pub fn set_embedding(&mut self, node_id: NodeID, embedding: &[f32]) {

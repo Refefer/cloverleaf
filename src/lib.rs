@@ -41,6 +41,7 @@ use crate::algos::ep::model::AveragedFeatureModel;
 use crate::algos::ann::NodeDistance;
 use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
+use crate::algos::alignment::{NeighborhoodAligner as NA};
 
 const SEED: u64 = 20222022;
 
@@ -1014,55 +1015,42 @@ impl VocabIterator {
 }
 
 #[pyclass]
-struct EmbeddingBiaser {
-    alpha: f32,
-    num_neighbors: Option<usize>
+struct NeighborhoodAligner {
+    aligner: NA
 }
 
 #[pymethods]
-impl EmbeddingBiaser {
+impl NeighborhoodAligner {
     #[new]
-    pub fn new(alpha: f32, num_neighbors: Option<usize>) -> Self {
-        EmbeddingBiaser {alpha, num_neighbors}
+    pub fn new(alpha: f32, max_neighbors: Option<usize>) -> Self {
+        let aligner = NA::new(alpha, max_neighbors);
+        NeighborhoodAligner {aligner}
     }
 
-    pub fn bias_embeddings(&self, 
-        embeddings: &mut NodeEmbeddings, 
+    pub fn align(&self, 
+        embeddings: &NodeEmbeddings, 
         graph: &Graph
     ) -> NodeEmbeddings {
-        let new_embeddings = embeddings.embeddings.clone();
+        
+        let new_embeddings = EmbeddingStore::new(embeddings.embeddings.len(), 
+                                                 embeddings.embeddings.dims(),
+                                                 embeddings.embeddings.distance());
         let num_nodes = graph.nodes();
         (0..num_nodes).into_par_iter().for_each(|node| {
             let new_emb = new_embeddings.get_embedding_mut_hogwild(node);
-            let (edges, weights) = graph.graph.get_edges(node);
-            let p = std::iter::once(weights[0])
-                .chain(weights.windows(2).map(|arr| arr[1] - arr[0]));
-
-            // Zero out current embedding
-            new_emb.iter_mut().for_each(|wi| *wi = 0f32);
-
-            // limit by max neighbors
-            let emb_set = edges.iter().zip(p);
-            let it: Box<dyn Iterator<Item=_>> = if let Some(n) = self.num_neighbors {
-                Box::new(emb_set.take(n))
-            } else {
-                Box::new(emb_set)
-            };
-
-            // Create a weighted average for all out nodes.
-            it.for_each(|(out_node, weight)| {
-                let e = embeddings.embeddings.get_embedding(*out_node);
-                new_emb.iter_mut().zip(e.iter()).for_each(|(wi, ei)| {
-                    *wi += weight * ei;
-                });
-            });
-
-            // Blend it with the original node
-            let orig_emb = embeddings.embeddings.get_embedding(node);
-            new_emb.iter_mut().zip(orig_emb.iter()).for_each(|(nwi, owi)| {
-                *nwi = *nwi * (1f32 - self.alpha) + *owi * self.alpha;
-            });
-
+            self.aligner.align(&(*graph.graph), &embeddings.embeddings, node, new_emb);
+            if new_emb.iter().all(|wi| *wi == 0.) {
+                println!("NodeID: {}", node);
+                println!("Embedding: {:?}", embeddings.embeddings.get_embedding(node));
+                let (edges, weights) = graph.graph.get_edges(node);
+                println!("edges: {:?}", edges);
+                println!("weights: {:?}", weights);
+                for edge in edges {
+                    println!("Node {}, Embedding: {:?}", edge, embeddings.embeddings.get_embedding(*edge));
+                }
+                
+                panic!();
+            }
         });
 
         NodeEmbeddings {
@@ -1184,7 +1172,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Query>()?;
     m.add_class::<RandomWalker>()?;
     m.add_class::<BiasedRandomWalker>()?;
-    m.add_class::<EmbeddingBiaser>()?;
+    m.add_class::<NeighborhoodAligner>()?;
     Ok(())
 }
 
