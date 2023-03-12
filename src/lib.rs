@@ -26,6 +26,7 @@ use float_ord::FloatOrd;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError};
 use itertools::Itertools;
+use fast_float::parse;
 
 use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID};
 use crate::vocab::Vocab;
@@ -905,7 +906,12 @@ impl NodeEmbeddings {
     }
 
     #[staticmethod]
-    pub fn load(path: &str, distance: Distance, node_type: Option<String>) -> PyResult<Self> {
+    pub fn load(
+        path: &str, 
+        distance: Distance, 
+        node_type: Option<String>, 
+        chunk_size: Option<usize>
+    ) -> PyResult<Self> {
         let num_embeddings = count_lines(path, &node_type)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
@@ -919,9 +925,9 @@ impl NodeEmbeddings {
         let mut es = EmbeddingStore::new(0, 0, EDist::Cosine);
         let filter_node = node_type.as_ref();
         let mut i = 0;
-        let mut buffer = Vec::with_capacity(1_000);
-        let mut p_buffer = Vec::with_capacity(1_000);
-        for chunk in &br.lines().map(|l| l.unwrap()).chunks(1_000) {
+        let mut buffer = Vec::with_capacity(chunk_size.unwrap_or(1_000));
+        let mut p_buffer = Vec::with_capacity(buffer.capacity());
+        for chunk in &br.lines().map(|l| l.unwrap()).chunks(buffer.capacity()) {
             buffer.clear();
             p_buffer.clear();
             
@@ -976,7 +982,7 @@ fn line_to_embedding(line: String) -> Option<(String,String,Vec<f32>)> {
     let name = pieces[1];
     let e = pieces[2];
     let emb: Result<Vec<f32>,_> = e[1..e.len() - 1].split(',')
-        .map(|wi| wi.trim().parse()).collect();
+        .map(|wi| parse(wi.trim())).collect();
 
     emb.ok().map(|e| (node_type.to_string(), name.to_string(), e))
 }

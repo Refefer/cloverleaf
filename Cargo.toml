@@ -21,6 +21,7 @@ simple_grad = {git = "https://github.com/Refefer/SimpleGrad"}
 indicatif = "0.17.1"
 itertools = "0.10.5"
 ryu = "1.0"
+fast-float = "0.2.0"
 
 [dependencies.hashbrown]
 version = "0.13"
