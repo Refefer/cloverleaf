@@ -19,6 +19,7 @@ pyo3 = { version = "0.17.1", features = ["extension-module"] }
 simple_grad = {git = "https://github.com/Refefer/SimpleGrad"}
 #simple_grad = {path = "/home/astanton/src/SimpleGrad"}
 indicatif = "0.17.1"
+itertools = "0.10.5"
 
 [dependencies.hashbrown]
 version = "0.13"

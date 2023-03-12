@@ -25,6 +25,7 @@ use rayon::prelude::*;
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError};
+use itertools::Itertools;
 
 use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID};
 use crate::vocab::Vocab;
@@ -929,30 +930,43 @@ impl NodeEmbeddings {
         let mut es = EmbeddingStore::new(0, 0, EDist::Cosine);
         let filter_node = node_type.as_ref();
         let mut i = 0;
-        for line in br.lines() {
-            let line = line.unwrap();
-
-            // If it doesn't match the pattern, move along
-            if let Some(node_type) = filter_node {
-                if !line.starts_with(node_type) {
-                    continue;
+        let mut buffer = Vec::with_capacity(1_000);
+        let mut p_buffer = Vec::with_capacity(1_000);
+        for chunk in &br.lines().map(|l| l.unwrap()).chunks(1_000) {
+            buffer.clear();
+            p_buffer.clear();
+            
+            // Read lines into a buffer for parallelizing
+            chunk.filter(|line| {
+                // If it doesn't match the pattern, move along
+                if let Some(node_type) = filter_node {
+                    line.starts_with(node_type)
+                } else {
+                    true
                 }
-            }
+            }).for_each(|l| buffer.push(l));
 
-            let (node_type, node_name, emb) = line_to_embedding(line)
-                .ok_or_else(|| PyValueError::new_err("Error parsing line"))?;
+            // Parse lines
+            buffer.par_drain(..).map(|line| {
+                line_to_embedding(line)
+                    .ok_or_else(|| PyValueError::new_err("Error parsing line"))
+            }).collect_into_vec(&mut p_buffer);
 
-            if i == 0 {
-                es = EmbeddingStore::new(num_embeddings, emb.len(), distance.to_edist());
-            }
+            for record in p_buffer.drain(..) {
+                let (node_type, node_name, emb) = record?;
 
-            let node_id = vocab.get_or_insert(node_type, node_name);
-            let m = es.get_embedding_mut(node_id);
-            if m.len() != emb.len() {
-                return Err(PyValueError::new_err("Embeddings have different sizes!"));
+                if i == 0 {
+                    es = EmbeddingStore::new(num_embeddings, emb.len(), distance.to_edist());
+                }
+
+                let node_id = vocab.get_or_insert(node_type, node_name);
+                let m = es.get_embedding_mut(node_id);
+                if m.len() != emb.len() {
+                    return Err(PyValueError::new_err("Embeddings have different sizes!"));
+                }
+                m.copy_from_slice(&emb);
+                i += 1;
             }
-            m.copy_from_slice(&emb);
-            i += 1;
         }
 
         let ne = NodeEmbeddings {
