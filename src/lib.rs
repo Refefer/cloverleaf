@@ -14,12 +14,12 @@ mod bitset;
 mod hogwild;
 mod progress;
 mod feature_store;
+mod io;
 
 use std::sync::Arc;
 use std::ops::Deref;
 use std::fs::File;
 use std::io::{Write,BufWriter,BufReader,BufRead};
-use std::fmt::Write as FmtWrite;
 
 use rayon::prelude::*;
 use float_ord::FloatOrd;
@@ -32,6 +32,7 @@ use crate::vocab::Vocab;
 use crate::sampler::Weighted;
 use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
 use crate::feature_store::FeatureStore;
+use crate::io::EmbeddingWriter;
 
 use crate::algos::rwr::{Steps,RWR};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
@@ -891,27 +892,15 @@ impl NodeEmbeddings {
     }
 
     pub fn save(&self, path: &str) -> PyResult<()> {
-        let f = File::create(path)
+        let mut writer = EmbeddingWriter::new(path, self.vocab.as_ref())
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-        let mut bw = BufWriter::new(f);
-        let mut s = String::new();
-        for node_id in 0..self.vocab.len() {
-            let (node_type, name) = self.vocab.get_name(node_id)
-                .expect("Programming error!");
+        let it = (0..self.vocab.len())
+            .map(|node_id| (node_id, self.embeddings.get_embedding(node_id)));
 
-            // Build the embedding to string
-            s.clear();
-            for (idx, wi) in self.embeddings.get_embedding(node_id).iter().enumerate() {
-                if idx > 0 {
-                    s.push_str(",");
-                }
-                write!(&mut s, "{}", wi).expect("Shouldn't error writing to a string");
-            }
+        writer.stream(it)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-            writeln!(&mut bw, "{}\t{}\t[{}]", node_type, name, s)
-                .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-        }
         Ok(())
     }
 
@@ -1053,18 +1042,6 @@ impl NeighborhoodAligner {
         (0..num_nodes).into_par_iter().for_each(|node| {
             let new_emb = new_embeddings.get_embedding_mut_hogwild(node);
             self.aligner.align(&(*graph.graph), &embeddings.embeddings, node, new_emb);
-            if new_emb.iter().all(|wi| *wi == 0.) {
-                println!("NodeID: {}", node);
-                println!("Embedding: {:?}", embeddings.embeddings.get_embedding(node));
-                let (edges, weights) = graph.graph.get_edges(node);
-                println!("edges: {:?}", edges);
-                println!("weights: {:?}", weights);
-                for edge in edges {
-                    println!("Node {}, Embedding: {:?}", edge, embeddings.embeddings.get_embedding(*edge));
-                }
-                
-                panic!();
-            }
         });
 
         NodeEmbeddings {
@@ -1072,6 +1049,35 @@ impl NeighborhoodAligner {
             vocab: embeddings.vocab.clone()
         }
     }
+
+    pub fn align_to_disk(
+        &self, 
+        path: &str,
+        embeddings: &NodeEmbeddings, 
+        graph: &Graph,
+        chunk_size: Option<usize>
+    ) -> PyResult<()> {
+       
+        let mut writer = EmbeddingWriter::new(path, embeddings.vocab.as_ref())
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let cs = chunk_size.unwrap_or(10_000);
+        let mut buffer = vec![vec![0.; embeddings.embeddings.dims()]; cs];
+        let mut ids = Vec::with_capacity(cs);
+        for chunk in &(0..graph.nodes()).chunks(cs) {
+            ids.clear();
+            chunk.for_each(|id| ids.push(id));
+
+            ids.par_iter().zip(buffer.par_iter_mut()).for_each(|(node, new_emb)| {
+                new_emb.iter_mut().for_each(|wi| *wi = 0f32);
+                self.aligner.align(&(*graph.graph), &embeddings.embeddings, *node, new_emb);
+            });
+
+            writer.stream(ids.iter().copied().zip(buffer.iter()).take(ids.len()))?;
+        }
+        Ok(())
+    }
+
 
 }
 

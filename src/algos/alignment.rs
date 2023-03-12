@@ -23,9 +23,6 @@ impl NeighborhoodAligner {
         let p = std::iter::once(weights[0])
             .chain(weights.windows(2).map(|arr| arr[1] - arr[0]));
 
-        // Zero out current embedding
-        //new_emb.iter_mut().for_each(|wi| *wi = 0f32);
-
         // limit by max neighbors
         let emb_set = edges.iter().zip(p);
         let it: Box<dyn Iterator<Item=_>> = if let Some(n) = self.max_neighbors {
