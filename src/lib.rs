@@ -1031,7 +1031,7 @@ struct NeighborhoodAligner {
 #[pymethods]
 impl NeighborhoodAligner {
     #[new]
-    pub fn new(alpha: f32, max_neighbors: Option<usize>) -> Self {
+    pub fn new(alpha: Option<f32>, max_neighbors: Option<usize>) -> Self {
         let aligner = NA::new(alpha, max_neighbors);
         NeighborhoodAligner {aligner}
     }

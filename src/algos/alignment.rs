@@ -2,14 +2,16 @@ use crate::graph::{Graph,NodeID};
 use crate::embeddings::EmbeddingStore;
 
 pub struct NeighborhoodAligner {
-    alpha: f32,
+    alpha: Option<f32>,
     max_neighbors: Option<usize>
 }
 
 impl NeighborhoodAligner {
-    pub fn new(alpha: f32, max_neighbors: Option<usize>) -> Self {
+
+    pub fn new(alpha: Option<f32>, max_neighbors: Option<usize>) -> Self {
         NeighborhoodAligner { alpha, max_neighbors }
     }
+
     pub fn align(
         &self,
         graph: &impl Graph,
@@ -42,8 +44,19 @@ impl NeighborhoodAligner {
 
         // Blend it with the original node, using alpha
         let orig_emb = embeddings.get_embedding(node);
+        
+        let alpha = if let Some(alpha) = self.alpha {
+            // Static alpha
+            alpha
+        } else {
+            // Adaptive alpha - we use the degree to determine
+            // how much to use
+            let degree = edges.len() as f32;
+            (1f32 / ((degree + 1f32).ln())).min(1f32)
+        };
+
         new_emb.iter_mut().zip(orig_emb.iter()).for_each(|(nwi, owi)| {
-            *nwi = *nwi * (1f32 - self.alpha) + *owi * self.alpha;
+            *nwi = *nwi * (1f32 - alpha) + *owi * alpha;
         });
     }
 
