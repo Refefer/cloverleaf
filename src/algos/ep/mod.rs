@@ -212,7 +212,7 @@ fn extract_grads(
         if grads.contains_key(&feat_id) { continue }
 
         if let Some(grad) = graph.get_grad(&var) {
-            if grad.iter().all(|gi| !gi.is_nan()) {
+            if grad.iter().all(|gi| !(gi.is_nan() || gi.is_infinite())) {
                 // Can get some nans in weird cases, such as the distance between
                 // a node and it's reconstruction when it shares all features.
                 // Since that's not all that helpful anyways, we simply ignore it and move on

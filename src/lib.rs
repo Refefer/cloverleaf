@@ -40,9 +40,9 @@ use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
 use crate::algos::ep::EmbeddingPropagation;
 use crate::algos::ep::loss::Loss;
-use crate::algos::ep::model::AveragedFeatureModel;
+use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
 use crate::algos::ann::NodeDistance;
-use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,EmbeddingBuilder};
+use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
 use crate::algos::alignment::{NeighborhoodAligner as NA};
 
@@ -424,10 +424,15 @@ impl EPLoss {
 
 }
 
+enum ModelType {
+    Averaged(AveragedFeatureModel),
+    Attention(AttentionFeatureModel)
+}
+
 #[pyclass]
 struct EmbeddingPropagator {
     ep: EmbeddingPropagation,
-    model: AveragedFeatureModel
+    model: ModelType 
 }
 
 #[pymethods]
@@ -442,8 +447,8 @@ impl EmbeddingPropagator {
         seed: Option<u64>,
         max_nodes: Option<usize>,
         max_features: Option<usize>,
-        indicator: Option<bool>
-
+        indicator: Option<bool>,
+        attention: Option<bool>
     ) -> Self {
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(0.9),
@@ -455,7 +460,11 @@ impl EmbeddingPropagator {
             indicator: indicator.unwrap_or(true)
         };
 
-        let model = AveragedFeatureModel::new(max_features, max_nodes);
+        let model = if let Some(true) = attention {
+            ModelType::Attention(AttentionFeatureModel::new(max_features, max_nodes))
+        } else {
+            ModelType::Averaged(AveragedFeatureModel::new(max_features, max_nodes))
+        };
 
         EmbeddingPropagator{ ep, model }
     }
@@ -476,12 +485,24 @@ impl EmbeddingPropagator {
            sfes
         });
 
-        let feat_embeds = self.ep.learn(
-            graph.graph.as_ref(), 
-            &mut features.features,
-            feature_embeddings,
-            &self.model
-        );
+        let feat_embeds = match &self.model {
+            ModelType::Averaged(model) => {
+                self.ep.learn(
+                    graph.graph.as_ref(), 
+                    &mut features.features,
+                    feature_embeddings,
+                    model
+                )
+            },
+            ModelType::Attention(model) => {
+                self.ep.learn(
+                    graph.graph.as_ref(), 
+                    &mut features.features,
+                    feature_embeddings,
+                    model
+                )
+            }
+        };
 
         let vocab = features.features.clone_vocab();
 
@@ -593,6 +614,37 @@ impl FeaturePropagator {
 
 }
 
+enum AggregatorType {
+    Averaged,
+    Weighted(f32),
+    Attention
+}
+
+#[pyclass]
+pub struct FeatureAggregator {
+    at: AggregatorType
+}
+
+#[pymethods]
+impl FeatureAggregator {
+
+    #[staticmethod]
+    pub fn Averaged() -> Self {
+        FeatureAggregator { at: AggregatorType::Averaged }
+    }
+
+    #[staticmethod]
+    pub fn Attention() -> Self {
+        FeatureAggregator { at: AggregatorType::Attention }
+    }
+
+    #[staticmethod]
+    pub fn Weighted(alpha: f32) -> Self {
+        FeatureAggregator { at: AggregatorType::Weighted(alpha) }
+    }
+
+}
+
 #[pyclass]
 pub struct FeatureEmbeddingAggregator {
     vocab: Arc<Vocab>,
@@ -604,12 +656,19 @@ impl FeatureEmbeddingAggregator {
     fn get_aggregator<'a>(
         &'a self, 
         es: &'a EmbeddingStore, 
-        alpha: Option<f32>
+        aggregator_type: &AggregatorType
     ) -> Box<dyn EmbeddingBuilder + Send + Sync + 'a> {
-        if let Some(alpha) = alpha {
-            Box::new(WeightedAggregator::new(es, &self.unigrams, alpha))
-        } else {
-            Box::new(AvgAggregator::new(es))
+        match aggregator_type {
+            AggregatorType::Weighted(alpha) => {
+                Box::new(WeightedAggregator::new(es, &self.unigrams, *alpha))
+            },
+            AggregatorType::Averaged => {
+                Box::new(AvgAggregator::new(es))
+            },
+            AggregatorType::Attention => {
+                Box::new(AttentionAggregator::new(es))
+            }
+
         }
     }
 
@@ -631,12 +690,12 @@ impl FeatureEmbeddingAggregator {
         graph: &Graph,
         feat_set: &FeatureSet, 
         feature_embeddings: &NodeEmbeddings,
-        alpha: Option<f32>
+        feature_aggregator: &FeatureAggregator
     ) -> NodeEmbeddings {
 
         let num_nodes = graph.nodes();
         let es = EmbeddingStore::new(num_nodes, feature_embeddings.dims(), EDist::Cosine);
-        let agg = self.get_aggregator(&feature_embeddings.embeddings, alpha);
+        let agg = self.get_aggregator(&feature_embeddings.embeddings, &feature_aggregator.at);
         (0..num_nodes).into_par_iter().for_each(|node| {
             // Safe to access in parallel
             let embedding = es.get_embedding_mut_hogwild(node);
@@ -653,7 +712,7 @@ impl FeatureEmbeddingAggregator {
         &self, 
         features: Vec<(String, String)>,
         feature_embeddings: &NodeEmbeddings,
-        alpha: Option<f32>,
+        feature_aggregator: &FeatureAggregator,
         strict: Option<bool>
     ) -> PyResult<Vec<f32>> {
         let v = feature_embeddings.vocab.deref();
@@ -667,7 +726,7 @@ impl FeatureEmbeddingAggregator {
         }
 
         let mut embedding = vec![0.; feature_embeddings.embeddings.dims()];
-        let agg = self.get_aggregator(&feature_embeddings.embeddings, alpha);
+        let agg = self.get_aggregator(&feature_embeddings.embeddings, &feature_aggregator.at);
         agg.construct(&ids, &mut embedding);
         Ok(embedding)
     }
@@ -1195,6 +1254,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<FeatureSet>()?;
     m.add_class::<FeaturePropagator>()?;
     m.add_class::<FeatureEmbeddingAggregator>()?;
+    m.add_class::<FeatureAggregator>()?;
     m.add_class::<Query>()?;
     m.add_class::<RandomWalker>()?;
     m.add_class::<BiasedRandomWalker>()?;

@@ -77,6 +77,12 @@ def build_arg_parser():
         default=None,
         help="If provided, uses weighted embeddings.")
 
+    parser.add_argument("--attention",
+        dest="attention",
+        action="store_true",
+        default=False,
+        help="If provided, uses self attention.")
+
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--embedding-propagation",
         dest="ep",
@@ -145,7 +151,7 @@ def main(args):
     ep = cloverleaf.EmbeddingPropagator(
         alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
         passes=args.passes, max_nodes=args.max_neighbors, 
-        max_features=args.max_features)
+        max_features=args.max_features, attention=args.attention)
 
     if args.warm_start is not None:
         feature_embeddings = cloverleaf.NodeEmbeddings.load(args.warm_start, cloverleaf.Distance.Cosine)
@@ -160,7 +166,14 @@ def main(args):
 
     print("Constructing nodes...")
     embedder = cloverleaf.FeatureEmbeddingAggregator(features)
-    node_embeddings = embedder.embed_graph(graph, features, feature_embeddings, alpha=args.alpha)
+    if args.attention:
+        aggregate = cloverleaf.FeatureAggregator.Attention()
+    elif args.alpha is not None:
+        aggregate = cloverleaf.FeatureAggregator.Weighted(args.alpha)
+    else:
+        aggregate = cloverleaf.FeatureAggregator.Averaged()
+
+    node_embeddings = embedder.embed_graph(graph, features, feature_embeddings, aggregate)
     embedder.save(args.output + '.embedder')
     node_embeddings.save(args.output + '.node-embeddings')
 

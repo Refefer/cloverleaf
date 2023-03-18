@@ -1,5 +1,8 @@
+use simple_grad::*;
+
 use crate::feature_store::FeatureStore;
 use crate::embeddings::EmbeddingStore;
+use crate::algos::ep::model::attention_mean;
 
 pub trait EmbeddingBuilder {
     fn construct( &self, features: &[usize], out: &mut [f32]) -> ();
@@ -107,3 +110,34 @@ impl <'a> EmbeddingBuilder for WeightedAggregator<'a> {
         out.iter_mut().for_each(|outi| *outi /= weight);
     }
 }
+
+pub struct AttentionAggregator<'a> {
+    embs: &'a EmbeddingStore
+}
+
+impl <'a> AttentionAggregator<'a> {
+    pub fn new(embs: &'a EmbeddingStore) -> Self {
+        AttentionAggregator { embs }
+    }
+
+}
+
+impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {
+    fn construct(
+        &self, 
+        features: &[usize],
+        out: &mut [f32]
+    ) {
+        out.fill(0f32);
+        let it = features.iter().map(|feat_id| {
+            let e = self.embs.get_embedding(*feat_id); 
+            (Constant::new(e.to_vec()), 1usize)
+        }).collect::<Vec<_>>();
+
+        let v = attention_mean(it.iter());
+        v.value().iter().zip(out.iter_mut()).for_each(|(vi, outi)| {
+            *outi = *vi;
+        });
+    }
+}
+
