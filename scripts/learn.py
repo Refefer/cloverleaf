@@ -158,7 +158,9 @@ def main(args):
     else:
         feature_embeddings = None
 
-    feature_embeddings = ep.learn_features(graph, features, feature_embeddings)
+    if args.passes > 0:
+        feature_embeddings = ep.learn_features(graph, features, feature_embeddings)
+
     eTime = time.time() - sTime
 
     print("Time to learn:{}, Nodes/sec:{}".format(eTime, (graph.nodes() * 50) / eTime, file=sys.stderr))

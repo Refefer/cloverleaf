@@ -98,7 +98,7 @@ def main(args):
 
         except Exception as e:
             print('Unable to run!')
-            raise
+            continue
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(

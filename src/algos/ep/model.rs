@@ -1,6 +1,7 @@
 use simple_grad::*;
 use hashbrown::HashMap;
 use rand::prelude::*;
+use float_ord::FloatOrd;
 
 use crate::FeatureStore;
 use crate::EmbeddingStore;
@@ -81,6 +82,7 @@ impl Model for AveragedFeatureModel {
             feature_embeddings,
             self.max_neighbor_nodes,
             self.max_features,
+            false,
             rng)
     }
 
@@ -91,16 +93,11 @@ impl Model for AveragedFeatureModel {
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
     ) -> (NodeCounts, ANode) { 
-        let mut feature_map = HashMap::new();
-        for node in nodes {
-            collect_embeddings_from_node(node, feature_store, 
-                                         feature_embeddings, 
-                                         &mut feature_map,
-                                         self.max_features,
-                                         rng);
-        }
-        let mean = mean_embeddings(feature_map.values());
-        (feature_map, mean)
+        construct_from_multiple_nodes(
+            nodes, feature_store, 
+            feature_embeddings, 
+            self.max_features,
+            rng, false)
     }
 
     fn parameters(&self) -> Vec<ANode> {
@@ -154,6 +151,7 @@ impl Model for AttentionFeatureModel {
             feature_embeddings,
             self.max_neighbor_nodes,
             self.max_features,
+            true,
             rng)
     }
 
@@ -164,16 +162,11 @@ impl Model for AttentionFeatureModel {
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
     ) -> (NodeCounts, ANode) { 
-        let mut feature_map = HashMap::new();
-        for node in nodes {
-            collect_embeddings_from_node(node, feature_store, 
-                                         feature_embeddings, 
-                                         &mut feature_map,
-                                         self.max_features,
-                                         rng);
-        }
-        let mean = mean_embeddings(feature_map.values());
-        (feature_map, mean)
+        construct_from_multiple_nodes(
+            nodes, feature_store, 
+            feature_embeddings, 
+            self.max_features,
+            rng, true)
     }
 
     fn parameters(&self) -> Vec<ANode> {
@@ -262,7 +255,12 @@ pub fn attention_mean<'a>(
             let (iv, ic) = items[i];
             let (jv, jc) = items[j];
             let dot = (&iv).dot(&jv);
-            let sdot = dot * (ic * jc) as f32;
+            let num = ic * jc;
+            let sdot = if num >= 1 {
+                dot * (ic * jc) as f32
+            } else {
+                dot
+            };
             scaled[i].push(sdot.clone());
             scaled[j].push(sdot);
         }
@@ -270,12 +268,22 @@ pub fn attention_mean<'a>(
 
     // Compute softmax
     let d_k = Constant::scalar((scaled[0][0].value().len() as f32).sqrt());
-    let exps: Vec<_> = scaled.into_iter()
-        .map(|dots| (dots.sum_all() / &d_k).exp())
+
+    let mut numers: Vec<_> = scaled.into_iter()
+        .map(|dots| dots.sum_all() / &d_k)
         .collect();
 
-    let denom = exps.clone().sum_all();
-    let softmax = exps.into_iter().map(|v| v / &denom);
+    let max_value = numers.iter().map(|v| v.value()[0])
+        .max_by_key(|v| FloatOrd(*v))
+        .expect("Shouldn't be non-zero!");
+
+    let mv = Constant::scalar(max_value);
+    numers.iter_mut().for_each(|v| {
+        *v = ((&*v) - &mv).exp()
+    });
+
+    let denom = numers.clone().sum_all();
+    let softmax = numers.into_iter().map(|v| v / &denom);
     items.into_iter().zip(softmax)
         .map(|((feat, _c), attention)| feat * attention)
         .collect::<Vec<_>>().sum_all()
@@ -292,6 +300,7 @@ pub fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     feature_embeddings: &EmbeddingStore,
     max_nodes: Option<usize>,
     max_features: Option<usize>,
+    attention: bool, 
     rng: &mut R
 ) -> (NodeCounts, ANode) {
     let edges = &graph.get_edges(node).0;
@@ -301,14 +310,16 @@ pub fn reconstruct_node_embedding<G: CGraph, R: Rng>(
             feature_store,
             feature_embeddings,
             max_features,
-            rng)
+            rng,
+            attention)
     } else {
         let it = edges.choose_multiple(rng, max_nodes.unwrap()).cloned();
         construct_from_multiple_nodes(it,
             feature_store,
             feature_embeddings,
             max_features,
-            rng)
+            rng,
+            attention)
     }
 }
 
@@ -317,17 +328,40 @@ pub fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     max_features: Option<usize>,
-    rng: &mut R
+    rng: &mut R,
+    attention: bool
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
+    let mut new_nodes = Vec::with_capacity(0);
     for node in nodes {
+        if attention {
+            new_nodes.push(node.clone());
+        }
+
         collect_embeddings_from_node(node, feature_store, 
                                      feature_embeddings, 
                                      &mut feature_map,
                                      max_features,
                                      rng);
     }
-    let mean = mean_embeddings(feature_map.values());
+
+    let mean = if !attention {
+        mean_embeddings(feature_map.values())
+    } else {
+        let mut feats_per_node = HashMap::new();
+        let mut output = Vec::new();
+        for node in new_nodes {
+            feats_per_node.clear();
+            for feat in feature_store.get_features(node).iter() {
+                if let Some((node, _)) = feature_map.get(feat) {
+                    let e = feats_per_node.entry(feat).or_insert_with(|| (node.clone(), 0usize));
+                    e.1 += 1;
+                }
+            }
+            output.push((attention_mean(feats_per_node.values()), 1))
+        }
+        mean_embeddings(output.iter())
+    };
     (feature_map, mean)
 }
 
