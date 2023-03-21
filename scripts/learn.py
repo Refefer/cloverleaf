@@ -79,9 +79,9 @@ def build_arg_parser():
 
     parser.add_argument("--attention",
         dest="attention",
-        action="store_true",
-        default=False,
-        help="If provided, uses self attention.")
+        type=int,
+        default=None,
+        help="If provided, uses self attention with D dims.")
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--embedding-propagation",
@@ -168,8 +168,8 @@ def main(args):
 
     print("Constructing nodes...")
     embedder = cloverleaf.FeatureEmbeddingAggregator(features)
-    if args.attention:
-        aggregate = cloverleaf.FeatureAggregator.Attention()
+    if args.attention is not None:
+        aggregate = cloverleaf.FeatureAggregator.Attention(args.attention)
     elif args.alpha is not None:
         aggregate = cloverleaf.FeatureAggregator.Weighted(args.alpha)
     else:
