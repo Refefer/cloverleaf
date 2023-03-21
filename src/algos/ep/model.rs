@@ -201,7 +201,7 @@ pub fn collect_embeddings_from_node<R: Rng>(
 // H(n)
 // Average the features associated with a node
 // to create the node embedding
-pub fn construct_node_embedding<R: Rng>(
+fn construct_node_embedding<R: Rng>(
     node: NodeID,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
@@ -245,16 +245,19 @@ pub fn attention_mean<'a>(
 ) -> ANode {
     let items: Vec<_> = it.collect();
     if items.len() == 1 {
-        return items[0].0.clone()
+        return get_value_vec(&items[0].0)
     }
+    let attention_vec = items.iter().map(|it| get_attention_vec(&it.0)).collect::<Vec<_>>();
     
     // Get the attention for each feature
     let mut scaled = vec![Vec::with_capacity(items.len()); items.len()];
     for i in 0..items.len() {
         for j in (i+1)..items.len() {
-            let (iv, ic) = items[i];
-            let (jv, jc) = items[j];
-            let dot = (&iv).dot(&jv);
+            let (_iv, ic) = items[i];
+            let iva = &attention_vec[i];
+            let (_jv, jc) = items[j];
+            let jva = &attention_vec[j];
+            let dot = (&iva).dot(&jva);
             let num = ic * jc;
             let sdot = if num >= 1 {
                 dot * (ic * jc) as f32
@@ -285,7 +288,7 @@ pub fn attention_mean<'a>(
     let denom = numers.clone().sum_all();
     let softmax = numers.into_iter().map(|v| v / &denom);
     items.into_iter().zip(softmax)
-        .map(|((feat, _c), attention)| feat * attention)
+        .map(|((feat, _c), attention)| get_value_vec(feat) * attention)
         .collect::<Vec<_>>().sum_all()
 }
 
@@ -293,7 +296,7 @@ pub fn attention_mean<'a>(
 // The Expensive function.  We grab a nodes neighbors
 // and use the average of their features to construct
 // an estimate of H(n)
-pub fn reconstruct_node_embedding<G: CGraph, R: Rng>(
+fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     graph: &G,
     node: NodeID,
     feature_store: &FeatureStore,
@@ -323,7 +326,7 @@ pub fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     }
 }
 
-pub fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
+fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
     nodes: I,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
@@ -348,21 +351,41 @@ pub fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
     let mean = if !attention {
         mean_embeddings(feature_map.values())
     } else {
-        let mut feats_per_node = HashMap::new();
-        let mut output = Vec::new();
-        for node in new_nodes {
-            feats_per_node.clear();
-            for feat in feature_store.get_features(node).iter() {
-                if let Some((node, _)) = feature_map.get(feat) {
-                    let e = feats_per_node.entry(feat).or_insert_with(|| (node.clone(), 0usize));
-                    e.1 += 1;
-                }
-            }
-            output.push((attention_mean(feats_per_node.values()), 1))
-        }
-        mean_embeddings(output.iter())
+        attention_multiple(new_nodes, feature_store, &feature_map)
     };
     (feature_map, mean)
+}
+
+fn get_value_vec(emb: &ANode) -> ANode {
+    let v = emb.value().len();
+    let mask_len = (v as f32 / 2f32) as usize;
+    emb.slice(mask_len, v - mask_len)
+}
+
+fn get_attention_vec(emb: &ANode) -> ANode {
+    let v = emb.value().len();
+    let mask_len = (v as f32 / 2f32) as usize;
+    emb.slice(0, mask_len)
+}
+
+fn attention_multiple(
+    new_nodes: Vec<NodeID>,
+    feature_store: &FeatureStore,
+    feature_map: &NodeCounts
+) -> ANode {
+    let mut feats_per_node = HashMap::new();
+    let mut output = Vec::new();
+    for node in new_nodes {
+        feats_per_node.clear();
+        for feat in feature_store.get_features(node).iter() {
+            if let Some((node, _)) = feature_map.get(feat) {
+                let e = feats_per_node.entry(feat).or_insert_with(|| (node.clone(), 0usize));
+                e.1 += 1;
+            }
+        }
+        output.push((attention_mean(feats_per_node.values()), 1))
+    }
+    mean_embeddings(output.iter())
 }
 
 pub fn mean_embeddings<'a,I: Iterator<Item=&'a (ANode, usize)>>(items: I) -> ANode {
