@@ -448,7 +448,7 @@ impl EmbeddingPropagator {
         max_nodes: Option<usize>,
         max_features: Option<usize>,
         indicator: Option<bool>,
-        attention: Option<bool>
+        attention: Option<usize>
     ) -> Self {
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(0.9),
@@ -460,8 +460,8 @@ impl EmbeddingPropagator {
             indicator: indicator.unwrap_or(true)
         };
 
-        let model = if let Some(true) = attention {
-            ModelType::Attention(AttentionFeatureModel::new(max_features, max_nodes))
+        let model = if let Some(dims) = attention {
+            ModelType::Attention(AttentionFeatureModel::new(dims, max_features, max_nodes))
         } else {
             ModelType::Averaged(AveragedFeatureModel::new(max_features, max_nodes))
         };
@@ -617,7 +617,7 @@ impl FeaturePropagator {
 enum AggregatorType {
     Averaged,
     Weighted(f32),
-    Attention
+    Attention(usize)
 }
 
 #[pyclass]
@@ -634,8 +634,8 @@ impl FeatureAggregator {
     }
 
     #[staticmethod]
-    pub fn Attention() -> Self {
-        FeatureAggregator { at: AggregatorType::Attention }
+    pub fn Attention(dims: usize) -> Self {
+        FeatureAggregator { at: AggregatorType::Attention(dims) }
     }
 
     #[staticmethod]
@@ -665,10 +665,20 @@ impl FeatureEmbeddingAggregator {
             AggregatorType::Averaged => {
                 Box::new(AvgAggregator::new(es))
             },
-            AggregatorType::Attention => {
-                Box::new(AttentionAggregator::new(es))
+            AggregatorType::Attention(dims) => {
+                Box::new(AttentionAggregator::new(es, *dims))
             }
 
+        }
+    }
+
+    fn get_attention_size(
+        &self, 
+        agg_type: &AggregatorType
+    ) -> usize {
+        match agg_type {
+            AggregatorType::Attention(dims) => *dims,
+            _ => 0
         }
     }
 
@@ -694,7 +704,10 @@ impl FeatureEmbeddingAggregator {
     ) -> NodeEmbeddings {
 
         let num_nodes = graph.nodes();
-        let es = EmbeddingStore::new(num_nodes, feature_embeddings.dims(), EDist::Cosine);
+        let dims = feature_embeddings.dims() 
+            - self.get_attention_size(&feature_aggregator.at);
+
+        let es = EmbeddingStore::new(num_nodes, dims, EDist::Cosine);
         let agg = self.get_aggregator(&feature_embeddings.embeddings, &feature_aggregator.at);
         (0..num_nodes).into_par_iter().for_each(|node| {
             // Safe to access in parallel

@@ -82,7 +82,7 @@ impl Model for AveragedFeatureModel {
             feature_embeddings,
             self.max_neighbor_nodes,
             self.max_features,
-            false,
+            0,
             rng)
     }
 
@@ -97,7 +97,7 @@ impl Model for AveragedFeatureModel {
             nodes, feature_store, 
             feature_embeddings, 
             self.max_features,
-            rng, false)
+            0, rng)
     }
 
     fn parameters(&self) -> Vec<ANode> {
@@ -107,16 +107,18 @@ impl Model for AveragedFeatureModel {
 }
 
 pub struct AttentionFeatureModel {
+    dims: usize,
     max_features: Option<usize>,
     max_neighbor_nodes: Option<usize>
 }
 
 impl AttentionFeatureModel {
     pub fn new(
+        dims: usize,
         max_features: Option<usize>,
         max_neighbor_nodes: Option<usize>
     ) -> Self {
-        AttentionFeatureModel { max_features, max_neighbor_nodes }
+        AttentionFeatureModel { dims, max_features, max_neighbor_nodes }
     }
 }
 
@@ -133,6 +135,7 @@ impl Model for AttentionFeatureModel {
             feature_store,
             feature_embeddings,
             self.max_features,
+            self.dims,
             rng)
     }
 
@@ -151,7 +154,7 @@ impl Model for AttentionFeatureModel {
             feature_embeddings,
             self.max_neighbor_nodes,
             self.max_features,
-            true,
+            self.dims,
             rng)
     }
 
@@ -166,7 +169,7 @@ impl Model for AttentionFeatureModel {
             nodes, feature_store, 
             feature_embeddings, 
             self.max_features,
-            rng, true)
+            self.dims, rng)
     }
 
     fn parameters(&self) -> Vec<ANode> {
@@ -227,6 +230,7 @@ pub fn attention_construct_node_embedding<R: Rng>(
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     max_features: Option<usize>,
+    attention_dims: usize,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
@@ -236,18 +240,21 @@ pub fn attention_construct_node_embedding<R: Rng>(
                                  max_features,
                                  rng);
 
-    let mean = attention_mean(feature_map.values());
+    let mean = attention_mean(feature_map.values(), attention_dims);
     (feature_map, mean)
 }
 
 pub fn attention_mean<'a>(
-    it: impl Iterator<Item=&'a (ANode, usize)>
+    it: impl Iterator<Item=&'a (ANode, usize)>,
+    attention_dims: usize
 ) -> ANode {
     let items: Vec<_> = it.collect();
     if items.len() == 1 {
-        return get_value_vec(&items[0].0)
+        return get_value_vec(&items[0].0, attention_dims)
     }
-    let attention_vec = items.iter().map(|it| get_attention_vec(&it.0)).collect::<Vec<_>>();
+    let attention_vec = items.iter()
+        .map(|it| get_attention_vec(&it.0, attention_dims))
+        .collect::<Vec<_>>();
     
     // Get the attention for each feature
     let mut scaled = vec![Vec::with_capacity(items.len()); items.len()];
@@ -288,7 +295,7 @@ pub fn attention_mean<'a>(
     let denom = numers.clone().sum_all();
     let softmax = numers.into_iter().map(|v| v / &denom);
     items.into_iter().zip(softmax)
-        .map(|((feat, _c), attention)| get_value_vec(feat) * attention)
+        .map(|((feat, _c), attention)| get_value_vec(feat, attention_dims) * attention)
         .collect::<Vec<_>>().sum_all()
 }
 
@@ -303,7 +310,7 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     feature_embeddings: &EmbeddingStore,
     max_nodes: Option<usize>,
     max_features: Option<usize>,
-    attention: bool, 
+    attention_dims: usize, 
     rng: &mut R
 ) -> (NodeCounts, ANode) {
     let edges = &graph.get_edges(node).0;
@@ -313,16 +320,16 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
             feature_store,
             feature_embeddings,
             max_features,
-            rng,
-            attention)
+            attention_dims,
+            rng)
     } else {
         let it = edges.choose_multiple(rng, max_nodes.unwrap()).cloned();
         construct_from_multiple_nodes(it,
             feature_store,
             feature_embeddings,
             max_features,
-            rng,
-            attention)
+            attention_dims,
+            rng)
     }
 }
 
@@ -331,13 +338,13 @@ fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     max_features: Option<usize>,
+    attention_dims:usize,
     rng: &mut R,
-    attention: bool
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
     let mut new_nodes = Vec::with_capacity(0);
     for node in nodes {
-        if attention {
+        if attention_dims > 0 {
             new_nodes.push(node.clone());
         }
 
@@ -348,30 +355,28 @@ fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
                                      rng);
     }
 
-    let mean = if !attention {
+    let mean = if attention_dims == 0 {
         mean_embeddings(feature_map.values())
     } else {
-        attention_multiple(new_nodes, feature_store, &feature_map)
+        attention_multiple(new_nodes, feature_store, &feature_map, attention_dims)
     };
     (feature_map, mean)
 }
 
-fn get_value_vec(emb: &ANode) -> ANode {
+fn get_value_vec(emb: &ANode, dims: usize) -> ANode {
     let v = emb.value().len();
-    let mask_len = (v as f32 / 2f32) as usize;
-    emb.slice(mask_len, v - mask_len)
+    emb.slice(dims, v - dims)
 }
 
-fn get_attention_vec(emb: &ANode) -> ANode {
-    let v = emb.value().len();
-    let mask_len = (v as f32 / 2f32) as usize;
-    emb.slice(0, mask_len)
+fn get_attention_vec(emb: &ANode, dims: usize) -> ANode {
+    emb.slice(0, dims)
 }
 
 fn attention_multiple(
     new_nodes: Vec<NodeID>,
     feature_store: &FeatureStore,
-    feature_map: &NodeCounts
+    feature_map: &NodeCounts,
+    attention_dims: usize
 ) -> ANode {
     let mut feats_per_node = HashMap::new();
     let mut output = Vec::new();
@@ -383,7 +388,7 @@ fn attention_multiple(
                 e.1 += 1;
             }
         }
-        output.push((attention_mean(feats_per_node.values()), 1))
+        output.push((attention_mean(feats_per_node.values(), attention_dims), 1))
     }
     mean_embeddings(output.iter())
 }
