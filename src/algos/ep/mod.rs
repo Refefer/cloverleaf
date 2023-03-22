@@ -77,13 +77,14 @@ impl EmbeddingPropagation {
         // Enable/disable shared memory pool
         use_shared_pool(true);
 
-        let mut lr_tracker = LearningRateTracker::new(5);
-        let mut alpha = self.alpha;
+        let mut lr_scheduler = AttentionLRScheduler::new(self.alpha / 100f32, self.alpha, 5);
+        let mut alpha = lr_scheduler.update(std::f32::INFINITY, 0);
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
+        let mut last_error = std::f32::INFINITY;
         for pass in 0..self.passes {
             pb.update_message(|msg| {
                 msg.clear();
-                write!(msg, "Pass {}/{}, Error: {:.5}, alpha: {:.5}", pass + 1, self.passes, lr_tracker.last(), alpha)
+                write!(msg, "Pass {}/{}, Error: {:.5}, alpha: {:.5}", pass + 1, self.passes, last_error, alpha)
                     .expect("Error writing out indicator message!");
             });
 
@@ -137,12 +138,8 @@ impl EmbeddingPropagation {
             }).collect();
 
             let error = err.iter().sum::<f32>() / err.len() as f32;
-            lr_tracker.update(error, pass);
-            // Decay alpha when we plateau
-            if lr_tracker.stagnated(pass) {
-                alpha /= 3.;
-                lr_tracker.reset(error, pass);
-            }
+            alpha = lr_scheduler.update(error, pass);
+            last_error = error;
         }
         pb.finish();
         feature_embeddings
@@ -266,6 +263,59 @@ impl LearningRateTracker {
 
     fn last(&self) -> f32 {
         self.last
+    }
+}
+
+trait LRScheduler {
+    fn update(&mut self, cur_error: f32, cur_pass: usize) -> f32;
+}
+
+struct LinearDecay {
+    tracker: LearningRateTracker,
+    alpha: f32,
+    decay: f32
+}
+
+impl LinearDecay {
+    fn new(alpha: f32, decay: f32, stagnation_epochs: usize) -> Self {
+        LinearDecay {
+            tracker: LearningRateTracker::new(stagnation_epochs),
+            alpha: alpha,
+            decay: decay
+        }
+    }
+}
+
+impl LRScheduler for LinearDecay {
+    fn update(&mut self, cur_error: f32, cur_pass: usize) -> f32 {
+        self.tracker.update(cur_error, cur_pass);
+        if self.tracker.stagnated(cur_pass) {
+            self.alpha = self.alpha * self.decay;
+            self.tracker.reset(cur_error, cur_pass);
+        }
+        self.alpha
+    }
+}
+
+struct AttentionLRScheduler {
+    init_alpha: f32,
+    alpha: f32,
+    warmup: usize
+}
+
+impl AttentionLRScheduler {
+    fn new(init_alpha: f32, alpha: f32, warmup: usize) -> Self {
+        AttentionLRScheduler { init_alpha, alpha, warmup }
+    }
+}
+
+impl LRScheduler for AttentionLRScheduler {
+    fn update(&mut self, _cur_error: f32, cur_pass: usize) -> f32 {
+        if cur_pass < self.warmup {
+            self.init_alpha
+        } else {
+            self.alpha / (1f32 + (cur_pass - self.warmup) as f32).sqrt()
+        }
     }
 }
 
