@@ -263,19 +263,16 @@ pub fn attention_mean<'a>(
     // Get the attention for each feature
     let mut scaled = vec![Vec::with_capacity(items.len()); items.len()];
     for i in 0..items.len() {
-        for j in (i+1)..items.len() {
+        for j in 0..items.len() {
             let (_, ic, qvi, kvi) = &items[i];
             let (_, jc, qvj, kvj) = &items[j];
             let mut dot_i_j = (&qvi).dot(&kvj);
-            let mut dot_j_i = (&qvj).dot(&kvi);
             let num = **ic * **jc;
             if num >= 1 {
                 let scale = Constant::scalar(num as f32);
                 dot_i_j = dot_i_j * &scale;
-                dot_j_i = dot_j_i * scale;
             }
             scaled[i].push(dot_i_j);
-            scaled[j].push(dot_j_i);
         }
     }
 
