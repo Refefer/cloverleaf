@@ -280,7 +280,7 @@ pub fn attention_mean<'a>(
     }
 
     // Compute softmax
-    let d_k = Constant::scalar((scaled[0][0].value().len() as f32).sqrt());
+    let d_k = Constant::scalar((items[0].2.value().len() as f32).sqrt());
 
     let mut numers: Vec<_> = scaled.into_iter()
         .map(|dots| dots.sum_all() / &d_k)
