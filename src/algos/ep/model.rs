@@ -248,31 +248,34 @@ pub fn attention_mean<'a>(
     it: impl Iterator<Item=&'a (ANode, usize)>,
     attention_dims: usize
 ) -> ANode {
-    let items: Vec<_> = it.collect();
+
+    let items: Vec<_> = it.map(|(node, count)| {
+        let query = get_query_vec(&node, attention_dims);
+        let key = get_key_vec(&node, attention_dims);
+        let value = get_value_vec(&node, attention_dims);
+        (value, count, query, key)
+    }).collect();
+
     if items.len() == 1 {
         return get_value_vec(&items[0].0, attention_dims)
     }
-    let attention_vec = items.iter()
-        .map(|it| get_attention_vec(&it.0, attention_dims))
-        .collect::<Vec<_>>();
     
     // Get the attention for each feature
     let mut scaled = vec![Vec::with_capacity(items.len()); items.len()];
     for i in 0..items.len() {
         for j in (i+1)..items.len() {
-            let (_iv, ic) = items[i];
-            let iva = &attention_vec[i];
-            let (_jv, jc) = items[j];
-            let jva = &attention_vec[j];
-            let dot = (&iva).dot(&jva);
-            let num = ic * jc;
-            let sdot = if num >= 1 {
-                dot * (ic * jc) as f32
-            } else {
-                dot
-            };
-            scaled[i].push(sdot.clone());
-            scaled[j].push(sdot);
+            let (_, ic, qvi, kvi) = &items[i];
+            let (_, jc, qvj, kvj) = &items[j];
+            let mut dot_i_j = (&qvi).dot(&kvj);
+            let mut dot_j_i = (&qvj).dot(&kvi);
+            let num = **ic * **jc;
+            if num >= 1 {
+                let scale = Constant::scalar(num as f32);
+                dot_i_j = dot_i_j * &scale;
+                dot_j_i = dot_j_i * scale;
+            }
+            scaled[i].push(dot_i_j);
+            scaled[j].push(dot_j_i);
         }
     }
 
@@ -295,9 +298,9 @@ pub fn attention_mean<'a>(
     let denom = numers.clone().sum_all();
     let softmax = numers.into_iter().map(|v| v / &denom);
     items.into_iter().zip(softmax)
-        .map(|((feat, _c), attention)| get_value_vec(feat, attention_dims) * attention)
+        .map(|((value, _c, _ , _), attention)| value * attention)
         .collect::<Vec<_>>().sum_all()
-}
+ }
 
 // ~H(n)
 // The Expensive function.  We grab a nodes neighbors
@@ -365,11 +368,15 @@ fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
 
 fn get_value_vec(emb: &ANode, dims: usize) -> ANode {
     let v = emb.value().len();
-    emb.slice(dims, v - dims)
+    emb.slice(2*dims, v - 2*dims)
 }
 
-fn get_attention_vec(emb: &ANode, dims: usize) -> ANode {
+fn get_query_vec(emb: &ANode, dims: usize) -> ANode {
     emb.slice(0, dims)
+}
+
+fn get_key_vec(emb: &ANode, dims: usize) -> ANode {
+    emb.slice(dims, dims)
 }
 
 fn attention_multiple(
