@@ -257,7 +257,7 @@ pub fn attention_mean<'a>(
     }).collect();
 
     if items.len() == 1 {
-        return get_value_vec(&items[0].0, attention_dims)
+        return items[0].0.clone()
     }
     
     // Get the attention for each feature
