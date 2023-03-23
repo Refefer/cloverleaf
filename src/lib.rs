@@ -677,11 +677,18 @@ impl FeatureEmbeddingAggregator {
         agg_type: &AggregatorType
     ) -> usize {
         match agg_type {
-            AggregatorType::Attention(dims) => *dims,
+            AggregatorType::Attention(dims) => 2 * *dims,
             _ => 0
         }
     }
 
+    fn get_dims(
+        &self, 
+        feat_embs: &NodeEmbeddings,
+        feat_agg: &FeatureAggregator
+    ) -> usize {
+        feat_embs.dims() - self.get_attention_size(&feat_agg.at)
+    }
 }
 
 #[pymethods]
@@ -704,8 +711,7 @@ impl FeatureEmbeddingAggregator {
     ) -> NodeEmbeddings {
 
         let num_nodes = graph.nodes();
-        let dims = feature_embeddings.dims() 
-            - self.get_attention_size(&feature_aggregator.at);
+        let dims = self.get_dims(feature_embeddings, feature_aggregator);
 
         let es = EmbeddingStore::new(num_nodes, dims, EDist::Cosine);
         let agg = self.get_aggregator(&feature_embeddings.embeddings, &feature_aggregator.at);
@@ -738,7 +744,8 @@ impl FeatureEmbeddingAggregator {
             }
         }
 
-        let mut embedding = vec![0.; feature_embeddings.embeddings.dims()];
+        let dims = self.get_dims(feature_embeddings, feature_aggregator);
+        let mut embedding = vec![0.; dims];
         let agg = self.get_aggregator(&feature_embeddings.embeddings, &feature_aggregator.at);
         agg.construct(&ids, &mut embedding);
         Ok(embedding)

@@ -311,7 +311,7 @@ impl AttentionLRScheduler {
 
 impl LRScheduler for AttentionLRScheduler {
     fn update(&mut self, _cur_error: f32, cur_pass: usize) -> f32 {
-        if cur_pass < self.warmup {
+        if cur_pass <= self.warmup {
             self.init_alpha
         } else {
             self.alpha / (1f32 + (cur_pass - self.warmup) as f32).sqrt()

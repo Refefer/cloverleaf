@@ -279,26 +279,29 @@ pub fn attention_mean<'a>(
     // Compute softmax
     let d_k = Constant::scalar((items[0].2.value().len() as f32).sqrt());
 
-    let mut numers: Vec<_> = scaled.into_iter()
-        .map(|dots| dots.sum_all() / &d_k)
-        .collect();
+    // Compute softmax for each feature
+    let mut att = Vec::with_capacity(items.len());
+    for row in scaled.into_iter() {
+        let row = row.concat() / &d_k;
+        let sm = softmax(row);
+        att.push(sm);
+    }
 
-    let max_value = numers.iter().map(|v| v.value()[0])
-        .max_by_key(|v| FloatOrd(*v))
-        .expect("Shouldn't be non-zero!");
-
-    let mv = Constant::scalar(max_value);
-    numers.iter_mut().for_each(|v| {
-        *v = ((&*v) - &mv).exp()
-    });
-
-    let denom = numers.clone().sum_all();
-    let softmax = numers.into_iter().map(|v| v / &denom);
+    let summed_weights = att.sum_all();
     let n = items.len() as f32;
-    items.into_iter().zip(softmax)
-        .map(|((value, _c, _ , _), attention)| value * attention)
+    items.into_iter().enumerate()
+        .map(|(i, (value, _c, _ , _))| value * summed_weights.slice(i, 1))
         .collect::<Vec<_>>().sum_all() / n
  }
+
+fn softmax(numers: ANode) -> ANode {
+    let max_value = numers.value().iter()
+        .max_by_key(|v| FloatOrd(**v))
+        .expect("Shouldn't be non-zero!");
+    let mv = Constant::scalar(*max_value);
+    let n = (numers - &mv).exp();
+    &n / n.sum()
+}
 
 // ~H(n)
 // The Expensive function.  We grab a nodes neighbors
