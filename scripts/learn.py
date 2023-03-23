@@ -167,16 +167,16 @@ def main(args):
     feature_embeddings.save(args.output + '.feature-embeddings')
 
     print("Constructing nodes...")
-    embedder = cloverleaf.FeatureEmbeddingAggregator(features)
     if args.attention is not None:
-        aggregate = cloverleaf.FeatureAggregator.Attention(args.attention)
+        aggregator = cloverleaf.FeatureAggregator.Attention(args.attention)
     elif args.alpha is not None:
-        aggregate = cloverleaf.FeatureAggregator.Weighted(args.alpha)
+        aggregator = cloverleaf.FeatureAggregator.Weighted(args.alpha, features)
     else:
-        aggregate = cloverleaf.FeatureAggregator.Averaged()
+        aggregator = cloverleaf.FeatureAggregator.Averaged()
 
-    node_embeddings = embedder.embed_graph(graph, features, feature_embeddings, aggregate)
-    embedder.save(args.output + '.embedder')
+    aggregate.save(args.output + '.embedder')
+    embedder = cloverleaf.NodeEmbedder(aggregator)
+    node_embeddings = embedder.embed_graph(graph, features, feature_embeddings)
     node_embeddings.save(args.output + '.node-embeddings')
 
 if __name__ == '__main__':

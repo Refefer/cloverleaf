@@ -25,7 +25,7 @@ def construct_adhoc_embedding(query, embeddings, aggregator, alpha=None):
     for token in build_grams(query):
         tokens.append(('feat', token))
 
-    e = aggregator.embed_adhoc(tokens, embeddings, alpha=alpha, strict=False)
+    e = aggregator.embed_adhoc(tokens, embeddings, strict=False)
     if sum(e) == 0:
         return None
 
@@ -61,9 +61,9 @@ def load(args):
     print("Loading Feature Embeddings...")
     fe_embeddings = cloverleaf.NodeEmbeddings.load(fe_fname, cloverleaf.Distance.Cosine)
     print("Loading aggregator")
-    aggregator = cloverleaf.FeatureEmbeddingAggregator.load(agg_fname)
+    aggregator = cloverleaf.FeatureAggregator.load(agg_fname)
     
-    return ne_embeddings, fe_embeddings, aggregator
+    return ne_embeddings, fe_embeddings, cloverleaf.NodeEmbedder(aggregator)
 
 def main(args):
     ne_embeddings, fe_embeddings, aggregator = load(args)
@@ -74,9 +74,9 @@ def main(args):
         try:
             if query.startswith('*'):
                 tokens = [('feat', t) for t in query[1:].strip().split()]
-                emb = aggregator.embed_adhoc(tokens, fe_embeddings, alpha=args.alpha, strict=True)
+                emb = aggregator.embed_adhoc(tokens, fe_embeddings, strict=True)
             elif '\t' not in query:
-                emb = construct_adhoc_embedding(query, fe_embeddings, aggregator, alpha=args.alpha)
+                emb = construct_adhoc_embedding(query, fe_embeddings, aggregator)
                 if emb is None:
                     print("Tokens not found in feature embeddings!")
                     continue
@@ -91,10 +91,14 @@ def main(args):
             top_k = ne_embeddings.nearest_neighbor(emb, args.k)
 
             rows = []
+            listings = []
             for (node_type, node), score in reversed(top_k):
                 rows.append((node_type, node, score))
+                if node_type == 'listing':
+                    listings.append(node)
 
             print(tabulate.tabulate(rows, headers=headers))
+            print(','.join(reversed(listings)))
 
         except Exception as e:
             print('Unable to run!')

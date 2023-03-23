@@ -614,13 +614,21 @@ impl FeaturePropagator {
 
 }
 
+#[derive(Clone)]
 enum AggregatorType {
     Averaged,
-    Weighted(f32),
-    Attention(usize)
+    Weighted {
+        alpha: f32, 
+        vocab: Arc<Vocab>,
+        unigrams: Arc<UnigramProbability>
+    },
+    Attention {
+        dims: usize
+    }
 }
 
 #[pyclass]
+#[derive(Clone)]
 pub struct FeatureAggregator {
     at: AggregatorType
 }
@@ -635,71 +643,154 @@ impl FeatureAggregator {
 
     #[staticmethod]
     pub fn Attention(dims: usize) -> Self {
-        FeatureAggregator { at: AggregatorType::Attention(dims) }
+        FeatureAggregator { at: AggregatorType::Attention {dims} }
     }
 
     #[staticmethod]
-    pub fn Weighted(alpha: f32) -> Self {
-        FeatureAggregator { at: AggregatorType::Weighted(alpha) }
+    pub fn Weighted(alpha: f32, fs: &FeatureSet) -> Self {
+        let unigrams = Arc::new(UnigramProbability::new(&fs.features));
+        let vocab = fs.vocab.clone();
+        FeatureAggregator { at: AggregatorType::Weighted {alpha, vocab, unigrams} }
     }
+
+    pub fn save(&self, path: &str) -> PyResult<()> {
+        let f = File::create(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let mut bw = BufWriter::new(f);
+        match &self.at {
+            AggregatorType::Averaged => {
+                writeln!(&mut bw, "Averaged")
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+            },
+            AggregatorType::Attention { dims } => {
+                writeln!(&mut bw, "Attention")
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                writeln!(&mut bw, "{}", dims)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+            },
+            AggregatorType::Weighted { alpha, vocab, unigrams } => {
+                writeln!(&mut bw, "Weighted")
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                writeln!(&mut bw, "{}", alpha)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                for (node, p_wi) in unigrams.iter().enumerate() {
+                    if let Some((f_node_type, f_name)) = vocab.get_name(node) {
+                        writeln!(&mut bw, "{}\t{}\t{}", f_node_type, f_name, *p_wi as f64)
+                            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                    } else {
+                        // We've moved to node individual embeddings
+                        break
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[staticmethod]
+    pub fn load(path: String) -> PyResult<Self> {
+        let f = File::open(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let mut br = BufReader::new(f);
+
+        // Find the type
+        let mut line = String::new();
+        br.read_line(&mut line)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        match line.trim_end() {
+            "Averaged" => Ok(FeatureAggregator::Averaged()),
+            "Attention" => {
+                line.clear();
+                br.read_line(&mut line)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                let dims = line.trim_end().parse::<usize>()
+                    .map_err(|_e| PyValueError::new_err(format!("invalid dim! {:?}", line)))?;
+
+                Ok(FeatureAggregator::Attention(dims))
+            },
+            "Weighted" => {
+                // get alpha
+                line.clear();
+                br.read_line(&mut line)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                let alpha = line.trim_end().parse::<f32>()
+                    .map_err(|_e| PyValueError::new_err(format!("invalid dim! {:?}", line)))?;
+
+                let mut vocab = Vocab::new();
+                let mut p_w = Vec::new();
+                for line in br.lines() {
+                    let line = line.unwrap();
+                    let pieces: Vec<_> = line.split('\t').collect();
+                    if pieces.len() != 3 {
+                        return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>weight ..."))
+                    }
+                    let p_wi = pieces[2].parse::<f64>()
+                        .map_err(|_e| PyValueError::new_err(format!("Tried to parse weight and failed:{:?}", line)))?;
+                    let node_id = vocab.get_or_insert(pieces[0].into(), pieces[1].into());
+                    if node_id < p_w.len() {
+                        return Err(PyValueError::new_err(format!("Duplicate feature found:{} {}", pieces[0], pieces[1])))
+                    }
+                    p_w.push(p_wi as f32);
+                }
+                let unigrams = Arc::new(UnigramProbability::from_vec(p_w));
+                let at = AggregatorType::Weighted { alpha, vocab:Arc::new(vocab), unigrams };
+                Ok(FeatureAggregator { at })
+
+            },
+            line => Err(PyValueError::new_err(format!("Unknown aggregator type: {}", line)))?
+        }
+
+    }
+
 
 }
 
 #[pyclass]
-pub struct FeatureEmbeddingAggregator {
-    vocab: Arc<Vocab>,
-    unigrams: UnigramProbability
+pub struct NodeEmbedder {
+    feat_agg: FeatureAggregator
 }
 
-impl FeatureEmbeddingAggregator {
+impl NodeEmbedder {
 
     fn get_aggregator<'a>(
         &'a self, 
         es: &'a EmbeddingStore, 
-        aggregator_type: &AggregatorType
+        aggregator_type: &'a AggregatorType
     ) -> Box<dyn EmbeddingBuilder + Send + Sync + 'a> {
         match aggregator_type {
-            AggregatorType::Weighted(alpha) => {
-                Box::new(WeightedAggregator::new(es, &self.unigrams, *alpha))
+            AggregatorType::Weighted {alpha, vocab, unigrams } => {
+                Box::new(WeightedAggregator::new(es, unigrams, *alpha))
             },
             AggregatorType::Averaged => {
                 Box::new(AvgAggregator::new(es))
             },
-            AggregatorType::Attention(dims) => {
+            AggregatorType::Attention {dims} => {
                 Box::new(AttentionAggregator::new(es, *dims))
             }
 
         }
     }
 
-    fn get_attention_size(
-        &self, 
-        agg_type: &AggregatorType
-    ) -> usize {
-        match agg_type {
-            AggregatorType::Attention(dims) => 2 * *dims,
+    fn get_attention_size(&self) -> usize {
+        match self.feat_agg.at {
+            AggregatorType::Attention { dims } => 2 * dims,
             _ => 0
         }
     }
 
-    fn get_dims(
-        &self, 
-        feat_embs: &NodeEmbeddings,
-        feat_agg: &FeatureAggregator
-    ) -> usize {
-        feat_embs.dims() - self.get_attention_size(&feat_agg.at)
+    fn get_dims(&self, feat_embs: &NodeEmbeddings) -> usize {
+        feat_embs.dims() - self.get_attention_size()
     }
 }
 
 #[pymethods]
-impl FeatureEmbeddingAggregator {
+impl NodeEmbedder {
     #[new]
-    pub fn new(fs: &FeatureSet) -> Self {
-        let up = UnigramProbability::new(&fs.features);
-        FeatureEmbeddingAggregator {
-            unigrams: up,
-            vocab: Arc::new(fs.features.clone_vocab())
-        }
+    pub fn new(feat_agg: FeatureAggregator) -> Self {
+        NodeEmbedder { feat_agg }
     }
 
     pub fn embed_graph(
@@ -707,14 +798,13 @@ impl FeatureEmbeddingAggregator {
         graph: &Graph,
         feat_set: &FeatureSet, 
         feature_embeddings: &NodeEmbeddings,
-        feature_aggregator: &FeatureAggregator
     ) -> NodeEmbeddings {
 
         let num_nodes = graph.nodes();
-        let dims = self.get_dims(feature_embeddings, feature_aggregator);
+        let dims = self.get_dims(feature_embeddings);
 
         let es = EmbeddingStore::new(num_nodes, dims, EDist::Cosine);
-        let agg = self.get_aggregator(&feature_embeddings.embeddings, &feature_aggregator.at);
+        let agg = self.get_aggregator(&feature_embeddings.embeddings, &self.feat_agg.at);
         (0..num_nodes).into_par_iter().for_each(|node| {
             // Safe to access in parallel
             let embedding = es.get_embedding_mut_hogwild(node);
@@ -731,7 +821,6 @@ impl FeatureEmbeddingAggregator {
         &self, 
         features: Vec<(String, String)>,
         feature_embeddings: &NodeEmbeddings,
-        feature_aggregator: &FeatureAggregator,
         strict: Option<bool>
     ) -> PyResult<Vec<f32>> {
         let v = feature_embeddings.vocab.deref();
@@ -744,59 +833,12 @@ impl FeatureEmbeddingAggregator {
             }
         }
 
-        let dims = self.get_dims(feature_embeddings, feature_aggregator);
+        let dims = self.get_dims(feature_embeddings);
         let mut embedding = vec![0.; dims];
-        let agg = self.get_aggregator(&feature_embeddings.embeddings, &feature_aggregator.at);
+        let agg = self.get_aggregator(&feature_embeddings.embeddings, &self.feat_agg.at);
         agg.construct(&ids, &mut embedding);
         Ok(embedding)
     }
-
-    pub fn save(&self, path: &str) -> PyResult<()> {
-        let f = File::create(path)
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-
-        let mut bw = BufWriter::new(f);
-        for (node, p_wi) in self.unigrams.iter().enumerate() {
-            if let Some((f_node_type, f_name)) = self.vocab.get_name(node) {
-                writeln!(&mut bw, "{}\t{}\t{}", f_node_type, f_name, *p_wi as f64)
-                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-            } else {
-                // We've moved to node individual embeddings
-                break
-            }
-        }
-        Ok(())
-    }
-
-    #[staticmethod]
-    pub fn load(path: String) -> PyResult<Self> {
-        let f = File::open(path)
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-
-        let br = BufReader::new(f);
-        let mut vocab = Vocab::new();
-        let mut p_w = Vec::new();
-        for line in br.lines() {
-            let line = line.unwrap();
-            let pieces: Vec<_> = line.split('\t').collect();
-            if pieces.len() != 3 {
-                return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>weight ..."))
-            }
-            let p_wi = pieces[2].parse::<f64>()
-                .map_err(|_e| PyValueError::new_err(format!("Tried to parse weight and failed:{:?}", line)))?;
-            let node_id = vocab.get_or_insert(pieces[0].into(), pieces[1].into());
-            if node_id < p_w.len() {
-                return Err(PyValueError::new_err(format!("Duplicate feature found:{} {}", pieces[0], pieces[1])))
-            }
-            p_w.push(p_wi as f32);
-        }
-
-        Ok(FeatureEmbeddingAggregator { 
-            vocab: Arc::new(vocab),
-            unigrams: UnigramProbability::from_vec(p_w) 
-        })
-    }
-
 
 }
 
@@ -1273,7 +1315,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Ann>()?;
     m.add_class::<FeatureSet>()?;
     m.add_class::<FeaturePropagator>()?;
-    m.add_class::<FeatureEmbeddingAggregator>()?;
+    m.add_class::<NodeEmbedder>()?;
     m.add_class::<FeatureAggregator>()?;
     m.add_class::<Query>()?;
     m.add_class::<RandomWalker>()?;
