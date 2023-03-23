@@ -294,9 +294,10 @@ pub fn attention_mean<'a>(
 
     let denom = numers.clone().sum_all();
     let softmax = numers.into_iter().map(|v| v / &denom);
+    let n = items.len() as f32;
     items.into_iter().zip(softmax)
         .map(|((value, _c, _ , _), attention)| value * attention)
-        .collect::<Vec<_>>().sum_all()
+        .collect::<Vec<_>>().sum_all() / n
  }
 
 // ~H(n)
