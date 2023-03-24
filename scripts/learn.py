@@ -174,10 +174,10 @@ def main(args):
     else:
         aggregator = cloverleaf.FeatureAggregator.Averaged()
 
-    aggregate.save(args.output + '.embedder')
     embedder = cloverleaf.NodeEmbedder(aggregator)
     node_embeddings = embedder.embed_graph(graph, features, feature_embeddings)
     node_embeddings.save(args.output + '.node-embeddings')
+    aggregator.save(args.output + '.embedder')
 
 if __name__ == '__main__':
     main(build_arg_parser().parse_args())

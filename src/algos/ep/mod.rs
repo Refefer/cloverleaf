@@ -81,7 +81,7 @@ impl EmbeddingPropagation {
         let mut alpha = lr_scheduler.update(std::f32::INFINITY, 0);
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
         let mut last_error = std::f32::INFINITY;
-        for pass in 0..self.passes {
+        for pass in 1..(self.passes + 1) {
             pb.update_message(|msg| {
                 msg.clear();
                 write!(msg, "Pass {}/{}, Error: {:.5}, alpha: {:.5}", pass + 1, self.passes, last_error, alpha)
