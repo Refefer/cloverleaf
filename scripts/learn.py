@@ -83,6 +83,12 @@ def build_arg_parser():
         default=None,
         help="If provided, uses self attention with D dims.")
 
+    parser.add_argument("--context-window",
+        dest="context_window",
+        type=int,
+        default=None,
+        help="If provided, uses self attention with local window size of CONTEXT_WINDOW * 2.")
+
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--embedding-propagation",
         dest="ep",
@@ -168,7 +174,7 @@ def main(args):
 
     print("Constructing nodes...")
     if args.attention is not None:
-        aggregator = cloverleaf.FeatureAggregator.Attention(args.attention)
+        aggregator = cloverleaf.FeatureAggregator.Attention(args.attention, args.context_window)
     elif args.alpha is not None:
         aggregator = cloverleaf.FeatureAggregator.Weighted(args.alpha, features)
     else:

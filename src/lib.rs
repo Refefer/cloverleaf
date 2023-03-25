@@ -1,10 +1,3 @@
-//#[cfg(not(target_env = "msvc"))]
-//use tikv_jemallocator::Jemalloc;
-//
-//#[cfg(not(target_env = "msvc"))]
-//#[global_allocator]
-//static GLOBAL: Jemalloc = Jemalloc;
-
 pub mod graph;
 pub mod algos;
 mod sampler;
@@ -461,7 +454,7 @@ impl EmbeddingPropagator {
         };
 
         let model = if let Some(dims) = attention {
-            ModelType::Attention(AttentionFeatureModel::new(dims, max_features, max_nodes))
+            ModelType::Attention(AttentionFeatureModel::new(dims, None, max_features, max_nodes))
         } else {
             ModelType::Averaged(AveragedFeatureModel::new(max_features, max_nodes))
         };
@@ -623,7 +616,8 @@ enum AggregatorType {
         unigrams: Arc<UnigramProbability>
     },
     Attention {
-        dims: usize
+        dims: usize,
+        window: Option<usize>
     }
 }
 
@@ -642,8 +636,8 @@ impl FeatureAggregator {
     }
 
     #[staticmethod]
-    pub fn Attention(dims: usize) -> Self {
-        FeatureAggregator { at: AggregatorType::Attention {dims} }
+    pub fn Attention(dims: usize, window: Option<usize>) -> Self {
+        FeatureAggregator { at: AggregatorType::Attention {dims, window} }
     }
 
     #[staticmethod]
@@ -663,10 +657,12 @@ impl FeatureAggregator {
                 writeln!(&mut bw, "Averaged")
                     .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
             },
-            AggregatorType::Attention { dims } => {
+            AggregatorType::Attention { dims, window } => {
                 writeln!(&mut bw, "Attention")
                     .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
                 writeln!(&mut bw, "{}", dims)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                writeln!(&mut bw, "{}", window.unwrap_or(0))
                     .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
             },
             AggregatorType::Weighted { alpha, vocab, unigrams } => {
@@ -708,8 +704,15 @@ impl FeatureAggregator {
                     .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
                 let dims = line.trim_end().parse::<usize>()
                     .map_err(|_e| PyValueError::new_err(format!("invalid dim! {:?}", line)))?;
+                let window = line.trim_end().parse::<usize>()
+                    .map_err(|_e| PyValueError::new_err(format!("invalid dim! {:?}", line)))?;
+                let window = if window == 0 {
+                    None
+                } else {
+                    Some(window)
+                };
 
-                Ok(FeatureAggregator::Attention(dims))
+                Ok(FeatureAggregator::Attention(dims, window))
             },
             "Weighted" => {
                 // get alpha
@@ -761,14 +764,14 @@ impl NodeEmbedder {
         aggregator_type: &'a AggregatorType
     ) -> Box<dyn EmbeddingBuilder + Send + Sync + 'a> {
         match aggregator_type {
-            AggregatorType::Weighted {alpha, vocab, unigrams } => {
+            AggregatorType::Weighted {alpha, vocab:_, unigrams } => {
                 Box::new(WeightedAggregator::new(es, unigrams, *alpha))
             },
             AggregatorType::Averaged => {
                 Box::new(AvgAggregator::new(es))
             },
-            AggregatorType::Attention {dims} => {
-                Box::new(AttentionAggregator::new(es, *dims))
+            AggregatorType::Attention {dims, window} => {
+                Box::new(AttentionAggregator::new(es, *dims, *window))
             }
 
         }
@@ -776,7 +779,7 @@ impl NodeEmbedder {
 
     fn get_attention_size(&self) -> usize {
         match self.feat_agg.at {
-            AggregatorType::Attention { dims } => 2 * dims,
+            AggregatorType::Attention { dims, window:_ } => 2 * dims,
             _ => 0
         }
     }

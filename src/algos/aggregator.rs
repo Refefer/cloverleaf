@@ -113,12 +113,13 @@ impl <'a> EmbeddingBuilder for WeightedAggregator<'a> {
 
 pub struct AttentionAggregator<'a> {
     embs: &'a EmbeddingStore,
-    dims: usize
+    dims: usize,
+    window: Option<usize>
 }
 
 impl <'a> AttentionAggregator<'a> {
-    pub fn new(embs: &'a EmbeddingStore, dims: usize) -> Self {
-        AttentionAggregator { embs, dims }
+    pub fn new(embs: &'a EmbeddingStore, dims: usize, window: Option<usize>) -> Self {
+        AttentionAggregator { embs, dims, window }
     }
 
 }
@@ -135,7 +136,7 @@ impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {
             (Constant::new(e.to_vec()), 1usize)
         }).collect::<Vec<_>>();
 
-        let v = attention_mean(it.iter(), self.dims);
+        let v = attention_mean(it.iter(), self.dims, self.window);
         v.value().iter().zip(out.iter_mut()).for_each(|(vi, outi)| {
             *outi = *vi;
         });
