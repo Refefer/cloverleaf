@@ -37,6 +37,9 @@ def get_attention(embs, feats, size):
 def cosine(e1, e2):
     return e1.dot(e2) / (e1.dot(e1) ** 0.5 * e2.dot(e2) ** 0.5)
 
+def format_row(row):
+    return [round(v, 3) for v in row]
+
 def main():
     embs = cloverleaf.NodeEmbeddings.load(sys.argv[1], cloverleaf.Distance.Cosine)
     size = int(sys.argv[2])
@@ -55,8 +58,10 @@ def main():
             terms = terms.split()
             terms, mat, embedding = get_attention(embs, terms, size)
             headers = terms
-            rows = [[term] + list(row) for term, row in zip(terms, mat)]
-            rows.append(['-'] + list(mat.sum(axis=0)))
+            rows = [[term] + format_row(row) for term, row in zip(terms, mat)]
+            rows.append(tabulate.SEPARATING_LINE)
+            summed = mat.sum(axis=0)
+            rows.append(['Softmax'] + format_row(summed / summed.sum()))
             print(tabulate.tabulate(rows, headers=headers))
             print(embedding)
         
