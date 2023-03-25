@@ -835,8 +835,10 @@ impl NodeEmbedder {
 
         let dims = self.get_dims(feature_embeddings);
         let mut embedding = vec![0.; dims];
-        let agg = self.get_aggregator(&feature_embeddings.embeddings, &self.feat_agg.at);
-        agg.construct(&ids, &mut embedding);
+        if ids.len() > 0 {
+            let agg = self.get_aggregator(&feature_embeddings.embeddings, &self.feat_agg.at);
+            agg.construct(&ids, &mut embedding);
+        }
         Ok(embedding)
     }
 
