@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use crate::embeddings::{EmbeddingStore,Distance};
 use std::collections::{HashMap as CHashMap};
 
@@ -79,12 +80,12 @@ impl Optimizer for AdamOptimizer {
         t: f32
     ) {
         let t = t + 1.;
-        for (feat_id, grad) in grads.into_iter() {
+        grads.into_par_iter().for_each(|(feat_id, grad)| {
 
             // Can get some nans in weird cases, such as the distance between
             // a node and it's reconstruction when it shares all features.
             // We just skip over those weird ones.
-            if grad.iter().all(|gi| !gi.is_nan()) {
+            if grad.par_iter().all(|gi| !gi.is_nan()) {
 
                 // Update first order mean
                 let mom = self.mom.get_embedding_mut_hogwild(feat_id);
@@ -108,7 +109,7 @@ impl Optimizer for AdamOptimizer {
                 });
 
             }
-        }
+        });
     }
 }
 

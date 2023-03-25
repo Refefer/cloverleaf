@@ -13,7 +13,7 @@ impl CLProgressBar {
         let pb = if enabled {
             let pb = ProgressBar::new(work as u64);
             let style = ProgressStyle::default_bar()
-                .template("[{msg}] {wide_bar} ({per_sec}) {pos:>7}/{len:7} {eta_precise}")
+                .template("[{msg}] {wide_bar} ({per_sec}) {pos:>7}/{len:7} - Elapsed: {elapsed_precise}, Remaining: {eta_precise}")
                 .expect("Shouldn't fail!");
 
             pb.set_style(style);
