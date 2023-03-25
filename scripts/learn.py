@@ -157,7 +157,8 @@ def main(args):
     ep = cloverleaf.EmbeddingPropagator(
         alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
         passes=args.passes, max_nodes=args.max_neighbors, 
-        max_features=args.max_features, attention=args.attention)
+        max_features=args.max_features, attention=args.attention,
+        context_window=args.context_window)
 
     if args.warm_start is not None:
         feature_embeddings = cloverleaf.NodeEmbeddings.load(args.warm_start, cloverleaf.Distance.Cosine)

@@ -272,7 +272,11 @@ pub fn attention_mean<'a>(
     let mut scaled = vec![vec![zero; items.len()]; items.len()];
     for i in 0..items.len() {
         let (j_start, j_end) = match window {
-            Some(size) => ((i - size).max(0), (i+size).min(items.len())),
+            Some(size) => {
+                let start = if size > i { 0 } else {i - size };
+                let stop = (i+size).min(items.len());
+                (start, stop)
+            },
             None => (0, items.len())
         };
         let (_, ic, qvi, _) = &items[i];

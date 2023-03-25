@@ -441,7 +441,8 @@ impl EmbeddingPropagator {
         max_nodes: Option<usize>,
         max_features: Option<usize>,
         indicator: Option<bool>,
-        attention: Option<usize>
+        attention: Option<usize>,
+        context_window: Option<usize>
     ) -> Self {
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(0.9),
@@ -454,7 +455,7 @@ impl EmbeddingPropagator {
         };
 
         let model = if let Some(dims) = attention {
-            ModelType::Attention(AttentionFeatureModel::new(dims, None, max_features, max_nodes))
+            ModelType::Attention(AttentionFeatureModel::new(dims, context_window, max_features, max_nodes))
         } else {
             ModelType::Averaged(AveragedFeatureModel::new(max_features, max_nodes))
         };
