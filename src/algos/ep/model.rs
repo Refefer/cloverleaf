@@ -246,7 +246,18 @@ pub fn attention_construct_node_embedding<R: Rng>(
                                  max_features,
                                  rng);
 
-    let mean = attention_mean(feature_map.values(), attention_dims, window);
+    let mean = if window.is_some() {
+        // Need to preserve order of features for context windows
+        let feats = feature_store.get_features(node);
+        let it = feats.iter()
+            .filter(|f| feature_map.contains_key(*f))
+            .map(|f| {
+                feature_map.get(f).expect("Some type of error!")
+            });
+        attention_mean(it, attention_dims, window)
+    } else {
+        attention_mean(feature_map.values(), attention_dims, window)
+    };
     (feature_map, mean)
 }
 
@@ -285,7 +296,7 @@ pub fn attention_mean<'a>(
             let (_, jc, _, kvj) = &items[j];
             let mut dot_i_j = (&qvi).dot(&kvj);
             let num = **ic * **jc;
-            if num >= 1 {
+            if num >= 1 && window.is_none() {
                 dot_i_j = dot_i_j * (num as f32);
             }
             row[j] = dot_i_j;
@@ -411,13 +422,20 @@ fn attention_multiple(
     let mut output = Vec::new();
     for node in new_nodes {
         feats_per_node.clear();
-        for feat in feature_store.get_features(node).iter() {
+        let feats = feature_store.get_features(node);
+        for feat in feats.iter() {
             if let Some((node, _)) = feature_map.get(feat) {
                 let e = feats_per_node.entry(feat).or_insert_with(|| (node.clone(), 0usize));
                 e.1 += 1;
             }
         }
-        output.push((attention_mean(feats_per_node.values(), attention_dims, window), 1))
+        let it = feats.iter()
+            .filter(|f| feats_per_node.contains_key(*f))
+            .map(|f| {
+                feats_per_node.get(f).expect("Some type of error!")
+            });
+
+        output.push((attention_mean(it, attention_dims, window), 1))
     }
     mean_embeddings(output.iter())
 }
