@@ -4,6 +4,7 @@ pub mod loss;
 pub mod model;
 
 use std::fmt::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 use hashbrown::HashMap;
@@ -72,19 +73,22 @@ impl EmbeddingPropagation {
 
         let random_sampler = node_sampler::RandomSamplerStrategy::new(graph);
 
-        let pb = CLProgressBar::new((self.passes * graph.len()) as u64, self.indicator);
+        let steps_per_pass = (graph.len() as f32 / self.batch_size as f32) as usize;
+
+        let pb = CLProgressBar::new((self.passes * steps_per_pass) as u64, self.indicator);
         
         // Enable/disable shared memory pool
         use_shared_pool(true);
 
-        let mut lr_scheduler = AttentionLRScheduler::new(self.alpha / 100f32, self.alpha, 5);
-        let mut alpha = lr_scheduler.update(std::f32::INFINITY, 0);
+        let lr_scheduler = AttentionLRScheduler::new(self.alpha / 100f32, self.alpha, steps_per_pass * 5);
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
         let mut last_error = std::f32::INFINITY;
+        let step = AtomicUsize::new(0);
         for pass in 1..(self.passes + 1) {
             pb.update_message(|msg| {
                 msg.clear();
-                write!(msg, "Pass {}/{}, Error: {:.5}, alpha: {:.5}", pass + 1, self.passes, last_error, alpha)
+                let alpha = lr_scheduler.compute(step.fetch_add(0, Ordering::Relaxed));
+                write!(msg, "Pass {}/{}, Error: {:.5}, Alpha: {:.5}", pass, self.passes, last_error, alpha)
                     .expect("Error writing out indicator message!");
             });
 
@@ -130,16 +134,16 @@ impl EmbeddingPropagation {
                 }
                 
                 // Backpropagate embeddings
+                let cur_step = step.fetch_add(1, Ordering::Relaxed);
+                let alpha = lr_scheduler.compute(cur_step);
                 optimizer.update(&feature_embeddings, all_grads, alpha, pass as f32);
 
                 // Update progress bar
-                pb.inc(nodes.len() as u64);
+                pb.inc(1);
                 error / cnt
             }).collect();
 
-            let error = err.iter().sum::<f32>() / err.len() as f32;
-            alpha = lr_scheduler.update(error, pass);
-            last_error = error;
+            last_error = err.iter().sum::<f32>() / err.len() as f32;
         }
         pb.finish();
         feature_embeddings
@@ -232,89 +236,25 @@ fn randomize_embedding_store(es: &mut EmbeddingStore, rng: &mut impl Rng) {
     }
 }
 
-struct LearningRateTracker {
-    pass: usize,
-    best: f32,
-    last: f32,
-    delta: usize
-}
-
-impl LearningRateTracker {
-    fn new(delta: usize) -> Self {
-        LearningRateTracker {pass: 0, best: std::f32::MAX, delta, last: std::f32::INFINITY}
-    }
-
-    fn update(&mut self, next: f32, cur_pass: usize) {
-        if next < self.best {
-            self.best = next;
-            self.pass = cur_pass;
-        }
-        self.last = next;
-    }
-
-    fn stagnated(&self, cur_pass: usize) -> bool {
-        cur_pass - self.pass >= self.delta
-    }
-
-    fn reset(&mut self, error: f32, pass: usize) {
-        self.best = error;
-        self.pass = pass;
-    }
-
-    fn last(&self) -> f32 {
-        self.last
-    }
-}
-
-trait LRScheduler {
-    fn update(&mut self, cur_error: f32, cur_pass: usize) -> f32;
-}
-
-struct LinearDecay {
-    tracker: LearningRateTracker,
-    alpha: f32,
-    decay: f32
-}
-
-impl LinearDecay {
-    fn new(alpha: f32, decay: f32, stagnation_epochs: usize) -> Self {
-        LinearDecay {
-            tracker: LearningRateTracker::new(stagnation_epochs),
-            alpha: alpha,
-            decay: decay
-        }
-    }
-}
-
-impl LRScheduler for LinearDecay {
-    fn update(&mut self, cur_error: f32, cur_pass: usize) -> f32 {
-        self.tracker.update(cur_error, cur_pass);
-        if self.tracker.stagnated(cur_pass) {
-            self.alpha = self.alpha * self.decay;
-            self.tracker.reset(cur_error, cur_pass);
-        }
-        self.alpha
-    }
-}
-
 struct AttentionLRScheduler {
-    init_alpha: f32,
+    min_alpha: f32,
     alpha: f32,
-    warmup: usize
+    warmup_steps: usize
 }
 
 impl AttentionLRScheduler {
-    fn new(init_alpha: f32, alpha: f32, warmup: usize) -> Self {
-        AttentionLRScheduler { init_alpha, alpha, warmup }
+    fn new(min_alpha: f32, alpha: f32, warmup_steps: usize) -> Self {
+        AttentionLRScheduler { min_alpha, alpha, warmup_steps }
     }
 }
 
-impl LRScheduler for AttentionLRScheduler {
-    fn update(&mut self, _cur_error: f32, cur_pass: usize) -> f32 {
-        if cur_pass <= self.warmup {
-            self.init_alpha
+impl AttentionLRScheduler {
+    fn compute(&self, cur_step: usize) -> f32 {
+        if cur_step > self.warmup_steps {
+            self.alpha / ((cur_step - self.warmup_steps) as f32).sqrt()
         } else {
-            self.alpha / (1f32 + (cur_pass - self.warmup) as f32).sqrt()
+            let ratio = cur_step as f32 / self.warmup_steps as f32;
+            self.min_alpha + ratio * (self.alpha - self.min_alpha)
         }
     }
 }
