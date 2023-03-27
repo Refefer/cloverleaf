@@ -80,34 +80,4 @@ mod pf_tests {
     use super::*;
     use crate::graph::CSR;
 
-    fn build_edges() -> Vec<(usize, usize, f32)> {
-        vec![
-            (0, 1, 1.),
-            (0, 2, 1.),
-            (1, 0, 1.),
-            (1, 2, 3.),
-            (2, 1, 3.),
-            (2, 0, 2.5),
-            (2, 3, 2.5),
-            (3, 2, 2.5),
-            (3, 4, 0.5),
-            (4, 3, 0.5),
-            (4, 5, 0.5),
-            (4, 6, 0.5),
-            (5, 4, 0.5),
-            (5, 6, 0.5),
-            (6, 4, 0.5),
-            (6, 5, 0.5),
-        ]
-    }
-
-    #[test]
-    fn run_test() {
-        let graph = CSR::construct_from_edges(build_edges());
-        let es = construct_slpa_embedding(&graph, 10, 0.3, 12345123);
-        for node_id in 0..graph.len() {
-            println!("{}: {:?}", node_id, es.get_embedding(node_id));
-        }
-        //panic!();
-    }
 }

@@ -285,23 +285,18 @@ mod ep_tests {
         let mut feature_store = FeatureStore::new(ccsr.len(), "feat".to_string());
         feature_store.fill_missing_nodes();
 
-        let mut agraph = Graph::new();
-
+        let model = super::model::AveragedFeatureModel::new(None, None);
         let ep = EmbeddingPropagation {
             alpha: 1e-2,
-            gamma: 0.1,
-            wd: 0f32,
             loss: Loss::MarginLoss(1f32, 1usize),
             batch_size: 32,
             dims: 5,
             passes: 50,
-            max_features: None,
-            max_nodes: None,
             seed: 202220222,
             indicator: false
         };
 
-        let embeddings = ep.learn_feature_embeddings(&ccsr, &mut agraph, &feature_store);
+        let embeddings = ep.learn_feature_embeddings(&ccsr, &feature_store, None, &model);
         for idx in 0..embeddings.len() {
             let e = embeddings.get_embedding(idx);
             println!("{:?} -> {:?}", idx, e);

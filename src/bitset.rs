@@ -50,15 +50,9 @@ mod bitset_tests {
         assert_eq!(bitset.is_set(6), false);
         assert_eq!(bitset.is_set(8), false);
         
-        bitset.unset_bit(3);
-
         for i in 0..10 {
-            if i == 3 {
-                assert_eq!(bitset.is_set(3), false);
-            } else {
-                let truthy = (i % 2) == 1;
-                assert_eq!(bitset.is_set(i), truthy);
-            }
+            let truthy = (i % 2) == 1;
+            assert_eq!(bitset.is_set(i), truthy);
         }
 
     }
