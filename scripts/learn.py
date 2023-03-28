@@ -65,6 +65,12 @@ def build_arg_parser():
         default=10,
         help="Samples MAX_NEIGHBORS nodes for node reconstruction.")
 
+    parser.add_argument("--hard-negatives",
+        dest="hard_negatives",
+        type=int,
+        default=None,
+        help="If provided, samples hard negatives from the graph")
+
     parser.add_argument("--min-feature-count",
         dest="min_feature_count",
         type=int,
@@ -158,7 +164,7 @@ def main(args):
         alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
         passes=args.passes, max_nodes=args.max_neighbors, 
         max_features=args.max_features, attention=args.attention,
-        context_window=args.context_window)
+        context_window=args.context_window, hard_negatives=args.hard_negatives)
 
     if args.warm_start is not None:
         feature_embeddings = cloverleaf.NodeEmbeddings.load(args.warm_start, cloverleaf.Distance.Cosine)

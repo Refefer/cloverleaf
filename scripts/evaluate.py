@@ -3,15 +3,13 @@ import random
 import sys
 import cloverleaf
 
-K = 100
-
 def load(ne_fname, fe_fname, agg_fname):
     print("Loading Node Embeddings...")
     ne_embeddings = cloverleaf.NodeEmbeddings.load(ne_fname, cloverleaf.Distance.Cosine)
     print("Loading Feature Embeddings...")
     fe_embeddings = cloverleaf.NodeEmbeddings.load(fe_fname, cloverleaf.Distance.Cosine)
     print("Loading aggregator")
-    aggregator = cloverleaf.FeatureEmbeddingAggregator.load(agg_fname)
+    aggregator = cloverleaf.FeatureAggregator.load(agg_fname)
     
     return ne_embeddings, fe_embeddings, aggregator
 
@@ -52,15 +50,15 @@ def main(args):
                 continue
 
             emb = ne_emb.get_embedding((fnt, fn))
-            top_k = ne_emb.nearest_neighbor(emb, K)
+            top_k = ne_emb.nearest_neighbor(emb, args.k)
             key = (tnt, tn)
             recall += any(node == key for node, s in top_k)
             n += 1
 
             if n % 1000 == 0:
-                print("{} - Recall@{}: {}".format(n, K, recall / n))
+                print("{} - Recall@{}: {}".format(n, args.k, recall / n))
 
-    print("Recall@{}: {}".format(K, recall / n))
+    print("Recall@{}: {}".format(args.k, recall / n))
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(

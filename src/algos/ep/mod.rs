@@ -1,7 +1,8 @@
-pub mod optimizer;
-pub mod node_sampler;
+mod optimizer;
+mod node_sampler;
 pub mod loss;
 pub mod model;
+mod scheduler;
 
 use std::fmt::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,6 +23,7 @@ use self::optimizer::{Optimizer,AdamOptimizer};
 use self::node_sampler::*;
 use self::loss::*;
 use self::model::Model;
+use self::scheduler::LRScheduler;
 
 pub struct EmbeddingPropagation {
     pub alpha: f32,
@@ -29,6 +31,7 @@ pub struct EmbeddingPropagation {
     pub batch_size: usize,
     pub dims: usize,
     pub passes: usize,
+    pub hard_negs: usize,
     pub seed: u64,
     pub indicator: bool
 }
@@ -71,7 +74,7 @@ impl EmbeddingPropagation {
             feature_embeddings.dims(), 
             feature_embeddings.len()); 
 
-        let random_sampler = node_sampler::RandomSamplerStrategy::new(graph);
+        let random_sampler = node_sampler::RandomWalkHardStrategy::new(self.hard_negs);
 
         let steps_per_pass = (graph.len() as f32 / self.batch_size as f32) as usize;
 
@@ -111,6 +114,7 @@ impl EmbeddingPropagation {
                 let mut all_grads = CHashMap::new();
 
                 let sampler = (&random_sampler).initialize_batch(
+                    &nodes,
                     graph,
                     features);
                 
@@ -181,7 +185,7 @@ impl EmbeddingPropagation {
         let mut negatives = Vec::with_capacity(num_negs);
         
         // Sample random negatives
-        sampler.sample_negatives(node, &mut negatives, num_negs, rng);
+        sampler.sample_negatives(graph, node, &mut negatives, num_negs, rng);
         
         let mut hu_vars = Vec::with_capacity(negatives.len());
         let mut hus = Vec::with_capacity(negatives.len());
@@ -242,47 +246,6 @@ fn randomize_embedding_store(es: &mut EmbeddingStore, rng: &mut impl Rng) {
         norm = norm.sqrt();
         e.iter_mut().for_each(|ei| *ei /= norm);
     }
-}
-
-enum LRScheduler {
-    Attention {
-        min_alpha: f32,
-        alpha: f32,
-        warmup_steps: usize 
-    },
-    ExpDecay {
-        min_alpha: f32,
-        alpha: f32,
-        decay: f32
-    },
-}
-
-impl LRScheduler {
-    fn attention(min_alpha: f32, alpha: f32, warmup_steps: usize) -> Self {
-        LRScheduler::Attention { min_alpha, alpha, warmup_steps }
-    }
-
-    fn exp_decay(min_alpha: f32, alpha: f32, decay: f32) -> Self {
-        LRScheduler::ExpDecay { min_alpha, alpha, decay }
-    }
-
-    fn compute(&self, cur_step: usize) -> f32 {
-        match self {
-            LRScheduler::Attention {min_alpha, alpha, warmup_steps} => {
-                if cur_step > *warmup_steps {
-                    alpha / ((cur_step - warmup_steps) as f32).sqrt()
-                } else {
-                    let ratio = cur_step as f32 / *warmup_steps as f32;
-                    min_alpha + ratio * (alpha - min_alpha)
-                }
-            },
-            LRScheduler::ExpDecay { min_alpha, alpha, decay } => {
-                (alpha * decay.powf(cur_step as f32)).max(*min_alpha)
-            }
-        }
-
-    }
-
 }
 
 
