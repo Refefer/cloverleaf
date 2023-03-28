@@ -34,6 +34,8 @@ pub trait Model: Send + Sync {
         rng: &mut R
     ) -> (NodeCounts, ANode); 
 
+    fn uses_attention(&self) -> bool;
+
     fn parameters(&self) -> Vec<ANode>;
 }
 
@@ -99,6 +101,10 @@ impl Model for AveragedFeatureModel {
             feature_embeddings, 
             self.max_features,
             0, None, rng)
+    }
+
+    fn uses_attention(&self) -> bool {
+        false
     }
 
     fn parameters(&self) -> Vec<ANode> {
@@ -175,6 +181,10 @@ impl Model for AttentionFeatureModel {
             feature_embeddings, 
             self.max_features,
             self.dims, self.window, rng)
+    }
+
+    fn uses_attention(&self) -> bool {
+        true
     }
 
     fn parameters(&self) -> Vec<ANode> {

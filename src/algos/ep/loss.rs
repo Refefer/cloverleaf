@@ -101,11 +101,11 @@ impl Loss {
         rng: &mut R
     ) -> (NodeCounts,ANode) {
         match self {
-            Loss::Contrastive(_,_) | Loss::MarginLoss(_,_) => {
+            Loss::MarginLoss(_,_) => {
                 model.reconstruct_node_embedding(
                     graph, node, feature_store, feature_embeddings, rng)
             },
-            Loss::StarSpace(_,_) => {
+            Loss::StarSpace(_,_) | Loss::Contrastive(_,_) => {
                 // Select random out edge
                 let edges = graph.get_edges(node).0;
                 // If it has no out edges, nothing to really do.  We can't build a comparison.

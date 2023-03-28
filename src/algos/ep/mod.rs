@@ -80,7 +80,15 @@ impl EmbeddingPropagation {
         // Enable/disable shared memory pool
         use_shared_pool(true);
 
-        let lr_scheduler = AttentionLRScheduler::new(self.alpha / 100f32, self.alpha, steps_per_pass * 5);
+        let lr_scheduler = if model.uses_attention() {
+            LRScheduler::attention(self.alpha / 100f32, self.alpha, steps_per_pass * 5)
+        } else {
+            let total_updates = steps_per_pass * self.passes;
+            let min_alpha = self.alpha / 1000.;
+            let decay = ((min_alpha.ln() - self.alpha.ln()) / (total_updates as f32)).exp();
+            LRScheduler::exp_decay(min_alpha, self.alpha, decay)
+        };
+
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
         let mut last_error = std::f32::INFINITY;
         let step = AtomicUsize::new(0);
@@ -236,28 +244,47 @@ fn randomize_embedding_store(es: &mut EmbeddingStore, rng: &mut impl Rng) {
     }
 }
 
-struct AttentionLRScheduler {
-    min_alpha: f32,
-    alpha: f32,
-    warmup_steps: usize
+enum LRScheduler {
+    Attention {
+        min_alpha: f32,
+        alpha: f32,
+        warmup_steps: usize 
+    },
+    ExpDecay {
+        min_alpha: f32,
+        alpha: f32,
+        decay: f32
+    },
 }
 
-impl AttentionLRScheduler {
-    fn new(min_alpha: f32, alpha: f32, warmup_steps: usize) -> Self {
-        AttentionLRScheduler { min_alpha, alpha, warmup_steps }
+impl LRScheduler {
+    fn attention(min_alpha: f32, alpha: f32, warmup_steps: usize) -> Self {
+        LRScheduler::Attention { min_alpha, alpha, warmup_steps }
     }
-}
 
-impl AttentionLRScheduler {
+    fn exp_decay(min_alpha: f32, alpha: f32, decay: f32) -> Self {
+        LRScheduler::ExpDecay { min_alpha, alpha, decay }
+    }
+
     fn compute(&self, cur_step: usize) -> f32 {
-        if cur_step > self.warmup_steps {
-            self.alpha / ((cur_step - self.warmup_steps) as f32).sqrt()
-        } else {
-            let ratio = cur_step as f32 / self.warmup_steps as f32;
-            self.min_alpha + ratio * (self.alpha - self.min_alpha)
+        match self {
+            LRScheduler::Attention {min_alpha, alpha, warmup_steps} => {
+                if cur_step > *warmup_steps {
+                    alpha / ((cur_step - warmup_steps) as f32).sqrt()
+                } else {
+                    let ratio = cur_step as f32 / *warmup_steps as f32;
+                    min_alpha + ratio * (alpha - min_alpha)
+                }
+            },
+            LRScheduler::ExpDecay { min_alpha, alpha, decay } => {
+                (alpha * decay.powf(cur_step as f32)).max(*min_alpha)
+            }
         }
+
     }
+
 }
+
 
 #[cfg(test)]
 mod ep_tests {
