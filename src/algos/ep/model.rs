@@ -304,14 +304,27 @@ pub fn attention_mean<'a>(
     // Compute attention matrix
     let attention_matrix = compute_attention_matrix(&items, window);
     
-    let att = compute_attention_softmax(attention_matrix, attention_dims);
+    let sm_att_mat = compute_attention_softmax(attention_matrix, attention_dims);
 
-    let summed_weights = att.sum_all();
     let n = items.len() as f32;
-    items.into_iter().enumerate()
-        .map(|(i, (at_i, _c))| at_i.value * summed_weights.slice(i, 1))
+    scale_vecs(items, &sm_att_mat)
         .collect::<Vec<_>>().sum_all() / n
- }
+}
+
+fn scale_vecs<'a>(
+    items: Vec<(Attention, usize)>, 
+    sm_att_mat: &'a Vec<ANode>
+) -> impl Iterator<Item=ANode> + 'a {
+
+    let mut rows = vec![Vec::new(); sm_att_mat.len()];
+    sm_att_mat.iter().enumerate().for_each(|(ri, row)| {
+        items.iter().enumerate().for_each(|(i, (att, _))| {
+            rows[ri].push(&att.value * row.slice(i, 1));
+        });
+    });
+
+    rows.into_iter().map(|sums| sums.sum_all())
+}
 
 fn compute_attention_matrix(
     items: &[(Attention, usize)],
@@ -584,5 +597,31 @@ mod model_tests {
         }
 
     }
+
+    #[test]
+    fn test_att_reweighted() {
+        let feats = create_att_vecs();
+
+        let att_matrix = compute_attention_matrix(&feats, None);
+        let softmax_matrix = compute_attention_softmax(att_matrix, 1);
+        let reweighted = scale_vecs(feats, &softmax_matrix).collect::<Vec<_>>();
+
+        let exp_weights = vec![
+            vec![ 1.0647,  1.0647],
+            vec![ 0.6667,  0.6667],
+            vec![-0.0858, -0.0858]
+        ];
+
+        for row in reweighted.iter() {
+            println!("{:?}", row.value());
+        }
+
+        for (row, erow) in reweighted.iter().zip(exp_weights.into_iter()) {
+            for (ri, eri) in row.value().iter().zip(erow.iter()) {
+                assert!((ri - eri).abs() < 1e-4);
+            }
+        }
+    }
+
 
 }

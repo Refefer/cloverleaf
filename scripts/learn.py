@@ -120,6 +120,12 @@ def build_arg_parser():
         metavar=('TEMPERATURE', 'NEGATIVES'),
         help="Optimizes using contrastive loss.")
 
+    parser.add_argument("--neighborhood-alignment",
+        dest="neighborhood_alignment",
+        type=float,
+        default=None,
+        help="If provided, applies neighborhood alignment to the embeddings.")
+
     return parser
 
 
@@ -189,7 +195,14 @@ def main(args):
 
     embedder = cloverleaf.NodeEmbedder(aggregator)
     node_embeddings = embedder.embed_graph(graph, features, feature_embeddings)
-    node_embeddings.save(args.output + '.node-embeddings')
+
+    if args.neighborhood_alignment is None:
+        node_embeddings.save(args.output + '.node-embeddings')
+    else:
+        node_embeddings.save(args.output + '.node-embeddings.orig')
+        aligner = cloverleaf.NeighborhoodAligner(args.neighborhood_alignment)
+        aligner.align_to_disk(args.output + '.node-embeddings', node_embeddings, graph)
+
     aggregator.save(args.output + '.embedder')
 
 if __name__ == '__main__':

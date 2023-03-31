@@ -280,6 +280,7 @@ mod ep_tests {
             alpha: 1e-2,
             loss: Loss::MarginLoss(1f32, 1usize),
             batch_size: 32,
+            hard_negs: 0,
             dims: 5,
             passes: 50,
             seed: 202220222,
