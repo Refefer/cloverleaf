@@ -1,4 +1,6 @@
 use simple_grad::*;
+use rand::prelude::*;
+use rand_xorshift::XorShiftRng;
 
 use crate::feature_store::FeatureStore;
 use crate::embeddings::EmbeddingStore;
@@ -141,7 +143,9 @@ impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {
         } else {
             AttentionType::Full
         };
-        let v = attention_mean(it.iter(), self.dims, &mut at);
+
+        let mut rng = XorShiftRng::seed_from_u64(0);
+        let v = attention_mean(it.iter(), self.dims, &mut at, &mut rng);
         v.value().iter().zip(out.iter_mut()).for_each(|(vi, outi)| {
             *outi = *vi;
         });

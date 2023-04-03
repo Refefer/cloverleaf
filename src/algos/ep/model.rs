@@ -275,9 +275,9 @@ pub fn attention_construct_node_embedding<R: Rng>(
             .map(|f| {
                 feature_map.get(f).expect("Some type of error!")
             });
-        attention_mean(it, attention_dims, &mut attention_type)
+        attention_mean(it, attention_dims, &mut attention_type, rng)
     } else {
-        attention_mean(feature_map.values(), attention_dims, &mut attention_type)
+        attention_mean(feature_map.values(), attention_dims, &mut attention_type, rng)
     };
     (feature_map, mean)
 }
@@ -344,7 +344,7 @@ fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
     }
 
     let mean = if let Some(at) = attention_type {
-        attention_multiple(new_nodes, feature_store, &feature_map, attention_dims, at)
+        attention_multiple(new_nodes, feature_store, &feature_map, attention_dims, at, rng)
     } else {
         mean_embeddings(feature_map.values())
     };
@@ -357,7 +357,8 @@ fn attention_multiple(
     feature_store: &FeatureStore,
     feature_map: &NodeCounts,
     attention_dims: usize,
-    mut attention_type: AttentionType
+    mut attention_type: AttentionType,
+    rng: &mut impl Rng
 ) -> ANode {
     let mut feats_per_node = HashMap::new();
     let mut output = Vec::new();
@@ -376,7 +377,7 @@ fn attention_multiple(
                 feats_per_node.get(f).expect("Some type of error!")
             });
 
-        output.push((attention_mean(it, attention_dims, &mut attention_type), 1))
+        output.push((attention_mean(it, attention_dims, &mut attention_type, rng), 1))
     }
     mean_embeddings(output.iter())
 }
