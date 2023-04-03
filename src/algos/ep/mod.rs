@@ -2,6 +2,7 @@ mod optimizer;
 mod node_sampler;
 pub mod loss;
 pub mod model;
+pub mod attention;
 mod scheduler;
 
 use std::fmt::Write;

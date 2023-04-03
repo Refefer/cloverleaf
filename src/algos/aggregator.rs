@@ -2,7 +2,7 @@ use simple_grad::*;
 
 use crate::feature_store::FeatureStore;
 use crate::embeddings::EmbeddingStore;
-use crate::algos::ep::model::attention_mean;
+use crate::algos::ep::attention::attention_mean;
 
 pub trait EmbeddingBuilder {
     fn construct( &self, features: &[usize], out: &mut [f32]) -> ();
