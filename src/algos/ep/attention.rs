@@ -3,6 +3,8 @@ use float_ord::FloatOrd;
 use rand::prelude::*;
 
 type AttentionMatrix = Vec<Vec<ANode>>;
+
+#[derive(Copy,Clone)]
 pub enum AttentionType {
     Full,
     Sliding(usize),
@@ -87,8 +89,7 @@ fn compute_attention_matrix(
     match at {
         AttentionType::Full => compute_full_attention_matrix(items),
         AttentionType::Sliding(window) => compute_sliding_attention_matrix(items, *window),
-        //AttentionType::Random(k) => compute_random_attention_matrix(items, *k, rng)
-        AttentionType::Random(k) => compute_sliding_attention_matrix(items, *k)
+        AttentionType::Random(k) => compute_random_attention_matrix(items, *k, rng)
     }
 }
 
@@ -143,25 +144,22 @@ fn compute_sliding_attention_matrix(
 
 fn compute_random_attention_matrix(
     items: &[(Attention, usize)],
-    window: usize
+    k: usize,
+    rng: &mut impl Rng
 ) -> AttentionMatrix {
     
      // Get the attention for each feature
     let zero = Constant::scalar(0.);
     let mut scaled = vec![vec![zero; items.len()]; items.len()];
+    let mut buff = vec![0; k];
     for i in 0..items.len() {
-        let (j_start, j_end) = {
-            let start = if window > i { 0 } else {i - window};
-            let stop = (i + window+ 1).min(items.len());
-            (start, stop)
-        };
-
         let at_i = &items[i].0;
         let row = &mut scaled[i];
-        for j in j_start..j_end {
-            let at_j = &items[j].0;
+        items.iter().enumerate().map(|(i,_)| i).choose_multiple_fill(rng, buff.as_mut_slice());
+        for j in buff.iter() {
+            let at_j = &items[*j].0;
             let dot_i_j = (&at_i.query).dot(&at_j.key);
-            row[j] = dot_i_j;
+            row[*j] = dot_i_j;
         }
     }
     scaled

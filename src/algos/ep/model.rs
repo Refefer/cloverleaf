@@ -115,7 +115,7 @@ impl Model for AveragedFeatureModel {
 
 pub struct AttentionFeatureModel {
     dims: usize,
-    window: Option<usize>,
+    at: AttentionType,
     max_features: Option<usize>,
     max_neighbor_nodes: Option<usize>
 }
@@ -123,19 +123,11 @@ pub struct AttentionFeatureModel {
 impl AttentionFeatureModel {
     pub fn new(
         dims: usize,
-        window: Option<usize>,
+        at: AttentionType,
         max_features: Option<usize>,
         max_neighbor_nodes: Option<usize>
     ) -> Self {
-        AttentionFeatureModel { dims, window, max_features, max_neighbor_nodes }
-    }
-
-    fn get_attention<R: Rng>(&self, rng: &mut R) -> AttentionType {
-        if let Some(size) = self.window {
-            AttentionType::Sliding(size)
-        } else {
-            AttentionType::Full
-        }
+        AttentionFeatureModel { dims, at, max_features, max_neighbor_nodes }
     }
 }
 
@@ -147,14 +139,13 @@ impl Model for AttentionFeatureModel {
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
     ) -> (NodeCounts, ANode) {
-        let at = self.get_attention(rng);
         attention_construct_node_embedding(
             node,
             feature_store,
             feature_embeddings,
             self.max_features,
             self.dims,
-            at,
+            self.at.clone(),
             rng)
     }
 
@@ -166,7 +157,6 @@ impl Model for AttentionFeatureModel {
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
     ) -> (NodeCounts, ANode){
-        let at = self.get_attention(rng);
         reconstruct_node_embedding(
             graph,
             node,
@@ -175,7 +165,7 @@ impl Model for AttentionFeatureModel {
             self.max_neighbor_nodes,
             self.max_features,
             self.dims,
-            Some(at),
+            Some(self.at.clone()),
             rng)
     }
 
@@ -186,12 +176,11 @@ impl Model for AttentionFeatureModel {
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
     ) -> (NodeCounts, ANode) { 
-        let at = self.get_attention(rng);
         construct_from_multiple_nodes(
             nodes, feature_store, 
             feature_embeddings, 
             self.max_features,
-            self.dims, Some(at), rng)
+            self.dims, Some(self.at.clone()), rng)
     }
 
     fn uses_attention(&self) -> bool {

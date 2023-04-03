@@ -34,6 +34,7 @@ use crate::algos::reweighter::{Reweighter};
 use crate::algos::ep::EmbeddingPropagation;
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
+use crate::algos::ep::attention::{AttentionType};
 use crate::algos::ann::NodeDistance;
 use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
@@ -443,7 +444,7 @@ impl EmbeddingPropagator {
         hard_negatives: Option<usize>,
         indicator: Option<bool>,
         attention: Option<usize>,
-        context_window: Option<usize>
+        context_window: Option<usize>,
     ) -> Self {
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(0.9),
@@ -457,7 +458,14 @@ impl EmbeddingPropagator {
         };
 
         let model = if let Some(dims) = attention {
-            ModelType::Attention(AttentionFeatureModel::new(dims, context_window, max_features, max_nodes))
+            let at = if let Some(size) = context_window {
+                AttentionType::Sliding(size)
+            } else if let Some(k) = max_features {
+                AttentionType::Random(k)
+            } else {
+                AttentionType::Full
+            };
+            ModelType::Attention(AttentionFeatureModel::new(dims, at, None, max_nodes))
         } else {
             ModelType::Averaged(AveragedFeatureModel::new(max_features, max_nodes))
         };
