@@ -151,7 +151,7 @@ fn compute_random_attention_matrix(
      // Get the attention for each feature
     let zero = Constant::scalar(0.);
     let mut scaled = vec![vec![zero; items.len()]; items.len()];
-    let mut buff = vec![0; k];
+    let mut buff = vec![0; k.min(items.len())];
     for i in 0..items.len() {
         let at_i = &items[i].0;
         let row = &mut scaled[i];
