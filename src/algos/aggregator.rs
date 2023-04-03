@@ -2,7 +2,7 @@ use simple_grad::*;
 
 use crate::feature_store::FeatureStore;
 use crate::embeddings::EmbeddingStore;
-use crate::algos::ep::attention::attention_mean;
+use crate::algos::ep::attention::{attention_mean,AttentionType};
 
 pub trait EmbeddingBuilder {
     fn construct( &self, features: &[usize], out: &mut [f32]) -> ();
@@ -136,7 +136,12 @@ impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {
             (Constant::new(e.to_vec()), 1usize)
         }).collect::<Vec<_>>();
 
-        let v = attention_mean(it.iter(), self.dims, self.window);
+        let mut at = if let Some(size) = self.window {
+            AttentionType::Sliding(size)
+        } else {
+            AttentionType::Full
+        };
+        let v = attention_mean(it.iter(), self.dims, &mut at);
         v.value().iter().zip(out.iter_mut()).for_each(|(vi, outi)| {
             *outi = *vi;
         });

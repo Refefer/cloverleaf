@@ -1,5 +1,11 @@
 use simple_grad::*;
 use float_ord::FloatOrd;
+use rand::prelude::*;
+
+pub enum AttentionType {
+    Full,
+    Sliding(usize),
+}
 
 fn get_value_vec(emb: &ANode, dims: usize) -> ANode {
     let v = emb.value().len();
@@ -33,7 +39,7 @@ impl Attention {
 pub fn attention_mean<'a>(
     it: impl Iterator<Item=&'a (ANode, usize)>,
     attention_dims: usize,
-    window: Option<usize>
+    at: &mut AttentionType
 ) -> ANode {
 
     let items: Vec<_> = it.map(|(node, count)| {
@@ -45,7 +51,7 @@ pub fn attention_mean<'a>(
     }
     
     // Compute attention matrix
-    let attention_matrix = compute_attention_matrix(&items, window);
+    let attention_matrix = compute_attention_matrix(&items, at);
     
     let sm_att_mat = compute_attention_softmax(attention_matrix, attention_dims);
 
@@ -69,22 +75,53 @@ fn scale_vecs<'a>(
     rows.into_iter().map(|sums| sums.sum_all())
 }
 
+#[inline]
 fn compute_attention_matrix(
     items: &[(Attention, usize)],
-    window: Option<usize>
+    at: &mut AttentionType
+) -> Vec<Vec<ANode>> {
+    match at {
+        AttentionType::Full => compute_full_attention_matrix(items),
+        AttentionType::Sliding(window) => compute_sliding_attention_matrix(items, *window)
+    }
+}
+
+fn compute_full_attention_matrix(
+    items: &[(Attention, usize)]
 ) -> Vec<Vec<ANode>> {
     
      // Get the attention for each feature
     let zero = Constant::scalar(0.);
     let mut scaled = vec![vec![zero; items.len()]; items.len()];
     for i in 0..items.len() {
-        let (j_start, j_end) = match window {
-            Some(size) => {
-                let start = if size > i { 0 } else {i - size };
-                let stop = (i + size + 1).min(items.len());
-                (start, stop)
-            },
-            None => (0, items.len())
+        let (at_i, ic) = &items[i];
+        let row = &mut scaled[i];
+        for j in 0..items.len() {
+            let (at_j, jc) = &items[j];
+            let mut dot_i_j = (&at_i.query).dot(&at_j.key);
+            let num = ic * jc;
+            if num >= 1 {
+                dot_i_j = dot_i_j * (num as f32);
+            }
+            row[j] = dot_i_j;
+        }
+    }
+    scaled
+}
+
+fn compute_sliding_attention_matrix(
+    items: &[(Attention, usize)],
+    window: usize
+) -> Vec<Vec<ANode>> {
+    
+     // Get the attention for each feature
+    let zero = Constant::scalar(0.);
+    let mut scaled = vec![vec![zero; items.len()]; items.len()];
+    for i in 0..items.len() {
+        let (j_start, j_end) = {
+            let start = if window > i { 0 } else {i - window};
+            let stop = (i + window+ 1).min(items.len());
+            (start, stop)
         };
 
         let (at_i, ic) = &items[i];
@@ -92,10 +129,6 @@ fn compute_attention_matrix(
         for j in j_start..j_end {
             let (at_j, jc) = &items[j];
             let mut dot_i_j = (&at_i.query).dot(&at_j.key);
-            let num = ic * jc;
-            if num >= 1 && window.is_none() {
-                dot_i_j = dot_i_j * (num as f32);
-            }
             row[j] = dot_i_j;
         }
     }
@@ -153,7 +186,7 @@ mod attention_tests {
             vec![vec![1.  * -1.], vec![1.  * 0.], vec![1.  * 1.]],
         ];
 
-        let att_matrix = compute_attention_matrix(&feats, None);
+        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Full);
         for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
             for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
                 assert_eq!(ri.value(), eri);
@@ -172,7 +205,7 @@ mod attention_tests {
             vec![vec![0.], vec![1.  * 0.], vec![1.  * 1.]],
         ];
 
-        let att_matrix = compute_attention_matrix(&feats, Some(1));
+        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Sliding(1));
         for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
             assert_eq!(row.len(), exp_row.len());
             for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
@@ -187,7 +220,7 @@ mod attention_tests {
         ];
 
         // larger window than feat set
-        let att_matrix = compute_attention_matrix(&feats, Some(10));
+        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Sliding(10));
         for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
             assert_eq!(row.len(), exp_row.len());
             for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
@@ -206,7 +239,7 @@ mod attention_tests {
             vec![0.09003057, 0.24472847, 0.66524096],
         ];
 
-        let att_matrix = compute_attention_matrix(&feats, None);
+        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Full);
         let softmax_matrix = compute_attention_softmax(att_matrix, 1);
 
         assert_eq!(softmax_matrix.len(), exp_softmax.len());
@@ -220,7 +253,7 @@ mod attention_tests {
     fn test_att_reweighted() {
         let feats = create_att_vecs();
 
-        let att_matrix = compute_attention_matrix(&feats, None);
+        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Full);
         let softmax_matrix = compute_attention_softmax(att_matrix, 1);
         let reweighted = scale_vecs(feats, &softmax_matrix).collect::<Vec<_>>();
 
