@@ -2,8 +2,6 @@ use simple_grad::*;
 use float_ord::FloatOrd;
 use rand::prelude::*;
 
-type AttentionMatrix = Vec<Vec<ANode>>;
-
 #[derive(Copy,Clone)]
 pub enum AttentionType {
     Full,
@@ -67,18 +65,22 @@ pub fn attention_mean<'a>(
 
 fn scale_vecs<'a>(
     items: Vec<(Attention, usize)>, 
-    sm_att_mat: &'a Vec<ANode>
+    sm_att_mat: &'a AttentionMatrix 
 ) -> impl Iterator<Item=ANode> + 'a {
 
     let mut rows = vec![Vec::new(); sm_att_mat.len()];
     sm_att_mat.iter().enumerate().for_each(|(ri, row)| {
-        items.iter().enumerate().for_each(|(i, (att, _))| {
-            rows[ri].push(&att.value * row.slice(i, 1));
+        items.iter().zip(row.iter()).for_each(|((att, _), scaled_v)| {
+            if let Some(v) = scaled_v {
+                rows[ri].push(&att.value * v);
+            }
         });
     });
 
     rows.into_iter().map(|sums| sums.sum_all())
 }
+
+type AttentionMatrix = Vec<Vec<Option<ANode>>>;
 
 #[inline]
 fn compute_attention_matrix(
@@ -98,8 +100,7 @@ fn compute_full_attention_matrix(
 ) -> AttentionMatrix {
     
      // Get the attention for each feature
-    let zero = Constant::scalar(0.);
-    let mut scaled = vec![vec![zero; items.len()]; items.len()];
+    let mut scaled = vec![vec![None; items.len()]; items.len()];
     for i in 0..items.len() {
         let (at_i, ic) = &items[i];
         let row = &mut scaled[i];
@@ -110,7 +111,7 @@ fn compute_full_attention_matrix(
             if num >= 1 {
                 dot_i_j = dot_i_j * (num as f32);
             }
-            row[j] = dot_i_j;
+            row[j] = Some(dot_i_j);
         }
     }
     scaled
@@ -122,8 +123,7 @@ fn compute_sliding_attention_matrix(
 ) -> AttentionMatrix {
     
      // Get the attention for each feature
-    let zero = Constant::scalar(0.);
-    let mut scaled = vec![vec![zero; items.len()]; items.len()];
+    let mut scaled = vec![vec![None; items.len()]; items.len()];
     for i in 0..items.len() {
         let (j_start, j_end) = {
             let start = if window > i { 0 } else {i - window};
@@ -136,7 +136,7 @@ fn compute_sliding_attention_matrix(
         for j in j_start..j_end {
             let at_j = &items[j].0;
             let dot_i_j = (&at_i.query).dot(&at_j.key);
-            row[j] = dot_i_j;
+            row[j] = Some(dot_i_j);
         }
     }
     scaled
@@ -149,8 +149,7 @@ fn compute_random_attention_matrix(
 ) -> AttentionMatrix {
     
      // Get the attention for each feature
-    let zero = Constant::scalar(0.);
-    let mut scaled = vec![vec![zero; items.len()]; items.len()];
+    let mut scaled = vec![vec![None; items.len()]; items.len()];
     let mut buff = vec![0; k.min(items.len())];
     for i in 0..items.len() {
         let at_i = &items[i].0;
@@ -159,35 +158,47 @@ fn compute_random_attention_matrix(
         for j in buff.iter() {
             let at_j = &items[*j].0;
             let dot_i_j = (&at_i.query).dot(&at_j.key);
-            row[*j] = dot_i_j;
+            row[*j] = Some(dot_i_j);
         }
     }
     scaled
 }
 
 fn compute_attention_softmax(
-    attention_matrix: AttentionMatrix,
+    mut attention_matrix: AttentionMatrix,
     d_k: usize
-) -> Vec<ANode> {
+) -> AttentionMatrix {
     // Compute softmax
     let d_k = Constant::scalar((d_k as f32).sqrt());
 
-    // Compute softmax for each feature
-    let mut att = Vec::with_capacity(attention_matrix.len());
-    for row in attention_matrix.into_iter() {
-        let row = row.concat() / &d_k;
-        let sm = softmax(row);
-        att.push(sm);
-    }
+    // Compute softmax for each non-masked feature
+    attention_matrix.iter_mut().for_each(|row| {
+        // Get non-zero rows
+        let non_zero_row: Vec<_>  = row.iter()
+            .filter(|x| x.is_some())
+            .map(|x| x.clone().unwrap())
+            .collect();
 
-    att
+        let nz_row = non_zero_row.concat() / &d_k;
+        let sm = softmax(nz_row);
+
+        let mut idx = 0;
+        row.iter_mut().for_each(|ri| {
+            if ri.is_some() {
+                *ri = Some(sm.slice(idx,1));
+                idx += 1;
+            }
+        });
+    });
+    attention_matrix
 }
 
 fn softmax(numers: ANode) -> ANode {
-
+    // Doesn't need to be part of the graph
     let max_value = numers.value().iter()
         .max_by_key(|v| FloatOrd(**v))
         .expect("Shouldn't be non-zero!");
+
     let mv = Constant::scalar(*max_value);
     let n = (numers - &mv).exp();
     &n / n.sum()
@@ -220,7 +231,7 @@ mod attention_tests {
         let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Full, &mut rng);
         for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
             for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
-                assert_eq!(ri.value(), eri);
+                assert_eq!(ri.unwrap().value(), eri);
             }
         }
 
@@ -241,7 +252,11 @@ mod attention_tests {
         for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
             assert_eq!(row.len(), exp_row.len());
             for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
-                assert_eq!(ri.value(), eri);
+                if let Some(v) = ri {
+                    assert_eq!(v.value(), eri);
+                } else {
+                    assert_eq!(eri, vec![0f32]);
+                }
             }
         }
 
@@ -256,7 +271,11 @@ mod attention_tests {
         for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
             assert_eq!(row.len(), exp_row.len());
             for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
-                assert_eq!(ri.value(), eri);
+                if let Some(v) = ri {
+                    assert_eq!(v.value(), eri);
+                } else {
+                    assert_eq!(eri, vec![0f32]);
+                }
             }
         }
     }
@@ -277,7 +296,8 @@ mod attention_tests {
 
         assert_eq!(softmax_matrix.len(), exp_softmax.len());
         for (row, exp_row) in softmax_matrix.into_iter().zip(exp_softmax.into_iter()) {
-            assert_eq!(row.value(), exp_row);
+            let r: Vec<_> = row.into_iter().map(|x| x.unwrap()).collect();
+            assert_eq!(r.concat().value(), exp_row);
         }
 
     }
