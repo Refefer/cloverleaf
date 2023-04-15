@@ -1,21 +1,27 @@
-import tabulate
+import argparse
 import sys
+
 import cloverleaf
 import numpy as np
+import tabulate
 
 def softmax(values):
     max_v = np.max(values, axis=1).reshape((-1, 1))
     numers = np.exp(values - max_v)
     return numers / np.sum(numers, axis=1).reshape((-1, 1))
 
-def get_key_query_value(emb, ASIZE):
-    return emb[:ASIZE], emb[ASIZE:ASIZE*2], emb[ASIZE*2:]
+# query, key, query, key, value
+def get_key_query_value(emb, head_num, num_heads, d_k):
+    query_start = head_num * d_k
+    key_start   = num_heads * d_k + head_num * d_k
+    value_start = num_heads * d_k * 2;
+    return emb[query_start:query_start+d_k], emb[key_start:key_start+d_k], emb[value_start:]
 
-def get_attention(embs, feats, size, context_window):
+def get_attention(embs, feats, head_num, num_heads, d_k, context_window):
     terms, query, key, value = [],[],[],[]
     for f in feats:
         if embs.contains(('feat', f)):
-            q, k, v = get_key_query_value(embs.get_embedding(('feat', f)), size)
+            q, k, v = get_key_query_value(embs.get_embedding(('feat', f)), head_num, num_heads, d_k)
             terms.append(f)
             query.append(q)
             key.append(k)
@@ -48,32 +54,54 @@ def cosine(e1, e2):
 def format_row(row):
     return [round(v, 3) for v in row]
 
-def main():
-    embs = cloverleaf.NodeEmbeddings.load(sys.argv[1], cloverleaf.Distance.Cosine)
-    size = int(sys.argv[2])
-    context_window = int(sys.argv[3]) if len(sys.argv) == 4 else None
-    print("Context Window:", context_window)
+def parse_embedder(fname):
+    with open(fname) as f:
+        etype = f.readline().strip()
+        if etype != 'Attention':
+            raise TypeError("Embedder type is not Attention!")
+
+        num_heads = int(f.readline().strip())
+        d_k = int(f.readline().strip())
+        window = int(f.readline().strip())
+        if window == 0:
+            window = None
+
+        return num_heads, d_k, window
+
+def main(args):
+    embs = cloverleaf.NodeEmbeddings.load(args.features, cloverleaf.Distance.Cosine)
+    num_heads, d_k, context_window = parse_embedder(args.embedder)
+    print(f"Num Heads:{num_heads}, d_k: {d_k}, sliding: {context_window}")
     while True:
         terms = input("> ")
-        if '/' in terms:
-            before, after = terms.split('/')
-            before = before.split()
-            after = after.split()
-            e1 = get_attention(embs, before, size, context_window)[2]
-            print("e1:",e1)
-            e2 = get_attention(embs, after, size, context_window)[2]
-            print("e2:",e2)
-            print(cosine(e1, e2))
-        else:
-            terms = terms.split()
-            terms, mat, embedding = get_attention(embs, terms, size, context_window)
-            headers = terms
+        terms = terms.split()
+        sms = []
+        for head_num in range(num_heads):
+            headers = ['Head {}'.format(head_num)] + terms
+            terms, mat, embedding = get_attention(embs, terms, head_num, num_heads, d_k, context_window)
             rows = [[term] + format_row(row) for term, row in zip(terms, mat)]
             rows.append(tabulate.SEPARATING_LINE)
             summed = mat.sum(axis=0)
-            rows.append(['Softmax'] + format_row(summed / summed.sum()))
+            sm = summed / summed.sum()
+            rows.append(['Softmax'] + format_row(sm))
+            sms.append(sm)
             print(tabulate.tabulate(rows, headers=headers))
-            print(embedding)
-        
+            print()
+
+        if num_heads > 1:
+            print(tabulate.tabulate([np.sum(sms, axis=0) / len(sms)], headers=terms))
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        description='Examine Attention Matrix',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    parser.add_argument("features",
+        help="Path to feature embeddings.")
+    parser.add_argument("embedder",
+        help="Path to embedder spec.")
+
+    return parser.parse_args()
+
 if __name__ == '__main__':
-    main()
+    main(build_arg_parser())

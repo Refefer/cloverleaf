@@ -89,6 +89,12 @@ def build_arg_parser():
         default=None,
         help="If provided, uses self attention with D dims.")
 
+    parser.add_argument("--attention-heads",
+        dest="attention_heads",
+        type=int,
+        default=1,
+        help="If attention is used, number of heads.  Default is 1")
+
     parser.add_argument("--context-window",
         dest="context_window",
         type=int,
@@ -169,8 +175,9 @@ def main(args):
     ep = cloverleaf.EmbeddingPropagator(
         alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
         passes=args.passes, max_nodes=args.max_neighbors, 
-        max_features=args.max_features, attention=args.attention,
-        context_window=args.context_window, hard_negatives=args.hard_negatives)
+        max_features=args.max_features, attention=args.attention, 
+        attention_heads=args.attention_heads, context_window=args.context_window, 
+        hard_negatives=args.hard_negatives)
 
     if args.warm_start is not None:
         feature_embeddings = cloverleaf.NodeEmbeddings.load(args.warm_start, cloverleaf.Distance.Cosine)
@@ -187,7 +194,7 @@ def main(args):
 
     print("Constructing nodes...")
     if args.attention is not None:
-        aggregator = cloverleaf.FeatureAggregator.Attention(args.attention, args.context_window)
+        aggregator = cloverleaf.FeatureAggregator.Attention(args.attention_heads, args.attention, args.context_window)
     elif args.alpha is not None:
         aggregator = cloverleaf.FeatureAggregator.Weighted(args.alpha, features)
     else:
