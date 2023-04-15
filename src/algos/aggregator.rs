@@ -139,7 +139,7 @@ impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {
         }).collect::<Vec<_>>();
 
         let mut at = if let Some(size) = self.window {
-            AttentionType::Sliding(size)
+            AttentionType::Sliding{window_size: size}
         } else {
             AttentionType::Full
         };

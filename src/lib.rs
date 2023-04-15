@@ -459,9 +459,9 @@ impl EmbeddingPropagator {
 
         let model = if let Some(dims) = attention {
             let at = if let Some(size) = context_window {
-                AttentionType::Sliding(size)
+                AttentionType::Sliding{window_size: size}
             } else if let Some(k) = max_features {
-                AttentionType::Random(k)
+                AttentionType::Random { num_features: k }
             } else {
                 AttentionType::Full
             };

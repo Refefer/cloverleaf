@@ -256,7 +256,7 @@ pub fn attention_construct_node_embedding<R: Rng>(
                                  max_features,
                                  rng);
 
-    let mean = if matches!(attention_type, AttentionType::Sliding(_)) {
+    let mean = if matches!(attention_type, AttentionType::Sliding{window_size: _}) {
         // Need to preserve order of features for context windows
         let feats = feature_store.get_features(node);
         let it = feats.iter()

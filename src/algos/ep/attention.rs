@@ -3,15 +3,40 @@ use float_ord::FloatOrd;
 use rand::prelude::*;
 
 #[derive(Copy,Clone)]
-pub enum AttentionType {
-    Full,
-    Sliding(usize),
-    Random(usize)
+pub struct MultiHeadedAttention {
+    num_heads: usize,
+    d_k: usize,
+    attention_type: AttentionType
 }
 
-fn get_value_vec(emb: &ANode, dims: usize) -> ANode {
-    let v = emb.value().len();
-    emb.slice(2*dims, v - 2*dims)
+#[derive(Copy,Clone)]
+pub enum AttentionType {
+    Full,
+    Sliding { window_size: usize },
+    Random { num_features: usize }
+}
+
+impl MultiHeadedAttention {
+    pub fn new(num_heads: usize, d_k: usize, attention_type: AttentionType) -> Self {
+        MultiHeadedAttention { num_heads, d_k, attention_type }
+    }
+
+    fn get_query_vec(&self, emb: &ANode, head_num: usize) -> ANode {
+        let start = self.d_k * head_num;
+        emb.slice(start, self.d_k)
+    }
+
+    fn get_key_vec(&self, emb: &ANode, head_num: usize) -> ANode {
+        let start = (self.num_heads * self.d_k) + self.d_k * head_num;
+        emb.slice(start, self.d_k)
+    }
+
+    fn get_value_vec(&self, emb: &ANode, dims: usize) -> ANode {
+        let offset = self.num_heads * self.d_k * 2;
+        let v = emb.value().len();
+        emb.slice(offset, v - offset)
+    }
+
 }
 
 fn get_query_vec(emb: &ANode, dims: usize) -> ANode {
@@ -20,6 +45,11 @@ fn get_query_vec(emb: &ANode, dims: usize) -> ANode {
 
 fn get_key_vec(emb: &ANode, dims: usize) -> ANode {
     emb.slice(dims, dims)
+}
+
+fn get_value_vec(emb: &ANode, dims: usize) -> ANode {
+    let v = emb.value().len();
+    emb.slice(2*dims, v - 2*dims)
 }
 
 #[derive(Clone)]
@@ -90,8 +120,8 @@ fn compute_attention_matrix(
 ) -> AttentionMatrix {
     match at {
         AttentionType::Full => compute_full_attention_matrix(items),
-        AttentionType::Sliding(window) => compute_sliding_attention_matrix(items, *window),
-        AttentionType::Random(k) => compute_random_attention_matrix(items, *k, rng)
+        AttentionType::Sliding{ window_size } => compute_sliding_attention_matrix(items, *window_size),
+        AttentionType::Random { num_features } => compute_random_attention_matrix(items, *num_features, rng)
     }
 }
 
@@ -248,7 +278,7 @@ mod attention_tests {
         ];
 
         let mut rng = XorShiftRng::seed_from_u64(0);
-        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Sliding(1), &mut rng);
+        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Sliding {window_size: 1}, &mut rng);
         for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
             assert_eq!(row.len(), exp_row.len());
             for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
@@ -267,7 +297,7 @@ mod attention_tests {
         ];
 
         // larger window than feat set
-        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Sliding(10), &mut rng);
+        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Sliding { window_size: 10}, &mut rng);
         for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
             assert_eq!(row.len(), exp_row.len());
             for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
