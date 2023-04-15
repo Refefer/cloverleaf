@@ -1,9 +1,13 @@
 use hashbrown::HashMap;
 use crate::graph::NodeID;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize,Ordering};
+
+static VOCAB_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone,Debug)]
 pub struct Vocab {
+    vocab_id: usize,
     vocab_to_idx: HashMap<(usize, Arc<String>), NodeID>,
     node_id_to_node: Vec<(usize,Arc<String>)>,
     node_type_to_id: HashMap<Arc<String>, usize>,
@@ -12,7 +16,9 @@ pub struct Vocab {
 
 impl Vocab {
     pub fn new() -> Self {
+        let vocab_id = VOCAB_ID.fetch_add(1, Ordering::SeqCst);
         Vocab { 
+            vocab_id: vocab_id,
             node_type_to_id: HashMap::new(),
             id_to_node_type: Vec::new(),
             vocab_to_idx: HashMap::new(),
@@ -20,11 +26,17 @@ impl Vocab {
         }
     }
 
+    pub fn is_identical(&self, other: &Vocab) -> bool {
+        self.vocab_id == other.vocab_id
+    }
+
     pub fn get_node_id(&self, node_type: String, name: String) -> Option<NodeID> {
-        let node_type = Arc::new(node_type);
-        self.node_type_to_id.get(&node_type).and_then(|nt_id| {
-            let node = Arc::new(name);
-            self.vocab_to_idx.get(&(*nt_id, node)).map(|n| n.clone())
+        self.get_node_id_int(&Arc::new(node_type), &Arc::new(name))
+    }
+
+    fn get_node_id_int(&self, node_type: &Arc<String>, name: &Arc<String>) -> Option<NodeID> {
+        self.node_type_to_id.get(node_type).and_then(|nt_id| {
+            self.vocab_to_idx.get(&(*nt_id, (*name).clone())).map(|n| n.clone())
         })
     }
 
@@ -71,6 +83,17 @@ impl Vocab {
 
     pub fn len(&self) -> usize {
         self.node_id_to_node.len()
+    }
+
+    pub fn translate_node(&self, other: &Vocab, other_node_id: NodeID) -> Option<NodeID> {
+        if self.is_identical(other) {
+            Some(other_node_id)
+        } else {
+            other.node_id_to_node.get(other_node_id).and_then(|(node_type_id, node_name)| {
+                let node_type = &other.id_to_node_type[*node_type_id];
+                self.get_node_id_int(node_type, &node_name)
+            })
+        }
     }
 }
 
