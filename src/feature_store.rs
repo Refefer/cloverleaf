@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use crate::NodeID;
 use crate::vocab::Vocab;
-use crate::embeddings::EmbeddingStore;
 
 #[derive(Debug)]
 pub struct FeatureStore {
