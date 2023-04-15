@@ -4,7 +4,7 @@ use rand_xorshift::XorShiftRng;
 
 use crate::feature_store::FeatureStore;
 use crate::embeddings::EmbeddingStore;
-use crate::algos::ep::attention::{attention_mean,AttentionType};
+use crate::algos::ep::attention::{attention_mean,MultiHeadedAttention};
 
 pub trait EmbeddingBuilder {
     fn construct( &self, features: &[usize], out: &mut [f32]) -> ();
@@ -115,13 +115,12 @@ impl <'a> EmbeddingBuilder for WeightedAggregator<'a> {
 
 pub struct AttentionAggregator<'a> {
     embs: &'a EmbeddingStore,
-    dims: usize,
-    window: Option<usize>
+    mha: MultiHeadedAttention
 }
 
 impl <'a> AttentionAggregator<'a> {
-    pub fn new(embs: &'a EmbeddingStore, dims: usize, window: Option<usize>) -> Self {
-        AttentionAggregator { embs, dims, window }
+    pub fn new(embs: &'a EmbeddingStore, mha: MultiHeadedAttention) -> Self {
+        AttentionAggregator { embs, mha }
     }
 
 }
@@ -138,14 +137,9 @@ impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {
             (Constant::new(e.to_vec()), 1usize)
         }).collect::<Vec<_>>();
 
-        let mut at = if let Some(size) = self.window {
-            AttentionType::Sliding{window_size: size}
-        } else {
-            AttentionType::Full
-        };
-
+        // No-op RNG
         let mut rng = XorShiftRng::seed_from_u64(0);
-        let v = attention_mean(it.iter(), self.dims, &mut at, &mut rng);
+        let v = attention_mean(it.iter(), &self.mha, &mut rng);
         v.value().iter().zip(out.iter_mut()).for_each(|(vi, outi)| {
             *outi = *vi;
         });

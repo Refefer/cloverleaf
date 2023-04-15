@@ -34,7 +34,7 @@ use crate::algos::reweighter::{Reweighter};
 use crate::algos::ep::EmbeddingPropagation;
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
-use crate::algos::ep::attention::{AttentionType};
+use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
 use crate::algos::ann::NodeDistance;
 use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
@@ -444,6 +444,7 @@ impl EmbeddingPropagator {
         hard_negatives: Option<usize>,
         indicator: Option<bool>,
         attention: Option<usize>,
+        attention_heads: Option<usize>,
         context_window: Option<usize>,
     ) -> Self {
         let ep = EmbeddingPropagation {
@@ -457,7 +458,8 @@ impl EmbeddingPropagator {
             indicator: indicator.unwrap_or(true)
         };
 
-        let model = if let Some(dims) = attention {
+        let model = if let Some(d_k) = attention {
+            let num_heads = attention_heads.unwrap_or(1);
             let at = if let Some(size) = context_window {
                 AttentionType::Sliding{window_size: size}
             } else if let Some(k) = max_features {
@@ -465,7 +467,8 @@ impl EmbeddingPropagator {
             } else {
                 AttentionType::Full
             };
-            ModelType::Attention(AttentionFeatureModel::new(dims, at, None, max_nodes))
+            let mha = MultiHeadedAttention::new(num_heads, d_k, at);
+            ModelType::Attention(AttentionFeatureModel::new(mha, None, max_nodes))
         } else {
             ModelType::Averaged(AveragedFeatureModel::new(max_features, max_nodes))
         };
@@ -627,7 +630,8 @@ enum AggregatorType {
         unigrams: Arc<UnigramProbability>
     },
     Attention {
-        dims: usize,
+        num_heads: usize,
+        d_k: usize,
         window: Option<usize>
     }
 }
@@ -647,8 +651,8 @@ impl FeatureAggregator {
     }
 
     #[staticmethod]
-    pub fn Attention(dims: usize, window: Option<usize>) -> Self {
-        FeatureAggregator { at: AggregatorType::Attention {dims, window} }
+    pub fn Attention(num_heads: usize, d_k: usize, window: Option<usize>) -> Self {
+        FeatureAggregator { at: AggregatorType::Attention {num_heads, d_k, window} }
     }
 
     #[staticmethod]
@@ -668,10 +672,12 @@ impl FeatureAggregator {
                 writeln!(&mut bw, "Averaged")
                     .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
             },
-            AggregatorType::Attention { dims, window } => {
+            AggregatorType::Attention { num_heads, d_k, window } => {
                 writeln!(&mut bw, "Attention")
                     .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-                writeln!(&mut bw, "{}", dims)
+                writeln!(&mut bw, "{}", num_heads)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                writeln!(&mut bw, "{}", d_k)
                     .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
                 writeln!(&mut bw, "{}", window.unwrap_or(0))
                     .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -710,20 +716,32 @@ impl FeatureAggregator {
         match line.trim_end() {
             "Averaged" => Ok(FeatureAggregator::Averaged()),
             "Attention" => {
+
                 line.clear();
                 br.read_line(&mut line)
                     .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-                let dims = line.trim_end().parse::<usize>()
+                let num_heads = line.trim_end().parse::<usize>()
                     .map_err(|_e| PyValueError::new_err(format!("invalid dim! {:?}", line)))?;
+
+                line.clear();
+                br.read_line(&mut line)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                let d_k = line.trim_end().parse::<usize>()
+                    .map_err(|_e| PyValueError::new_err(format!("invalid dim! {:?}", line)))?;
+
+                line.clear();
+                br.read_line(&mut line)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
                 let window = line.trim_end().parse::<usize>()
                     .map_err(|_e| PyValueError::new_err(format!("invalid dim! {:?}", line)))?;
+
                 let window = if window == 0 {
                     None
                 } else {
                     Some(window)
                 };
 
-                Ok(FeatureAggregator::Attention(dims, window))
+                Ok(FeatureAggregator::Attention(num_heads, d_k, window))
             },
             "Weighted" => {
                 // get alpha
@@ -781,8 +799,14 @@ impl NodeEmbedder {
             AggregatorType::Averaged => {
                 Box::new(AvgAggregator::new(es))
             },
-            AggregatorType::Attention {dims, window} => {
-                Box::new(AttentionAggregator::new(es, *dims, *window))
+            AggregatorType::Attention {num_heads, d_k, window} => {
+                let at = if let Some(window_size) = window {
+                    AttentionType::Sliding { window_size: *window_size }
+                } else {
+                    AttentionType::Full
+                };
+                let mha = MultiHeadedAttention::new(*num_heads, *d_k, at);
+                Box::new(AttentionAggregator::new(es, mha))
             }
 
         }
@@ -790,7 +814,7 @@ impl NodeEmbedder {
 
     fn get_attention_size(&self) -> usize {
         match self.feat_agg.at {
-            AggregatorType::Attention { dims, window:_ } => 2 * dims,
+            AggregatorType::Attention { num_heads, d_k, window:_ } => 2 * num_heads * d_k,
             _ => 0
         }
     }

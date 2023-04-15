@@ -21,6 +21,10 @@ impl MultiHeadedAttention {
         MultiHeadedAttention { num_heads, d_k, attention_type }
     }
 
+    pub fn preserve_feature_order(&self) -> bool {
+        matches!(self.attention_type,  AttentionType::Sliding {window_size:_})
+    }
+
     fn get_query_vec(&self, emb: &ANode, head_num: usize) -> ANode {
         let start = self.d_k * head_num;
         emb.slice(start, self.d_k)
@@ -31,7 +35,7 @@ impl MultiHeadedAttention {
         emb.slice(start, self.d_k)
     }
 
-    fn get_value_vec(&self, emb: &ANode, dims: usize) -> ANode {
+    fn get_value_vec(&self, emb: &ANode) -> ANode {
         let offset = self.num_heads * self.d_k * 2;
         let v = emb.value().len();
         emb.slice(offset, v - offset)
@@ -60,39 +64,46 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(node: &ANode, attention_dims: usize) -> Self {
-        let query = get_query_vec(&node, attention_dims);
-        let key = get_key_vec(&node, attention_dims);
-        let value = get_value_vec(&node, attention_dims);
+    fn new(node: &ANode, mha: &MultiHeadedAttention, head: usize) -> Self {
+        let query = mha.get_query_vec(&node, head);
+        let key = mha.get_key_vec(&node, head);
+        let value = mha.get_value_vec(&node);
         Attention {query, key, value}
     }
 }
 
 pub fn attention_mean<'a>(
     it: impl Iterator<Item=&'a (ANode, usize)>,
-    attention_dims: usize,
-    at: &mut AttentionType,
+    mha: &MultiHeadedAttention,
     rng: &mut impl Rng
 ) -> ANode {
 
-    let items: Vec<_> = it.map(|(node, count)| {
-        (Attention::new(node, attention_dims), *count)
-    }).collect();
+    let features = it.collect::<Vec<_>>();
+    let mut averages = Vec::with_capacity(mha.num_heads);
+    for head in 0..mha.num_heads {
+        let items: Vec<_> = features.iter().map(|(node, count)| {
+            (Attention::new(node, mha, head), *count)
+        }).collect();
 
-    if items.len() == 1 {
-        return items[0].0.value.clone()
+        if items.len() == 1 {
+            return items[0].0.value.clone()
+        }
+        
+        // Compute attention matrix
+        let attention_matrix = compute_attention_matrix(&items, &mha.attention_type, rng);
+        
+        let sm_att_mat = compute_attention_softmax(attention_matrix, mha.d_k);
+
+        let n = items.len() as f32;
+        let mean = scale_vecs(items, &sm_att_mat)
+            .collect::<Vec<_>>().sum_all() / n;
+        averages.push(mean);
     }
-    
-    // Compute attention matrix
-    let attention_matrix = compute_attention_matrix(&items, at, rng);
-    
-    let sm_att_mat = compute_attention_softmax(attention_matrix, attention_dims);
 
-    let n = items.len() as f32;
-    scale_vecs(items, &sm_att_mat)
-        .collect::<Vec<_>>().sum_all() / n
+    averages.sum_all() / (mha.num_heads as f32)
 }
 
+/// Computes value level attention scaling.
 fn scale_vecs<'a>(
     items: Vec<(Attention, usize)>, 
     sm_att_mat: &'a AttentionMatrix 
@@ -115,7 +126,7 @@ type AttentionMatrix = Vec<Vec<Option<ANode>>>;
 #[inline]
 fn compute_attention_matrix(
     items: &[(Attention, usize)],
-    at: &mut AttentionType,
+    at: &AttentionType,
     rng: &mut impl Rng
 ) -> AttentionMatrix {
     match at {
@@ -240,10 +251,15 @@ mod attention_tests {
     use rand_xorshift::XorShiftRng;
 
     fn create_att_vecs() -> Vec<(Attention, usize)> {
+        let mha = MultiHeadedAttention {
+            d_k: 1,
+            num_heads: 1,
+            attention_type: AttentionType::Full
+        };
         vec![
-            (Attention::new(&Variable::new(vec![-1., -1., 1., 1.]), 1), 1),
-            (Attention::new(&Variable::new(vec![0., 0., 2., 2.]), 1), 1),
-            (Attention::new(&Variable::new(vec![1., 1., -1., -1.]), 1), 1)
+            (Attention::new(&Variable::new(vec![-1., -1., 1., 1.]), &mha, 0), 1),
+            (Attention::new(&Variable::new(vec![0., 0., 2., 2.]), &mha, 0), 1),
+            (Attention::new(&Variable::new(vec![1., 1., -1., -1.]), &mha, 0), 1)
         ]
     }
 

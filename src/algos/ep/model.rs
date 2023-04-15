@@ -5,7 +5,7 @@ use rand::prelude::*;
 use crate::FeatureStore;
 use crate::EmbeddingStore;
 use crate::graph::{Graph as CGraph,NodeID};
-use super::attention::{attention_mean,AttentionType};
+use super::attention::{attention_mean,MultiHeadedAttention};
 
 pub trait Model: Send + Sync {
 
@@ -84,7 +84,6 @@ impl Model for AveragedFeatureModel {
             feature_embeddings,
             self.max_neighbor_nodes,
             self.max_features,
-            0,
             None,
             rng)
     }
@@ -100,7 +99,7 @@ impl Model for AveragedFeatureModel {
             nodes, feature_store, 
             feature_embeddings, 
             self.max_features,
-            0, None, rng)
+            None, rng)
     }
 
     fn uses_attention(&self) -> bool {
@@ -114,20 +113,18 @@ impl Model for AveragedFeatureModel {
 }
 
 pub struct AttentionFeatureModel {
-    dims: usize,
-    at: AttentionType,
+    mha: MultiHeadedAttention,
     max_features: Option<usize>,
     max_neighbor_nodes: Option<usize>
 }
 
 impl AttentionFeatureModel {
     pub fn new(
-        dims: usize,
-        at: AttentionType,
+        mha: MultiHeadedAttention,
         max_features: Option<usize>,
         max_neighbor_nodes: Option<usize>
     ) -> Self {
-        AttentionFeatureModel { dims, at, max_features, max_neighbor_nodes }
+        AttentionFeatureModel { mha, max_features, max_neighbor_nodes }
     }
 }
 
@@ -144,8 +141,7 @@ impl Model for AttentionFeatureModel {
             feature_store,
             feature_embeddings,
             self.max_features,
-            self.dims,
-            self.at.clone(),
+            self.mha.clone(),
             rng)
     }
 
@@ -164,8 +160,7 @@ impl Model for AttentionFeatureModel {
             feature_embeddings,
             self.max_neighbor_nodes,
             self.max_features,
-            self.dims,
-            Some(self.at.clone()),
+            Some(self.mha.clone()),
             rng)
     }
 
@@ -180,7 +175,7 @@ impl Model for AttentionFeatureModel {
             nodes, feature_store, 
             feature_embeddings, 
             self.max_features,
-            self.dims, Some(self.at.clone()), rng)
+            Some(self.mha.clone()), rng)
     }
 
     fn uses_attention(&self) -> bool {
@@ -245,8 +240,7 @@ pub fn attention_construct_node_embedding<R: Rng>(
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     max_features: Option<usize>,
-    attention_dims: usize,
-    mut attention_type: AttentionType,
+    mha: MultiHeadedAttention,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
@@ -256,7 +250,7 @@ pub fn attention_construct_node_embedding<R: Rng>(
                                  max_features,
                                  rng);
 
-    let mean = if matches!(attention_type, AttentionType::Sliding{window_size: _}) {
+    let mean = if mha.preserve_feature_order() {
         // Need to preserve order of features for context windows
         let feats = feature_store.get_features(node);
         let it = feats.iter()
@@ -264,9 +258,9 @@ pub fn attention_construct_node_embedding<R: Rng>(
             .map(|f| {
                 feature_map.get(f).expect("Some type of error!")
             });
-        attention_mean(it, attention_dims, &mut attention_type, rng)
+        attention_mean(it, &mha, rng)
     } else {
-        attention_mean(feature_map.values(), attention_dims, &mut attention_type, rng)
+        attention_mean(feature_map.values(), &mha, rng)
     };
     (feature_map, mean)
 }
@@ -283,8 +277,7 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     feature_embeddings: &EmbeddingStore,
     max_nodes: Option<usize>,
     max_features: Option<usize>,
-    attention_dims: usize, 
-    attention_type: Option<AttentionType>,
+    mha: Option<MultiHeadedAttention>,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
     let edges = &graph.get_edges(node).0;
@@ -294,8 +287,7 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
             feature_store,
             feature_embeddings,
             max_features,
-            attention_dims,
-            attention_type,
+            mha,
             rng)
     } else {
         let it = edges.choose_multiple(rng, max_nodes.unwrap()).cloned();
@@ -303,8 +295,7 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
             feature_store,
             feature_embeddings,
             max_features,
-            attention_dims,
-            attention_type,
+            mha,
             rng)
     }
 }
@@ -314,14 +305,13 @@ fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     max_features: Option<usize>,
-    attention_dims: usize,
-    attention_type: Option<AttentionType>,
+    mha: Option<MultiHeadedAttention>,
     rng: &mut R,
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
     let mut new_nodes = Vec::with_capacity(0);
     for node in nodes {
-        if attention_dims > 0 {
+        if mha.is_some() {
             new_nodes.push(node.clone());
         }
 
@@ -332,8 +322,8 @@ fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
                                      rng);
     }
 
-    let mean = if let Some(at) = attention_type {
-        attention_multiple(new_nodes, feature_store, &feature_map, attention_dims, at, rng)
+    let mean = if let Some(attention) = mha {
+        attention_multiple(new_nodes, feature_store, &feature_map, attention, rng)
     } else {
         mean_embeddings(feature_map.values())
     };
@@ -345,8 +335,7 @@ fn attention_multiple(
     new_nodes: Vec<NodeID>,
     feature_store: &FeatureStore,
     feature_map: &NodeCounts,
-    attention_dims: usize,
-    mut attention_type: AttentionType,
+    mha: MultiHeadedAttention,
     rng: &mut impl Rng
 ) -> ANode {
     let mut feats_per_node = HashMap::new();
@@ -366,7 +355,7 @@ fn attention_multiple(
                 feats_per_node.get(f).expect("Some type of error!")
             });
 
-        output.push((attention_mean(it, attention_dims, &mut attention_type, rng), 1))
+        output.push((attention_mean(it, &mha, rng), 1))
     }
     mean_embeddings(output.iter())
 }
