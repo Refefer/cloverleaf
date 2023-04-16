@@ -85,11 +85,18 @@ def main(args):
             sm = summed / summed.sum()
             rows.append(['Softmax'] + format_row(sm))
             sms.append(sm)
-            print(tabulate.tabulate(rows, headers=headers))
+            rows.append(tabulate.SEPARATING_LINE)
+            idxs = np.argsort(sm)[::-1]
+            rows.append(['Sorted'] + [terms[i] for i in idxs])
+            print(tabulate.tabulate(rows, headers=headers, tablefmt="fancy_grid"))
             print()
 
-        if num_heads > 1:
-            print(tabulate.tabulate([np.sum(sms, axis=0) / len(sms)], headers=terms))
+        avg = np.sum(sms, axis=0) / len(sms)
+        idxs = np.argsort(avg)[::-1]
+        header = ['Terms'] + [terms[i] for i in idxs]
+        sorted_scores = ['Average'] + format_row([avg[i] for i in idxs])
+        print(tabulate.tabulate([sorted_scores], headers=header, tablefmt="fancy_grid"))
+        print()
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
