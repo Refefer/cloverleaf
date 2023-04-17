@@ -43,19 +43,6 @@ impl MultiHeadedAttention {
 
 }
 
-fn get_query_vec(emb: &ANode, dims: usize) -> ANode {
-    emb.slice(0, dims)
-}
-
-fn get_key_vec(emb: &ANode, dims: usize) -> ANode {
-    emb.slice(dims, dims)
-}
-
-fn get_value_vec(emb: &ANode, dims: usize) -> ANode {
-    let v = emb.value().len();
-    emb.slice(2*dims, v - 2*dims)
-}
-
 #[derive(Clone)]
 struct Attention {
     query: ANode,
@@ -97,6 +84,8 @@ pub fn attention_mean<'a>(
         let n = items.len() as f32;
         let mean = scale_vecs(items, &sm_att_mat)
             .collect::<Vec<_>>().sum_all() / n;
+
+        //averages.push(mean.tanh());
         averages.push(mean);
     }
 

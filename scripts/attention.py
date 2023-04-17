@@ -75,11 +75,14 @@ def main(args):
     while True:
         terms = input("> ")
         terms = terms.split()
+        actual_terms = None
         sms = []
         for head_num in range(num_heads):
-            headers = ['Head {}'.format(head_num)] + terms
-            terms, mat, embedding = get_attention(embs, terms, head_num, num_heads, d_k, context_window)
-            rows = [[term] + format_row(row) for term, row in zip(terms, mat)]
+            nterms, mat, embedding = get_attention(embs, terms, head_num, num_heads, d_k, context_window)
+            if actual_terms is None:
+                actual_terms = nterms[:]
+
+            rows = [[term] + format_row(row) for term, row in zip(nterms, mat)]
             rows.append(tabulate.SEPARATING_LINE)
             summed = mat.sum(axis=0)
             sm = summed / summed.sum()
@@ -87,13 +90,14 @@ def main(args):
             sms.append(sm)
             rows.append(tabulate.SEPARATING_LINE)
             idxs = np.argsort(sm)[::-1]
-            rows.append(['Sorted'] + [terms[i] for i in idxs])
+            rows.append(['Sorted'] + [nterms[i] for i in idxs])
+            headers = ['Head {}'.format(head_num)] + actual_terms
             print(tabulate.tabulate(rows, headers=headers, tablefmt="fancy_grid"))
             print()
 
         avg = np.sum(sms, axis=0) / len(sms)
         idxs = np.argsort(avg)[::-1]
-        header = ['Terms'] + [terms[i] for i in idxs]
+        header = ['Terms'] + [actual_terms[i] for i in idxs]
         sorted_scores = ['Average'] + format_row([avg[i] for i in idxs])
         print(tabulate.tabulate([sorted_scores], headers=header, tablefmt="fancy_grid"))
         print()
