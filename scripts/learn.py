@@ -101,6 +101,17 @@ def build_arg_parser():
         default=None,
         help="If provided, uses self attention with local window size of CONTEXT_WINDOW * 2.")
 
+    parser.add_argument("--neighborhood-alignment",
+        dest="neighborhood_alignment",
+        type=float,
+        default=None,
+        help="If provided, applies neighborhood alignment to the embeddings.")
+
+    parser.add_argument("--full-features",
+        dest="full_features",
+        default=None,
+        help="If provided, embeds features from the given file instead of training set.")
+
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--embedding-propagation",
         dest="ep",
@@ -126,12 +137,6 @@ def build_arg_parser():
         metavar=('TEMPERATURE', 'NEGATIVES'),
         help="Optimizes using contrastive loss.")
 
-    parser.add_argument("--neighborhood-alignment",
-        dest="neighborhood_alignment",
-        type=float,
-        default=None,
-        help="If provided, applies neighborhood alignment to the embeddings.")
-
     return parser
 
 
@@ -144,9 +149,9 @@ def main(args):
     graph = cloverleaf.Graph.load(g_name, cloverleaf.EdgeType.Undirected)
     print("Nodes={},Edges={}".format(graph.nodes(), graph.edges()), file=sys.stderr)
     print('Loading features...')
-    features = cloverleaf.FeatureSet(graph)
+    features = cloverleaf.FeatureSet.new_from_graph(graph)
     if f_name != 'none':
-        features.load_features(f_name, error_on_missing=False)
+        features.load_into(f_name)
         if args.min_feature_count > 1:
             print("Pruning features: Original {}".format(features.num_features()))
             features = features.prune_min_count(args.min_feature_count)
@@ -201,7 +206,10 @@ def main(args):
         aggregator = cloverleaf.FeatureAggregator.Averaged()
 
     embedder = cloverleaf.NodeEmbedder(aggregator)
-    node_embeddings = embedder.embed_graph(graph, features, feature_embeddings)
+    if args.full_features:
+        features = cloverleaf.FeatureSet.new_from_file(args.full_features)
+
+    node_embeddings = embedder.embed_feature_set(features, feature_embeddings)
 
     if args.neighborhood_alignment is None:
         node_embeddings.save(args.output + '.node-embeddings')

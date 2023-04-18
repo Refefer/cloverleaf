@@ -528,18 +528,62 @@ pub struct FeatureSet {
     features: FeatureStore
 }
 
+impl FeatureSet {
+    fn read_vocab_from_file(path: &str) -> PyResult<Vocab> {
+        let mut vocab = Vocab::new();
+        let f = File::open(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let br = BufReader::new(f);
+        for line in br.lines() {
+            let line = line.unwrap();
+            let pieces: Vec<_> = line.split('\t').collect();
+            if pieces.len() != 3 {
+                return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ..."))
+            }
+            vocab.get_or_insert(pieces[0].into(), pieces[1].into());
+        }
+        Ok(vocab)
+    }
+}
+
 #[pymethods]
 impl FeatureSet {
-    #[new]
-    pub fn new(graph: &Graph, namespace: Option<String>) -> Self {
+
+    // Loads features tied to a graph
+    #[staticmethod]
+    pub fn new_from_graph(graph: &Graph, path: Option<String>, namespace: Option<String>) -> PyResult<Self> {
+
         let ns = namespace.unwrap_or_else(|| "feat".to_string());
-        FeatureSet {
-            features: FeatureStore::new(graph.graph.len(), ns),
-            vocab: graph.vocab.clone()
+        let mut fs = FeatureSet {
+            vocab: graph.vocab.clone(),
+            features: FeatureStore::new(graph.graph.len(), ns)
+        };
+
+        if let Some(path) = path {
+            fs.load_into(path)?;
         }
+        Ok(fs)
     }
 
-    pub fn add_features(&mut self, node: (String,String), features: Vec<String>) -> PyResult<()> {
+    // Loads features tied to a graph
+    #[staticmethod]
+    pub fn new_from_file(path: String, namespace: Option<String>) -> PyResult<Self> {
+
+        // Build the vocab from the file first, get the length of the feature set
+        let vocab = Arc::new(FeatureSet::read_vocab_from_file(&path)?);
+        let ns = namespace.unwrap_or_else(|| "feat".to_string());
+        let feats = FeatureStore::new(vocab.len(), ns);
+        let mut fs = FeatureSet {
+            vocab: vocab,
+            features: feats
+        };
+
+        fs.load_into(path)?;
+        Ok(fs)
+    }
+
+    pub fn set_features(&mut self, node: (String,String), features: Vec<String>) -> PyResult<()> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         self.features.set_features(node_id, features);
         Ok(())
@@ -550,12 +594,11 @@ impl FeatureSet {
         Ok(self.features.get_pretty_features(node_id))
     }
 
-    pub fn load_features(&mut self, path: String, error_on_missing: Option<bool>) -> PyResult<()> {
+    pub fn load_into(&mut self, path: String) -> PyResult<()> {
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
         let br = BufReader::new(f);
-        let strict = error_on_missing.unwrap_or(true);
         for line in br.lines() {
             let line = line.unwrap();
             let pieces: Vec<_> = line.split('\t').collect();
@@ -564,12 +607,13 @@ impl FeatureSet {
             }
             let bow = pieces[2].split_whitespace()
                 .map(|s| s.to_string()).collect();
-            let ret = self.add_features((pieces[0].to_string(), pieces[1].to_string()), bow);
-            if strict {
-                ret?
-            } 
+            self.set_features((pieces[0].to_string(), pieces[1].to_string()), bow);
         }
         Ok(())
+    }
+
+    pub fn nodes(&self) -> usize {
+        self.vocab.len()
     }
 
     pub fn num_features(&self) -> usize {
@@ -831,26 +875,36 @@ impl NodeEmbedder {
         NodeEmbedder { feat_agg }
     }
 
-    pub fn embed_graph(
+    pub fn embed_feature_set(
         &self, 
-        graph: &Graph,
         feat_set: &FeatureSet, 
         feature_embeddings: &NodeEmbeddings,
     ) -> NodeEmbeddings {
 
-        let num_nodes = graph.nodes();
+        let num_nodes = feat_set.vocab.len();
         let dims = self.get_dims(feature_embeddings);
 
         let es = EmbeddingStore::new(num_nodes, dims, EDist::Cosine);
         let agg = self.get_aggregator(&feature_embeddings.embeddings, &self.feat_agg.at);
+        let fs_vocab = feat_set.features.get_vocab();
         (0..num_nodes).into_par_iter().for_each(|node| {
             // Safe to access in parallel
             let embedding = es.get_embedding_mut_hogwild(node);
-            agg.construct(feat_set.features.get_features(node), embedding);
+            // Translate nodes
+            let new_feats: Vec<_> = feat_set.features.get_features(node)
+                .iter()
+                .map(|feat_id| feature_embeddings.vocab.translate_node(&fs_vocab, *feat_id))
+                .filter(|n| n.is_some())
+                .map(|n| n.unwrap())
+                .collect();
+            
+            if new_feats.len() > 0 {
+                agg.construct(&new_feats, embedding);
+            }
         });
 
         NodeEmbeddings {
-            vocab: graph.vocab.clone(),
+            vocab: feat_set.vocab.clone(),
             embeddings: es
         }
     }
