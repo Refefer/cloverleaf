@@ -16,6 +16,8 @@ pub enum AttentionType {
     Random { num_features: usize }
 }
 
+// Multi-headed attention is encoded as
+// Q1,K1,Q2,K2,V1,V2
 impl MultiHeadedAttention {
     pub fn new(num_heads: usize, d_k: usize, attention_type: AttentionType) -> Self {
         MultiHeadedAttention { num_heads, d_k, attention_type }
@@ -35,10 +37,12 @@ impl MultiHeadedAttention {
         emb.slice(start, self.d_k)
     }
 
-    fn get_value_vec(&self, emb: &ANode) -> ANode {
-        let offset = self.num_heads * self.d_k * 2;
+    fn get_value_vec(&self, emb: &ANode, head_num: usize) -> ANode {
+        let query_key_size = self.num_heads * self.d_k * 2;
         let v = emb.value().len();
-        emb.slice(offset, v - offset)
+        let d_model = ((v - query_key_size) as f32 / self.num_heads as f32) as usize;
+        let start = query_key_size + d_model * head_num;
+        emb.slice(start, d_model)
     }
 
 }
@@ -54,7 +58,7 @@ impl Attention {
     fn new(node: &ANode, mha: &MultiHeadedAttention, head: usize) -> Self {
         let query = mha.get_query_vec(&node, head);
         let key = mha.get_key_vec(&node, head);
-        let value = mha.get_value_vec(&node);
+        let value = mha.get_value_vec(&node, head);
         Attention {query, key, value}
     }
 }
