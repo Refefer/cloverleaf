@@ -48,6 +48,12 @@ def build_arg_parser():
         default=9e-1,
         help="Learning Rate.")
 
+    parser.add_argument("--valid-pct",
+        dest='valid_pct',
+        type=float,
+        default=0.1,
+        help="Percentage of nodes to use for validation.")
+
     parser.add_argument("--batch-size",
         type=int,
         default=128,
@@ -182,7 +188,7 @@ def main(args):
         passes=args.passes, max_nodes=args.max_neighbors, 
         max_features=args.max_features, attention=args.attention, 
         attention_heads=args.attention_heads, context_window=args.context_window, 
-        hard_negatives=args.hard_negatives)
+        hard_negatives=args.hard_negatives, valid_pct=args.valid_pct)
 
     if args.warm_start is not None:
         feature_embeddings = cloverleaf.NodeEmbeddings.load(args.warm_start, cloverleaf.Distance.Cosine)

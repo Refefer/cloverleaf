@@ -27,96 +27,20 @@ pub trait NodeSampler {
         rng: &mut R); 
 }
 
-pub struct RandomSamplerStrategy {
-    unigram_table: Vec<f32>
-}
-
-impl RandomSamplerStrategy {
-
-    pub fn new<G: CGraph>(
-        graph: &G
-    ) -> Self {
-        RandomSamplerStrategy {
-            unigram_table: RandomSamplerStrategy::create_neg_sample_table(graph)
-        }
-    }
-
-    pub fn create_neg_sample_table<G: CGraph>(
-        graph: &G
-    ) -> Vec<f32> {
-        let mut fast_biased = vec![0f32; graph.len()];
-        let denom = (0..graph.len())
-            .map(|idx| (graph.degree(idx) as f64).powf(0.75))
-            .sum::<f64>();
-
-        let mut acc = 0f64;
-        fast_biased.iter_mut().enumerate().for_each(|(i, w)| {
-            *w = (acc / denom) as f32;
-            acc += (graph.degree(i) as f64).powf(0.75);
-        });
-        fast_biased[graph.len()-1] = 1.;
-        fast_biased
-    }
-}
-
-impl <'s> BatchSamplerStrategy for &'s RandomSamplerStrategy {
-    type Sampler = RandomSampler<'s>;
-
-    fn initialize_batch<'b,G: CGraph + Send + Sync>(
-        &self,
-        _nodes: &[&NodeID],
-        _graph: &G,
-        _features: &FeatureStore
-    ) -> Self::Sampler {
-        RandomSampler { unigram_table: &self.unigram_table }
-    }
- 
-}
-
-pub struct RandomSampler<'a> {
-    unigram_table: &'a Vec<f32>
-}
-
-impl <'a> NodeSampler for RandomSampler<'a>  {
-    fn sample_negatives<R: Rng>(
-        &self, 
-        _graph: &impl CGraph,
-        anchor: NodeID, 
-        negatives: &mut Vec<NodeID>,
-        num_negs: usize,
-        rng: &mut R) {
-
-        // We make a good attempt to get the full negatives, but bail
-        // if it's computationally too expensive
-        for _ in 0..(num_negs*2) {
-            let p: f32 = rng.gen();
-            let neg_node = match self.unigram_table.binary_search_by_key(&FloatOrd(p), |w| FloatOrd(*w)) {
-                Ok(idx) => idx,
-                Err(idx) => idx
-            };
-
-            if neg_node != anchor { 
-                negatives.push(neg_node) ;
-                if negatives.len() == num_negs { break }
-            }
-        }
-    }
-
-}
-
 // Finds hard negatives through exploration of local graph walks
 pub struct RandomWalkHardStrategy {
-    num_hard_negatives: usize
+    num_hard_negatives: usize,
+    train_idxs: Vec<NodeID>
 }
 
 impl RandomWalkHardStrategy {
-   pub fn new(num_hard_negatives: usize) -> Self {
-        RandomWalkHardStrategy { num_hard_negatives }
+   pub fn new(num_hard_negatives: usize, train_idxs: &[NodeID]) -> Self {
+        RandomWalkHardStrategy { num_hard_negatives, train_idxs: train_idxs.to_vec() }
     }
 }
 
-impl BatchSamplerStrategy for &RandomWalkHardStrategy {
-    type Sampler = RandomWalkHardSampler;
+impl <'a> BatchSamplerStrategy for &'a RandomWalkHardStrategy {
+    type Sampler = RandomWalkHardSampler<'a>;
 
     fn initialize_batch<'b,G: CGraph + Send + Sync>(
         &self,
@@ -126,17 +50,19 @@ impl BatchSamplerStrategy for &RandomWalkHardStrategy {
     ) -> Self::Sampler {
         RandomWalkHardSampler { 
             p: 0.25, 
-            num_hard_negatives: self.num_hard_negatives 
+            num_hard_negatives: self.num_hard_negatives,
+            train_idxs: self.train_idxs.as_slice()
         }
     }
 }
 
-pub struct RandomWalkHardSampler {
+pub struct RandomWalkHardSampler<'a> {
     p: f32,
-    num_hard_negatives: usize
+    num_hard_negatives: usize,
+    train_idxs: &'a [NodeID]
 }
 
-impl NodeSampler for RandomWalkHardSampler {
+impl <'a> NodeSampler for RandomWalkHardSampler<'a> {
     fn sample_negatives<R: Rng>(
         &self, 
         graph: &impl CGraph,
@@ -156,9 +82,9 @@ impl NodeSampler for RandomWalkHardSampler {
             if negatives.len() >= num_hard_negs { break }
         }
 
-        let dist = Uniform::new(0, graph.len());
+        let dist = Uniform::new(0, self.train_idxs.len());
         while negatives.len() < num_negs {
-            negatives.push(dist.sample(rng));
+            negatives.push(self.train_idxs[dist.sample(rng)]);
         }
     }
 }

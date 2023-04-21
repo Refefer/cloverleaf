@@ -441,6 +441,7 @@ impl EmbeddingPropagator {
         seed: Option<u64>,
         max_nodes: Option<usize>,
         max_features: Option<usize>,
+        valid_pct: Option<f32>,
         hard_negatives: Option<usize>,
         indicator: Option<bool>,
         attention: Option<usize>,
@@ -454,6 +455,7 @@ impl EmbeddingPropagator {
             passes: passes.unwrap_or(100),
             loss: loss.map(|l|l.loss).unwrap_or(Loss::MarginLoss(1f32,1)),
             hard_negs: hard_negatives.unwrap_or(0),
+            valid_pct: valid_pct.unwrap_or(0.1),
             seed: seed.unwrap_or(SEED),
             indicator: indicator.unwrap_or(true)
         };
