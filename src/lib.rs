@@ -1172,6 +1172,9 @@ impl NodeEmbeddings {
                 }
 
                 let node_id = vocab.get_or_insert(node_type, node_name);
+                if node_id < i {
+                    return Err(PyKeyError::new_err(format!("found duplicate node at {}!", i)));
+                }
                 let m = es.get_embedding_mut(node_id);
                 if m.len() != emb.len() {
                     return Err(PyValueError::new_err("Embeddings have different sizes!"));
@@ -1390,7 +1393,7 @@ fn convert_node_distance(
         .map(|n| {
             let (node_id, dist) = n.to_tup();
             let (node_type, name) = vocab.get_name(node_id)
-                .expect("Can't find node id in graph!");
+                .expect("Can't find node id in vocab!");
             (((*node_type).clone(), (*name).clone()), dist)
         }).collect()
 }
