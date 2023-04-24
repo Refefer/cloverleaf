@@ -30,7 +30,7 @@ pub struct EmbeddingPropagation {
     pub alpha: f32,
     pub loss: Loss,
     pub batch_size: usize,
-    pub dims: usize,
+    pub d_model: usize,
     pub passes: usize,
     pub hard_negs: usize,
     pub seed: u64,
@@ -62,10 +62,11 @@ impl EmbeddingPropagation {
 
         let mut rng = XorShiftRng::seed_from_u64(self.seed);
 
+        let dims = model.feature_dims(self.d_model);
         let feature_embeddings = if let Some(embs) = feature_embeddings {
             embs
         } else {
-            let mut fe = EmbeddingStore::new(features.num_features(), self.dims, Distance::Cosine);
+            let mut fe = EmbeddingStore::new(features.num_features(), dims, Distance::Cosine);
             // Initialize embeddings as random
             randomize_embedding_store(&mut fe, &mut rng);
             fe
@@ -90,9 +91,9 @@ impl EmbeddingPropagation {
         use_shared_pool(true);
 
         let lr_scheduler = if model.uses_attention() || true {
-            let warm_up_passes = (self.passes as f32 / 5f32) as usize;
+            let warm_up_steps = ((steps_per_pass * self.passes) as f32 / 5f32) as usize;
             let max_steps = self.passes * steps_per_pass;
-            LRScheduler::cos_decay(self.alpha / 100f32, self.alpha, steps_per_pass * warm_up_passes, max_steps)
+            LRScheduler::cos_decay(self.alpha / 100f32, self.alpha, warm_up_steps, max_steps)
         } else {
             let total_updates = steps_per_pass * self.passes;
             let min_alpha = self.alpha / 1000.;
@@ -100,12 +101,11 @@ impl EmbeddingPropagation {
             LRScheduler::exp_decay(min_alpha, self.alpha, decay)
         };
 
-        
         let random_sampler = node_sampler::RandomWalkHardStrategy::new(self.hard_negs, &node_idxs);
         let valid_random_sampler = node_sampler::RandomWalkHardStrategy::new(self.hard_negs, &valid_idxs);
 
         let mut last_error = std::f32::INFINITY;
-        let step = AtomicUsize::new(0);
+        let step = AtomicUsize::new(1);
         let mut valid_error = std::f32::INFINITY;
         
         for pass in 1..(self.passes + 1) {
@@ -169,21 +169,23 @@ impl EmbeddingPropagation {
 
             last_error = err.iter().sum::<f32>() / err.len() as f32;
             
-            // Validate
-            let valid_errors = valid_idxs.par_iter().chunks(self.batch_size).map(|nodes| {
-                let sampler = (&valid_random_sampler).initialize_batch(&nodes, graph, features);
+            if valid_idxs.len() > 0 {
+                // Validate
+                let valid_errors = valid_idxs.par_iter().chunks(self.batch_size).map(|nodes| {
+                    let sampler = (&valid_random_sampler).initialize_batch(&nodes, graph, features);
 
-                nodes.par_iter().map(|node_id| {
-                    let mut rng = XorShiftRng::seed_from_u64(self.seed - 1);
-                    let loss = self.run_forward_pass(
-                        graph, **node_id, &features, &feature_embeddings, 
-                        model, &sampler, &mut rng).0;
+                    nodes.par_iter().map(|node_id| {
+                        let mut rng = XorShiftRng::seed_from_u64(self.seed - 1);
+                        let loss = self.run_forward_pass(
+                            graph, **node_id, &features, &feature_embeddings, 
+                            model, &sampler, &mut rng).0;
 
-                    loss.value()[0]
-                }).sum::<f32>()
-            }).sum::<f32>();
-            
-            valid_error = valid_errors / valid_idxs.len() as f32;
+                        loss.value()[0]
+                    }).sum::<f32>()
+                }).sum::<f32>();
+                
+                valid_error = valid_errors / valid_idxs.len() as f32;
+            }
         }
         pb.finish();
         feature_embeddings
@@ -319,7 +321,7 @@ mod ep_tests {
             loss: Loss::MarginLoss(1f32, 1usize),
             batch_size: 32,
             hard_negs: 0,
-            dims: 5,
+            d_model: 5,
             valid_pct: 0.0,
             passes: 50,
             seed: 202220222,

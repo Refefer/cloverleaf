@@ -451,7 +451,7 @@ impl EmbeddingPropagator {
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(0.9),
             batch_size: batch_size.unwrap_or(50),
-            dims: dims.unwrap_or(100),
+            d_model: dims.unwrap_or(100),
             passes: passes.unwrap_or(100),
             loss: loss.map(|l|l.loss).unwrap_or(Loss::MarginLoss(1f32,1)),
             hard_negs: hard_negatives.unwrap_or(0),
@@ -866,7 +866,13 @@ impl NodeEmbedder {
     }
 
     fn get_dims(&self, feat_embs: &NodeEmbeddings) -> usize {
-        feat_embs.dims() - self.get_attention_size()
+        match self.feat_agg.at {
+            AggregatorType::Attention { num_heads, d_k, window:_ } =>  {
+                let attention_dims = 2 * num_heads * d_k;
+                (feat_embs.dims() - attention_dims) / num_heads
+            },
+            _ => feat_embs.dims()
+        }
     }
 }
 

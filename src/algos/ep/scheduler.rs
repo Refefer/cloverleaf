@@ -1,4 +1,5 @@
 
+#[derive(Debug)]
 pub enum LRScheduler {
     CosDecay {
         min_alpha: f32,
