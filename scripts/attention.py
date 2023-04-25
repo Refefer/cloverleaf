@@ -15,7 +15,10 @@ def get_key_query_value(emb, head_num, num_heads, d_k):
     query_start = head_num * d_k
     key_start   = num_heads * d_k + head_num * d_k
     value_start = num_heads * d_k * 2;
-    return emb[query_start:query_start+d_k], emb[key_start:key_start+d_k], emb[value_start:]
+    values = emb[value_start:]
+    value_size = int(len(values) / num_heads)
+    value = values[head_num * value_size:(head_num+1) * value_size]
+    return emb[query_start:query_start+d_k], emb[key_start:key_start+d_k], value
 
 def get_attention(embs, feats, head_num, num_heads, d_k, context_window):
     terms, query, key, value = [],[],[],[]
