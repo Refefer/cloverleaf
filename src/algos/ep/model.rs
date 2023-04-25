@@ -36,6 +36,8 @@ pub trait Model: Send + Sync {
 
     fn uses_attention(&self) -> bool;
 
+    fn feature_dims(&self, d_model: usize) -> usize;
+
     fn parameters(&self) -> Vec<ANode>;
 }
 
@@ -100,6 +102,10 @@ impl Model for AveragedFeatureModel {
             feature_embeddings, 
             self.max_features,
             None, rng)
+    }
+
+    fn feature_dims(&self, d_model: usize) -> usize {
+        d_model
     }
 
     fn uses_attention(&self) -> bool {
@@ -180,6 +186,10 @@ impl Model for AttentionFeatureModel {
 
     fn uses_attention(&self) -> bool {
         true
+    }
+
+    fn feature_dims(&self, d_model: usize) -> usize {
+        self.mha.num_heads * (self.mha.d_k * 2 + d_model)
     }
 
     fn parameters(&self) -> Vec<ANode> {

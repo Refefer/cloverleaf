@@ -195,7 +195,7 @@ def main(args):
     else:
         feature_embeddings = None
 
-    if args.passes > 0:
+    if args.passes > 0 or feature_embeddings is None:
         feature_embeddings = ep.learn_features(graph, features, feature_embeddings)
 
     eTime = time.time() - sTime

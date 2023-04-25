@@ -4,8 +4,8 @@ use rand::prelude::*;
 
 #[derive(Copy,Clone)]
 pub struct MultiHeadedAttention {
-    num_heads: usize,
-    d_k: usize,
+    pub num_heads: usize,
+    pub d_k: usize,
     attention_type: AttentionType
 }
 

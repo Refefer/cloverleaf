@@ -57,10 +57,15 @@ def load(args):
     agg_fname = args.model + '.embedder'
 
     print("Loading Node Embeddings...")
+    sys.stdout.flush()
     ne_embeddings = cloverleaf.NodeEmbeddings.load(ne_fname, cloverleaf.Distance.Cosine, args.filter_type)
+    print("Found {} node embeddings".format(ne_embeddings.len()))
     print("Loading Feature Embeddings...")
+    sys.stdout.flush()
     fe_embeddings = cloverleaf.NodeEmbeddings.load(fe_fname, cloverleaf.Distance.Cosine)
+    print("Found {} feature embeddings".format(ne_embeddings.len()))
     print("Loading aggregator")
+    sys.stdout.flush()
     aggregator = cloverleaf.FeatureAggregator.load(agg_fname)
     
     return ne_embeddings, fe_embeddings, cloverleaf.NodeEmbedder(aggregator)
