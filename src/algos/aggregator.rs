@@ -1,6 +1,10 @@
-use crate::algos::utils::FeatureStore;
+use simple_grad::*;
+use rand::prelude::*;
+use rand_xorshift::XorShiftRng;
+
+use crate::feature_store::FeatureStore;
 use crate::embeddings::EmbeddingStore;
-use crate::NodeID;
+use crate::algos::ep::attention::{attention_mean,MultiHeadedAttention};
 
 pub trait EmbeddingBuilder {
     fn construct( &self, features: &[usize], out: &mut [f32]) -> ();
@@ -33,6 +37,9 @@ impl <'a> EmbeddingBuilder for AvgAggregator<'a> {
             let e = self.embs.get_embedding(*feat_id); 
             AvgAggregator::isum(out, e);
         }
+
+        let len = features.len() as f32;
+        out.iter_mut().for_each(|outi| *outi /= len);
     }
 }
 
@@ -105,3 +112,37 @@ impl <'a> EmbeddingBuilder for WeightedAggregator<'a> {
         out.iter_mut().for_each(|outi| *outi /= weight);
     }
 }
+
+pub struct AttentionAggregator<'a> {
+    embs: &'a EmbeddingStore,
+    mha: MultiHeadedAttention
+}
+
+impl <'a> AttentionAggregator<'a> {
+    pub fn new(embs: &'a EmbeddingStore, mha: MultiHeadedAttention) -> Self {
+        AttentionAggregator { embs, mha }
+    }
+
+}
+
+impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {
+    fn construct(
+        &self, 
+        features: &[usize],
+        out: &mut [f32]
+    ) {
+        out.fill(0f32);
+        let it = features.iter().map(|feat_id| {
+            let e = self.embs.get_embedding(*feat_id); 
+            (Constant::new(e.to_vec()), 1usize)
+        }).collect::<Vec<_>>();
+
+        // No-op RNG
+        let mut rng = XorShiftRng::seed_from_u64(0);
+        let v = attention_mean(it.iter(), &self.mha, &mut rng);
+        v.value().iter().zip(out.iter_mut()).for_each(|(vi, outi)| {
+            *outi = *vi;
+        });
+    }
+}
+

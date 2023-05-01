@@ -1,10 +1,3 @@
-//#[cfg(not(target_env = "msvc"))]
-//use tikv_jemallocator::Jemalloc;
-//
-//#[cfg(not(target_env = "msvc"))]
-//#[global_allocator]
-//static GLOBAL: Jemalloc = Jemalloc;
-
 pub mod graph;
 pub mod algos;
 mod sampler;
@@ -13,29 +6,39 @@ mod embeddings;
 mod bitset;
 mod hogwild;
 mod progress;
+mod feature_store;
+mod io;
 
 use std::sync::Arc;
 use std::ops::Deref;
 use std::fs::File;
-use std::io::{Write,BufWriter,Read,BufReader,BufRead};
-use std::fmt::Write as FmtWrite;
+use std::io::{Write,BufWriter,BufReader,BufRead};
 
 use rayon::prelude::*;
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError};
+use itertools::Itertools;
+use fast_float::parse;
 
-use crate::graph::{CSR,CumCSR,Graph,NodeID};
-use crate::algos::rwr::{Steps,RWR};
-use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
-use crate::algos::reweighter::{Reweighter};
-use crate::algos::ep::{EmbeddingPropagation,Loss};
-use crate::algos::utils::FeatureStore;
-use crate::algos::ann::NodeDistance;
+use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID};
 use crate::vocab::Vocab;
 use crate::sampler::Weighted;
 use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
-use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,EmbeddingBuilder};
+use crate::feature_store::FeatureStore;
+use crate::io::EmbeddingWriter;
+
+use crate::algos::rwr::{Steps,RWR};
+use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
+use crate::algos::reweighter::{Reweighter};
+use crate::algos::ep::EmbeddingPropagation;
+use crate::algos::ep::loss::Loss;
+use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
+use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
+use crate::algos::ann::NodeDistance;
+use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
+use crate::algos::feat_propagation::propagate_features;
+use crate::algos::alignment::{NeighborhoodAligner as NA};
 
 const SEED: u64 = 20222022;
 
@@ -109,19 +112,19 @@ impl Distance {
 }
 
 #[pyclass]
-pub struct RwrGraph {
+pub struct Graph {
     graph: Arc<CumCSR>,
     vocab: Arc<Vocab>
 }
 
 #[pymethods]
-impl RwrGraph {
+impl Graph {
 
     #[new]
     fn new(edges: Vec<((String,String),(String,String),f32)>) -> Self {
         let (graph, vocab) = build_csr(edges.into_iter());
         eprintln!("Converting to CDF format...");
-        RwrGraph {
+        Graph {
             graph: Arc::new(CumCSR::convert(graph)),
             vocab: Arc::new(vocab)
         }
@@ -148,6 +151,10 @@ impl RwrGraph {
                 ((*nt).clone(), (*n).clone())
             }).collect();
         Ok((names, weights.to_vec()))
+    }
+
+    pub fn vocab(&self) -> VocabIterator {
+        VocabIterator::new(self.vocab.clone())
     }
 
     /// Saves a graph to disk
@@ -201,7 +208,7 @@ impl RwrGraph {
 
         let csr = CSR::construct_from_edges(edges);
 
-        let g = RwrGraph {
+        let g = Graph {
             graph: Arc::new(CumCSR::convert(csr)),
             vocab: Arc::new(vocab)
         };
@@ -231,7 +238,7 @@ impl RandomWalker {
 
     pub fn walk(
         &self, 
-        graph: &RwrGraph,
+        graph: &Graph,
         node: (String, String), 
         seed: Option<u64>, 
         k: Option<usize>, 
@@ -281,7 +288,7 @@ impl BiasedRandomWalker {
 
     pub fn walk(
         &self, 
-        graph: &RwrGraph,
+        graph: &Graph,
         embeddings: &NodeEmbeddings,
         node: (String,String), 
         context: &Query,
@@ -316,7 +323,7 @@ impl BiasedRandomWalker {
         // Reweight results if requested
         if let Some(cn) = rerank_context {
             println!("Reranking...");
-            let c_emb = lookup_embedding(context, embeddings)?;
+            let c_emb = lookup_embedding(cn, embeddings)?;
             Reweighter::new(self.blend.unwrap_or(0.5))
                 .reweight(&mut results, node_embeddings, c_emb);
         }
@@ -365,14 +372,14 @@ impl GraphBuilder {
         }
     }
 
-    pub fn build_graph(&mut self) -> RwrGraph {
+    pub fn build_graph(&mut self) -> Graph {
         let mut vocab = Vocab::new(); 
         std::mem::swap(&mut vocab, &mut self.vocab);
         let mut edges = Vec::new();
         std::mem::swap(&mut edges, &mut self.edges);
         let graph = CSR::construct_from_edges(edges);
 
-        RwrGraph {
+        Graph {
             graph: Arc::new(CumCSR::convert(graph)),
             vocab: Arc::new(vocab)
         }
@@ -404,11 +411,22 @@ impl EPLoss {
         EPLoss { loss: Loss::StarSpace(gamma, negatives.max(1)) }
     }
 
+    #[staticmethod]
+    pub fn ppr(gamma: f32, negatives: usize, restart_p: f32) -> Self {
+        EPLoss { loss: Loss::PPR(gamma, negatives.max(1), restart_p) }
+    }
+
+}
+
+enum ModelType {
+    Averaged(AveragedFeatureModel),
+    Attention(AttentionFeatureModel)
 }
 
 #[pyclass]
 struct EmbeddingPropagator {
-    ep: EmbeddingPropagation
+    ep: EmbeddingPropagation,
+    model: ModelType 
 }
 
 #[pymethods]
@@ -420,32 +438,51 @@ impl EmbeddingPropagator {
         batch_size: Option<usize>, 
         dims: Option<usize>,
         passes: Option<usize>,
-        wd: Option<f32>,
         seed: Option<u64>,
         max_nodes: Option<usize>,
         max_features: Option<usize>,
-        indicator: Option<bool>
-
+        valid_pct: Option<f32>,
+        hard_negatives: Option<usize>,
+        indicator: Option<bool>,
+        attention: Option<usize>,
+        attention_heads: Option<usize>,
+        context_window: Option<usize>,
+        noise: Option<f32>
     ) -> Self {
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(0.9),
             batch_size: batch_size.unwrap_or(50),
-            dims: dims.unwrap_or(100),
+            d_model: dims.unwrap_or(100),
             passes: passes.unwrap_or(100),
-            wd: wd.unwrap_or(0f32),
             loss: loss.map(|l|l.loss).unwrap_or(Loss::MarginLoss(1f32,1)),
+            hard_negs: hard_negatives.unwrap_or(0),
+            valid_pct: valid_pct.unwrap_or(0.1),
             seed: seed.unwrap_or(SEED),
-            max_nodes: max_nodes,
-            max_features: max_features,
-            indicator: indicator.unwrap_or(true)
+            indicator: indicator.unwrap_or(true),
+            noise: noise.unwrap_or(0.0)
         };
 
-        EmbeddingPropagator{ ep }
+        let model = if let Some(d_k) = attention {
+            let num_heads = attention_heads.unwrap_or(1);
+            let at = if let Some(size) = context_window {
+                AttentionType::Sliding{window_size: size}
+            } else if let Some(k) = max_features {
+                AttentionType::Random { num_features: k }
+            } else {
+                AttentionType::Full
+            };
+            let mha = MultiHeadedAttention::new(num_heads, d_k, at);
+            ModelType::Attention(AttentionFeatureModel::new(mha, None, max_nodes))
+        } else {
+            ModelType::Averaged(AveragedFeatureModel::new(max_features, max_nodes))
+        };
+
+        EmbeddingPropagator{ ep, model }
     }
 
     pub fn learn_features(
         &mut self, 
-        graph: &RwrGraph, 
+        graph: &Graph, 
         features: &mut FeatureSet,
         feature_embeddings: Option<&mut NodeEmbeddings>
     ) -> NodeEmbeddings {
@@ -459,11 +496,24 @@ impl EmbeddingPropagator {
            sfes
         });
 
-        let feat_embeds = self.ep.learn(
-            graph.graph.as_ref(), 
-            &mut features.features,
-            feature_embeddings
-        );
+        let feat_embeds = match &self.model {
+            ModelType::Averaged(model) => {
+                self.ep.learn(
+                    graph.graph.as_ref(), 
+                    &mut features.features,
+                    feature_embeddings,
+                    model
+                )
+            },
+            ModelType::Attention(model) => {
+                self.ep.learn(
+                    graph.graph.as_ref(), 
+                    &mut features.features,
+                    feature_embeddings,
+                    model
+                )
+            }
+        };
 
         let vocab = features.features.clone_vocab();
 
@@ -482,18 +532,62 @@ pub struct FeatureSet {
     features: FeatureStore
 }
 
+impl FeatureSet {
+    fn read_vocab_from_file(path: &str) -> PyResult<Vocab> {
+        let mut vocab = Vocab::new();
+        let f = File::open(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let br = BufReader::new(f);
+        for line in br.lines() {
+            let line = line.unwrap();
+            let pieces: Vec<_> = line.split('\t').collect();
+            if pieces.len() != 3 {
+                return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ..."))
+            }
+            vocab.get_or_insert(pieces[0].into(), pieces[1].into());
+        }
+        Ok(vocab)
+    }
+}
+
 #[pymethods]
 impl FeatureSet {
-    #[new]
-    pub fn new(graph: &RwrGraph, namespace: Option<String>) -> Self {
+
+    // Loads features tied to a graph
+    #[staticmethod]
+    pub fn new_from_graph(graph: &Graph, path: Option<String>, namespace: Option<String>) -> PyResult<Self> {
+
         let ns = namespace.unwrap_or_else(|| "feat".to_string());
-        FeatureSet {
-            features: FeatureStore::new(graph.graph.len(), ns),
-            vocab: graph.vocab.clone()
+        let mut fs = FeatureSet {
+            vocab: graph.vocab.clone(),
+            features: FeatureStore::new(graph.graph.len(), ns)
+        };
+
+        if let Some(path) = path {
+            fs.load_into(path)?;
         }
+        Ok(fs)
     }
 
-    pub fn add_features(&mut self, node: (String,String), features: Vec<String>) -> PyResult<()> {
+    // Loads features tied to a graph
+    #[staticmethod]
+    pub fn new_from_file(path: String, namespace: Option<String>) -> PyResult<Self> {
+
+        // Build the vocab from the file first, get the length of the feature set
+        let vocab = Arc::new(FeatureSet::read_vocab_from_file(&path)?);
+        let ns = namespace.unwrap_or_else(|| "feat".to_string());
+        let feats = FeatureStore::new(vocab.len(), ns);
+        let mut fs = FeatureSet {
+            vocab: vocab,
+            features: feats
+        };
+
+        fs.load_into(path)?;
+        Ok(fs)
+    }
+
+    pub fn set_features(&mut self, node: (String,String), features: Vec<String>) -> PyResult<()> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         self.features.set_features(node_id, features);
         Ok(())
@@ -504,12 +598,11 @@ impl FeatureSet {
         Ok(self.features.get_pretty_features(node_id))
     }
 
-    pub fn load_features(&mut self, path: String, error_on_missing: Option<bool>) -> PyResult<()> {
+    pub fn load_into(&mut self, path: String) -> PyResult<()> {
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
         let br = BufReader::new(f);
-        let strict = error_on_missing.unwrap_or(true);
         for line in br.lines() {
             let line = line.unwrap();
             let pieces: Vec<_> = line.split('\t').collect();
@@ -518,72 +611,310 @@ impl FeatureSet {
             }
             let bow = pieces[2].split_whitespace()
                 .map(|s| s.to_string()).collect();
-            let ret = self.add_features((pieces[0].to_string(), pieces[1].to_string()), bow);
-            if strict {
-                ret?
-            } 
+            self.set_features((pieces[0].to_string(), pieces[1].to_string()), bow);
         }
         Ok(())
+    }
+
+    pub fn nodes(&self) -> usize {
+        self.vocab.len()
     }
 
     pub fn num_features(&self) -> usize {
         self.features.num_features()
     }
 
+    pub fn vocab(&self) -> VocabIterator {
+        VocabIterator::new(self.vocab.clone())
+    }
+
+    pub fn prune_min_count(&self, count: usize) -> Self {
+        FeatureSet {
+            features: self.features.prune_min_count(count),
+            vocab: self.vocab.clone()
+        }
+    }
+
 }
 
 #[pyclass]
-pub struct FeatureEmbeddingAggregator {
-    vocab: Arc<Vocab>,
-    unigrams: UnigramProbability
+pub struct FeaturePropagator {
+    k: usize,
+    threshold: f32,
+    max_iters: usize
 }
 
-impl FeatureEmbeddingAggregator {
+#[pymethods]
+impl FeaturePropagator {
+    #[new]
+    pub fn new(k: usize, threshold: Option<f32>, max_iters: Option<usize>) -> Self {
+        FeaturePropagator { 
+            k: k, 
+            threshold: threshold.unwrap_or(0.),
+            max_iters: max_iters.unwrap_or(20)
+        }
+    }
+
+    pub fn propagate(&self,
+        graph: &Graph,
+        features: &mut FeatureSet
+    ) {
+        propagate_features(
+            graph.graph.deref(), 
+            &mut features.features, 
+            self.max_iters,
+            self.k,
+            self.threshold);
+    }
+
+}
+
+#[derive(Clone)]
+enum AggregatorType {
+    Averaged,
+    Weighted {
+        alpha: f32, 
+        vocab: Arc<Vocab>,
+        unigrams: Arc<UnigramProbability>
+    },
+    Attention {
+        num_heads: usize,
+        d_k: usize,
+        window: Option<usize>
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct FeatureAggregator {
+    at: AggregatorType
+}
+
+#[pymethods]
+impl FeatureAggregator {
+
+    #[staticmethod]
+    pub fn Averaged() -> Self {
+        FeatureAggregator { at: AggregatorType::Averaged }
+    }
+
+    #[staticmethod]
+    pub fn Attention(num_heads: usize, d_k: usize, window: Option<usize>) -> Self {
+        FeatureAggregator { at: AggregatorType::Attention {num_heads, d_k, window} }
+    }
+
+    #[staticmethod]
+    pub fn Weighted(alpha: f32, fs: &FeatureSet) -> Self {
+        let unigrams = Arc::new(UnigramProbability::new(&fs.features));
+        let vocab = fs.vocab.clone();
+        FeatureAggregator { at: AggregatorType::Weighted {alpha, vocab, unigrams} }
+    }
+
+    pub fn save(&self, path: &str) -> PyResult<()> {
+        let f = File::create(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let mut bw = BufWriter::new(f);
+        match &self.at {
+            AggregatorType::Averaged => {
+                writeln!(&mut bw, "Averaged")
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+            },
+            AggregatorType::Attention { num_heads, d_k, window } => {
+                writeln!(&mut bw, "Attention")
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                writeln!(&mut bw, "{}", num_heads)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                writeln!(&mut bw, "{}", d_k)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                writeln!(&mut bw, "{}", window.unwrap_or(0))
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+            },
+            AggregatorType::Weighted { alpha, vocab, unigrams } => {
+                writeln!(&mut bw, "Weighted")
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                writeln!(&mut bw, "{}", alpha)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                for (node, p_wi) in unigrams.iter().enumerate() {
+                    if let Some((f_node_type, f_name)) = vocab.get_name(node) {
+                        writeln!(&mut bw, "{}\t{}\t{}", f_node_type, f_name, *p_wi as f64)
+                            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                    } else {
+                        // We've moved to node individual embeddings
+                        break
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[staticmethod]
+    pub fn load(path: String) -> PyResult<Self> {
+        let f = File::open(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let mut br = BufReader::new(f);
+
+        // Find the type
+        let mut line = String::new();
+        br.read_line(&mut line)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        match line.trim_end() {
+            "Averaged" => Ok(FeatureAggregator::Averaged()),
+            "Attention" => {
+
+                line.clear();
+                br.read_line(&mut line)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                let num_heads = line.trim_end().parse::<usize>()
+                    .map_err(|_e| PyValueError::new_err(format!("invalid dim! {:?}", line)))?;
+
+                line.clear();
+                br.read_line(&mut line)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                let d_k = line.trim_end().parse::<usize>()
+                    .map_err(|_e| PyValueError::new_err(format!("invalid dim! {:?}", line)))?;
+
+                line.clear();
+                br.read_line(&mut line)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                let window = line.trim_end().parse::<usize>()
+                    .map_err(|_e| PyValueError::new_err(format!("invalid dim! {:?}", line)))?;
+
+                let window = if window == 0 {
+                    None
+                } else {
+                    Some(window)
+                };
+
+                Ok(FeatureAggregator::Attention(num_heads, d_k, window))
+            },
+            "Weighted" => {
+                // get alpha
+                line.clear();
+                br.read_line(&mut line)
+                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+                let alpha = line.trim_end().parse::<f32>()
+                    .map_err(|_e| PyValueError::new_err(format!("invalid dim! {:?}", line)))?;
+
+                let mut vocab = Vocab::new();
+                let mut p_w = Vec::new();
+                for line in br.lines() {
+                    let line = line.unwrap();
+                    let pieces: Vec<_> = line.split('\t').collect();
+                    if pieces.len() != 3 {
+                        return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>weight ..."))
+                    }
+                    let p_wi = pieces[2].parse::<f64>()
+                        .map_err(|_e| PyValueError::new_err(format!("Tried to parse weight and failed:{:?}", line)))?;
+                    let node_id = vocab.get_or_insert(pieces[0].into(), pieces[1].into());
+                    if node_id < p_w.len() {
+                        return Err(PyValueError::new_err(format!("Duplicate feature found:{} {}", pieces[0], pieces[1])))
+                    }
+                    p_w.push(p_wi as f32);
+                }
+                let unigrams = Arc::new(UnigramProbability::from_vec(p_w));
+                let at = AggregatorType::Weighted { alpha, vocab:Arc::new(vocab), unigrams };
+                Ok(FeatureAggregator { at })
+
+            },
+            line => Err(PyValueError::new_err(format!("Unknown aggregator type: {}", line)))?
+        }
+
+    }
+
+
+}
+
+#[pyclass]
+pub struct NodeEmbedder {
+    feat_agg: FeatureAggregator
+}
+
+impl NodeEmbedder {
 
     fn get_aggregator<'a>(
         &'a self, 
         es: &'a EmbeddingStore, 
-        alpha: Option<f32>
+        aggregator_type: &'a AggregatorType
     ) -> Box<dyn EmbeddingBuilder + Send + Sync + 'a> {
-        if let Some(alpha) = alpha {
-            Box::new(WeightedAggregator::new(es, &self.unigrams, alpha))
-        } else {
-            Box::new(AvgAggregator::new(es))
+        match aggregator_type {
+            AggregatorType::Weighted {alpha, vocab:_, unigrams } => {
+                Box::new(WeightedAggregator::new(es, unigrams, *alpha))
+            },
+            AggregatorType::Averaged => {
+                Box::new(AvgAggregator::new(es))
+            },
+            AggregatorType::Attention {num_heads, d_k, window} => {
+                let at = if let Some(window_size) = window {
+                    AttentionType::Sliding { window_size: *window_size }
+                } else {
+                    AttentionType::Full
+                };
+                let mha = MultiHeadedAttention::new(*num_heads, *d_k, at);
+                Box::new(AttentionAggregator::new(es, mha))
+            }
+
         }
     }
 
+    fn get_attention_size(&self) -> usize {
+        match self.feat_agg.at {
+            AggregatorType::Attention { num_heads, d_k, window:_ } => 2 * num_heads * d_k,
+            _ => 0
+        }
+    }
+
+    fn get_dims(&self, feat_embs: &NodeEmbeddings) -> usize {
+        match self.feat_agg.at {
+            AggregatorType::Attention { num_heads, d_k, window:_ } =>  {
+                let attention_dims = 2 * num_heads * d_k;
+                (feat_embs.dims() - attention_dims) / num_heads
+            },
+            _ => feat_embs.dims()
+        }
+    }
 }
 
 #[pymethods]
-impl FeatureEmbeddingAggregator {
+impl NodeEmbedder {
     #[new]
-    pub fn new(fs: &FeatureSet) -> Self {
-        let up = UnigramProbability::new(&fs.features);
-        FeatureEmbeddingAggregator {
-            unigrams: up,
-            vocab: Arc::new(fs.features.clone_vocab())
-        }
+    pub fn new(feat_agg: FeatureAggregator) -> Self {
+        NodeEmbedder { feat_agg }
     }
 
-    pub fn embed_graph(
+    pub fn embed_feature_set(
         &self, 
-        graph: &RwrGraph,
         feat_set: &FeatureSet, 
         feature_embeddings: &NodeEmbeddings,
-        alpha: Option<f32>
     ) -> NodeEmbeddings {
 
-        let num_nodes = graph.nodes();
-        let es = EmbeddingStore::new(num_nodes, feature_embeddings.dims(), EDist::Cosine);
-        let agg = self.get_aggregator(&feature_embeddings.embeddings, alpha);
+        let num_nodes = feat_set.vocab.len();
+        let dims = self.get_dims(feature_embeddings);
+
+        let es = EmbeddingStore::new(num_nodes, dims, EDist::Cosine);
+        let agg = self.get_aggregator(&feature_embeddings.embeddings, &self.feat_agg.at);
+        let fs_vocab = feat_set.features.get_vocab();
         (0..num_nodes).into_par_iter().for_each(|node| {
             // Safe to access in parallel
             let embedding = es.get_embedding_mut_hogwild(node);
-            agg.construct(feat_set.features.get_features(node), embedding);
+            // Translate nodes
+            let new_feats: Vec<_> = feat_set.features.get_features(node)
+                .iter()
+                .map(|feat_id| feature_embeddings.vocab.translate_node(&fs_vocab, *feat_id))
+                .filter(|n| n.is_some())
+                .map(|n| n.unwrap())
+                .collect();
+            
+            if new_feats.len() > 0 {
+                agg.construct(&new_feats, embedding);
+            }
         });
 
         NodeEmbeddings {
-            vocab: graph.vocab.clone(),
+            vocab: feat_set.vocab.clone(),
             embeddings: es
         }
     }
@@ -592,7 +923,6 @@ impl FeatureEmbeddingAggregator {
         &self, 
         features: Vec<(String, String)>,
         feature_embeddings: &NodeEmbeddings,
-        alpha: Option<f32>,
         strict: Option<bool>
     ) -> PyResult<Vec<f32>> {
         let v = feature_embeddings.vocab.deref();
@@ -605,58 +935,14 @@ impl FeatureEmbeddingAggregator {
             }
         }
 
-        let mut embedding = vec![0.; feature_embeddings.embeddings.dims()];
-        let agg = self.get_aggregator(&feature_embeddings.embeddings, alpha);
-        agg.construct(&ids, &mut embedding);
+        let dims = self.get_dims(feature_embeddings);
+        let mut embedding = vec![0.; dims];
+        if ids.len() > 0 {
+            let agg = self.get_aggregator(&feature_embeddings.embeddings, &self.feat_agg.at);
+            agg.construct(&ids, &mut embedding);
+        }
         Ok(embedding)
     }
-
-    pub fn save(&self, path: &str) -> PyResult<()> {
-        let f = File::create(path)
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-
-        let mut bw = BufWriter::new(f);
-        for (node, p_wi) in self.unigrams.iter().enumerate() {
-            if let Some((f_node_type, f_name)) = self.vocab.get_name(node) {
-                writeln!(&mut bw, "{}\t{}\t{}", f_node_type, f_name, *p_wi as f64)
-                    .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-            } else {
-                // We've moved to node individual embeddings
-                break
-            }
-        }
-        Ok(())
-    }
-
-    #[staticmethod]
-    pub fn load(path: String) -> PyResult<Self> {
-        let f = File::open(path)
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-
-        let br = BufReader::new(f);
-        let mut vocab = Vocab::new();
-        let mut p_w = Vec::new();
-        for line in br.lines() {
-            let line = line.unwrap();
-            let pieces: Vec<_> = line.split('\t').collect();
-            if pieces.len() != 3 {
-                return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>weight ..."))
-            }
-            let p_wi = pieces[2].parse::<f64>()
-                .map_err(|e| PyValueError::new_err(format!("Tried to parse weight and failed:{:?}", line)))?;
-            let node_id = vocab.get_or_insert(pieces[0].into(), pieces[1].into());
-            if node_id < p_w.len() {
-                return Err(PyValueError::new_err(format!("Duplicate feature found:{} {}", pieces[0], pieces[1])))
-            }
-            p_w.push(p_wi as f32);
-        }
-
-        Ok(FeatureEmbeddingAggregator { 
-            vocab: Arc::new(vocab),
-            unigrams: UnigramProbability::from_vec(p_w) 
-        })
-    }
-
 
 }
 
@@ -702,7 +988,7 @@ impl DistanceEmbedder {
 
     }
 
-    pub fn learn(&self, graph: &RwrGraph) -> NodeEmbeddings {
+    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
         let es = crate::algos::dist::construct_walk_distances(graph.graph.as_ref(), self.n_landmarks, self.landmarks);
         NodeEmbeddings {
             vocab: graph.vocab.clone(),
@@ -727,7 +1013,7 @@ impl ClusterLPAEmbedder {
         }
     }
 
-    pub fn learn(&self, graph: &RwrGraph) -> NodeEmbeddings {
+    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
         let seed = self.seed.unwrap_or(SEED);
         let es = crate::algos::lpa::construct_lpa_embedding(graph.graph.as_ref(), self.k, self.passes, seed);
         NodeEmbeddings {
@@ -753,7 +1039,7 @@ impl SLPAEmbedder {
         }
     }
 
-    pub fn learn(&self, graph: &RwrGraph) -> NodeEmbeddings {
+    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
         let seed = self.seed.unwrap_or(SEED);
         let es = crate::algos::slpa::construct_slpa_embedding(graph.graph.as_ref(), self.k, self.threshold, seed);
         NodeEmbeddings {
@@ -773,7 +1059,7 @@ pub struct NodeEmbeddings {
 #[pymethods]
 impl NodeEmbeddings {
     #[new]
-    pub fn new(graph: &RwrGraph, dims: usize, distance: Distance) -> Self {
+    pub fn new(graph: &Graph, dims: usize, distance: Distance) -> Self {
         let dist = distance.to_edist();
 
         let es = EmbeddingStore::new(graph.graph.len(), dims, dist);
@@ -818,7 +1104,7 @@ impl NodeEmbeddings {
                 nt == filter_type
             })
         } else {
-            self.embeddings.nearest_neighbor(&emb, k, |node_id| true)
+            self.embeddings.nearest_neighbor(&emb, k, |_node_id| true)
         };
         convert_node_distance(&self.vocab, dists)
     }
@@ -831,34 +1117,26 @@ impl NodeEmbeddings {
         self.embeddings.len()
     }
 
-    
     pub fn save(&self, path: &str) -> PyResult<()> {
-        let f = File::create(path)
+        let mut writer = EmbeddingWriter::new(path, self.vocab.as_ref())
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-        let mut bw = BufWriter::new(f);
-        let mut s = String::new();
-        for node_id in 0..self.vocab.len() {
-            let (node_type, name) = self.vocab.get_name(node_id)
-                .expect("Programming error!");
+        let it = (0..self.vocab.len())
+            .map(|node_id| (node_id, self.embeddings.get_embedding(node_id)));
 
-            // Build the embedding to string
-            s.clear();
-            for (idx, wi) in self.embeddings.get_embedding(node_id).iter().enumerate() {
-                if idx > 0 {
-                    s.push_str(",");
-                }
-                write!(&mut s, "{}", wi).expect("Shouldn't error writing to a string");
-            }
+        writer.stream(it)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-            writeln!(&mut bw, "{}\t{}\t[{}]", node_type, name, s)
-                .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-        }
         Ok(())
     }
 
     #[staticmethod]
-    pub fn load(path: &str, distance: Distance, node_type: Option<String>) -> PyResult<Self> {
+    pub fn load(
+        path: &str, 
+        distance: Distance, 
+        node_type: Option<String>, 
+        chunk_size: Option<usize>
+    ) -> PyResult<Self> {
         let num_embeddings = count_lines(path, &node_type)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
@@ -872,30 +1150,46 @@ impl NodeEmbeddings {
         let mut es = EmbeddingStore::new(0, 0, EDist::Cosine);
         let filter_node = node_type.as_ref();
         let mut i = 0;
-        for line in br.lines() {
-            let line = line.unwrap();
-
-            // If it doesn't match the pattern, move along
-            if let Some(node_type) = filter_node {
-                if !line.starts_with(node_type) {
-                    continue;
+        let mut buffer = Vec::with_capacity(chunk_size.unwrap_or(1_000));
+        let mut p_buffer = Vec::with_capacity(buffer.capacity());
+        for chunk in &br.lines().map(|l| l.unwrap()).chunks(buffer.capacity()) {
+            buffer.clear();
+            p_buffer.clear();
+            
+            // Read lines into a buffer for parallelizing
+            chunk.filter(|line| {
+                // If it doesn't match the pattern, move along
+                if let Some(node_type) = filter_node {
+                    line.starts_with(node_type)
+                } else {
+                    true
                 }
-            }
+            }).for_each(|l| buffer.push(l));
 
-            let (node_type, node_name, emb) = line_to_embedding(line)
-                .ok_or_else(|| PyValueError::new_err("Error parsing line"))?;
+            // Parse lines
+            buffer.par_drain(..).map(|line| {
+                line_to_embedding(line)
+                    .ok_or_else(|| PyValueError::new_err("Error parsing line"))
+            }).collect_into_vec(&mut p_buffer);
 
-            if i == 0 {
-                es = EmbeddingStore::new(num_embeddings, emb.len(), distance.to_edist());
-            }
+            for record in p_buffer.drain(..) {
+                let (node_type, node_name, emb) = record?;
 
-            let node_id = vocab.get_or_insert(node_type, node_name);
-            let m = es.get_embedding_mut(node_id);
-            if m.len() != emb.len() {
-                return Err(PyValueError::new_err("Embeddings have different sizes!"));
+                if i == 0 {
+                    es = EmbeddingStore::new(num_embeddings, emb.len(), distance.to_edist());
+                }
+
+                let node_id = vocab.get_or_insert(node_type, node_name);
+                if node_id < i {
+                    return Err(PyKeyError::new_err(format!("found duplicate node at {}!", i)));
+                }
+                let m = es.get_embedding_mut(node_id);
+                if m.len() != emb.len() {
+                    return Err(PyValueError::new_err("Embeddings have different sizes!"));
+                }
+                m.copy_from_slice(&emb);
+                i += 1;
             }
-            m.copy_from_slice(&emb);
-            i += 1;
         }
 
         let ne = NodeEmbeddings {
@@ -916,7 +1210,7 @@ fn line_to_embedding(line: String) -> Option<(String,String,Vec<f32>)> {
     let name = pieces[1];
     let e = pieces[2];
     let emb: Result<Vec<f32>,_> = e[1..e.len() - 1].split(',')
-        .map(|wi| wi.trim().parse()).collect();
+        .map(|wi| parse(wi.trim())).collect();
 
     emb.ok().map(|e| (node_type.to_string(), name.to_string(), e))
 }
@@ -958,6 +1252,71 @@ impl VocabIterator {
 }
 
 #[pyclass]
+struct NeighborhoodAligner {
+    aligner: NA
+}
+
+#[pymethods]
+impl NeighborhoodAligner {
+    #[new]
+    pub fn new(alpha: Option<f32>, max_neighbors: Option<usize>) -> Self {
+        let aligner = NA::new(alpha, max_neighbors);
+        NeighborhoodAligner {aligner}
+    }
+
+    pub fn align(&self, 
+        embeddings: &NodeEmbeddings, 
+        graph: &Graph
+    ) -> NodeEmbeddings {
+        
+        let new_embeddings = EmbeddingStore::new(embeddings.embeddings.len(), 
+                                                 embeddings.embeddings.dims(),
+                                                 embeddings.embeddings.distance());
+        let num_nodes = graph.nodes();
+        (0..num_nodes).into_par_iter().for_each(|node| {
+            let new_emb = new_embeddings.get_embedding_mut_hogwild(node);
+            self.aligner.align(&(*graph.graph), &embeddings.embeddings, node, new_emb);
+        });
+
+        NodeEmbeddings {
+            embeddings: new_embeddings,
+            vocab: embeddings.vocab.clone()
+        }
+    }
+
+    pub fn align_to_disk(
+        &self, 
+        path: &str,
+        embeddings: &NodeEmbeddings, 
+        graph: &Graph,
+        chunk_size: Option<usize>
+    ) -> PyResult<()> {
+       
+        let mut writer = EmbeddingWriter::new(path, embeddings.vocab.as_ref())
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let cs = chunk_size.unwrap_or(10_000);
+        let mut buffer = vec![vec![0.; embeddings.embeddings.dims()]; cs];
+        let mut ids = Vec::with_capacity(cs);
+        for chunk in &(0..graph.nodes()).chunks(cs) {
+            ids.clear();
+            chunk.for_each(|id| ids.push(id));
+
+            ids.par_iter().zip(buffer.par_iter_mut()).for_each(|(node, new_emb)| {
+                new_emb.iter_mut().for_each(|wi| *wi = 0f32);
+                self.aligner.align(&(*graph.graph), &embeddings.embeddings, *node, new_emb);
+            });
+
+            writer.stream(ids.iter().copied().zip(buffer.iter()).take(ids.len()))?;
+        }
+        Ok(())
+    }
+
+
+}
+
+
+#[pyclass]
 struct Ann {
     graph: Arc<CumCSR>,
     vocab: Arc<Vocab>,
@@ -967,7 +1326,7 @@ struct Ann {
 #[pymethods]
 impl Ann {
     #[new]
-    pub fn new(graph: &RwrGraph, max_steps: Option<usize>) -> Self {
+    pub fn new(graph: &Graph, max_steps: Option<usize>) -> Self {
         Ann {
             graph: graph.graph.clone(),
             vocab: graph.vocab.clone(),
@@ -1042,14 +1401,14 @@ fn convert_node_distance(
         .map(|n| {
             let (node_id, dist) = n.to_tup();
             let (node_type, name) = vocab.get_name(node_id)
-                .expect("Can't find node id in graph!");
+                .expect("Can't find node id in vocab!");
             (((*node_type).clone(), (*name).clone()), dist)
         }).collect()
 }
 
 #[pymodule]
 fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
-    m.add_class::<RwrGraph>()?;
+    m.add_class::<Graph>()?;
     m.add_class::<Distance>()?;
     m.add_class::<GraphBuilder>()?;
     m.add_class::<EdgeType>()?;
@@ -1062,10 +1421,13 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<EPLoss>()?;
     m.add_class::<Ann>()?;
     m.add_class::<FeatureSet>()?;
-    m.add_class::<FeatureEmbeddingAggregator>()?;
+    m.add_class::<FeaturePropagator>()?;
+    m.add_class::<NodeEmbedder>()?;
+    m.add_class::<FeatureAggregator>()?;
     m.add_class::<Query>()?;
     m.add_class::<RandomWalker>()?;
     m.add_class::<BiasedRandomWalker>()?;
+    m.add_class::<NeighborhoodAligner>()?;
     Ok(())
 }
 

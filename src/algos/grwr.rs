@@ -142,7 +142,7 @@ mod grwr_tests {
         };
 
         let es = EmbeddingStore::new(ccsr.len(), 1, Distance::Cosine);
-        let candidates = rwr.sample(&ccsr, &Unweighted, &es, 0, 0);
+        let candidates = rwr.sample(&ccsr, &Unweighted, &es, 0, &[0f32]);
         assert_eq!(candidates.len(), 1);
         assert!(candidates.contains_key(&1));
     }
@@ -163,7 +163,7 @@ mod grwr_tests {
 
         let es = EmbeddingStore::new(ccsr.len(), 1, Distance::Cosine);
 
-        let mut candidates: Vec<_> = rwr.sample(&ccsr, &Weighted, &es, 1, 1)
+        let mut candidates: Vec<_> = rwr.sample(&ccsr, &Weighted, &es, 1, &[1f32])
             .into_iter().collect();
         candidates.sort_by_key(|(_node_id, weight)| FloatOrd(-*weight));
 

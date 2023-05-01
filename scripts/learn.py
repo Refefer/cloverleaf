@@ -5,21 +5,9 @@ import json
 import cloverleaf
 import numpy as np
 
-PASSES = 200
-BATCH_SIZE = 128
-ALPHA = 9e-1
-DIMS = 50
-MAX_FEATURES=None
-MAX_NODES=10
-WD = 0
-#loss = cloverleaf.EPLoss.contrastive(1, 5)
-    #loss = cloverleaf.EPLoss.starspace(0.5, 5)
-LOSS = cloverleaf.EPLoss.margin(10, 5)
-
-
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description='Plots embeddings',
+        description='Learn cloverleaf embeddings',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument("edges",
@@ -37,6 +25,13 @@ def build_arg_parser():
         default=None,
         help="If provided, loads feature embeddings from a previous run.")
 
+    parser.add_argument("--propagate-features",
+        dest="feat_prop",
+        type=int,
+        default=None,
+        required=False,
+        help="Propagates feature instead of using anonymous features")
+
     parser.add_argument("--dims",
         dest="dims",
         type=int,
@@ -52,6 +47,18 @@ def build_arg_parser():
         type=float,
         default=9e-1,
         help="Learning Rate.")
+
+    parser.add_argument("--gradient-noise",
+        dest="gradient_noise",
+        type=float,
+        default=0.0,
+        help="If provided, adds gradient noise scaled by GRADIENT_NOISE")
+
+    parser.add_argument("--valid-pct",
+        dest='valid_pct',
+        type=float,
+        default=0.1,
+        help="Percentage of nodes to use for validation.")
 
     parser.add_argument("--batch-size",
         type=int,
@@ -70,11 +77,52 @@ def build_arg_parser():
         default=10,
         help="Samples MAX_NEIGHBORS nodes for node reconstruction.")
 
-    parser.add_argument("--weight-decay",
-        dest="wd",
+    parser.add_argument("--hard-negatives",
+        dest="hard_negatives",
+        type=int,
+        default=None,
+        help="If provided, samples hard negatives from the graph")
+
+    parser.add_argument("--min-feature-count",
+        dest="min_feature_count",
+        type=int,
+        default=1,
+        help="If set, filters out features which have fewer than min_count.")
+
+    parser.add_argument("--alpha",
+        dest="alpha",
         type=float,
-        default=0,
-        help="If provided, adds weight decay to the embeddings.")
+        default=None,
+        help="If provided, uses weighted embeddings.")
+
+    parser.add_argument("--attention",
+        dest="attention",
+        type=int,
+        default=None,
+        help="If provided, uses self attention with D dims.")
+
+    parser.add_argument("--attention-heads",
+        dest="attention_heads",
+        type=int,
+        default=1,
+        help="If attention is used, number of heads.  Default is 1")
+
+    parser.add_argument("--context-window",
+        dest="context_window",
+        type=int,
+        default=None,
+        help="If provided, uses self attention with local window size of CONTEXT_WINDOW * 2.")
+
+    parser.add_argument("--neighborhood-alignment",
+        dest="neighborhood_alignment",
+        type=float,
+        default=None,
+        help="If provided, applies neighborhood alignment to the embeddings.")
+
+    parser.add_argument("--full-features",
+        dest="full_features",
+        default=None,
+        help="If provided, embeds features from the given file instead of training set.")
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--embedding-propagation",
@@ -88,6 +136,12 @@ def build_arg_parser():
         nargs=2,
         metavar=('MARGIN', 'NEGATIVES'),
         help="Optimizes using Starspace embedding learning.")
+
+    group.add_argument("--ppr",
+        dest="ppr",
+        nargs=3,
+        metavar=('MARGIN', 'EXAMPLES', 'RESTART_PROB'),
+        help="Optimizes uses Personalized Page Rank Sampling")
 
     group.add_argument("--contrastive",
         dest="contrastive",
@@ -104,12 +158,20 @@ def main(args):
     f_name = args.features
     
     print("Loading graph...")
-    graph = cloverleaf.RwrGraph.load(g_name, cloverleaf.EdgeType.Undirected)
+    graph = cloverleaf.Graph.load(g_name, cloverleaf.EdgeType.Undirected)
     print("Nodes={},Edges={}".format(graph.nodes(), graph.edges()), file=sys.stderr)
     print('Loading features...')
-    features = cloverleaf.FeatureSet(graph)
+    features = cloverleaf.FeatureSet.new_from_graph(graph)
     if f_name != 'none':
-        features.load_features(f_name, error_on_missing=False)
+        features.load_into(f_name)
+        if args.min_feature_count > 1:
+            print("Pruning features: Original {}".format(features.num_features()))
+            features = features.prune_min_count(args.min_feature_count)
+
+        if args.feat_prop is not None:
+            print("Propagating features")
+            fp = cloverleaf.FeaturePropagator(args.feat_prop)
+            fp.propagate(graph, features)
 
     print("Unique Features found: {}".format(features.num_features()))
     sTime = time.time()
@@ -120,30 +182,55 @@ def main(args):
     elif args.starspace is not None:
         margin, negatives = args.starspace
         loss = cloverleaf.EPLoss.starspace(float(margin), int(negatives))
+    elif args.ppr is not None:
+        temp, negs, p = args.ppr
+        loss = cloverleaf.EPLoss.ppr(float(temp), int(negs), float(p))
     else:
         temp, negs = args.contrastive
         loss = cloverleaf.EPLoss.contrastive(float(temp), int(negs))
 
     ep = cloverleaf.EmbeddingPropagator(
         alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
-        passes=args.passes, wd=args.wd, max_nodes=args.max_neighbors, max_features=args.max_features)
+        passes=args.passes, max_nodes=args.max_neighbors, 
+        max_features=args.max_features, attention=args.attention, 
+        attention_heads=args.attention_heads, context_window=args.context_window, 
+        noise=args.gradient_noise, hard_negatives=args.hard_negatives, valid_pct=args.valid_pct)
 
     if args.warm_start is not None:
         feature_embeddings = cloverleaf.NodeEmbeddings.load(args.warm_start, cloverleaf.Distance.Cosine)
     else:
         feature_embeddings = None
 
-    feature_embeddings = ep.learn_features(graph, features, feature_embeddings)
+    if args.passes > 0 or feature_embeddings is None:
+        feature_embeddings = ep.learn_features(graph, features, feature_embeddings)
+
     eTime = time.time() - sTime
 
     print("Time to learn:{}, Nodes/sec:{}".format(eTime, (graph.nodes() * 50) / eTime, file=sys.stderr))
     feature_embeddings.save(args.output + '.feature-embeddings')
 
     print("Constructing nodes...")
-    embedder = cloverleaf.FeatureEmbeddingAggregator(features)
-    node_embeddings = embedder.embed_graph(graph, features, feature_embeddings, alpha=None)
-    embedder.save(args.output + '.embedder')
-    node_embeddings.save(args.output + '.node-embeddings')
+    if args.attention is not None:
+        aggregator = cloverleaf.FeatureAggregator.Attention(args.attention_heads, args.attention, args.context_window)
+    elif args.alpha is not None:
+        aggregator = cloverleaf.FeatureAggregator.Weighted(args.alpha, features)
+    else:
+        aggregator = cloverleaf.FeatureAggregator.Averaged()
+
+    embedder = cloverleaf.NodeEmbedder(aggregator)
+    if args.full_features:
+        features = cloverleaf.FeatureSet.new_from_file(args.full_features)
+
+    node_embeddings = embedder.embed_feature_set(features, feature_embeddings)
+
+    if args.neighborhood_alignment is None:
+        node_embeddings.save(args.output + '.node-embeddings')
+    else:
+        node_embeddings.save(args.output + '.node-embeddings.orig')
+        aligner = cloverleaf.NeighborhoodAligner(args.neighborhood_alignment)
+        aligner.align_to_disk(args.output + '.node-embeddings', node_embeddings, graph)
+
+    aggregator.save(args.output + '.embedder')
 
 if __name__ == '__main__':
     main(build_arg_parser().parse_args())

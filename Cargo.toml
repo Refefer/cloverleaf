@@ -16,15 +16,15 @@ rayon = "1.5"
 float-ord = "0.2"
 atomic_float = "0.1"
 pyo3 = { version = "0.17.1", features = ["extension-module"] }
-#simple_grad = {git = "https://github.com/Refefer/SimpleGrad"}
-simple_grad = {path = "/home/astanton/src/SimpleGrad"}
+simple_grad = {git = "https://github.com/Refefer/SimpleGrad"}
+#simple_grad = {path = "/home/astanton/src/SimpleGrad"}
 indicatif = "0.17.1"
-
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.5"
+itertools = "0.10.5"
+ryu = "1.0"
+fast-float = "0.2.0"
 
 [dependencies.hashbrown]
-version = "0.12"
+version = "0.13"
 features = ["rayon"]
 
 [dev-dependencies]

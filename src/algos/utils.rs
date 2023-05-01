@@ -1,6 +1,4 @@
 use rand::prelude::*;
-use crate::NodeID;
-use crate::vocab::Vocab;
 
 pub struct Counter<'a> {
     slice: &'a [usize],
@@ -59,73 +57,6 @@ pub fn get_best_count<R: Rng>(counts: &[usize], rng: &mut R) -> usize{
 
 }
 
-#[derive(Debug)]
-pub struct FeatureStore {
-    features: Vec<Vec<usize>>,
-    namespace: String,
-    feature_vocab: Vocab,
-}
-
-impl FeatureStore {
-
-    pub fn new(size: usize, namespace: String) -> Self {
-        FeatureStore {
-            features: vec![Vec::with_capacity(0); size],
-            namespace: namespace,
-            feature_vocab: Vocab::new(),
-        }
-    }
-
-    pub fn get_ns(&self) -> &String {
-        &self.namespace
-    }
-
-    pub fn set_features(&mut self, node: NodeID, node_features: Vec<String>) {
-        self.features[node] = node_features.into_iter()
-            .map(|f| self.feature_vocab.get_or_insert(self.namespace.clone(), f))
-            .collect()
-    }
-
-    pub fn get_features(&self, node: NodeID) -> &[usize] {
-        &self.features[node]
-    }
-
-    pub fn get_pretty_features(&self, node: NodeID) -> Vec<String> {
-        self.features[node].iter().map(|v_id| {
-            let (_nt, name) = self.feature_vocab.get_name(*v_id).unwrap();
-            (*name).clone()
-        }).collect()
-    }
-
-    pub fn num_features(&self) -> usize {
-        self.feature_vocab.len()
-    }
-
-    pub fn num_nodes(&self) -> usize {
-        self.features.len()
-    }
-
-    pub fn fill_missing_nodes(&mut self) {
-        let mut idxs = self.feature_vocab.len();
-        for i in 0..self.features.len() {
-            if self.features[i].len() == 0 {
-                self.set_features(i, vec![format!("_node_{}", i)]);
-            }
-        }
-    }
-
-    pub fn get_vocab(self) -> Vocab {
-        self.feature_vocab
-    }
-
-    pub fn clone_vocab(&self) -> Vocab {
-        self.feature_vocab.clone()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item=&Vec<usize>> {
-        self.features.iter()
-    }
-}
 
 #[cfg(test)]
 mod utils_tests {

@@ -2,24 +2,11 @@ import traceback
 import sys
 import numpy as np
 import json
+import argparse
 
 import tabulate
 import cloverleaf
 from sklearn.utils import murmurhash3_32
-
-K = 50
-CHAR_GRAMS = False
-ALPHA = 1e-3 
-
-def char_grams(token, grams=(3,6), hash_space=50001):
-    t = '^{}$'.format(token)
-    gs = set([t])
-    for cg in grams:
-        for window in range(len(t) - cg + 1):
-            idx = murmurhash3_32(t[window:window+cg], positive=True)
-            gs.add('cg:{}'.format(idx % hash_space))
-
-    return list(gs)
 
 def build_grams(query):
     pieces = query.split()
@@ -28,11 +15,7 @@ def build_grams(query):
         for i in range(len(pieces) - g + 1):
             bow.append('_'.join(pieces[i:i+g]))
 
-    if CHAR_GRAMS:
-        for token in pieces:
-            bow.extend(char_grams(token))
-    else:
-        bow.extend(pieces)
+    bow.extend(pieces)
 
     print("Terms:", bow)
     return bow
@@ -42,7 +25,7 @@ def construct_adhoc_embedding(query, embeddings, aggregator, alpha=None):
     for token in build_grams(query):
         tokens.append(('feat', token))
 
-    e = aggregator.embed_adhoc(tokens, embeddings, alpha=alpha, strict=False)
+    e = aggregator.embed_adhoc(tokens, embeddings, strict=False)
     if sum(e) == 0:
         return None
 
@@ -68,13 +51,27 @@ def build_embedding(queries, embeddings):
 
     return np.mean(np.array(e), axis=0)
 
-def main(ne_fname, fe_fname, agg_fname):
+def load(args):
+    ne_fname = args.model + '.node-embeddings'
+    fe_fname = args.model + '.feature-embeddings'
+    agg_fname = args.model + '.embedder'
+
     print("Loading Node Embeddings...")
-    ne_embeddings = cloverleaf.NodeEmbeddings.load(ne_fname, cloverleaf.Distance.Cosine)
+    sys.stdout.flush()
+    ne_embeddings = cloverleaf.NodeEmbeddings.load(ne_fname, cloverleaf.Distance.Cosine, args.filter_type)
+    print("Found {} node embeddings".format(ne_embeddings.len()))
     print("Loading Feature Embeddings...")
+    sys.stdout.flush()
     fe_embeddings = cloverleaf.NodeEmbeddings.load(fe_fname, cloverleaf.Distance.Cosine)
+    print("Found {} feature embeddings".format(ne_embeddings.len()))
     print("Loading aggregator")
-    aggregator = cloverleaf.FeatureEmbeddingAggregator.load(agg_fname)
+    sys.stdout.flush()
+    aggregator = cloverleaf.FeatureAggregator.load(agg_fname)
+    
+    return ne_embeddings, fe_embeddings, cloverleaf.NodeEmbedder(aggregator)
+
+def main(args):
+    ne_embeddings, fe_embeddings, aggregator = load(args)
 
     headers = ('type', 'Name', 'Score')
     while True:
@@ -82,15 +79,11 @@ def main(ne_fname, fe_fname, agg_fname):
         try:
             if query.startswith('*'):
                 tokens = [('feat', t) for t in query[1:].strip().split()]
-                emb = aggregator.embed_adhoc(tokens, fe_embeddings, alpha=ALPHA, strict=True)
+                emb = aggregator.embed_adhoc(tokens, fe_embeddings, strict=True)
             elif '\t' not in query:
-                if fe_fname is not None:
-                    emb = construct_adhoc_embedding(query, fe_embeddings, aggregator, alpha=ALPHA)
-                    if emb is None:
-                        print("Tokens not found in feature embeddings!")
-                        continue
-                else:
-                    print("feature embeddings not available!")
+                emb = construct_adhoc_embedding(query, fe_embeddings, aggregator)
+                if emb is None:
+                    print("Tokens not found in feature embeddings!")
                     continue
 
             else:
@@ -100,21 +93,49 @@ def main(ne_fname, fe_fname, agg_fname):
             print()
             print(emb)
 
-            top_k = ne_embeddings.nearest_neighbor(emb, K)
+            top_k = ne_embeddings.nearest_neighbor(emb, args.k)
 
             rows = []
+            listings = []
             for (node_type, node), score in reversed(top_k):
                 rows.append((node_type, node, score))
+                if node_type == 'listing':
+                    listings.append(node)
 
             print(tabulate.tabulate(rows, headers=headers))
+            print(','.join(reversed(listings)))
 
         except Exception as e:
-            traceback.print_exception(e)
+            print('Unable to run!')
             continue
 
-if __name__ == '__main__':
-    node_embeddings = sys.argv[1]
-    feature_embeddings = sys.argv[2]
-    embedder = sys.argv[3]
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        description='Query Cloverleaf embeddings',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    main(node_embeddings, feature_embeddings, embedder)
+    parser.add_argument("model",
+        help="Path to model prefix.")
+
+    parser.add_argument("--k",
+        dest="k",
+        type=int,
+        default=50,
+        help="Max number of results to return")
+
+    parser.add_argument("--alpha",
+        dest="alpha",
+        type=float,
+        default=None,
+        help="Alpha to use for weighted embeddings.")
+
+    parser.add_argument("--filter-type",
+        dest="filter_type",
+        default=None,
+        help="If provided, only searches the provided node type.")
+
+    return parser
+
+if __name__ == '__main__':
+    args = build_arg_parser().parse_args()
+    main(args)

@@ -1,5 +1,3 @@
-use std::collections::BinaryHeap;
-
 use float_ord::FloatOrd;
 use rayon::prelude::*;
 
@@ -14,6 +12,7 @@ pub enum Entity<'a> {
     Embedding(&'a [f32])
 }
 
+#[derive(Copy,Clone)]
 pub enum Distance {
     ALT,
     Cosine,
@@ -38,7 +37,11 @@ impl Distance {
                     ei * ej
                 }).sum::<f32>();
                 let cosine_score = dot / (d1.sqrt() * d2.sqrt());
-                -cosine_score + 1.
+                if cosine_score.is_nan() {
+                    std::f32::INFINITY
+                } else {
+                    -cosine_score + 1.
+                }
             },
 
             Distance::Euclidean => {
@@ -85,6 +88,7 @@ impl Distance {
     }
 }
 
+#[derive(Clone)]
 pub struct EmbeddingStore {
     dims: usize,
     embeddings: Hogwild<Vec<f32>>,
@@ -114,6 +118,10 @@ impl EmbeddingStore {
 
     pub fn len(&self) -> usize {
         self.nodes
+    }
+
+    pub fn distance(&self) -> Distance {
+        self.distance
     }
 
     pub fn set_embedding(&mut self, node_id: NodeID, embedding: &[f32]) {
