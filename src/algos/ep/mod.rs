@@ -12,6 +12,7 @@ use rayon::prelude::*;
 use hashbrown::HashMap;
 use std::collections::{HashMap as CHashMap};
 use rand::prelude::*;
+use rand_distr::StandardNormal;
 use rand_xorshift::XorShiftRng;
 use simple_grad::*;
 
@@ -35,6 +36,7 @@ pub struct EmbeddingPropagation {
     pub hard_negs: usize,
     pub seed: u64,
     pub valid_pct: f32,
+    pub noise: f32,
     pub indicator: bool
 }
 
@@ -90,15 +92,20 @@ impl EmbeddingPropagation {
         // Enable/disable shared memory pool
         use_shared_pool(true);
 
-        let lr_scheduler = if model.uses_attention() || true {
-            let warm_up_steps = ((steps_per_pass * self.passes) as f32 / 5f32) as usize;
+        let total_updates = steps_per_pass * self.passes;
+        let lr_scheduler = {
+            let warm_up_steps = (total_updates as f32 / 5f32) as usize;
             let max_steps = self.passes * steps_per_pass;
             LRScheduler::cos_decay(self.alpha / 100f32, self.alpha, warm_up_steps, max_steps)
+        };
+
+        // Noise 
+        let noise_scheduler = if self.noise > 1e-9 {
+            let min_noise = 1e-9f32;
+            let decay = (((min_noise.ln()) - self.noise.ln()) / (total_updates as f32)).exp();
+            LRScheduler::exp_decay(0.0, self.noise, decay)
         } else {
-            let total_updates = steps_per_pass * self.passes;
-            let min_alpha = self.alpha / 1000.;
-            let decay = ((min_alpha.ln() - self.alpha.ln()) / (total_updates as f32)).exp();
-            LRScheduler::exp_decay(min_alpha, self.alpha, decay)
+            LRScheduler::noop()
         };
 
         let random_sampler = node_sampler::RandomWalkHardStrategy::new(self.hard_negs, &node_idxs);
@@ -112,22 +119,24 @@ impl EmbeddingPropagation {
 
             pb.update_message(|msg| {
                 msg.clear();
-                let alpha = lr_scheduler.compute(step.fetch_add(0, Ordering::Relaxed));
-                write!(msg, "Pass {}/{}, Train: {:.5}, Valid: {:.5}, Alpha: {:.5}", pass, self.passes, last_error, valid_error, alpha)
+                let cur_step = step.load(Ordering::Relaxed);
+                let alpha = lr_scheduler.compute(cur_step);
+                let noise = noise_scheduler.compute(cur_step);
+                write!(msg, "Pass {}/{}, Train: {:.5}, Valid: {:.5}, LR: {:.5}, Noise: {:.5}", pass, self.passes, 
+                       last_error, valid_error, alpha, noise)
                     .expect("Error writing out indicator message!");
             });
+
+            if pass % 10 == 0 {
+                println!();
+            }
 
             // Shuffle for SGD
             node_idxs.shuffle(&mut rng);
             let err: Vec<_> = node_idxs.par_iter().chunks(self.batch_size).enumerate().map(|(i, nodes)| {
+
                 let mut grads = Vec::with_capacity(self.batch_size);
                 
-                // We are using std Hashmap instead of hashbrown due to a weird bug
-                // where the optimizer, for whatever reason, has troubles draining it
-                // on 0.13.  We'll keep testing it on subsequent fixes but until then
-                // std is the way to go.
-                let mut all_grads = CHashMap::new();
-
                 let sampler = (&random_sampler).initialize_batch(
                     &nodes,
                     graph,
@@ -146,6 +155,13 @@ impl EmbeddingPropagation {
 
                 let mut error = 0f32;
                 let mut cnt = 0f32;
+                
+                // We are using std Hashmap instead of hashbrown due to a weird bug
+                // where the optimizer, for whatever reason, has troubles draining it
+                // on 0.13.  We'll keep testing it on subsequent fixes but until then
+                // std is the way to go.
+                let mut all_grads = CHashMap::new();
+
                 // Since we're dealing with multiple reconstructions with likely shared features,
                 // we aggregate all the gradients
                 for (err, grad_set) in grads.drain(..nodes.len()) {
@@ -157,8 +173,20 @@ impl EmbeddingPropagation {
                     cnt += 1f32;
                 }
 
-                // Backpropagate embeddings
                 let cur_step = step.fetch_add(1, Ordering::Relaxed);
+
+                // Add gaussian noise to help regulate embeddings
+                if self.noise > 0.0 {
+                    let noise = noise_scheduler.compute(cur_step);
+                    all_grads.par_iter_mut().for_each(|(feat, emb)| {
+                        let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + feat) as u64);
+                        emb.iter_mut().for_each(|ei| {
+                            *ei += noise * rng.sample::<f32,StandardNormal>(StandardNormal);
+                        });
+                    });
+                }
+
+                // Backpropagate embeddings
                 let alpha = lr_scheduler.compute(cur_step);
                 optimizer.update(&feature_embeddings, all_grads, alpha, pass as f32);
 
@@ -324,6 +352,7 @@ mod ep_tests {
             d_model: 5,
             valid_pct: 0.0,
             passes: 50,
+            noise: 0.0,
             seed: 202220222,
             indicator: false
         };

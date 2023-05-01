@@ -37,7 +37,11 @@ impl Distance {
                     ei * ej
                 }).sum::<f32>();
                 let cosine_score = dot / (d1.sqrt() * d2.sqrt());
-                -cosine_score + 1.
+                if cosine_score.is_nan() {
+                    std::f32::INFINITY
+                } else {
+                    -cosine_score + 1.
+                }
             },
 
             Distance::Euclidean => {

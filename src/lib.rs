@@ -447,6 +447,7 @@ impl EmbeddingPropagator {
         attention: Option<usize>,
         attention_heads: Option<usize>,
         context_window: Option<usize>,
+        noise: Option<f32>
     ) -> Self {
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(0.9),
@@ -457,7 +458,8 @@ impl EmbeddingPropagator {
             hard_negs: hard_negatives.unwrap_or(0),
             valid_pct: valid_pct.unwrap_or(0.1),
             seed: seed.unwrap_or(SEED),
-            indicator: indicator.unwrap_or(true)
+            indicator: indicator.unwrap_or(true),
+            noise: noise.unwrap_or(0.0)
         };
 
         let model = if let Some(d_k) = attention {
