@@ -64,3 +64,16 @@ impl <G: Graph> Sampler<G> for Unweighted {
         Some(edges[idx])
     }
 }
+
+// Uses a blend of weighted versus unweighted sampling
+pub struct GreedySampler(pub f32);
+
+impl <G: CDFGraph> Sampler<G> for GreedySampler {
+    fn sample<R:Rng>(&self, g: &G, node: NodeID, rng: &mut R) -> Option<NodeID> {
+        if rng.gen::<f32>() < self.0 {
+            Unweighted.sample(g, node, rng)
+        } else {
+            Weighted.sample(g, node, rng)
+        }
+    }
+}

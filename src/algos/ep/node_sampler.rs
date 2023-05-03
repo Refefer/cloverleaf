@@ -1,4 +1,3 @@
-use float_ord::FloatOrd;
 use rand::prelude::*;
 use rand_distr::{Distribution,Uniform};
 

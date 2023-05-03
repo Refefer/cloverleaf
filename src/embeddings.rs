@@ -6,7 +6,7 @@ use crate::bitset::BitSet;
 use crate::hogwild::Hogwild;
 use crate::algos::ann::{TopK,NodeDistance};
 
-#[derive(Clone,Debug)]
+#[derive(Clone,Copy,Debug)]
 pub enum Entity<'a> {
     Node(NodeID),
     Embedding(&'a [f32])

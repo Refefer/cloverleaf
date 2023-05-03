@@ -51,6 +51,7 @@ impl RWR {
        ret
     }
 
+    /// Runs a random walk, returning the terminal node.
     pub fn walk<G: Graph + Send + Sync>(
         &self, 
         graph: &G, 
@@ -61,14 +62,12 @@ impl RWR {
        let mut cur_node = start_node;
        match self.steps {
            Steps::Probability(alpha) => loop {
-               loop {
-                   // Sample the next edge
-                   cur_node = sampler.sample(graph, cur_node, rng)
-                       .unwrap_or(start_node);
+               // Sample the next edge
+               cur_node = sampler.sample(graph, cur_node, rng)
+                   .unwrap_or(start_node);
 
-                   if rng.gen::<f32>() < alpha {
-                       break;
-                   }
+               if rng.gen::<f32>() < alpha {
+                   break
                }
            },
            Steps::Fixed(steps) => for _ in 0..steps {
@@ -80,40 +79,41 @@ impl RWR {
        cur_node
     }
 
-    pub fn rollout<G: Graph + Send + Sync>(
-        &self, 
-        graph: &G, 
-        sampler: &impl Sampler<G>,
-        start_node: NodeID,
-        rng: &mut impl Rng,
-        output: &mut Vec<NodeID>
-    ) {
-        output.clear();
-        let mut cur_node = start_node;
-        match self.steps {
-           Steps::Probability(alpha) => loop {
-               loop {
-                   // Sample the next edge
-                   cur_node = sampler.sample(graph, cur_node, rng)
-                       .unwrap_or(start_node);
-
-                   output.push(cur_node);
-                   if rng.gen::<f32>() < alpha {
-                       break;
-                   }
-               }
-           },
-           Steps::Fixed(steps) => for _ in 0..steps {
-               // Sample the next edge
-               cur_node = sampler.sample(graph, cur_node, &mut rng)
-                   .unwrap_or(start_node);
-               output.push(cur_node);
-           }
-       };
-    }
-
+    
 
 }
+/// Creates a trajectory by randomly walking through the graph, recording it
+/// in the output vector
+pub fn rollout<G: Graph + Send + Sync>(
+    graph: &G, 
+    steps: Steps, 
+    sampler: &impl Sampler<G>,
+    start_node: NodeID,
+    rng: &mut impl Rng,
+    output: &mut Vec<NodeID>
+) {
+    output.clear();
+    let mut cur_node = start_node;
+    match steps {
+       Steps::Probability(alpha) => loop {
+           // Sample the next edge
+           cur_node = sampler.sample(graph, cur_node, rng)
+               .unwrap_or(start_node);
+
+           output.push(cur_node);
+           if rng.gen::<f32>() < alpha {
+               break;
+           }
+       },
+       Steps::Fixed(steps) => for _ in 0..steps {
+           // Sample the next edge
+           cur_node = sampler.sample(graph, cur_node, rng)
+               .unwrap_or(start_node);
+           output.push(cur_node);
+       }
+   };
+}
+
 
 #[cfg(test)]
 mod rwr_tests {
