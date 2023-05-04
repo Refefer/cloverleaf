@@ -183,29 +183,12 @@ impl CumCSR {
         for start_stop in csr.rows.windows(2) {
             let (start, stop) = (start_stop[0], start_stop[1]);
             if start < stop {
-                CumCSR::convert_edges_to_cdf(&mut csr.weights[start..stop]);
+                convert_edges_to_cdf(&mut csr.weights[start..stop]);
             }
         }
         CumCSR(csr)
     }
 
-    pub fn convert_edges_to_cdf(weights: &mut [f32]) {
-        let mut denom = weights.iter().sum::<f32>();
-        if denom == 0f32 {
-            // If we have no weights, set all weights to uniform.
-            weights.iter_mut().for_each(|w| {
-                *w = 1.
-            });
-            denom = weights.len() as f32;
-        }
-
-        let mut acc = 0.;
-        weights.iter_mut().for_each(|w| {
-            acc += *w;
-            *w = acc / denom;
-        });
-        weights[weights.len() - 1] = 1.;
-    }
 }
 
 impl Graph for CumCSR {
@@ -267,7 +250,7 @@ impl <'a,G:Graph> OptCDFGraph<'a,G> {
         for idx in 0..self.len() {
             let (start, stop) = self.get_edge_range(idx);
             if start < stop {
-                CumCSR::convert_edges_to_cdf(&mut self.weights[start..stop]);
+                convert_edges_to_cdf(&mut self.weights[start..stop]);
             }
         }
     }
@@ -351,6 +334,23 @@ impl <'a> Iterator for CDFtoP<'a> {
     }
 }
 
+pub fn convert_edges_to_cdf(weights: &mut [f32]) {
+    let mut denom = weights.iter().sum::<f32>();
+    if denom == 0f32 {
+        // If we have no weights, set all weights to uniform.
+        weights.iter_mut().for_each(|w| {
+            *w = 1.
+        });
+        denom = weights.len() as f32;
+    }
+
+    let mut acc = 0.;
+    weights.iter_mut().for_each(|w| {
+        acc += *w;
+        *w = acc / denom;
+    });
+    weights[weights.len() - 1] = 1.;
+}
 
 #[cfg(test)]
 mod csr_tests {

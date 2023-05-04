@@ -6,7 +6,7 @@ use hashbrown::HashSet;
 
 use std::ops::Deref;
 
-use crate::graph::{Graph, NodeID, CDFGraph, OptCDFGraph};
+use crate::graph::*;
 use crate::embeddings::{EmbeddingStore,Entity};
 use crate::hogwild::{Hogwild};
 use crate::sampler::{GreedySampler};
@@ -43,7 +43,7 @@ impl SupervisedMCIteration {
         graph: &(impl CDFGraph + Send + Sync),
         rewards: Vec<(NodeID, NodeID, f32)>,
         distances: EmbeddingStore
-    ) -> () {
+    ) -> Vec<f32> {
 
         // Track the current states, we use hogwild to allow for parallel
         // processing of paths
@@ -57,7 +57,8 @@ impl SupervisedMCIteration {
         for pass in 0..self.iterations {
             rewards.par_iter().enumerate().for_each(|(i, (start_node, end_node, reward))| {
                 // For each node, rollout num_walks times and compute the rewards
-                let mut rng = XorShiftRng::seed_from_u64((self.seed + (graph.len() * pass) as u64) + i as u64);
+                let seed = (self.seed + (graph.len() * pass) as u64) + i as u64;
+                let mut rng = XorShiftRng::seed_from_u64(seed);
                 let mut trajectory = Vec::new();
                 let mut seen = HashSet::new();
                 for _ in 0..self.num_walks {
@@ -104,7 +105,7 @@ impl SupervisedMCIteration {
 
                 let (r, c) = agg[node_id];
                 let fn_vs = r / c as f32;
-                for (mut wi, out_node) in weights.iter_mut().zip(edges.iter()) {
+                for (wi, out_node) in weights.iter_mut().zip(edges.iter()) {
                     let (r, c) = agg[*out_node];
                     let tn_vs = r / c as f32;
                     
@@ -115,7 +116,32 @@ impl SupervisedMCIteration {
             t_graph = OptCDFGraph::new(graph, new_edges);
         }
 
+        let mut weights = t_graph.into_weights();
+        interpolate_edges(self.alpha, graph, &mut weights);
+        weights
+
     }
+}
+
+fn interpolate_edges(alpha: f32, g: &impl CDFGraph, weights: &mut [f32]) {
+    for node_id in 0..g.len() {
+        let ow = g.get_edges(node_id).1;
+        let (start, stop) = g.get_edge_range(node_id);
+        let mut nw = &mut weights[start..stop];
+        normalize(&mut nw);
+        CDFtoP::new(ow).zip(nw.iter_mut()).for_each(|(owi, nwi)| {
+            let w = alpha * owi + (1f32 - alpha) * *nwi;
+            *nwi = w;
+        });
+
+        convert_edges_to_cdf(&mut nw);
+    }
+}
+
+fn normalize(w: &mut [f32]) {
+    let mut s: f32 = w.iter().sum();
+    if s == 0f32 { s = 1.; }
+    w.iter_mut().for_each(|wi| *wi /= s);
 }
 
 #[cfg(test)]
