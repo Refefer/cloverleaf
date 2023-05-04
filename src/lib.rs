@@ -39,6 +39,7 @@ use crate::algos::ann::NodeDistance;
 use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
 use crate::algos::alignment::{NeighborhoodAligner as NA};
+use crate::algos::smci::SupervisedMCIteration;
 
 const SEED: u64 = 20222022;
 
@@ -1346,6 +1347,61 @@ impl Ann {
         let seed = seed.unwrap_or(SEED + 10);
         let ann = algos::ann::Ann::new(k, self.max_steps + k, seed);
         let nodes = ann.find(query_embedding, &(*self.graph), &embeddings.embeddings);
+        Ok(convert_node_distance(&self.vocab, nodes))
+    }
+}
+
+#[pyclass]
+struct Smci {
+    graph: Arc<CumCSR>,
+    vocab: Arc<Vocab>,
+    rewards: Vec<(NodeID,NodeID,f32)>
+}
+
+#[pymethods]
+impl Smci {
+    #[new]
+    pub fn new(graph: &Graph) -> Self {
+        Smci {
+            graph: graph.graph.clone(),
+            vocab: graph.vocab.clone(),
+            rewards: Vec::new()
+        }
+    }
+
+    pub fn add_reward(
+        &mut self, 
+        from_node: (String, String), 
+        to_node: (String, String), 
+        reward: f32
+    ) -> PyResult<()> {
+        let f_n = get_node_id(self.vocab.deref(), from_node.0, from_node.1)?;
+        let t_n = get_node_id(self.vocab.deref(), to_node.0, to_node.1)?;
+        self.rewards.push((f_n, t_n, reward));
+    }
+
+    pub fn optimize(
+        &self, 
+        iterations: usize,
+        num_walks: usize,
+        alpha: f32,
+        discount: f32,
+        explore_pct: f32,
+        restart_prob: f32,
+        seed: Option<u64>
+    ) -> PyResult<Vec<((String, String), f32)>> {
+        let smci = SupervisedMCIteration {
+            iterations,
+            num_walks,
+            alpha,
+            discount,
+            explore_pct,
+            restart_prob,
+            seed: seed.unwrap_or(SEED)
+        };
+
+        let new_graph = smci.learn(graph.deref(),
+
         Ok(convert_node_distance(&self.vocab, nodes))
     }
 }

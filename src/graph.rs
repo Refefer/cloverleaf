@@ -189,6 +189,39 @@ impl CumCSR {
         CumCSR(csr)
     }
 
+    pub fn clone_with_edges(&self, weights: Vec<f32>) -> Result<CumCSR,&'static str> {
+        if weights.len() != self.0.weights.len() {
+            Err("weights lengths not equal!")?
+        }
+
+        let graph = CSR {
+            rows: self.0.rows.clone(),
+            columns: self.0.columns.clone(),
+            weights: weights
+        };
+
+        // Test that the weights are properly CDF
+        for node_id in 0..graph.len() {
+            let weights = self.get_edges(node_id).1;
+            for pair in weights.windows(2) {
+                match pair {
+                    &[p, n] => { 
+                        if p > 1.0 {
+                            Err("Edge weight exceeds 1.0, illegal in CDF")?
+                        } else if n > p {
+                            Err("Edge weight for node in decreasing order")?
+                        }
+                    },
+                    _ => panic!("Something busted with built in")
+                }
+            }
+            if weights[weights.len() - 1] > 1.0 {
+                Err("Edge weight exceeds 1.0, illegal in CDF")?
+            }
+        }
+
+        Ok(CumCSR(graph))
+    }
 }
 
 impl Graph for CumCSR {
@@ -429,7 +462,7 @@ mod csr_tests {
         let csr = CSR::construct_from_edges(edges);
         let ccsr = CumCSR::convert(csr);
 
-        let (edges, weights) = ccsr.get_edges(1);
+        let weights = ccsr.get_edges(1).1;
         let ps = CDFtoP::new(weights);
         let exp = vec![3./15., 2./15., 10./15.];
         ps.zip(exp.iter()).for_each(|(p, exp_p)| {

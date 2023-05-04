@@ -41,7 +41,7 @@ impl SupervisedMCIteration {
     pub fn learn(
         &self,
         graph: &(impl CDFGraph + Send + Sync),
-        rewards: Vec<(NodeID, NodeID, f32)>,
+        rewards: &[(NodeID, NodeID, f32)],
         distances: EmbeddingStore
     ) -> Vec<f32> {
 
