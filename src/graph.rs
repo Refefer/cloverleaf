@@ -208,7 +208,7 @@ impl CumCSR {
                     &[p, n] => { 
                         if p > 1.0 {
                             Err("Edge weight exceeds 1.0, illegal in CDF")?
-                        } else if n > p {
+                        } else if n < p {
                             Err("Edge weight for node in decreasing order")?
                         }
                     },

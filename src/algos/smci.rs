@@ -11,30 +11,31 @@ use crate::embeddings::{EmbeddingStore,Entity};
 use crate::hogwild::{Hogwild};
 use crate::sampler::{GreedySampler};
 use crate::algos::rwr::{rollout,Steps};
+use crate::vocab::TranslationTable;
 
 pub struct SupervisedMCIteration {
     // number of full passes over the dataset
-    iterations: usize,
+    pub iterations: usize,
 
     // number of walks per node, which we aggregate
-    num_walks: usize,
+    pub num_walks: usize,
 
     // how much should we interpolate between the original graph and the 
     // learned graph? alpha * orig + (1-alpha) * learned.
-    alpha: f32,
+    pub alpha: f32,
 
     // gamma: how much we discount each step
-    discount: f32,
+    pub discount: f32,
 
     // ensure we're exploring at least P percentage of the time
-    explore_pct: f32,
+    pub explore_pct: f32,
 
     // MCVI is a trajectory based optimizer; we stop each trajectory
     // with P probability after a step
-    restart_prob: f32,
+    pub restart_prob: f32,
 
     // Random seed
-    seed: u64
+    pub seed: u64
 }
 
 impl SupervisedMCIteration {
@@ -42,7 +43,7 @@ impl SupervisedMCIteration {
         &self,
         graph: &(impl CDFGraph + Send + Sync),
         rewards: &[(NodeID, NodeID, f32)],
-        distances: EmbeddingStore
+        distances: Option<(&EmbeddingStore, TranslationTable)>,
     ) -> Vec<f32> {
 
         // Track the current states, we use hogwild to allow for parallel
@@ -72,11 +73,27 @@ impl SupervisedMCIteration {
                     // This allows us to extract value from every rollout regardless of whether it
                     // lands on the reward node
                     let terminal = trajectory[trajectory.len() - 1];
-                    let dist = distances.compute_distance(&Entity::Node(*end_node), 
-                                                          &Entity::Node(terminal));
+                    let dist = if terminal == *end_node {
+                        Some(0f32)
+                    } else if let Some((embs, trans_table)) = &distances {
+                        match (trans_table[*end_node], trans_table[terminal]) {
+                            (Some(en), Some(tn)) => {
+                                let d = embs.compute_distance(&Entity::Node(*end_node), &Entity::Node(terminal));
+                                Some(d)
+                            }
+                            _ => None
+                        }
+                        
+                    } else {
+                        None
+                    };
                     
                     // Needs more love to figure out the right scaling function
-                    let actual_reward = reward / (dist + 1f32);
+                    let actual_reward = if let Some(d) = dist {
+                        reward / (d + 1f32)
+                    } else {
+                        0.0
+                    };
                     let traj_len = trajectory.len() - 1;
 
                     // Update the rewards for the graph
@@ -85,7 +102,7 @@ impl SupervisedMCIteration {
                         if !seen.contains(node) {
                             seen.insert(*node);
                             let r = actual_reward * self.discount.powf((traj_len - i) as f32);
-                            let mut agg = h_v_state.get()[*node];
+                            let mut agg = &mut h_v_state.get()[*node];
                             agg.0 += r;
                             agg.1 += 1;
                         }

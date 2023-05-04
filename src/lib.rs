@@ -21,7 +21,7 @@ use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError};
 use itertools::Itertools;
 use fast_float::parse;
 
-use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID};
+use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID,CDFtoP};
 use crate::vocab::Vocab;
 use crate::sampler::Weighted;
 use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
@@ -169,7 +169,7 @@ impl Graph {
                 .expect("Programming error!");
 
             let (edges, weights) = self.graph.get_edges(node);
-            for (out_node, weight) in edges.iter().zip(weights.iter()) {
+            for (out_node, weight) in edges.iter().zip(CDFtoP::new(weights)) {
 
                 let (t_node_type, t_name) = self.vocab.get_name(*out_node)
                     .expect("Programming error!");
@@ -1378,6 +1378,7 @@ impl Smci {
         let f_n = get_node_id(self.vocab.deref(), from_node.0, from_node.1)?;
         let t_n = get_node_id(self.vocab.deref(), to_node.0, to_node.1)?;
         self.rewards.push((f_n, t_n, reward));
+        Ok(())
     }
 
     pub fn optimize(
@@ -1388,8 +1389,9 @@ impl Smci {
         discount: f32,
         explore_pct: f32,
         restart_prob: f32,
+        embeddings: Option<&NodeEmbeddings>,
         seed: Option<u64>
-    ) -> PyResult<Vec<((String, String), f32)>> {
+    ) -> PyResult<Graph> {
         let smci = SupervisedMCIteration {
             iterations,
             num_walks,
@@ -1400,9 +1402,20 @@ impl Smci {
             seed: seed.unwrap_or(SEED)
         };
 
-        let new_graph = smci.learn(graph.deref(),
+        let embs = embeddings.map(|e| {
+            let tt = e.vocab.create_translation_table(self.vocab.deref());
+            (&e.embeddings, tt)
+        });
+        let weights = smci.learn(self.graph.deref(), &self.rewards, embs);
 
-        Ok(convert_node_distance(&self.vocab, nodes))
+        let new_graph = self.graph.clone_with_edges(weights)
+            .expect("this is all internal, should just work");
+
+        Ok(Graph {
+            graph: Arc::new(new_graph),
+            vocab: self.vocab.clone()
+        })
+
     }
 }
 
@@ -1484,6 +1497,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<RandomWalker>()?;
     m.add_class::<BiasedRandomWalker>()?;
     m.add_class::<NeighborhoodAligner>()?;
+    m.add_class::<Smci>()?;
     Ok(())
 }
 
