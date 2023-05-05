@@ -79,9 +79,8 @@ impl RWR {
        cur_node
     }
 
-    
-
 }
+
 /// Creates a trajectory by randomly walking through the graph, recording it
 /// in the output vector
 pub fn rollout<G: Graph + Send + Sync>(

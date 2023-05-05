@@ -3,6 +3,7 @@ use rayon::prelude::*;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use hashbrown::HashSet;
+use float_ord::FloatOrd;
 
 use std::ops::Deref;
 
@@ -27,8 +28,14 @@ pub struct SupervisedMCIteration {
     // gamma: how much we discount each step
     pub discount: f32,
 
+    // How much we penalize each step
+    pub step_penalty: f32,
+
     // ensure we're exploring at least P percentage of the time
     pub explore_pct: f32,
+
+    // contrast the probability distribution
+    pub compression: f32,
 
     // MCVI is a trajectory based optimizer; we stop each trajectory
     // with P probability after a step
@@ -56,12 +63,13 @@ impl SupervisedMCIteration {
         let mut t_graph = OptCDFGraph::clone_from_cdf(graph);
         let sampler = GreedySampler(self.explore_pct);
         for pass in 0..self.iterations {
-            rewards.par_iter().enumerate().for_each(|(i, (start_node, end_node, reward))| {
+            let average_reward = rewards.par_iter().enumerate().map(|(i, (start_node, end_node, reward))| {
                 // For each node, rollout num_walks times and compute the rewards
                 let seed = (self.seed + (graph.len() * pass) as u64) + i as u64;
                 let mut rng = XorShiftRng::seed_from_u64(seed);
                 let mut trajectory = Vec::new();
                 let mut seen = HashSet::new();
+                let mut err = 0.0;
                 for _ in 0..self.num_walks {
                     trajectory.clear();
                     
@@ -89,15 +97,17 @@ impl SupervisedMCIteration {
                     };
                     
                     // Needs more love to figure out the right scaling function
+                    let traj_len = trajectory.len() - 1;
                     let actual_reward = if let Some(d) = dist {
                         reward / (d + 1f32)
                     } else {
                         0.0
-                    };
-                    let traj_len = trajectory.len() - 1;
+                    } + self.step_penalty * traj_len as f32; 
 
                     // Update the rewards for the graph
                     seen.clear();
+                    //println!("Reward: {:?}", actual_reward);
+                    println!("trajectory: {:?}", trajectory);
                     for (i, node) in trajectory.iter().enumerate() {
                         if !seen.contains(node) {
                             seen.insert(*node);
@@ -107,12 +117,18 @@ impl SupervisedMCIteration {
                             agg.1 += 1;
                         }
                     }
+
+                    err += actual_reward;
                 }
+
+                err / self.num_walks as f32
                 
-            });
+            }).sum::<f32>();
+
+            println!("Average Reward: {}", average_reward / rewards.len() as f32);
 
             // Create new edges from V(S)
-            let agg = h_v_state.deref();
+            let mut agg = h_v_state.deref();
             let mut new_edges = t_graph.into_weights();
             for node_id in 0..graph.len() {
                 let edges = graph.get_edges(node_id).0;
@@ -127,8 +143,15 @@ impl SupervisedMCIteration {
                     let tn_vs = r / c as f32;
                     
                     // If the node we're moving to is worse than the node we're on, set to zero
-                    *wi = (tn_vs - fn_vs).max(0.);
+                    *wi = tn_vs - fn_vs;
                 }
+
+                softmax(weights);
+                scale_weights(weights, self.compression);
+
+                edges.iter().zip(weights.iter()).for_each(|(ei, wi)| {
+                    println!("{} -> {} : {}", node_id, ei, wi);
+                });
             }
             t_graph = OptCDFGraph::new(graph, new_edges);
         }
@@ -141,18 +164,37 @@ impl SupervisedMCIteration {
 }
 
 fn interpolate_edges(alpha: f32, g: &impl CDFGraph, weights: &mut [f32]) {
+    let mut t = Vec::new();
     for node_id in 0..g.len() {
         let ow = g.get_edges(node_id).1;
         let (start, stop) = g.get_edge_range(node_id);
         let mut nw = &mut weights[start..stop];
-        normalize(&mut nw);
-        CDFtoP::new(ow).zip(nw.iter_mut()).for_each(|(owi, nwi)| {
-            let w = alpha * owi + (1f32 - alpha) * *nwi;
-            *nwi = w;
+        let owi = CDFtoP::new(ow);
+        let nwi = CDFtoP::new(nw);
+        t.clear();
+        owi.zip(nwi).for_each(|(owi, nwi)| {
+            let w = alpha * owi + (1f32 - alpha) * nwi;
+            t.push(w);
         });
-
+        nw.clone_from_slice(&t);
         convert_edges_to_cdf(&mut nw);
     }
+}
+
+fn softmax(weights: &mut [f32]) {
+    let max = weights.iter()
+        .max_by_key(|v| FloatOrd(**v))
+        .map(|v| *v);
+
+    if let Some(max) = max {
+        weights.iter_mut().for_each(|v| *v = (*v - max).exp());
+        let mut denom = weights.iter().sum::<f32>();
+        weights.iter_mut().for_each(|v| *v /= denom);
+    }
+}
+
+fn scale_weights(weights: &mut [f32], pow: f32) {
+    weights.iter_mut().for_each(|wi| *wi = wi.powf(pow));
 }
 
 fn normalize(w: &mut [f32]) {

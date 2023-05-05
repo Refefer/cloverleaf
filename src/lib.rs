@@ -1387,8 +1387,10 @@ impl Smci {
         num_walks: usize,
         alpha: f32,
         discount: f32,
+        step_penalty: f32,
         explore_pct: f32,
         restart_prob: f32,
+        compression: Option<f32>,
         embeddings: Option<&NodeEmbeddings>,
         seed: Option<u64>
     ) -> PyResult<Graph> {
@@ -1397,8 +1399,10 @@ impl Smci {
             num_walks,
             alpha,
             discount,
+            step_penalty,
             explore_pct,
             restart_prob,
+            compression: compression.unwrap_or(1.0),
             seed: seed.unwrap_or(SEED)
         };
 
