@@ -19,19 +19,20 @@ graph = gb.build_graph()
 smci = cloverleaf.Smci(graph)
 
 smci.add_reward(('node', '0'), ('node', '3'), 2)
-smci.add_reward(('node', '1'), ('node', '5'), -2)
-#smci.add_reward(('node', '8'), ('node', '5'), 2)
-#smci.add_reward(('node', '8'), ('node', '4'), -2)
+smci.add_reward(('node', '0'), ('node', '4'), -2)
+smci.add_reward(('node', '7'), ('node', '4'), 2)
+smci.add_reward(('node', '7'), ('node', '3'), -2)
 
 new_graph = smci.optimize(
     iterations=5,
     num_walks=100,
-    alpha=0.0,
-    discount=0.9,
+    alpha=0.1,
+    discount=0.1,
     step_penalty=-0.1,
     explore_pct=0.0,
-    compression=5.0,
-    restart_prob=1/3)
+    compression=10.0,
+    restart_prob=1/5,
+    seed=123123)
 
 new_graph.save("/tmp/here")
 print("done")

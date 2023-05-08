@@ -106,8 +106,6 @@ impl SupervisedMCIteration {
 
                     // Update the rewards for the graph
                     seen.clear();
-                    //println!("Reward: {:?}", actual_reward);
-                    println!("trajectory: {:?}", trajectory);
                     for (i, node) in trajectory.iter().enumerate() {
                         if !seen.contains(node) {
                             seen.insert(*node);
@@ -148,11 +146,11 @@ impl SupervisedMCIteration {
 
                 softmax(weights);
                 scale_weights(weights, self.compression);
-
-                edges.iter().zip(weights.iter()).for_each(|(ei, wi)| {
-                    println!("{} -> {} : {}", node_id, ei, wi);
-                });
             }
+            h_v_state.get().iter_mut().for_each(|r| {
+                r.0 = 0f32;
+                r.1 = 1;
+            });
             t_graph = OptCDFGraph::new(graph, new_edges);
         }
 
