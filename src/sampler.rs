@@ -18,13 +18,17 @@ impl <S: CDFGraph> Sampler<S> for Weighted {
             return None
         }
 
-        let p: f32 = rng.gen();
-        let idx = match weights.binary_search_by_key(&FloatOrd(p), |w| FloatOrd(*w)) {
-            Ok(idx) => idx,
-            Err(idx) => idx
-        };
+        let idx = weighted_sample_cdf(weights, rng);
         Some(edges[idx])
- 
+    }
+}
+
+#[inline]
+fn weighted_sample_cdf<R: Rng>(weights: &[f32], rng: &mut R) -> usize {
+    let p: f32 = rng.gen();
+    match weights.binary_search_by_key(&FloatOrd(p), |w| FloatOrd(*w)) {
+        Ok(idx) => idx,
+        Err(idx) => idx
     }
 }
 
