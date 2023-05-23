@@ -140,9 +140,9 @@ impl SupervisedMCIteration {
                     let (r, c) = agg[*out_node];
                     let tn_vs = r / c as f32;
                     
-                    // If the node we're moving to is worse than the node we're on, set to zero
                     *wi = tn_vs - fn_vs;
                 }
+
 
                 softmax(weights);
                 scale_weights(weights, self.compression);
