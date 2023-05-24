@@ -147,10 +147,10 @@ impl SupervisedMCIteration {
                 softmax(weights);
                 scale_weights(weights, self.compression);
             }
-            h_v_state.get().iter_mut().for_each(|r| {
-                r.0 = 0f32;
-                r.1 = 1;
-            });
+            //h_v_state.get().iter_mut().for_each(|r| {
+            //    r.0 = 0f32;
+            //    r.1 = 1;
+            //});
             t_graph = OptCDFGraph::new(graph, new_edges);
         }
 
