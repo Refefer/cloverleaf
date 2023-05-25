@@ -37,7 +37,12 @@ impl Distance {
                     ei * ej
                 }).sum::<f32>();
                 let cosine_score = dot / (d1.sqrt() * d2.sqrt());
-                -cosine_score + 1.
+                let dist = -cosine_score + 1.;
+                if dist.is_nan() {
+                    std::f32::INFINITY
+                } else {
+                    dist
+                }
             },
 
             Distance::Euclidean => {
@@ -52,6 +57,7 @@ impl Distance {
                 }).sum::<f32>();
                 not_matches / e1.len() as f32
             },
+
             Distance::Jaccard => {
                 let mut idx1 = 0;
                 let mut idx2 = 0;
