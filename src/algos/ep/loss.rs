@@ -6,12 +6,14 @@ use crate::EmbeddingStore;
 use crate::FeatureStore;
 use crate::graph::{Graph as CGraph,NodeID};
 use super::model::*;
+use super::attention::softmax;
 
 #[derive(Copy,Clone)]
 pub enum Loss {
     MarginLoss(f32, usize),
     Contrastive(f32, usize),
     StarSpace(f32, usize),
+    RankLoss(f32, usize),
     PPR(f32, usize, f32)
 }
 
@@ -21,11 +23,13 @@ impl Loss {
             Loss::Contrastive(_, negs) => *negs,
             Loss::MarginLoss(_, negs)  => *negs,
             Loss::StarSpace(_, negs) => *negs,
+            Loss::RankLoss(_, negs) => *negs,
             Loss::PPR(_, negs, _) => *negs
         }
     }
 
-    // thv is the reconstruction of v from its neighbor nodes
+    // thv is the reconstruction of v from its neighbor nodes or 
+    // a random positive, depending on the loss
     // hv is the embedding constructed from its features
     // hu is a random negative node constructed via its neighbors
     pub fn compute(&self, thv: ANode, hv: ANode, hus: Vec<ANode>) -> ANode {
@@ -47,7 +51,6 @@ impl Loss {
                 }
             },
 
-            // This isn't working particularly well yet - need to figure out why
             Loss::StarSpace(gamma, _)  => {
                 let thv_norm = il2norm(thv);
                 let hv_norm  = il2norm(hv);
@@ -88,6 +91,25 @@ impl Loss {
                 ds.push(d1_exp.clone());
                 -(d1_exp / ds.sum_all()).ln()
             }
+
+            Loss::RankLoss(tau, _)  => {
+                // Get the dot products
+                let mut ds: Vec<_> = hus.into_iter().map(|hu| {
+                    hu.dot(&hv)
+                }).collect();
+                // Add the positive example
+                ds.push(hv.dot(&thv));
+                let len = ds.len();
+                let dsc = ds.concat();
+                let sm = softmax(dsc);
+                let p = sm.slice(len-1, 1);
+                if p.value()[0] < *tau {
+                    -p.ln()
+                } else {
+                    Constant::scalar(0f32)
+                }
+            }
+
         }
     }
 
@@ -105,9 +127,10 @@ impl Loss {
                 model.reconstruct_node_embedding(
                     graph, node, feature_store, feature_embeddings, rng)
             },
-            Loss::StarSpace(_,_) | Loss::Contrastive(_,_) => {
+            Loss::StarSpace(_,_) | Loss::Contrastive(_,_) | Loss::RankLoss(_,_) => {
                 // Select random out edge
                 let edges = graph.get_edges(node).0;
+
                 // If it has no out edges, nothing to really do.  We can't build a comparison.
                 let choice = *edges.choose(rng).unwrap_or(&node);
                 model.construct_node_embedding(

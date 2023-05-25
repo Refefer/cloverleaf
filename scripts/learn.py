@@ -137,6 +137,12 @@ def build_arg_parser():
         metavar=('MARGIN', 'NEGATIVES'),
         help="Optimizes using Starspace embedding learning.")
 
+    group.add_argument("--rank",
+        dest="rank",
+        nargs=2,
+        metavar=('MARGIN', 'NEGATIVES'),
+        help="Performs rank loss on the items.")
+
     group.add_argument("--ppr",
         dest="ppr",
         nargs=3,
@@ -185,6 +191,9 @@ def main(args):
     elif args.ppr is not None:
         temp, negs, p = args.ppr
         loss = cloverleaf.EPLoss.ppr(float(temp), int(negs), float(p))
+    elif args.rank is not None:
+        tau, negs = args.rank
+        loss = cloverleaf.EPLoss.rank(float(tau), int(negs))
     else:
         temp, negs = args.contrastive
         loss = cloverleaf.EPLoss.contrastive(float(temp), int(negs))
