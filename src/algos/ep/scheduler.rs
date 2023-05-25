@@ -12,6 +12,7 @@ pub enum LRScheduler {
         alpha: f32,
         decay: f32
     },
+    Noop
 }
 
 impl LRScheduler {
@@ -21,6 +22,10 @@ impl LRScheduler {
 
     pub fn exp_decay(min_alpha: f32, alpha: f32, decay: f32) -> Self {
         LRScheduler::ExpDecay { min_alpha, alpha, decay }
+    }
+
+    pub fn noop() -> Self {
+        LRScheduler::Noop 
     }
 
     pub fn compute(&self, cur_step: usize) -> f32 {
@@ -36,7 +41,8 @@ impl LRScheduler {
             },
             LRScheduler::ExpDecay { min_alpha, alpha, decay } => {
                 (alpha * decay.powf(cur_step as f32)).max(*min_alpha)
-            }
+            },
+            LRScheduler::Noop => 0.0
         }
 
     }

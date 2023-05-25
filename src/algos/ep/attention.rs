@@ -227,7 +227,7 @@ fn compute_attention_softmax(
     attention_matrix
 }
 
-fn softmax(numers: ANode) -> ANode {
+pub fn softmax(numers: ANode) -> ANode {
     // Doesn't need to be part of the graph
     let max_value = numers.value().iter()
         .max_by_key(|v| FloatOrd(**v))

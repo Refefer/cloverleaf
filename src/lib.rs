@@ -21,7 +21,7 @@ use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError};
 use itertools::Itertools;
 use fast_float::parse;
 
-use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID};
+use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID,CDFtoP};
 use crate::vocab::Vocab;
 use crate::sampler::Weighted;
 use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
@@ -39,6 +39,7 @@ use crate::algos::ann::NodeDistance;
 use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
 use crate::algos::alignment::{NeighborhoodAligner as NA};
+use crate::algos::smci::SupervisedMCIteration;
 
 const SEED: u64 = 20222022;
 
@@ -168,7 +169,7 @@ impl Graph {
                 .expect("Programming error!");
 
             let (edges, weights) = self.graph.get_edges(node);
-            for (out_node, weight) in edges.iter().zip(weights.iter()) {
+            for (out_node, weight) in edges.iter().zip(CDFtoP::new(weights)) {
 
                 let (t_node_type, t_name) = self.vocab.get_name(*out_node)
                     .expect("Programming error!");
@@ -412,6 +413,12 @@ impl EPLoss {
     }
 
     #[staticmethod]
+    pub fn rank(tau: f32, negatives: usize) -> Self {
+        EPLoss { loss: Loss::RankLoss(tau, negatives.max(1)) }
+    }
+
+
+    #[staticmethod]
     pub fn ppr(gamma: f32, negatives: usize, restart_p: f32) -> Self {
         EPLoss { loss: Loss::PPR(gamma, negatives.max(1), restart_p) }
     }
@@ -447,6 +454,7 @@ impl EmbeddingPropagator {
         attention: Option<usize>,
         attention_heads: Option<usize>,
         context_window: Option<usize>,
+        noise: Option<f32>
     ) -> Self {
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(0.9),
@@ -457,7 +465,8 @@ impl EmbeddingPropagator {
             hard_negs: hard_negatives.unwrap_or(0),
             valid_pct: valid_pct.unwrap_or(0.1),
             seed: seed.unwrap_or(SEED),
-            indicator: indicator.unwrap_or(true)
+            indicator: indicator.unwrap_or(true),
+            noise: noise.unwrap_or(0.0)
         };
 
         let model = if let Some(d_k) = attention {
@@ -1348,6 +1357,78 @@ impl Ann {
     }
 }
 
+#[pyclass]
+struct Smci {
+    graph: Arc<CumCSR>,
+    vocab: Arc<Vocab>,
+    rewards: Vec<(NodeID,NodeID,f32)>
+}
+
+#[pymethods]
+impl Smci {
+    #[new]
+    pub fn new(graph: &Graph) -> Self {
+        Smci {
+            graph: graph.graph.clone(),
+            vocab: graph.vocab.clone(),
+            rewards: Vec::new()
+        }
+    }
+
+    pub fn add_reward(
+        &mut self, 
+        from_node: (String, String), 
+        to_node: (String, String), 
+        reward: f32
+    ) -> PyResult<()> {
+        let f_n = get_node_id(self.vocab.deref(), from_node.0, from_node.1)?;
+        let t_n = get_node_id(self.vocab.deref(), to_node.0, to_node.1)?;
+        self.rewards.push((f_n, t_n, reward));
+        Ok(())
+    }
+
+    pub fn optimize(
+        &self, 
+        iterations: usize,
+        num_walks: usize,
+        alpha: f32,
+        discount: f32,
+        step_penalty: f32,
+        explore_pct: f32,
+        restart_prob: f32,
+        compression: Option<f32>,
+        embeddings: Option<&NodeEmbeddings>,
+        seed: Option<u64>
+    ) -> PyResult<Graph> {
+        let smci = SupervisedMCIteration {
+            iterations,
+            num_walks,
+            alpha,
+            discount,
+            step_penalty,
+            explore_pct,
+            restart_prob,
+            compression: compression.unwrap_or(1.0),
+            seed: seed.unwrap_or(SEED)
+        };
+
+        let embs = embeddings.map(|e| {
+            let tt = e.vocab.create_translation_table(self.vocab.deref());
+            (&e.embeddings, tt)
+        });
+        let weights = smci.learn(self.graph.deref(), &self.rewards, embs);
+
+        let new_graph = self.graph.clone_with_edges(weights)
+            .expect("this is all internal, should just work");
+
+        Ok(Graph {
+            graph: Arc::new(new_graph),
+            vocab: self.vocab.clone()
+        })
+
+    }
+}
+
 fn lookup_embedding<'a>(
     query: &'a Query, 
     embeddings: &'a NodeEmbeddings
@@ -1426,6 +1507,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<RandomWalker>()?;
     m.add_class::<BiasedRandomWalker>()?;
     m.add_class::<NeighborhoodAligner>()?;
+    m.add_class::<Smci>()?;
     Ok(())
 }
 

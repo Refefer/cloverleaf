@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicUsize,Ordering};
 
 static VOCAB_ID: AtomicUsize = AtomicUsize::new(0);
 
+pub type TranslationTable = Vec<Option<NodeID>>;
+
 #[derive(Clone,Debug)]
 pub struct Vocab {
     vocab_id: usize,
@@ -95,6 +97,18 @@ impl Vocab {
             })
         }
     }
+
+    pub fn create_translation_table(&self, to_vocab: &Vocab) -> TranslationTable {
+        if self.is_identical(to_vocab) {
+            (0..self.node_id_to_node.len()).map(|idx| Some(idx)).collect()
+        } else {
+            self.node_id_to_node.iter().map(|(node_type_id, node_name)| {
+                let node_type = &self.id_to_node_type[*node_type_id];
+                to_vocab.get_node_id_int(node_type, node_name)
+            }).collect()
+        }
+    }
+
 }
 
 #[cfg(test)]

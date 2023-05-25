@@ -163,7 +163,6 @@ fn hill_climb<'a, G: CGraph, R: Rng>(
 #[cfg(test)]
 mod ann_tests {
     use super::*;
-    use crate::graph::{CumCSR,CSR};
 
     fn build_star_edges() -> Vec<(usize, usize, f32)> {
         let mut edges = Vec::new();

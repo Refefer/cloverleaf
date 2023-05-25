@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use crate::graph::{Graph,NodeID};
 use crate::sampler::Sampler;
 
+#[derive(Clone,Copy)]
 pub enum Steps {
     Fixed(usize),
     Probability(f32)
@@ -28,26 +29,9 @@ impl RWR {
     ) -> HashMap<NodeID, f32> {
        let mut ret = (0..self.walks).into_par_iter()
            .map(|idx| {
+
                let mut rng = XorShiftRng::seed_from_u64(self.seed + idx as u64);
-               let mut cur_node = start_node;
-               match self.steps {
-                   Steps::Probability(alpha) => loop {
-                       // Sample the next edge
-                       cur_node = sampler.sample(graph, cur_node, &mut rng)
-                           .unwrap_or(start_node);
-
-                       if rng.gen::<f32>() < alpha {
-                           break;
-                       }
-                   },
-                   Steps::Fixed(steps) => for _ in 0..steps {
-                       // Sample the next edge
-                       cur_node = sampler.sample(graph, cur_node, &mut rng)
-                           .unwrap_or(start_node);
-                   }
-               };
-               cur_node
-
+               self.walk(graph, sampler, start_node, &mut rng) 
            }).fold(|| HashMap::new(), |mut acc, node_id| {
                *acc.entry(node_id).or_insert(0f32) += 1.; 
                acc
@@ -67,7 +51,68 @@ impl RWR {
        ret
     }
 
+    /// Runs a random walk, returning the terminal node.
+    pub fn walk<G: Graph + Send + Sync>(
+        &self, 
+        graph: &G, 
+        sampler: &impl Sampler<G>,
+        start_node: NodeID,
+        rng: &mut impl Rng
+    ) -> NodeID {
+       let mut cur_node = start_node;
+       match self.steps {
+           Steps::Probability(alpha) => loop {
+               // Sample the next edge
+               cur_node = sampler.sample(graph, cur_node, rng)
+                   .unwrap_or(start_node);
+
+               if rng.gen::<f32>() < alpha {
+                   break
+               }
+           },
+           Steps::Fixed(steps) => for _ in 0..steps {
+               // Sample the next edge
+               cur_node = sampler.sample(graph, cur_node, rng)
+                   .unwrap_or(start_node);
+           }
+       }
+       cur_node
+    }
+
 }
+
+/// Creates a trajectory by randomly walking through the graph, recording it
+/// in the output vector
+pub fn rollout<G: Graph + Send + Sync>(
+    graph: &G, 
+    steps: Steps, 
+    sampler: &impl Sampler<G>,
+    start_node: NodeID,
+    rng: &mut impl Rng,
+    output: &mut Vec<NodeID>
+) {
+    output.clear();
+    let mut cur_node = start_node;
+    match steps {
+       Steps::Probability(alpha) => loop {
+           // Sample the next edge
+           cur_node = sampler.sample(graph, cur_node, rng)
+               .unwrap_or(start_node);
+
+           output.push(cur_node);
+           if rng.gen::<f32>() < alpha {
+               break;
+           }
+       },
+       Steps::Fixed(steps) => for _ in 0..steps {
+           // Sample the next edge
+           cur_node = sampler.sample(graph, cur_node, rng)
+               .unwrap_or(start_node);
+           output.push(cur_node);
+       }
+   };
+}
+
 
 #[cfg(test)]
 mod rwr_tests {

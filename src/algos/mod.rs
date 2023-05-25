@@ -8,5 +8,6 @@ pub mod ep;
 pub mod ann;
 pub mod utils;
 pub mod aggregator;
+pub mod smci;
 pub mod feat_propagation;
 pub mod alignment;

@@ -14,9 +14,14 @@ pub trait Graph {
     /// Get edges and corresponding weights
     fn get_edges(&self, idx: NodeID) -> (&[NodeID], &[f32]);
     
+    /// Get edge offset in graph
+    fn get_edge_range(&self, idx: NodeID) -> (usize, usize);
+    
+}
+
+pub trait ModifiableGraph {
     /// Get edges and corresponding weights
     fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]);
-
 }
 
 /// Used for trait bounds.  Confirms the underlying weights for each node
@@ -29,6 +34,7 @@ pub trait CDFGraph: Graph {}
 
 /// Compressed Sparse Row Format.  We use this for graphs since adjancency
 /// lists tend to use more memory.
+#[derive(Clone)]
 pub struct CSR {
     rows: Vec<NodeID>,
     columns: Vec<NodeID>,
@@ -90,18 +96,26 @@ impl Graph for CSR {
 
     // Get edges and corresponding weights
     fn get_edges(&self, idx: NodeID) -> (&[NodeID], &[f32]) {
-        let start = self.rows[idx];
-        let stop  = self.rows[idx+1];
+        let (start, stop) = self.get_edge_range(idx);
         (&self.columns[start..stop], &self.weights[start..stop])
     }
-    
-    // Get edges and corresponding weights
-    fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]) {
+
+    // get edge range
+    fn get_edge_range(&self, idx: NodeID) -> (usize, usize) {
         let start = self.rows[idx];
         let stop  = self.rows[idx+1];
-        (&mut self.columns[start..stop], &mut self.weights[start..stop])
+        (start, stop)
     }
     
+}
+
+impl ModifiableGraph for CSR {
+    // Get edges and corresponding weights
+    fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]) {
+        let (start, stop) = self.get_edge_range(idx);
+        (&mut self.columns[start..stop], &mut self.weights[start..stop])
+    }
+
 }
 
 pub struct NormalizedCSR(CSR);
@@ -112,7 +126,12 @@ impl NormalizedCSR {
             let (start, stop) = (start_stop[0], start_stop[1]);
             let slice = &mut csr.weights[start..stop];
             let denom = slice.iter().sum::<f32>();
-            slice.iter_mut().for_each(|w| *w /= denom);
+            if denom > 0f32 {
+                slice.iter_mut().for_each(|w| *w /= denom);
+            } else {
+                let n = slice.len() as f32;
+                slice.iter_mut().for_each(|w| *w = 1f32 / n );
+            }
         }
         NormalizedCSR(csr)
     }
@@ -139,15 +158,24 @@ impl Graph for NormalizedCSR {
         self.0.get_edges(idx)
     }
     
+    // get edge range
+    fn get_edge_range(&self, idx: NodeID) -> (usize, usize) {
+        self.0.get_edge_range(idx)
+    }
+
+     
+}
+
+impl ModifiableGraph for NormalizedCSR {
     /// Get edges and corresponding weights
     fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]) {
         self.0.modify_edges(idx)
     }
- 
 }
 
 impl NormalizedGraph for NormalizedCSR {}
 
+#[derive(Clone)]
 pub struct CumCSR(CSR);
 
 impl CumCSR {
@@ -155,17 +183,44 @@ impl CumCSR {
         for start_stop in csr.rows.windows(2) {
             let (start, stop) = (start_stop[0], start_stop[1]);
             if start < stop {
-                let slice = &mut csr.weights[start..stop];
-                let denom = slice.iter().sum::<f32>();
-                let mut acc = 0.;
-                slice.iter_mut().for_each(|w| {
-                    acc += *w;
-                    *w = acc / denom;
-                });
-                slice[slice.len() - 1] = 1.;
+                convert_edges_to_cdf(&mut csr.weights[start..stop]);
             }
         }
         CumCSR(csr)
+    }
+
+    pub fn clone_with_edges(&self, weights: Vec<f32>) -> Result<CumCSR,&'static str> {
+        if weights.len() != self.0.weights.len() {
+            Err("weights lengths not equal!")?
+        }
+
+        let graph = CSR {
+            rows: self.0.rows.clone(),
+            columns: self.0.columns.clone(),
+            weights: weights
+        };
+
+        // Test that the weights are properly CDF
+        for node_id in 0..graph.len() {
+            let weights = self.get_edges(node_id).1;
+            for pair in weights.windows(2) {
+                match pair {
+                    &[p, n] => { 
+                        if p > 1.0 {
+                            Err("Edge weight exceeds 1.0, illegal in CDF")?
+                        } else if n < p {
+                            Err("Edge weight for node in decreasing order")?
+                        }
+                    },
+                    _ => panic!("Something busted with built in")
+                }
+            }
+            if weights[weights.len() - 1] > 1.0 {
+                Err("Edge weight exceeds 1.0, illegal in CDF")?
+            }
+        }
+
+        Ok(CumCSR(graph))
     }
 }
 
@@ -190,14 +245,145 @@ impl Graph for CumCSR {
         self.0.get_edges(idx)
     }
     
+    /// Get edge Range
+    fn get_edge_range(&self, idx: NodeID) -> (usize, usize) {
+        self.0.get_edge_range(idx)
+    }
+
+}
+
+impl ModifiableGraph for CumCSR {
+    
     /// Get edges and corresponding weights
     fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]) {
         self.0.modify_edges(idx)
     }
- 
+
 }
 
 impl CDFGraph for CumCSR {}
+
+pub struct OptCDFGraph<'a,G> {
+    graph: &'a G,
+    weights: Vec<f32>
+}
+
+impl <'a,G:Graph> OptCDFGraph<'a,G> {
+    pub fn new(graph: &'a G, weights: Vec<f32>) -> Self {
+        let mut s = OptCDFGraph { graph, weights };
+        s.convert_edges();
+        s
+    }
+
+    pub fn into_weights(self) -> Vec<f32> {
+        self.weights
+    }
+
+    pub fn convert_edges(&mut self) {
+        for idx in 0..self.len() {
+            let (start, stop) = self.get_edge_range(idx);
+            if start < stop {
+                convert_edges_to_cdf(&mut self.weights[start..stop]);
+            }
+        }
+    }
+
+}
+
+impl <'a,G:CDFGraph> OptCDFGraph<'a,G> {
+    pub fn clone_from_cdf(graph: &'a G) -> Self {
+        let mut weights = vec![0f32; graph.edges()];
+        for node_id in 0..graph.len() {
+            let w = graph.get_edges(node_id).1;
+            let (start, stop) = graph.get_edge_range(node_id);
+            weights[start..stop].clone_from_slice(w);
+        }
+
+        OptCDFGraph { graph, weights }
+    }
+
+}
+
+impl <'a,G:Graph> Graph for OptCDFGraph<'a,G> {
+    /// Get number of nodes in graph
+    fn len(&self) -> usize {
+        self.graph.len()
+    }
+
+    /// Get number of nodes in graph
+    fn edges(&self) -> usize {
+        self.graph.edges()
+    }
+
+    /// Get degree of node in graph
+    fn degree(&self, idx: NodeID) -> usize {
+        self.graph.degree(idx)
+    }
+
+    /// Get edges and corresponding weights
+    fn get_edges(&self, idx: NodeID) -> (&[NodeID], &[f32]) {
+        let edges = self.graph.get_edges(idx).0;
+        let (start, stop) = self.get_edge_range(idx);
+        let weights = &self.weights[start..stop];
+        (edges, weights)
+    }
+    
+    /// Get edge Range
+    fn get_edge_range(&self, idx: NodeID) -> (usize, usize) {
+        self.graph.get_edge_range(idx)
+    }
+
+}
+
+impl <'a,G:Graph> CDFGraph for OptCDFGraph<'a,G> {}
+
+#[derive(Clone,Copy)]
+pub struct CDFtoP<'a> {
+    cdf: &'a [f32],
+    idx: usize
+}
+
+impl <'a> CDFtoP<'a> {
+    pub fn new(weights: &'a [f32]) -> Self {
+        CDFtoP { cdf: weights, idx: 0 }
+    }
+}
+
+impl <'a> Iterator for CDFtoP<'a> {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx < self.cdf.len() {
+            let p = if self.idx == 0 {
+                Some(self.cdf[self.idx])
+            } else {
+                Some(self.cdf[self.idx] - self.cdf[self.idx-1])
+            };
+            self.idx += 1;
+            p
+        } else {
+            None
+        }
+    }
+}
+
+pub fn convert_edges_to_cdf(weights: &mut [f32]) {
+    let mut denom = weights.iter().sum::<f32>();
+    if denom == 0f32 {
+        // If we have no weights, set all weights to uniform.
+        weights.iter_mut().for_each(|w| {
+            *w = 1.
+        });
+        denom = weights.len() as f32;
+    }
+
+    let mut acc = 0.;
+    weights.iter_mut().for_each(|w| {
+        acc += *w;
+        *w = acc / denom;
+    });
+    weights[weights.len() - 1] = 1.;
+}
 
 #[cfg(test)]
 mod csr_tests {
@@ -269,5 +455,19 @@ mod csr_tests {
 
     }
 
+    #[test]
+    fn construct_cdf_to_p() {
+        let edges = build_edges();
+
+        let csr = CSR::construct_from_edges(edges);
+        let ccsr = CumCSR::convert(csr);
+
+        let weights = ccsr.get_edges(1).1;
+        let ps = CDFtoP::new(weights);
+        let exp = vec![3./15., 2./15., 10./15.];
+        ps.zip(exp.iter()).for_each(|(p, exp_p)| {
+            assert!((p - exp_p).abs() < 1e-7);
+        });
+    }
 
 }

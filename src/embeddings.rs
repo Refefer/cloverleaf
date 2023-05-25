@@ -6,7 +6,7 @@ use crate::bitset::BitSet;
 use crate::hogwild::Hogwild;
 use crate::algos::ann::{TopK,NodeDistance};
 
-#[derive(Clone,Debug)]
+#[derive(Clone,Copy,Debug)]
 pub enum Entity<'a> {
     Node(NodeID),
     Embedding(&'a [f32])
@@ -37,11 +37,10 @@ impl Distance {
                     ei * ej
                 }).sum::<f32>();
                 let cosine_score = dot / (d1.sqrt() * d2.sqrt());
-                let dist = -cosine_score + 1.;
-                if dist.is_nan() {
+                if cosine_score.is_nan() {
                     std::f32::INFINITY
                 } else {
-                    dist
+                    -cosine_score + 1.
                 }
             },
 

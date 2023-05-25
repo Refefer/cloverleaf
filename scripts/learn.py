@@ -48,6 +48,12 @@ def build_arg_parser():
         default=9e-1,
         help="Learning Rate.")
 
+    parser.add_argument("--gradient-noise",
+        dest="gradient_noise",
+        type=float,
+        default=0.0,
+        help="If provided, adds gradient noise scaled by GRADIENT_NOISE")
+
     parser.add_argument("--valid-pct",
         dest='valid_pct',
         type=float,
@@ -131,6 +137,12 @@ def build_arg_parser():
         metavar=('MARGIN', 'NEGATIVES'),
         help="Optimizes using Starspace embedding learning.")
 
+    group.add_argument("--rank",
+        dest="rank",
+        nargs=2,
+        metavar=('MARGIN', 'NEGATIVES'),
+        help="Performs rank loss on the items.")
+
     group.add_argument("--ppr",
         dest="ppr",
         nargs=3,
@@ -179,6 +191,9 @@ def main(args):
     elif args.ppr is not None:
         temp, negs, p = args.ppr
         loss = cloverleaf.EPLoss.ppr(float(temp), int(negs), float(p))
+    elif args.rank is not None:
+        tau, negs = args.rank
+        loss = cloverleaf.EPLoss.rank(float(tau), int(negs))
     else:
         temp, negs = args.contrastive
         loss = cloverleaf.EPLoss.contrastive(float(temp), int(negs))
@@ -188,7 +203,7 @@ def main(args):
         passes=args.passes, max_nodes=args.max_neighbors, 
         max_features=args.max_features, attention=args.attention, 
         attention_heads=args.attention_heads, context_window=args.context_window, 
-        hard_negatives=args.hard_negatives, valid_pct=args.valid_pct)
+        noise=args.gradient_noise, hard_negatives=args.hard_negatives, valid_pct=args.valid_pct)
 
     if args.warm_start is not None:
         feature_embeddings = cloverleaf.NodeEmbeddings.load(args.warm_start, cloverleaf.Distance.Cosine)
