@@ -103,7 +103,8 @@ impl Loss {
                 let dsc = ds.concat();
                 let sm = softmax(dsc);
                 let p = sm.slice(len-1, 1);
-                if p.value()[0] < *tau {
+                let pi = p.value()[0];
+                if pi < *tau {
                     -p.ln()
                 } else {
                     Constant::scalar(0f32)
@@ -123,11 +124,11 @@ impl Loss {
         rng: &mut R
     ) -> (NodeCounts,ANode) {
         match self {
-            Loss::MarginLoss(_,_) => {
+            Loss::MarginLoss(_,_) | Loss::RankLoss(_,_) => {
                 model.reconstruct_node_embedding(
                     graph, node, feature_store, feature_embeddings, rng)
             },
-            Loss::StarSpace(_,_) | Loss::Contrastive(_,_) | Loss::RankLoss(_,_) => {
+            Loss::StarSpace(_,_) | Loss::Contrastive(_,_)  => {
                 // Select random out edge
                 let edges = graph.get_edges(node).0;
 

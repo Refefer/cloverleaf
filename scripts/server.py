@@ -40,7 +40,7 @@ def construct_adhoc_embedding(query, embeddings, aggregator, alpha=None):
     for token in build_grams(query):
         tokens.append(('feat', token))
 
-    e = AGGREGATOR.embed_adhoc(tokens, embeddings, alpha=alpha, strict=False)
+    e = AGGREGATOR.embed_adhoc(tokens, embeddings, strict=False)
     if sum(e) == 0:
         return None
 
@@ -77,13 +77,13 @@ def build_arg_parser():
 
 def load(ne_fname, fe_fname, agg_fname):
     print("Loading Node Embeddings...")
-    ne_embeddings = cloverleaf.NodeEmbeddings.load(ne_fname, cloverleaf.Distance.Euclidean)
+    ne_embeddings = cloverleaf.NodeEmbeddings.load(ne_fname, cloverleaf.Distance.Cosine)
     print("Loading Feature Embeddings...")
-    fe_embeddings = cloverleaf.NodeEmbeddings.load(fe_fname, cloverleaf.Distance.Euclidean)
+    fe_embeddings = cloverleaf.NodeEmbeddings.load(fe_fname, cloverleaf.Distance.Cosine, 'feat')
     print("Loading aggregator")
-    aggregator = cloverleaf.FeatureEmbeddingAggregator.load(agg_fname)
+    aggregator = cloverleaf.FeatureAggregator.load(agg_fname)
     
-    return ne_embeddings, fe_embeddings, aggregator
+    return ne_embeddings, fe_embeddings, cloverleaf.NodeEmbedder(aggregator)
 
 if __name__ == '__main__':
     args = build_arg_parser().parse_args()

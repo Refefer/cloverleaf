@@ -176,26 +176,34 @@ impl EmbeddingPropagation {
                 let cur_step = step.fetch_add(1, Ordering::Relaxed);
 
                 // Add gaussian noise to help regulate embeddings
-                if self.noise > 0.0 {
-                    let noise = noise_scheduler.compute(cur_step);
-                    all_grads.par_iter_mut().for_each(|(feat, emb)| {
-                        let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + feat) as u64);
-                        emb.iter_mut().for_each(|ei| {
-                            *ei += noise * rng.sample::<f32,StandardNormal>(StandardNormal);
+                if cnt > 0f32 {
+                    if self.noise > 0.0 {
+                        let noise = noise_scheduler.compute(cur_step);
+                        all_grads.par_iter_mut().for_each(|(feat, emb)| {
+                            let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + feat) as u64);
+                            emb.iter_mut().for_each(|ei| {
+                                *ei += noise * rng.sample::<f32,StandardNormal>(StandardNormal);
+                            });
                         });
-                    });
-                }
+                    }
 
-                // Backpropagate embeddings
-                let alpha = lr_scheduler.compute(cur_step);
-                optimizer.update(&feature_embeddings, all_grads, alpha, pass as f32);
+                    // Backpropagate embeddings
+                    let alpha = lr_scheduler.compute(cur_step);
+                    optimizer.update(&feature_embeddings, all_grads, alpha, pass as f32);
+                }
 
                 // Update progress bar
                 pb.inc(1);
-                error / cnt
+                if cnt > 0f32 {
+                    error / cnt
+                } else {
+                    0f32
+                }
             }).collect();
 
-            last_error = err.iter().sum::<f32>() / err.len() as f32;
+            last_error = err.iter()
+                .filter(|x| !x.is_infinite() )
+                .sum::<f32>() / err.len() as f32;
             
             if valid_idxs.len() > 0 {
                 // Validate

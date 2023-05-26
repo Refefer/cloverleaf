@@ -16,6 +16,7 @@ pub enum Entity<'a> {
 pub enum Distance {
     ALT,
     Cosine,
+    Dot,
     Euclidean,
     Hamming,
     Jaccard
@@ -48,6 +49,12 @@ impl Distance {
                 e1.iter().zip(e2.iter()).map(|(ei, ej)| {
                     (*ei - *ej).powf(2.)
                 }).sum::<f32>().sqrt()
+            },
+
+            Distance::Dot => {
+                -e1.iter().zip(e2.iter()).map(|(ei, ej)| {
+                    *ei * *ej
+                }).sum::<f32>()
             },
 
             Distance::Hamming => {

@@ -1,12 +1,39 @@
+//! This is the main interface for Cloverleaf
+//! It has tight coupling to python, specifically as the lingua franca of the machine learning
+//! world.  Consequently, this coupling has a couple of nuances that limit cloverleaf's ability
+//! as a standalone module but that's ok :)
+
+/// Main interface for defining graphs
 pub mod graph;
+
+/// We define all the algorithms within this module
 pub mod algos;
+
+/// How can we efficiently sample from the graph?
 mod sampler;
+
+/// Maps node types, node names to internal IDs and back
 mod vocab;
+
+/// Where we store embeddings.  These are both node and feature embeddings
 mod embeddings;
+
+/// Simple bitset
 mod bitset;
+
+/// This interface allows us to update embeddings (and other structures) in multiple threads
+/// without having to gain exclusive write access.  Do _not_ clone hogwild structures as they
+/// will still point to the underlying data
 mod hogwild;
+
+/// Who doesn't like progress bars?
 mod progress;
+
+/// Mapping from nodes -> features
 mod feature_store;
+
+/// Beginnings of refactoring out IO operations for efficient loading/writing of different data
+/// structures
 mod io;
 
 use std::sync::Arc;
@@ -43,6 +70,7 @@ use crate::algos::smci::SupervisedMCIteration;
 
 const SEED: u64 = 20222022;
 
+/// Simple method for taking an iterator of edges and constructing a CSR graph and associated vocab
 fn build_csr(edges: impl Iterator<Item=((String,String),(String,String),f32)>) -> (CSR, Vocab) {
     
     // Convert to NodeIDs
@@ -59,6 +87,8 @@ fn build_csr(edges: impl Iterator<Item=((String,String),(String,String),f32)>) -
     (csr, vocab)
 }
 
+/// Maps an iterator of node ids and scores back to their pretty names with optional top K and
+/// filtering by node types.
 fn convert_scores(
     vocab: &Vocab, 
     scores: impl Iterator<Item=(NodeID, f32)>, 
@@ -82,6 +112,7 @@ fn convert_scores(
         .collect()
 }
 
+/// Convenience method for getting an internal node id from pretty name
 fn get_node_id(vocab: &Vocab, node_type: String, node: String) -> PyResult<NodeID> {
     if let Some(node_id) = vocab.get_node_id(node_type.clone(), node.clone()) {
         Ok(node_id)
@@ -90,11 +121,13 @@ fn get_node_id(vocab: &Vocab, node_type: String, node: String) -> PyResult<NodeI
     }
 }
 
+/// This maps our python definition to an internal ADT for embedding distnaces
 #[pyclass]
 #[derive(Clone)]
 pub enum Distance {
     Cosine,
     Euclidean,
+    Dot,
     ALT,
     Jaccard,
     Hamming
@@ -104,6 +137,7 @@ impl Distance {
     fn to_edist(&self) -> EDist {
         match self {
             Distance::Cosine => EDist::Cosine,
+            Distance::Dot => EDist::Dot,
             Distance::Euclidean => EDist::Euclidean,
             Distance::ALT => EDist::ALT,
             Distance::Hamming => EDist::Hamming,
@@ -112,6 +146,7 @@ impl Distance {
     }
 }
 
+/// Main python wrapper for graphs
 #[pyclass]
 pub struct Graph {
     graph: Arc<CumCSR>,
@@ -221,6 +256,7 @@ impl Graph {
 
 }
 
+/// Basic RP3b walker
 #[pyclass]
 #[derive(Clone)]
 struct RandomWalker {
@@ -270,6 +306,7 @@ impl RandomWalker {
 
 }
 
+/// Rp3b walker with the ability to bias walks according to a provided embedding set.
 #[pyclass]
 #[derive(Clone)]
 struct BiasedRandomWalker {
@@ -335,6 +372,7 @@ impl BiasedRandomWalker {
 
 }
 
+/// Type of edge
 #[pyclass]
 #[derive(Clone)]
 pub enum EdgeType {
