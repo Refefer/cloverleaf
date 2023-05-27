@@ -14,6 +14,7 @@ pub enum Loss {
     Contrastive(f32, usize),
     StarSpace(f32, usize),
     RankLoss(f32, usize),
+    RankSpace(f32, usize),
     PPR(f32, usize, f32)
 }
 
@@ -24,6 +25,7 @@ impl Loss {
             Loss::MarginLoss(_, negs)  => *negs,
             Loss::StarSpace(_, negs) => *negs,
             Loss::RankLoss(_, negs) => *negs,
+            Loss::RankSpace(_, negs) => *negs,
             Loss::PPR(_, negs, _) => *negs
         }
     }
@@ -32,13 +34,13 @@ impl Loss {
     // a random positive, depending on the loss
     // hv is the embedding constructed from its features
     // hu is a random negative node constructed via its neighbors
-    pub fn compute(&self, thv: ANode, hv: ANode, hus: Vec<ANode>) -> ANode {
+    pub fn compute(&self, thv: ANode, hv: ANode, hus: &[ANode]) -> ANode {
         match self {
 
             Loss::MarginLoss(gamma, _) | Loss::PPR(gamma, _, _) => {
-                let d1 = gamma + euclidean_distance(thv.clone(), hv);
-                let pos_losses = hus.into_iter()
-                    .map(|hu| &d1 - euclidean_distance(thv.clone(), hu))
+                let d1 = gamma + euclidean_distance(&thv, &hv);
+                let pos_losses = hus.iter()
+                    .map(|hu| &d1 - euclidean_distance(&thv, hu))
                     .filter(|loss| loss.value()[0] > 0f32)
                     .collect::<Vec<_>>();
 
@@ -51,14 +53,20 @@ impl Loss {
                 }
             },
 
+            Loss::RankSpace(gamma, n) => {
+                let ss_loss = Loss::StarSpace(*gamma, *n).compute(thv.clone(), hv.clone(), hus);
+                let rank_loss = Loss::RankLoss(*gamma, *n).compute(thv, hv, hus);
+                ss_loss + rank_loss
+            }
+
             Loss::StarSpace(gamma, _)  => {
-                let thv_norm = il2norm(thv);
-                let hv_norm  = il2norm(hv);
+                let thv_norm = il2norm(&thv);
+                let hv_norm  = il2norm(&hv);
 
                 // margin between a positive node and its reconstruction
                 // The more correlated
                 let reconstruction_dist = cosine(thv_norm.clone(), hv_norm.clone());
-                let losses = hus.into_iter()
+                let losses = hus.iter()
                     .map(|hu| {
                         let hu_norm = il2norm(hu);
                         // Margin loss
@@ -78,10 +86,10 @@ impl Loss {
             },
 
             Loss::Contrastive(tau, _)  => {
-                let thv_norm = il2norm(thv);
-                let hv_norm  = il2norm(hv);
+                let thv_norm = il2norm(&thv);
+                let hv_norm  = il2norm(&hv);
 
-                let mut ds: Vec<_> = hus.into_iter().map(|hu| {
+                let mut ds: Vec<_> = hus.iter().map(|hu| {
                     let hu_norm = il2norm(hu);
                     (cosine(thv_norm.clone(), hu_norm) / *tau).exp()
                 }).collect();
@@ -94,9 +102,10 @@ impl Loss {
 
             Loss::RankLoss(tau, _)  => {
                 // Get the dot products
-                let mut ds: Vec<_> = hus.into_iter().map(|hu| {
+                let mut ds: Vec<_> = hus.iter().map(|hu| {
                     hu.dot(&hv)
                 }).collect();
+                
                 // Add the positive example
                 ds.push(hv.dot(&thv));
                 let len = ds.len();
@@ -124,11 +133,11 @@ impl Loss {
         rng: &mut R
     ) -> (NodeCounts,ANode) {
         match self {
-            Loss::MarginLoss(_,_) | Loss::RankLoss(_,_) => {
+            Loss::MarginLoss(_,_) => {
                 model.reconstruct_node_embedding(
                     graph, node, feature_store, feature_embeddings, rng)
             },
-            Loss::StarSpace(_,_) | Loss::Contrastive(_,_)  => {
+            Loss::StarSpace(_,_) | Loss::Contrastive(_,_) | Loss::RankLoss(_,_) | Loss::RankSpace (_,_) => {
                 // Select random out edge
                 let edges = graph.get_edges(node).0;
 
@@ -196,15 +205,15 @@ fn l2norm(v: ANode) -> ANode {
     v.pow(2f32).sum().pow(0.5)
 }
 
-fn il2norm(v: ANode) -> ANode {
-    &v / l2norm(v.clone())
+fn il2norm(v: &ANode) -> ANode {
+    v / l2norm(v.clone())
 }
 
 fn cosine(x1: ANode, x2: ANode) -> ANode {
     x1.dot(&x2)
 }
 
-fn euclidean_distance(e1: ANode, e2: ANode) -> ANode {
+fn euclidean_distance(e1: &ANode, e2: &ANode) -> ANode {
     (e1 - e2).pow(2f32).sum().pow(0.5)
 }
 
@@ -216,14 +225,14 @@ mod ep_loss_tests {
     fn test_euclidean_dist() {
         let x = Variable::new(vec![1f32, 3f32]);
         let y = Variable::new(vec![3f32, 5f32]);
-        let dist = euclidean_distance(x, y);
+        let dist = euclidean_distance(&x, &y);
         assert_eq!(dist.value(), &[(8f32).powf(0.5)]);
     }
 
     #[test]
     fn test_l2norm() {
         let x = Variable::new(vec![1f32, 3f32]);
-        let norm = il2norm(x);
+        let norm = il2norm(&x);
         let denom = 10f32.powf(0.5);
         assert_eq!(norm.value(), &[1f32 / denom, 3f32 / denom]);
     }

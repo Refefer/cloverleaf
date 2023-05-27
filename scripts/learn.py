@@ -143,6 +143,12 @@ def build_arg_parser():
         metavar=('MARGIN', 'NEGATIVES'),
         help="Performs rank loss on the items.")
 
+    group.add_argument("--rank-space",
+        dest="rankspace",
+        nargs=2,
+        metavar=('MARGIN', 'NEGATIVES'),
+        help="Performs rank loss + starspace on the items.")
+
     group.add_argument("--ppr",
         dest="ppr",
         nargs=3,
@@ -194,6 +200,10 @@ def main(args):
     elif args.rank is not None:
         tau, negs = args.rank
         loss = cloverleaf.EPLoss.rank(float(tau), int(negs))
+    elif args.rankspace is not None:
+        tau, negs = args.rankspace
+        loss = cloverleaf.EPLoss.rankspace(float(tau), int(negs))
+
     else:
         temp, negs = args.contrastive
         loss = cloverleaf.EPLoss.contrastive(float(temp), int(negs))

@@ -455,6 +455,10 @@ impl EPLoss {
         EPLoss { loss: Loss::RankLoss(tau, negatives.max(1)) }
     }
 
+    #[staticmethod]
+    pub fn rankspace(tau: f32, negatives: usize) -> Self {
+        EPLoss { loss: Loss::RankSpace(tau, negatives.max(1)) }
+    }
 
     #[staticmethod]
     pub fn ppr(gamma: f32, negatives: usize, restart_p: f32) -> Self {

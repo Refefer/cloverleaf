@@ -86,7 +86,7 @@ impl SupervisedMCIteration {
                     } else if let Some((embs, trans_table)) = &distances {
                         match (trans_table[*end_node], trans_table[terminal]) {
                             (Some(en), Some(tn)) => {
-                                let d = embs.compute_distance(&Entity::Node(*end_node), &Entity::Node(terminal));
+                                let d = embs.compute_distance(&Entity::Node(en), &Entity::Node(tn));
                                 Some(d)
                             }
                             _ => None

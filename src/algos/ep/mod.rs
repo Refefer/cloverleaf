@@ -261,7 +261,7 @@ impl EmbeddingPropagation {
         });
 
         // Compute error
-        let loss = self.loss.compute(thv, hv.clone(), hus.clone());
+        let loss = self.loss.compute(thv, hv.clone(), &hus);
 
         (loss, hv_vars, thv_vars, hu_vars)
 
