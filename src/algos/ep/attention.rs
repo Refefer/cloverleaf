@@ -1,18 +1,35 @@
+//! This module constructs a node embedding from a set of features through various different
+//! attention methods.  Notably, we use averaged versus concat -> linear projection due to
+//! performance cost.  This has representational downsides but performs significantly faster and
+//! with no extra parmeters.
 use simple_grad::*;
 use float_ord::FloatOrd;
 use rand::prelude::*;
 
+/// The number of heads to use, and parmeters, for attention.
 #[derive(Copy,Clone)]
 pub struct MultiHeadedAttention {
+    /// Number of attention heads
     pub num_heads: usize,
+
+    /// Number of dimentions to use for both query and key vectors
     pub d_k: usize,
-    attention_type: AttentionType
+
+    /// Attention type
+    pub attention_type: AttentionType
 }
 
 #[derive(Copy,Clone)]
 pub enum AttentionType {
+    /// Computes the full attention matrix of the feature step.  Incredibly expensive if the
+    /// feature size is large: O(N^2)
     Full,
+
+    /// Sliding attention, which looks at [i-window_size:i+window_size] for each attention matrix.  Quite a bit faster than Full, but can't attend to features beyond the window size: O(N * window_size * 2)
     Sliding { window_size: usize },
+
+    /// Randomly selects num_features and computes full attention on it.  Can learn longer distance
+    /// relationships due to random selection at the expense of longer train times.
     Random { num_features: usize }
 }
 
@@ -47,6 +64,7 @@ impl MultiHeadedAttention {
 
 }
 
+/// Struct for easy access of the different pieces of the vector.
 #[derive(Clone)]
 struct Attention {
     query: ANode,
@@ -63,6 +81,8 @@ impl Attention {
     }
 }
 
+/// The big chalupa: given attention and a set of vectors, computes the attention according to the
+/// attention type within the MHA parameter.  
 pub fn attention_mean<'a>(
     it: impl Iterator<Item=&'a (ANode, usize)>,
     mha: &MultiHeadedAttention,
@@ -124,11 +144,16 @@ fn compute_attention_matrix(
 ) -> AttentionMatrix {
     match at {
         AttentionType::Full => compute_full_attention_matrix(items),
-        AttentionType::Sliding{ window_size } => compute_sliding_attention_matrix(items, *window_size),
-        AttentionType::Random { num_features } => compute_random_attention_matrix(items, *num_features, rng)
+        AttentionType::Sliding{ window_size } => {
+            compute_sliding_attention_matrix(items, *window_size)
+        },
+        AttentionType::Random { num_features } => {
+            compute_random_attention_matrix(items, *num_features, rng)
+        }
     }
 }
 
+// Computes the full N^2 attention matrix.  
 fn compute_full_attention_matrix(
     items: &[(Attention, usize)]
 ) -> AttentionMatrix {
@@ -151,6 +176,7 @@ fn compute_full_attention_matrix(
     scaled
 }
 
+// Computes the sliding attention matrix
 fn compute_sliding_attention_matrix(
     items: &[(Attention, usize)],
     window: usize
@@ -176,6 +202,8 @@ fn compute_sliding_attention_matrix(
     scaled
 }
 
+// Computes the random attention matrix.  For each features, we select k random features to attend
+// toward.
 fn compute_random_attention_matrix(
     items: &[(Attention, usize)],
     k: usize,
@@ -198,6 +226,10 @@ fn compute_random_attention_matrix(
     scaled
 }
 
+
+// Learn the softmax of the attention matrix.  Lots of effort in place to make this efficient,
+// within the limitations of dynamic allocations.  Might make sense to make a special attention
+// operator ala pytorch/tensorflow within simple_grad.
 fn compute_attention_softmax(
     mut attention_matrix: AttentionMatrix,
     d_k: usize
@@ -227,6 +259,7 @@ fn compute_attention_softmax(
     attention_matrix
 }
 
+// Simple softmax.
 pub fn softmax(numers: ANode) -> ANode {
     // Doesn't need to be part of the graph
     let max_value = numers.value().iter()

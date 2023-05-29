@@ -1,17 +1,23 @@
+//! Learning rate scheduler.  We use a couple of different variants depending on the method needed.
 
+/// Tracks the different schedulers which have different benefits
 #[derive(Debug)]
 pub enum LRScheduler {
+    /// Generally useful: uses a warmup period to get good starting gradients in Adam, then slowly
+    /// decays over the course of the rest of the passes.
     CosDecay {
         min_alpha: f32,
         alpha: f32,
         warmup_steps: usize,
         max_steps: usize
     },
+    /// Simple exponential decay
     ExpDecay {
         min_alpha: f32,
         alpha: f32,
         decay: f32
     },
+    /// Returns zero
     Noop
 }
 

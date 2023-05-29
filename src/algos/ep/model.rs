@@ -1,3 +1,6 @@
+//! The Embedding Propagation framework parameterizes over the feature aggregator - that is, given
+//! a node with a set of features, how do we combine them to product a node embedding?
+//! This module defines them
 use simple_grad::*;
 use hashbrown::HashMap;
 use rand::prelude::*;
@@ -7,8 +10,10 @@ use crate::EmbeddingStore;
 use crate::graph::{Graph as CGraph,NodeID};
 use super::attention::{attention_mean,MultiHeadedAttention};
 
+/// Main interface for model.  Needs to be threadsafe
 pub trait Model: Send + Sync {
 
+    /// Given a node, construct a node embedding from its features.
     fn construct_node_embedding<R: Rng>(
         &self,
         node: NodeID,
@@ -17,6 +22,7 @@ pub trait Model: Send + Sync {
         rng: &mut R
     ) -> (NodeCounts, ANode);
 
+    /// Given a node, reconstruct a node from its neighborhood
     fn reconstruct_node_embedding<G: CGraph, R: Rng>(
         &self,
         graph: &G,
@@ -26,6 +32,7 @@ pub trait Model: Send + Sync {
         rng: &mut R
     ) -> (NodeCounts, ANode);
 
+    /// Construct multiple node embeddings - we use this for negatives, typically.
     fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
         &self,
         nodes: I,
@@ -34,15 +41,24 @@ pub trait Model: Send + Sync {
         rng: &mut R
     ) -> (NodeCounts, ANode); 
 
+    /// Indicates whether it uses attention
     fn uses_attention(&self) -> bool;
 
+    /// Size of the node embedding.  
     fn feature_dims(&self, d_model: usize) -> usize;
 
+    /// Currently unused and should be axed (YAGNI).  If models have parmeters they can learn, we
+    /// can expose them here.  Not wired up currently
     fn parameters(&self) -> Vec<ANode>;
 }
 
+/// Creates node embeddings by averaging features together
 pub struct AveragedFeatureModel {
+    /// Randomly sample max_features if provided
     max_features: Option<usize>,
+
+    /// In the case of the node reconstruction, we use max_neighbor_nodes instead of the entire
+    /// neighborhood.  This is critical when we have nodes with large neighbors.
     max_neighbor_nodes: Option<usize>
 }
 
@@ -118,9 +134,16 @@ impl Model for AveragedFeatureModel {
  
 }
 
+/// Attention model. Uses attention to combine features into node embeddings.  Slow, but pretty
+/// powerful when used on the right feature set. 
 pub struct AttentionFeatureModel {
+    /// Defines the attention type and number of heads
     mha: MultiHeadedAttention,
+
+    /// Max features to consider
     max_features: Option<usize>,
+    
+    /// Max neighbors to consider for reconstruction
     max_neighbor_nodes: Option<usize>
 }
 
@@ -198,8 +221,12 @@ impl Model for AttentionFeatureModel {
  
 }
 
+/// We track the number of times a features has been seen to help reduce the gradient graph we need
+/// to compute.  It's a bit of a headache for the book keeping but the speed up is worth it.  Could
+/// probably be abstracted better.
 pub type NodeCounts = HashMap<usize, (ANode, usize)>;
 
+/// Gets the feature embeddings for a node, adding or updating the counts
 pub fn collect_embeddings_from_node<R: Rng>(
     node: NodeID,
     feature_store: &FeatureStore,
@@ -277,7 +304,7 @@ pub fn attention_construct_node_embedding<R: Rng>(
 
 
 // ~H(n)
-// The Expensive function.  We grab a nodes neighbors
+// The Expensive function.  We grab a node'ss neighbors
 // and use the average of their features to construct
 // an estimate of H(n)
 fn reconstruct_node_embedding<G: CGraph, R: Rng>(

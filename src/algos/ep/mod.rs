@@ -1,3 +1,6 @@
+//! Defines the embedding propagation algorithm.  It needs to be rebranded since the actual paper
+//! defines it around a loss which we instead parameterize.  Maybe EmbeddingLearner or something
+//! generic?
 mod optimizer;
 mod node_sampler;
 pub mod loss;
@@ -27,21 +30,44 @@ use self::loss::*;
 use self::model::{Model,NodeCounts};
 use self::scheduler::LRScheduler;
 
+/// Defines the propagator
 pub struct EmbeddingPropagation {
+    /// Learning rate for updating feature embeddings
     pub alpha: f32,
+
+    /// Loss to minimize.
     pub loss: Loss,
+
+    /// Batch size to use.  Larger batches have fewer updates, but also lower variance
     pub batch_size: usize,
+
+    /// Sice of the node embeddings.  Feature embeddings can be larger if they use attention
     pub d_model: usize,
+
+    /// Number of passes to optimize for
     pub passes: usize,
+
+    /// Whether we use hard negatives or not.  We might strip this out since I've had difficulty
+    /// using it to improve test loss
     pub hard_negs: usize,
+
+    /// Random seed
     pub seed: u64,
+
+    /// We split out valid_pct of nodes to use for validation.
     pub valid_pct: f32,
+
+    /// If added, we add noise to the gradients as a way to regularize the results; this can be
+    /// useful when the model overfits and validation start to diverge.
     pub noise: f32,
+
+    /// Whether to show a pretty indicator
     pub indicator: bool
 }
 
 impl EmbeddingPropagation {
 
+    /// Learns the feature embeddings.
     pub fn learn<G: CGraph + Send + Sync, M: Model>(
         &self, 
         graph: &G, 
@@ -74,7 +100,8 @@ impl EmbeddingPropagation {
             fe
         };
 
-        // Initializer SGD optimizer
+        // Initializer SGD optimizer.  Right now we hard code the parameters for the optimizer but
+        // in the future we could allow for this to be parameterized.
         let optimizer = AdamOptimizer::new(0.9, 0.999,
             feature_embeddings.dims(), 
             feature_embeddings.len()); 
@@ -85,6 +112,7 @@ impl EmbeddingPropagation {
         let valid_idx = (graph.len() as f32 * self.valid_pct) as usize;
         let valid_idxs = node_idxs.split_off(graph.len() - valid_idx);
 
+        // Number of update stpes
         let steps_per_pass = (node_idxs.len() as f32 / self.batch_size as f32) as usize;
 
         let pb = CLProgressBar::new((self.passes * steps_per_pass) as u64, self.indicator);
@@ -108,6 +136,7 @@ impl EmbeddingPropagation {
             LRScheduler::noop()
         };
 
+        // Initialize samplers for negatives.
         let random_sampler = node_sampler::RandomWalkHardStrategy::new(self.hard_negs, &node_idxs);
         let valid_random_sampler = node_sampler::RandomWalkHardStrategy::new(self.hard_negs, &valid_idxs);
 
@@ -157,7 +186,7 @@ impl EmbeddingPropagation {
                 let mut cnt = 0f32;
                 
                 // We are using std Hashmap instead of hashbrown due to a weird bug
-                // where the optimizer, for whatever reason, has troubles draining it
+                // where the optimizer, for whatever reason, has trouble draining it
                 // on 0.13.  We'll keep testing it on subsequent fixes but until then
                 // std is the way to go.
                 let mut all_grads = CHashMap::new();
@@ -201,12 +230,13 @@ impl EmbeddingPropagation {
                 }
             }).collect();
 
+            // Some losses go toward infinity.  This is a bug we should fix.
             last_error = err.iter()
                 .filter(|x| !x.is_infinite() )
                 .sum::<f32>() / err.len() as f32;
             
             if valid_idxs.len() > 0 {
-                // Validate
+                // Validate.  We use the same random seed for consistency across iterations.
                 let valid_errors = valid_idxs.par_iter().chunks(self.batch_size).map(|nodes| {
                     let sampler = (&valid_random_sampler).initialize_batch(&nodes, graph, features);
 
@@ -277,6 +307,12 @@ impl EmbeddingPropagation {
 
         // Compute gradients
         let mut agraph = Graph::new();
+
+        // This call is about 90% of the entire cost of the algorithm.  The compute graph is
+        // incredibly deep when using attention and requires the computation of several gigabytes
+        // of gradients.
+        // Non-attention methods are substantially simpler to compute the gradients for and are two
+        // orders of a magnitude lower.
         agraph.backward(&loss);
 
         let mut grads = HashMap::new();
@@ -292,6 +328,7 @@ impl EmbeddingPropagation {
 
 }
 
+/// We extract the gradients for each unique feature
 fn extract_grads(
     graph: &Graph, 
     grads: &mut HashMap<usize, Vec<f32>>, 
@@ -311,6 +348,7 @@ fn extract_grads(
     }
 }
 
+// Randomize embeddings.  Might make more sense to have in the embedding file.
 fn randomize_embedding_store(es: &mut EmbeddingStore, rng: &mut impl Rng) {
     for idx in 0..es.len() {
         let e = es.get_embedding_mut(idx);

@@ -1,3 +1,6 @@
+//! Defines the different losses for use within the Embedding Propagation framework.
+//! Admitedly, the EP framework isn't parameterized on loss, so technically choosing a loss other
+//! than Margin Loss is a different optimizer. 
 use simple_grad::*;
 use rand::prelude::*;
 use rand_distr::{Distribution,Uniform};
@@ -10,11 +13,27 @@ use super::attention::softmax;
 
 #[derive(Copy,Clone)]
 pub enum Loss {
+    /// This is the max margin loss with threshold that's common in embedding work.  FaceNet was
+    /// one of the first to define it and a good starting point
     MarginLoss(f32, usize),
+
+    /// Contrastive Loss is another embedding approach; this one uses tau, or temperature, to
+    /// moderate how much weight to give differences
     Contrastive(f32, usize),
+
+    /// This is loss used in the StarSpace paper.  It's basically max margin loss but using cosine
+    /// rather than euclidean distances
     StarSpace(f32, usize),
+
+    /// This use negative log likelihood to maximize a 1-of-N ranked list.
     RankLoss(f32, usize),
+    
+    /// This combines StarSpace and RankLoss, which for search purposes significantly outperforms
+    /// the other losses
     RankSpace(f32, usize),
+
+    /// This uses PPR to generate a set of candidates for optimize toward.  Should be broken out as
+    /// it's fairly unique.
     PPR(f32, usize, f32)
 }
 

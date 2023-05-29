@@ -1,7 +1,11 @@
+//! Defines the actual gradient optimizers for SGD.
+//! Nothing particularly special about these, just canonical versions of the ones used in practice.
 use rayon::prelude::*;
 use crate::embeddings::{EmbeddingStore,Distance};
 use std::collections::{HashMap as CHashMap};
 
+/// Optimizer trait.  We provide it the feature set, the gradient maps, and a few other details
+/// (such as alpha==learning rate), and it optimizes.
 pub trait Optimizer {
     fn update(
         &self, 
@@ -13,13 +17,13 @@ pub trait Optimizer {
 
 }
 
+/// Nesterov-momentum based optimizer.
 pub struct MomentumOptimizer {
     gamma: f32,
     mom: EmbeddingStore
 }
 
 impl MomentumOptimizer {
-
     pub fn new(gamma: f32, dims: usize, length: usize) -> Self {
         let mom = EmbeddingStore::new(length, dims, Distance::Cosine);
         MomentumOptimizer {gamma, mom}
@@ -54,6 +58,10 @@ impl Optimizer for MomentumOptimizer {
 
 }
 
+/// Adam Optimizer.  Should basically be always preferred over momentum due to better performance
+/// in almost all cases.  Momentum _can_ be used when memory is at a premium - Adam requires 3x the
+/// learnable parmeters (aka all the feature embeddings) where ask momentum only needs 1x.  In
+/// practice, this is never an issue.
 pub struct AdamOptimizer {
     beta_1: f32,
     beta_2: f32,

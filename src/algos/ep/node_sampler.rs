@@ -1,9 +1,12 @@
+//! Defines Samplers for selecting negatives from the graph.  This is a big over-engineered right
+//! now as the intent was to have richer samplers which ended up not being the limiting step.
 use rand::prelude::*;
 use rand_distr::{Distribution,Uniform};
 
 use crate::feature_store::FeatureStore;
 use crate::graph::{Graph as CGraph,NodeID};
 
+/// We initialize a new sampler for each batch.
 pub trait BatchSamplerStrategy {
     type Sampler: NodeSampler;
 
@@ -16,6 +19,8 @@ pub trait BatchSamplerStrategy {
 
 }
 
+/// Creates a sampler for use within a batch.  If we needed to precompute something, we can do it
+/// during the initialization of the sampler within the strategy.
 pub trait NodeSampler {
     fn sample_negatives<R: Rng>(
         &self, 
@@ -26,8 +31,11 @@ pub trait NodeSampler {
         rng: &mut R); 
 }
 
-// Finds hard negatives through exploration of local graph walks
+/// Finds hard negatives through exploration of local graph walks.  It will fill the negatives with
+/// both easy negatives and hard negatives.  The take so far is random walks are perhaps too close
+/// to being weak positives rather than hard negatives.
 pub struct RandomWalkHardStrategy {
+    /// Fills 
     num_hard_negatives: usize,
     train_idxs: Vec<NodeID>
 }
@@ -48,6 +56,7 @@ impl <'a> BatchSamplerStrategy for &'a RandomWalkHardStrategy {
         _features: &FeatureStore
     ) -> Self::Sampler {
         RandomWalkHardSampler { 
+            // Hard coded right now; should be parameterized
             p: 0.25, 
             num_hard_negatives: self.num_hard_negatives,
             train_idxs: self.train_idxs.as_slice()
@@ -56,8 +65,10 @@ impl <'a> BatchSamplerStrategy for &'a RandomWalkHardStrategy {
 }
 
 pub struct RandomWalkHardSampler<'a> {
+    // Restart probability
     p: f32,
     num_hard_negatives: usize,
+    /// Only sample from the train IDs for obvious reasons.
     train_idxs: &'a [NodeID]
 }
 
