@@ -14,13 +14,13 @@ use crate::algos::utils::{get_best_count,Counter};
 pub fn construct_slpa_embedding(
     graph: &(impl Graph + Send + Sync),
 
-    /// Number of communities to learn
+    // Number of communities to learn
     k: usize,
     
-    /// Filter out communities with less than t probability
+    // Filter out communities with less than t probability
     threshold: f32,
 
-    /// Random seed
+    // Random seed
     seed: u64
 ) -> EmbeddingStore {
     let dims = (k / (k as f32 * threshold).ceil() as usize) + 1;

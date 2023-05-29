@@ -18,7 +18,7 @@ pub struct NeighborhoodAligner {
 
 impl NeighborhoodAligner {
 
-    pub fn new(alpha: Option<f32>, max_neighbors: Option<usize>) -> Self {k
+    pub fn new(alpha: Option<f32>, max_neighbors: Option<usize>) -> Self {
         NeighborhoodAligner { alpha, max_neighbors }
     }
 

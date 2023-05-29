@@ -11,19 +11,19 @@ use crate::bitset::BitSet;
 
 /// Propagates features into a feature store.
 pub fn propagate_features(
-    /// Graph to guide propagation with
+    // Graph to guide propagation with
     graph: &(impl Graph + Send + Sync),
     
-    /// Feature Store to propagate from and to
+    // Feature Store to propagate from and to
     features: &mut FeatureStore,
 
-    /// Number of passes to propagate
+    // Number of passes to propagate
     max_iters: usize,
 
-    /// Max Number of features to propagate to each node
+    // Max Number of features to propagate to each node
     k: usize,
 
-    /// features that fall under this threshold will be filtered out
+    // features that fall under this threshold will be filtered out
     threshold: f32
 ) {
     let mut is_propagated = BitSet::new(features.num_nodes());
