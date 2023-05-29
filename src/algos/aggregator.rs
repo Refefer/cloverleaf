@@ -1,3 +1,6 @@
+//! Aggregators take models, feature embeddings, and a feature set and convert them into
+//! embeddings.  They are constructed adhoc so can be used in parallel as well as within the python
+//! interface
 use simple_grad::*;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
@@ -10,6 +13,7 @@ pub trait EmbeddingBuilder {
     fn construct( &self, features: &[usize], out: &mut [f32]) -> ();
 }
 
+/// Simply averages feature embeddings together to create a new embedding
 pub struct AvgAggregator<'a> {
     embs: &'a EmbeddingStore
 }
@@ -43,6 +47,7 @@ impl <'a> EmbeddingBuilder for AvgAggregator<'a> {
     }
 }
 
+/// Computes the P(feature) for a feature set.  
 pub struct UnigramProbability {
     p_w: Vec<f32>
 }
@@ -74,6 +79,7 @@ impl UnigramProbability {
     }
 }
 
+/// Uses IDF to weight the features so rarer tokens have a larger impact on the embedding.
 pub struct WeightedAggregator<'a> {
     embs: &'a EmbeddingStore,
     up: &'a UnigramProbability,
@@ -113,6 +119,8 @@ impl <'a> EmbeddingBuilder for WeightedAggregator<'a> {
     }
 }
 
+/// Constructs an embedding from a sequenced feature set using attention.  Expensive but relatively
+/// effective for text features
 pub struct AttentionAggregator<'a> {
     embs: &'a EmbeddingStore,
     mha: MultiHeadedAttention
@@ -122,7 +130,6 @@ impl <'a> AttentionAggregator<'a> {
     pub fn new(embs: &'a EmbeddingStore, mha: MultiHeadedAttention) -> Self {
         AttentionAggregator { embs, mha }
     }
-
 }
 
 impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {

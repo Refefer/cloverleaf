@@ -1,4 +1,7 @@
 /// Supervized Monte Carlo Iteration
+/// We oscillate between running monte carlo trajectories, computing rewards, and updating the
+/// polic with what we've learned from previous runs.  We can also provide embeddings to increase
+/// the signal when the reward maps are sparse.
 use rayon::prelude::*;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
@@ -126,7 +129,7 @@ impl SupervisedMCIteration {
             println!("Average Reward: {}", average_reward / rewards.len() as f32);
 
             // Create new edges from V(S)
-            let mut agg = h_v_state.deref();
+            let agg = h_v_state.deref();
             let mut new_edges = t_graph.into_weights();
             for node_id in 0..graph.len() {
                 let edges = graph.get_edges(node_id).0;
@@ -147,10 +150,6 @@ impl SupervisedMCIteration {
                 softmax(weights);
                 scale_weights(weights, self.compression);
             }
-            //h_v_state.get().iter_mut().for_each(|r| {
-            //    r.0 = 0f32;
-            //    r.1 = 1;
-            //});
             t_graph = OptCDFGraph::new(graph, new_edges);
         }
 
@@ -186,19 +185,13 @@ fn softmax(weights: &mut [f32]) {
 
     if let Some(max) = max {
         weights.iter_mut().for_each(|v| *v = (*v - max).exp());
-        let mut denom = weights.iter().sum::<f32>();
+        let denom = weights.iter().sum::<f32>();
         weights.iter_mut().for_each(|v| *v /= denom);
     }
 }
 
 fn scale_weights(weights: &mut [f32], pow: f32) {
     weights.iter_mut().for_each(|wi| *wi = wi.powf(pow));
-}
-
-fn normalize(w: &mut [f32]) {
-    let mut s: f32 = w.iter().sum();
-    if s == 0f32 { s = 1.; }
-    w.iter_mut().for_each(|wi| *wi /= s);
 }
 
 #[cfg(test)]

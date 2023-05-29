@@ -1,3 +1,6 @@
+/// This module defines the methods for computing distance embeddings using the Landmark selection
+/// method.  It starts by selecting K landmarks (either randomly or by max degree), then computing
+/// the distance between each node in the graph and each landmark.  
 use std::collections::{VecDeque,BinaryHeap};
 use std::cmp::Reverse;
 use std::sync::Mutex;
@@ -16,6 +19,8 @@ pub enum LandmarkSelection {
     Degree
 }
 
+/// Ignores edge weights and computes it assuming each edge has the same weight.  This radically
+/// changes the compute costs since we can avoid Djikstra's algorithm which is very expensive.
 pub fn unweighted_walk_distance(
     graph: &impl Graph,
     start_node: NodeID
@@ -42,6 +47,7 @@ pub fn unweighted_walk_distance(
 }
 
 /// Finds the top K nodes by degree.  Uses NodeID as a tie breaker.
+/// TODO: We should use the TopK struct from ANN and refactor this away.
 fn top_k_nodes(
     graph: &impl Graph,
     k: usize
@@ -57,6 +63,7 @@ fn top_k_nodes(
     bh.into_iter().map(|Reverse((_, node_id))| node_id).collect()
 }
 
+/// Selects landmarks based on random selction.
 fn rand_k_nodes(
     graph: &impl Graph,
     k: usize,
@@ -66,6 +73,7 @@ fn rand_k_nodes(
     (0..graph.len()).choose_multiple(&mut rng, k)
 }
 
+/// Constructs the distance embeddings, returning them upstream
 pub fn construct_walk_distances(
     graph: &(impl Graph + Send + Sync),
     k: usize,

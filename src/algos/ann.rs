@@ -1,3 +1,7 @@
+//! This module defines a mediocre way of approximating nearest neighbors through random graph
+//! traversals and greedy hill climbing toward embeddings which minimize the distance.  It's fine,
+//! works better than nothing, but leaves a lot to be desired and is entirely dependent on the
+//! connectedness of the graph.  Meh.
 use std::cmp::{Eq,PartialEq,Ordering,Reverse};
 use std::collections::BinaryHeap;
 
@@ -10,6 +14,7 @@ use float_ord::FloatOrd;
 use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::{EmbeddingStore,Entity};
 
+/// Defines a distance metric which we can use with heaps.  Lower == better
 #[derive(Copy, Clone, Debug)]
 pub struct NodeDistance(f32, NodeID);
 
@@ -39,6 +44,7 @@ impl PartialEq for NodeDistance {
     }
 }
 
+/// Struct which tracks the top K nodes according to some distance.  Useful outside of ANN as well.
 pub struct TopK {
     heap: BinaryHeap<Reverse<NodeDistance>>,
     k: usize
@@ -79,6 +85,9 @@ impl TopK {
 
 impl Eq for NodeDistance {}
 
+/// This Ann hill climbs from random starting nodes within the graph.  if the graph isn't fully
+/// connected, good luck.  Depending on the smoothness of the embeddings amongst neighbors, has a
+/// habit of running into local minimas.  It's fine, just not anything special.
 #[derive(Debug)]
 pub struct Ann {
     k: usize,
@@ -109,6 +118,9 @@ impl Ann {
     
 }
 
+// This hill climbs.  We start with a node and compute the embeddings for each node.  We greedily
+// explore the edges where the distance is minmized.  We return the best nodes after performing the
+// search `max_steps` times.
 fn hill_climb<'a, G: CGraph, R: Rng>(
     needle: Entity<'a>, 
     graph: &G, 

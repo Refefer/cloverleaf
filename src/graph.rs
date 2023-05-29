@@ -1,3 +1,8 @@
+//! This is the core graph library.
+//! While we define a number of different representations, including mutability, in practice we're
+//! only using CSR variants which also assumes static construction.  We have a couplte of tricks
+//! defined in here to allow for swapping of edges while minimizing the amount of memory we have to
+//! copy.
 
 pub type NodeID = usize;
 
@@ -118,6 +123,7 @@ impl ModifiableGraph for CSR {
 
 }
 
+/// Normalizes sum of weights for a node to 1
 pub struct NormalizedCSR(CSR);
 
 impl NormalizedCSR {
@@ -175,6 +181,8 @@ impl ModifiableGraph for NormalizedCSR {
 
 impl NormalizedGraph for NormalizedCSR {}
 
+/// This is the main one used in Cloverleaf - converts CSR formatted graphs into CDF format to make sampling from
+/// edges efficient (log(N)).  
 #[derive(Clone)]
 pub struct CumCSR(CSR);
 
@@ -263,6 +271,8 @@ impl ModifiableGraph for CumCSR {
 
 impl CDFGraph for CumCSR {}
 
+/// This is a graph which allows us to swap in a new set of edge weights without having to copy the
+/// entire graph.  We use it in cases where policies update edge transition probabilities.
 pub struct OptCDFGraph<'a,G> {
     graph: &'a G,
     weights: Vec<f32>
@@ -337,6 +347,7 @@ impl <'a,G:Graph> Graph for OptCDFGraph<'a,G> {
 
 impl <'a,G:Graph> CDFGraph for OptCDFGraph<'a,G> {}
 
+/// Struct which converts CDF format to transition probabilities.
 #[derive(Clone,Copy)]
 pub struct CDFtoP<'a> {
     cdf: &'a [f32],
@@ -367,6 +378,7 @@ impl <'a> Iterator for CDFtoP<'a> {
     }
 }
 
+/// Converts a set of weights to CDF
 pub fn convert_edges_to_cdf(weights: &mut [f32]) {
     let mut denom = weights.iter().sum::<f32>();
     if denom == 0f32 {
