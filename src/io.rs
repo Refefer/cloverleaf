@@ -1,3 +1,4 @@
+//! The beginnings of a refactor of load/save methods currently defined within lib.rs
 use crate::graph::NodeID;
 use std::fs::File;
 use std::io::{Write,BufWriter,Result as IOResult};
@@ -7,6 +8,8 @@ use ryu::Buffer;
 
 use crate::vocab::Vocab;
 
+/// Streaming writer for NodeEmbeddings.  Since Embeddings are often gigantic, creating them adhoc
+/// then streaming them to disk is beneficial.
 pub struct EmbeddingWriter<'a> {
     vocab: &'a Vocab,
     output: BufWriter<File>,

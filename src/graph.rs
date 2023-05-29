@@ -24,6 +24,7 @@ pub trait Graph {
     
 }
 
+/// trait which allows graphs to be updated
 pub trait ModifiableGraph {
     /// Get edges and corresponding weights
     fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]);

@@ -68,6 +68,8 @@ use crate::algos::feat_propagation::propagate_features;
 use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::smci::SupervisedMCIteration;
 
+/// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
+/// allow for deterministic performance across all algorithms using any stochasticity.
 const SEED: u64 = 20222022;
 
 /// Simple method for taking an iterator of edges and constructing a CSR graph and associated vocab
@@ -372,7 +374,7 @@ impl BiasedRandomWalker {
 
 }
 
-/// Type of edge
+/// Type of edge.  Undirected edges internally get converted to two directed edges.
 #[pyclass]
 #[derive(Clone)]
 pub enum EdgeType {
@@ -380,6 +382,7 @@ pub enum EdgeType {
     Undirected
 }
 
+/// Allows the user to build a graph incrementally before converting it into a proper CSR graph
 #[pyclass]
 struct GraphBuilder {
     vocab: Vocab,
@@ -412,10 +415,13 @@ impl GraphBuilder {
     }
 
     pub fn build_graph(&mut self) -> Graph {
+        // We swap the internal buffers with new buffers; we do this to preserve memory whenever
+        // possible.
         let mut vocab = Vocab::new(); 
-        std::mem::swap(&mut vocab, &mut self.vocab);
         let mut edges = Vec::new();
+        std::mem::swap(&mut vocab, &mut self.vocab);
         std::mem::swap(&mut edges, &mut self.edges);
+
         let graph = CSR::construct_from_edges(edges);
 
         Graph {
@@ -426,6 +432,7 @@ impl GraphBuilder {
 
 }
 
+/// A python wrapper for the internal ADT used for defining losses
 #[pyclass]
 #[derive(Clone)]
 struct EPLoss {
@@ -467,11 +474,13 @@ impl EPLoss {
 
 }
 
+/// A wrapper for model types
 enum ModelType {
     Averaged(AveragedFeatureModel),
     Attention(AttentionFeatureModel)
 }
 
+/// The main embedding class.  Flexible with loads of options.
 #[pyclass]
 struct EmbeddingPropagator {
     ep: EmbeddingPropagation,
@@ -482,20 +491,50 @@ struct EmbeddingPropagator {
 impl EmbeddingPropagator {
     #[new]
     pub fn new(
+        // Learning rate
         alpha: Option<f32>, 
+
+        // Optimization loss
         loss: Option<EPLoss>,
+
+        // Batch size 
         batch_size: Option<usize>, 
+
+        // Node embedding size
         dims: Option<usize>,
+
+        // Number of passes to run
         passes: Option<usize>,
+
+        // Random seed to use
         seed: Option<u64>,
+
+        // Max neighbors to use for reconstructions
         max_nodes: Option<usize>,
+
+        // Max features to use for optimization
         max_features: Option<usize>,
+
+        // Percentage of nodes to use for validation
         valid_pct: Option<f32>,
+
+        // Number of hard negatives, produced from random walks.  The quality of these deeply
+        // depend on the quality of the graph
         hard_negatives: Option<usize>,
+
+        // Whether to have a pretty indicator.
         indicator: Option<bool>,
+
+        // Number of dims to use for attention.  If missing, uses the Averaged model
         attention: Option<usize>,
+
+        // Number of heads to use.  Defaults to one, but only used if attention dims are set
         attention_heads: Option<usize>,
+
+        // Use sliding window context.
         context_window: Option<usize>,
+
+        // Use gradient noise where we sample from the normal distribution and blend with `noise`
         noise: Option<f32>
     ) -> Self {
         let ep = EmbeddingPropagation {
@@ -529,6 +568,7 @@ impl EmbeddingPropagator {
         EmbeddingPropagator{ ep, model }
     }
 
+    /// The big one - kicks off learning the features used to construct nodes.
     pub fn learn_features(
         &mut self, 
         graph: &Graph, 
@@ -575,6 +615,7 @@ impl EmbeddingPropagator {
     }
 }
 
+/// Defines the FeatureSet class, which allows setting discrete features for a node
 #[pyclass]
 pub struct FeatureSet {
     vocab: Arc<Vocab>,
@@ -582,6 +623,7 @@ pub struct FeatureSet {
 }
 
 impl FeatureSet {
+
     fn read_vocab_from_file(path: &str) -> PyResult<Vocab> {
         let mut vocab = Vocab::new();
         let f = File::open(path)
@@ -647,6 +689,7 @@ impl FeatureSet {
         Ok(self.features.get_pretty_features(node_id))
     }
 
+    /// Loads features from a graph, constructing a new vocabulary
     pub fn load_into(&mut self, path: String) -> PyResult<()> {
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -686,10 +729,16 @@ impl FeatureSet {
 
 }
 
+/// Propagates features within a feature set, using a graph to find neighbors.
 #[pyclass]
 pub struct FeaturePropagator {
+    /// Max number of features for each node
     k: usize,
+
+    /// Filters out feature which don't meet the minimum feature count
     threshold: f32,
+
+    /// Number of passes to run.  In practice, this should be pretty small.
     max_iters: usize
 }
 
@@ -718,6 +767,8 @@ impl FeaturePropagator {
 
 }
 
+/// After we train a set of features using EP, we need to use an aggregator to take a set of
+/// features and glue them into a new NodeEmbedding
 #[derive(Clone)]
 enum AggregatorType {
     Averaged,
@@ -733,6 +784,7 @@ enum AggregatorType {
     }
 }
 
+/// This constructs node embeddings based on the AggregatorType and a set of FeatureEmbeddings.
 #[pyclass]
 #[derive(Clone)]
 pub struct FeatureAggregator {
@@ -759,6 +811,8 @@ impl FeatureAggregator {
         FeatureAggregator { at: AggregatorType::Weighted {alpha, vocab, unigrams} }
     }
 
+    /// Write the details to disk.  We should use a proper serialization library instead of the hot
+    /// non-sense currently used.
     pub fn save(&self, path: &str) -> PyResult<()> {
         let f = File::create(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -877,6 +931,8 @@ impl FeatureAggregator {
 
 }
 
+/// Finally, a node embedder.  This wraps the FeatureAggregator because who doesn't like more
+/// indirection?
 #[pyclass]
 pub struct NodeEmbedder {
     feat_agg: FeatureAggregator
@@ -909,13 +965,6 @@ impl NodeEmbedder {
         }
     }
 
-    fn get_attention_size(&self) -> usize {
-        match self.feat_agg.at {
-            AggregatorType::Attention { num_heads, d_k, window:_ } => 2 * num_heads * d_k,
-            _ => 0
-        }
-    }
-
     fn get_dims(&self, feat_embs: &NodeEmbeddings) -> usize {
         match self.feat_agg.at {
             AggregatorType::Attention { num_heads, d_k, window:_ } =>  {
@@ -934,6 +983,7 @@ impl NodeEmbedder {
         NodeEmbedder { feat_agg }
     }
 
+    /// Embeds a full featureset into NodeEmbeddings
     pub fn embed_feature_set(
         &self, 
         feat_set: &FeatureSet, 
@@ -968,6 +1018,7 @@ impl NodeEmbedder {
         }
     }
 
+    /// Embeds a set of features into a Node Embedding.
     pub fn embed_adhoc(
         &self, 
         features: Vec<(String, String)>,
@@ -995,6 +1046,9 @@ impl NodeEmbedder {
 
 }
 
+/// Count the number of lines in an embeddings file so we only have to do one allocation.  If
+/// NodeEmbeddings internal memory structure changes, such as using slabs, this might be less
+/// relevant.
 fn count_lines(path: &str, node_type: &Option<String>) -> std::io::Result<usize> {
     let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -1015,6 +1069,7 @@ fn count_lines(path: &str, node_type: &Option<String>) -> std::io::Result<usize>
     Ok(count)
 }
 
+/// Struct for defining ALT embeddings
 #[pyclass]
 struct DistanceEmbedder {
     landmarks: algos::dist::LandmarkSelection,
@@ -1046,6 +1101,7 @@ impl DistanceEmbedder {
     }
 }
 
+/// Struct for learning Clustered LPA embeddings.  Uses Hamming Distance for equivalence.
 #[pyclass]
 struct ClusterLPAEmbedder{
     k: usize, 
@@ -1072,6 +1128,8 @@ impl ClusterLPAEmbedder {
     }
 }
 
+/// Struct for learning Speaker-Listener multi-cluster embeddings.  Uses Hamming Distance for
+/// distance.
 #[pyclass]
 struct SLPAEmbedder {
     k: usize, 
@@ -1099,6 +1157,7 @@ impl SLPAEmbedder {
 
 }
 
+/// Wrapper for EmbeddingStore.
 #[pyclass]
 pub struct NodeEmbeddings {
     vocab: Arc<Vocab>,
@@ -1249,6 +1308,8 @@ impl NodeEmbeddings {
     }
 }
 
+/// Reads a line and converts it to a node type, node name, and embedding.
+/// Blows up if it doesn't meet the formatting.
 fn line_to_embedding(line: String) -> Option<(String,String,Vec<f32>)> {
     let pieces:Vec<_> = line.split('\t').collect();
     if pieces.len() != 3 {
@@ -1264,6 +1325,7 @@ fn line_to_embedding(line: String) -> Option<(String,String,Vec<f32>)> {
     emb.ok().map(|e| (node_type.to_string(), name.to_string(), e))
 }
 
+/// Simple iterator over the vocab.
 #[pyclass]
 pub struct VocabIterator {
     vocab: Arc<Vocab>,
@@ -1300,6 +1362,7 @@ impl VocabIterator {
     }
 }
 
+/// Wraps the NeighborhoodAligner algorithm.
 #[pyclass]
 struct NeighborhoodAligner {
     aligner: NA
@@ -1333,6 +1396,7 @@ impl NeighborhoodAligner {
         }
     }
 
+    /// Since embeddings can be large, also allows streaming them to disk instead of in memory.
     pub fn align_to_disk(
         &self, 
         path: &str,
@@ -1364,7 +1428,7 @@ impl NeighborhoodAligner {
 
 }
 
-
+/// Wrapper for the relatively crappy ANN solution.
 #[pyclass]
 struct Ann {
     graph: Arc<CumCSR>,
@@ -1399,10 +1463,12 @@ impl Ann {
     }
 }
 
+/// Wrapper for the Supervised Monte-Carlo Iteration.  It stores the reward maps on the struct.
 #[pyclass]
 struct Smci {
     graph: Arc<CumCSR>,
     vocab: Arc<Vocab>,
+    /// Maps Node 1 -> Node 2 = Reward
     rewards: Vec<(NodeID,NodeID,f32)>
 }
 
@@ -1471,6 +1537,7 @@ impl Smci {
     }
 }
 
+/// Helper method for looking up an embedding.
 fn lookup_embedding<'a>(
     query: &'a Query, 
     embeddings: &'a NodeEmbeddings

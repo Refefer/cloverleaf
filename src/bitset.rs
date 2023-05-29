@@ -1,4 +1,6 @@
+//! BitSet class; we use it in a few places to know when things have been set, such as embeddings.
 
+/// Simple BitSet class, using 32-bit unsized ints for track flags
 #[derive(Clone)]
 pub struct BitSet {
     bitfield: Vec<u32>

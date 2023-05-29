@@ -1,8 +1,16 @@
+//! This provides a simple wrapper around a type to allow for multiple mutable accesses.  
+//! The cost of this approach is that two threads can update the same value at the same time which
+//! can make for some significant unpleasantness.  Consequently, it should only be used for SGD
+//! algorithms (e.g. hogwild optimization) or to access embeddings in parallel where it's know
+//! there won't be concurrent accesses.
+//!
+//! You have been warned.
 use std::sync::Arc;
 use std::cell::UnsafeCell;
 use std::ops::{Deref,DerefMut};
 
 
+/// Defines the main HogWild structure.  Any item, T, can be mutated across multiple threads.
 #[derive(Clone)]
 pub struct Hogwild<T>(Arc<UnsafeCell<T>>);
 
@@ -11,6 +19,7 @@ impl<T> Hogwild<T> {
         Hogwild(Arc::new(UnsafeCell::new(target)))
     }
 
+    /// Get a mutable reference to T from a shared reference.
     pub fn get(&self) -> &mut T {
         let ptr = self.0.as_ref().get();
         unsafe { &mut *ptr }

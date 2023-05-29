@@ -1,11 +1,21 @@
+//! Defines the FeatureStore class which is used to define discrete features for each node
 use std::sync::Arc;
 use crate::NodeID;
 use crate::vocab::Vocab;
 
+/// Main FeatureStore struct.  We use a vector of vectors to allow for dynamic numbers of features.
+/// This can and should be updated to a more memory friendly approach since vectors have surprising
+/// overhead and the number of discrete features tends to be relatively small.
 #[derive(Debug)]
 pub struct FeatureStore {
+    /// Raw storage for features, indexed by node id
     features: Vec<Vec<usize>>,
+
+    /// Since we often convert features to embeddings, which need namespaces, we have a feature
+    /// namespace.
     namespace: String,
+
+    /// Maps a raw feature to a feature_id
     feature_vocab: Vocab,
 }
 
@@ -70,6 +80,8 @@ impl FeatureStore {
         self.features.len()
     }
 
+    /// This method assigns an unique, anonymous feature to all nodes which lack any features.  This is
+    /// necessary for all graph embedding algorithms which map {feature} -> Embedding.
     pub fn fill_missing_nodes(&mut self) {
         for i in 0..self.features.len() {
             if self.features[i].len() == 0 {
@@ -90,6 +102,8 @@ impl FeatureStore {
         self.features.iter()
     }
 
+    /// Count the number of occurrences of each feature in the feature set.  This is helpful when
+    /// pruning to a minimum count.
     pub fn count_features(&self) -> Vec<usize> {
         let mut counts = vec![0usize; self.feature_vocab.len()];
         for feats in self.features.iter() {
@@ -100,6 +114,9 @@ impl FeatureStore {
         counts
     }
 
+    /// Removes features which don't meet the provided `count`.  This is helpful to prevent one-off
+    /// occurences of words acting as node biasesand otherwise harming the quality of the
+    /// embeddings.
     pub fn prune_min_count(&self, count: usize) -> FeatureStore {
         let counts = self.count_features();
 

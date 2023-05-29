@@ -1,3 +1,5 @@
+//! The main Embedding class.  This defines both distance metrics as well as access to the
+//! embeddings.
 use float_ord::FloatOrd;
 use rayon::prelude::*;
 
@@ -6,19 +8,36 @@ use crate::bitset::BitSet;
 use crate::hogwild::Hogwild;
 use crate::algos::ann::{TopK,NodeDistance};
 
+/// Entity allows for adhoc embeddings versus looking up by NodeID within the embedding set
 #[derive(Clone,Copy,Debug)]
 pub enum Entity<'a> {
+    /// Use the embedding defined at NodeID
     Node(NodeID),
+
+    /// Use an adhoc embedding
     Embedding(&'a [f32])
 }
 
+/// Defines different distance metrics such that a distance of zero is perfect.
 #[derive(Copy,Clone)]
 pub enum Distance {
+    /// A* using Landmark Triangulation
     ALT,
+
+    /// Cosine distance
     Cosine,
+
+    /// Simple Dot distance.  We modify it by taking the negative, so lower is closer.  Not a true
+    /// distance but oh well
     Dot,
+
+    /// Simple L2 Norm Euclidean Distance
     Euclidean,
+
+    /// Simple binary hamming distance
     Hamming,
+
+    /// Jaccard distance, treating each float as an identifier
     Jaccard
 }
 
@@ -96,12 +115,23 @@ impl Distance {
     }
 }
 
+/// The core Embedding Store used everywhere.
 #[derive(Clone)]
 pub struct EmbeddingStore {
+    /// Dimensions of each embedding
     dims: usize,
+
+    /// The embeddings are a congiuous vector, wrapped in a Hogwild algorithm so they can be
+    /// updated in parallal.
     embeddings: Hogwild<Vec<f32>>,
+
+    /// Bitfield measuring if an embedding has been set
     bitfield: BitSet,
+
+    /// distance metric to use
     distance: Distance,
+
+    /// Number of nodes in the Embedding Store
     nodes: usize
 }
 
