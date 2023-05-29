@@ -1,3 +1,6 @@
+//! Classic label propagation algorithm for learning clusters based on the graph.  Not much to say;
+//! it's single threaded, fast, and a bit finicky on the number of passes (overfitting can produce
+//! worse clusters), but it's a good baseline.
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -9,6 +12,7 @@ use crate::graph::Graph;
 use crate::embeddings::{EmbeddingStore,Distance};
 use crate::algos::utils::get_best_count;
 
+/// Computes the LPA
 pub fn lpa(
     graph: &impl Graph,
     passes: usize,
@@ -41,6 +45,9 @@ pub fn lpa(
     clusters
 }
 
+/// this runs LPA with multiple seeds to normalize away some of the randomness of the LPA
+/// algorithm.  We can run it in parallel and update our embedding without collisions.  Fast,
+/// produces reasonably good homophily embeddings.  Another good baseline.
 pub fn construct_lpa_embedding(
     graph: &(impl Graph + Send + Sync),
     k: usize,

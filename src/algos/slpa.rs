@@ -1,3 +1,5 @@
+//! Speaker-Listener LPA algorithm.  This allows us to detect overlapping communities and is
+//! conveniently parallel.  Another good baseline which is typically a strong performer.
 use rand::prelude::*;
 use rand_distr::{Distribution,Uniform};
 use rand_xorshift::XorShiftRng;
@@ -8,20 +10,29 @@ use crate::graph::Graph;
 use crate::embeddings::{EmbeddingStore, Distance};
 use crate::algos::utils::{get_best_count,Counter};
 
+/// Learns the SLPA algorithm
 pub fn construct_slpa_embedding(
     graph: &(impl Graph + Send + Sync),
+
+    /// Number of communities to learn
     k: usize,
+    
+    /// Filter out communities with less than t probability
     threshold: f32,
+
+    /// Random seed
     seed: u64
 ) -> EmbeddingStore {
     let dims = (k / (k as f32 * threshold).ceil() as usize) + 1;
     let mut es = EmbeddingStore::new(graph.len(), dims, Distance::Jaccard);
 
+    // Each node starts in its own cluster
     let mut clusters = vec![0usize; graph.len() * k];
     for i in 0..graph.len() {
         clusters[i*k] = i;
     }
 
+    // Temporary cluster assignment
     let mut buffer = vec![0; graph.len()];
     for pass in 1..k {
         // Select a node, look at its 

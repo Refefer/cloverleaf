@@ -1,3 +1,7 @@
+//! Defines the Guided Random Walk with Restarts.  This algorithm allows us to bias random walks
+//! according to node embeddings, where it will do a hill climb toward embeddings which minmize the
+//! distance.  This is helpful if the embeddings capture data independent of the graph, such as
+//! user preferences.  
 use hashbrown::HashMap;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
@@ -8,8 +12,14 @@ use crate::sampler::Sampler;
 use crate::embeddings::EmbeddingStore;
 use crate::algos::reweighter::Reweighter;
 
+/// Determins if we used Fixed steps or a restart Probability
 pub enum Steps {
+    /// Walks K steps
     Fixed(usize),
+
+    /// Restart probability of p, max steps of K.  This is different
+    /// than a restart probability and terminal probability, but is much more efficient to query
+    /// using BFS.
     Probability(f32, usize)
 }
 
@@ -23,15 +33,26 @@ impl Steps {
 }
 
 pub struct GuidedRWR {
+    /// How we compute the number of steps we're taking
     pub steps: Steps,
+
+    /// Number of walks we take
     pub walks: usize,
+
+    /// How much to bias toward the walk, how much to bias toward the embedding distance
     pub alpha: f32,
+
+    /// Beta parameter from the RP3b walk
     pub beta: f32,
+
+    /// Random seed for determinism
     pub seed: u64
 }
 
 impl GuidedRWR {
 
+    /// This uses a diffusion type method to shift counts at each step.  The advantage of this is
+    /// significantly better cache coherence since we only have to look up weights once per node.
     pub fn sample<G: Graph + Send + Sync>(
         &self, 
         graph: &G, 

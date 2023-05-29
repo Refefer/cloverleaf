@@ -1,3 +1,5 @@
+//! Classic Random walk with Restarts.  This uses the Rp3b algorithm to allow biasing toward/away
+//! from popular nodes to rarer nodes.  
 use hashbrown::HashMap;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
@@ -6,9 +8,13 @@ use rayon::prelude::*;
 use crate::graph::{Graph,NodeID};
 use crate::sampler::Sampler;
 
+// Fixed step or random restarts
 #[derive(Clone,Copy)]
 pub enum Steps {
+    /// Every walk is K steps long
     Fixed(usize),
+    
+    /// A walk ends random with p probability
     Probability(f32)
 }
 
@@ -29,7 +35,6 @@ impl RWR {
     ) -> HashMap<NodeID, f32> {
        let mut ret = (0..self.walks).into_par_iter()
            .map(|idx| {
-
                let mut rng = XorShiftRng::seed_from_u64(self.seed + idx as u64);
                self.walk(graph, sampler, start_node, &mut rng) 
            }).fold(|| HashMap::new(), |mut acc, node_id| {
@@ -82,7 +87,7 @@ impl RWR {
 }
 
 /// Creates a trajectory by randomly walking through the graph, recording it
-/// in the output vector
+/// in the output vector.  We can use this for a variety of other problems, such as SMCI.
 pub fn rollout<G: Graph + Send + Sync>(
     graph: &G, 
     steps: Steps, 

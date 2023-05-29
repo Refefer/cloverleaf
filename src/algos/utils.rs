@@ -1,5 +1,7 @@
+/// Random utility functions
 use rand::prelude::*;
 
+/// Counts a set of items by id.  See the test for examples.
 pub struct Counter<'a> {
     slice: &'a [usize],
     idx: usize
@@ -33,7 +35,7 @@ impl <'a> Iterator for Counter<'a> {
     }
 }
 
-pub fn get_best_count<R: Rng>(counts: &[usize], rng: &mut R) -> usize{
+pub fn get_best_count<R: Rng>(counts: &[usize], rng: &mut R) -> usize {
     let mut best_count = 0;
     let mut ties = Vec::new();
     for (cluster, count) in Counter::new(counts) {

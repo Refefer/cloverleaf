@@ -1,3 +1,5 @@
+//! A simple node reweighter.  Takes a mapping of nodes to weights, an embedding store, and
+//! reweights the counts according to an alpha parameter and the distance to a context.
 use hashbrown::HashMap;
 use rayon::prelude::*;
 
@@ -40,7 +42,11 @@ impl Reweighter {
         1. / (1. + (-x).exp())
     }
 
-    fn reweight_by_distance(results: &mut HashMap<NodeID, f32>, distances: &HashMap<NodeID,f32>, alpha: f32) {
+    fn reweight_by_distance(
+        results: &mut HashMap<NodeID, f32>, 
+        distances: &HashMap<NodeID,f32>, 
+        alpha: f32
+    ) {
         // Z Normalize the values to a unit Normal, then run it through a sigmoid
         // transform (pretending it's a logistic distribution) to convert to probabilities.
         // In cases where an embedding is missing, we set the distance to the expected value
