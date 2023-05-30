@@ -3,7 +3,6 @@ import time
 import sys
 import json
 import cloverleaf
-import numpy as np
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
