@@ -6,7 +6,7 @@ Install
 ---
 
 1. Setup a new python virtualenv
-2. pip install maturin
+2. pip install maturin numpy
 3. Ensure you have the latest Rust compiler
 4. RUSTFLAGS="-C target-cpu=native" maturin develop --release
 5. Profit!
