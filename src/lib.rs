@@ -67,6 +67,7 @@ use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregat
 use crate::algos::feat_propagation::propagate_features;
 use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::smci::SupervisedMCIteration;
+use crate::algos::pprrank::PprRank;
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
@@ -1536,6 +1537,129 @@ impl Smci {
 
     }
 }
+
+/// 
+#[pyclass]
+#[derive(Clone)]
+struct PprRankLearner {
+    alpha: f32,
+    batch_size: usize,
+    dims: usize,
+    passes: usize,
+    negatives: usize,
+    steps: Steps,
+    walks: usize,
+    k: usize,
+    valid_pct: f32,
+    beta: f32
+}
+
+#[pymethods]
+impl PprRankLearner {
+
+    #[new]
+    fn new(
+         // Learning rate
+        alpha: f32, 
+
+        // Batch size 
+        batch_size: usize, 
+
+        // Node embedding size
+        dims: usize,
+
+        // Number of passes to run
+        passes: usize,
+
+        // Number of steps to take
+        steps: f32,
+
+        // Number of walks per node
+        walks: usize,
+
+        //
+        k: usize,
+        
+        //
+        beta: Option<f32>,
+
+        // Percentage of nodes to use for validation
+        valid_pct: Option<f32>,
+
+        // Number of  negatives, produced from random walks.  The quality of these deeply
+        // depend on the quality of the graph
+        negatives: usize
+    ) -> PyResult<Self> {
+
+        let steps = if steps >= 1. {
+            Steps::Fixed(steps as usize)
+        } else if steps > 0. {
+            Steps::Probability(steps)
+        } else {
+            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
+        };
+
+        Ok(PprRankLearner {
+            alpha,
+            batch_size,
+            dims,
+            passes,
+            steps,
+            negatives,
+            walks,
+            k,
+            valid_pct: valid_pct.unwrap_or(0.1),
+            beta: beta.unwrap_or(0.8)
+        })
+    }
+
+    pub fn learn_features(
+        &self, 
+        graph: &Graph, 
+        features: &mut FeatureSet,
+        feature_embeddings: Option<&mut NodeEmbeddings>,
+        indicator: Option<bool>,
+        seed: Option<u64>
+    ) -> NodeEmbeddings {
+
+        
+        let ppr_rank = PprRank {
+            alpha: self.alpha,
+            batch_size: self.batch_size,
+            dims: self.dims,
+            passes: self.passes,
+            steps: self.steps,
+            negatives: self.negatives,
+            num_walks: self.walks,
+            beta: self.beta,
+            k: self.k,
+            valid_pct: self.valid_pct,
+            indicator: indicator.unwrap_or(true),
+            seed: seed.unwrap_or(SEED)
+        };
+
+        features.features.fill_missing_nodes();
+
+        // Pull out the EmbeddingStore
+        let feature_embeddings = feature_embeddings.map(|fes| {
+           let mut sfes = EmbeddingStore::new(fes.vocab.len(), 0, EDist::Cosine);
+           std::mem::swap(&mut sfes, &mut fes.embeddings);
+           sfes
+        });
+
+        let feat_embeds = ppr_rank.learn(&*graph.graph, &features.features, feature_embeddings);
+        let vocab = features.features.clone_vocab();
+
+        let feature_embeddings = NodeEmbeddings {
+            vocab: Arc::new(vocab),
+            embeddings: feat_embeds};
+
+        feature_embeddings
+    }
+
+}
+
+
 
 /// Helper method for looking up an embedding.
 fn lookup_embedding<'a>(

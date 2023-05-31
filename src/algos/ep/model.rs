@@ -251,7 +251,7 @@ pub fn collect_embeddings_from_node<R: Rng>(
 // H(n)
 // Average the features associated with a node
 // to create the node embedding
-fn construct_node_embedding<R: Rng>(
+pub fn construct_node_embedding<R: Rng>(
     node: NodeID,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,

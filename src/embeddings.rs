@@ -2,6 +2,7 @@
 //! embeddings.
 use float_ord::FloatOrd;
 use rayon::prelude::*;
+use rand::prelude::*;
 
 use crate::graph::NodeID;
 use crate::bitset::BitSet;
@@ -229,6 +230,20 @@ impl EmbeddingStore {
         }).into_sorted()
     }
 
+}
+
+/// Randomize embeddings.  
+pub fn randomize_embedding_store(es: &mut EmbeddingStore, rng: &mut impl Rng) {
+    for idx in 0..es.len() {
+        let e = es.get_embedding_mut(idx);
+        let mut norm = 0f32;
+        e.iter_mut().for_each(|ei| {
+            *ei = 2f32 * rng.gen::<f32>() - 1f32;
+            norm += ei.powf(2f32);
+        });
+        norm = norm.sqrt();
+        e.iter_mut().for_each(|ei| *ei /= norm);
+    }
 }
 
 #[cfg(test)]
