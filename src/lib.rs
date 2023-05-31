@@ -1740,6 +1740,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<RandomWalker>()?;
     m.add_class::<BiasedRandomWalker>()?;
     m.add_class::<NeighborhoodAligner>()?;
+    m.add_class::<PprRankLearner>()?;
     m.add_class::<Smci>()?;
     Ok(())
 }
