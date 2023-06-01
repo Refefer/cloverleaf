@@ -19,7 +19,7 @@ use crate::progress::CLProgressBar;
 use crate::feature_store::FeatureStore;
 use crate::algos::ep::attention::softmax;
 use crate::algos::ep::model::{construct_node_embedding,NodeCounts};
-//use crate::algos::grad_utils::optimizer::
+use crate::algos::ep::extract_grads;
 use crate::algos::grad_utils::node_sampler::{RandomWalkHardStrategy,NodeSampler,BatchSamplerStrategy};
 use crate::algos::grad_utils::optimizer::{Optimizer,AdamOptimizer};
 use crate::algos::grad_utils::scheduler::LRScheduler;
@@ -121,8 +121,6 @@ impl PprRank {
         // Number of update stpes
         let steps_per_pass = (node_idxs.len() as f32 / self.batch_size as f32) as usize;
 
-        let pb = CLProgressBar::new((self.passes * steps_per_pass) as u64, self.indicator);
-        
         // Enable/disable shared memory pool
         use_shared_pool(true);
 
@@ -142,10 +140,11 @@ impl PprRank {
         let mut valid_error = std::f32::INFINITY;
 
         // Generate the top K for each node once
-        let walk_list = self.generate_random_walks(graph, self.seed+1,);
+        let walk_lib = self.generate_random_walks(graph, self.seed+1,);
 
-        println!("{} -> {:?}", 0, walk_list[0]);
+        println!("{} -> {:?}", 0, walk_lib.get(0));
         println!("");
+        let pb = CLProgressBar::new((self.passes * steps_per_pass) as u64, self.indicator);
         
         for pass in 1..(self.passes + 1) {
 
@@ -177,7 +176,7 @@ impl PprRank {
                 nodes.par_iter().map(|node_id| {
                     let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + **node_id) as u64);
                     let (loss, feat_maps) = self.run_forward_pass(
-                        graph, **node_id, &walk_list, &features, &feature_embeddings, &sampler, &mut rng);
+                        graph, **node_id, &walk_lib, &features, &feature_embeddings, &sampler, &mut rng);
 
                     let grads = self.extract_gradients(&loss, feat_maps);
                     (loss.value()[0], grads)
@@ -227,7 +226,7 @@ impl PprRank {
                     nodes.par_iter().map(|node_id| {
                         let mut rng = XorShiftRng::seed_from_u64(self.seed + **node_id as u64);
                         let loss = self.run_forward_pass(
-                            graph, **node_id, &walk_list, &features, &feature_embeddings, 
+                            graph, **node_id, &walk_lib, &features, &feature_embeddings, 
                             &sampler, &mut rng).0;
 
                         loss.value()[0]
@@ -262,56 +261,74 @@ impl PprRank {
         &self, 
         graph: &G,
         seed: u64
-    ) -> Vec<Vec<(NodeID,f32)>> {
-        (0..graph.len()).into_par_iter().map(|node_id| {
-            let rwr = RWR {
-                steps: self.steps.clone(),
-                walks: self.num_walks,
-                beta: self.beta,
-                seed: seed + node_id as u64
-            };
+    ) -> WalkLibrary {
+        let mut walk_lib = WalkLibrary::new(graph.len(), self.k);
+        let rwr = RWR {
+            steps: self.steps.clone(),
+            walks: self.num_walks,
+            beta: self.beta,
+            seed: seed + 13
+        };
 
-            let scores = rwr.sample(graph, &Weighted, node_id).into_iter();
-            let mut scores: Vec<_> = scores.collect();
-            scores.sort_by_key(|(_k, v)| FloatOrd(-*v));
-            let mut s = scores.into_iter()
-                .filter(|(k,_v)| *k != node_id)
-                .map(|(k, v)| (k, v.powf(self.compression)))
-                .take(self.k)
-                .collect::<Vec<_>>();
+        let pb = CLProgressBar::new(graph.len() as u64, self.indicator);
+        let idxs = (0..graph.len()).collect::<Vec<_>>();
+        idxs.chunks(1024).for_each(|node_ids| {
+            let groups: Vec<_> = node_ids.par_iter().map(|node_id| {
+                let mut nodes = Vec::with_capacity(self.k);
+                let mut weights = Vec::with_capacity(self.k);
+                
+                let scores = rwr.sample(graph, &Weighted, *node_id).into_iter();
+                let mut scores: Vec<_> = scores.collect();
+                scores.sort_by_key(|(_k, v)| FloatOrd(-*v));
+                scores.into_iter()
+                    .filter(|(k,_v)| k != node_id)
+                    .map(|(k, v)| (k, v.powf(self.compression)))
+                    .take(self.k)
+                    .for_each(|(k, v)| {
+                        nodes.push(k);
+                        weights.push(v);
+                    });
 
-            let sum = s.iter().map(|(_k, v)| v).sum::<f32>();
-            s.iter_mut().for_each(|(_k, v)| *v /= sum);
-            s
-        }).collect()
+                let sum = weights.iter().sum::<f32>();
+                weights.iter_mut().for_each(|v| *v /= sum);
+                pb.inc(1);
+                (*node_id, nodes, weights)
+            }).collect();
+
+            groups.into_iter().for_each(|(node_id, nodes, weights)| {
+                walk_lib.set(node_id, &nodes, &weights);
+            });
+        });
+        pb.finish();
+        walk_lib
     }
 
     fn run_forward_pass<G: CGraph + Send + Sync, R: Rng, S: NodeSampler>(
         &self, 
         graph: &G,
         node: NodeID,
-        walk_map: &[Vec<(NodeID, f32)>],
+        walk_lib: &WalkLibrary,
         features: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         sampler: &S,
         rng: &mut R
     ) -> (ANode, Vec<NodeCounts>) {
         let mut ranked_ids = Vec::with_capacity(self.k + self.negatives);
+        let mut ranked_scores = Vec::with_capacity(self.k + self.negatives);
 
         // Add the positives
-        ranked_ids.extend_from_slice(&walk_map[node]);
+        let (nodes, scores) = walk_lib.get(node);
+        ranked_ids.extend_from_slice(nodes);
+        ranked_scores.extend_from_slice(scores);
 
-        // Add the negatives
-        let mut negatives = Vec::with_capacity(self.negatives);
-        
         // Sample random negatives
-        sampler.sample_negatives(graph, node, &mut negatives, self.negatives, rng);
-        negatives.into_iter().for_each(|n| ranked_ids.push((n, 0f32)));
+        sampler.sample_negatives(graph, node, &mut ranked_ids, self.negatives, rng);
+        (0..self.negatives).for_each(|_|ranked_scores.push(0.));
 
         // Create the embeddings
         let mut ranked_embeddings = Vec::with_capacity(ranked_ids.len());
         let mut feat_maps = Vec::with_capacity(ranked_ids.len());
-        ranked_ids.iter().for_each(|(node_id, _)| {
+        ranked_ids.iter().for_each(|node_id| {
             let (fm, emb) = self.construct_avg_node(*node_id, features, feature_embeddings, rng);
             feat_maps.push(fm);
             ranked_embeddings.push(emb);
@@ -321,7 +338,7 @@ impl PprRank {
         feat_maps.push(fm);
         
         // Compute error
-        let loss = self.loss(&query_node, &ranked_embeddings, &ranked_ids);
+        let loss = self.loss(&query_node, &ranked_embeddings, &ranked_scores);
 
         (loss, feat_maps)
     }
@@ -330,7 +347,7 @@ impl PprRank {
         &self,
         query_node: &ANode,
         ranked_nodes: &[ANode],
-        node_weights: &[(NodeID, f32)]
+        node_weights: &[f32]
     ) -> ANode {
 
         // Compute dot score, then the softmax
@@ -340,12 +357,11 @@ impl PprRank {
 
         let sm_scores = softmax(scores);
         //println!("{:?} -> {:?}", node_weights, sm_scores.value());
-        let ordered = (0..ranked_nodes.len())
-            .filter(|idx| node_weights[*idx].1 > 0f32)
-            .map(|idx| {
-                let s = node_weights[idx].1;
+        let ordered = node_weights.iter().enumerate()
+            .filter(|(i, s)| **s > 0f32)
+            .map(|(idx, s)| {
                 let k = sm_scores.slice(idx, 1);
-                k.ln() * s
+                k.ln() * *s
             }).collect::<Vec<ANode>>();
 
         -ordered.sum_all()
@@ -373,28 +389,38 @@ impl PprRank {
 
 }
 
-fn il2norm(v: &ANode) -> ANode {
-    let norm = v.pow(2f32).sum().pow(0.5);
-    v / norm
+struct WalkLibrary {
+    k: usize,
+    nodes: Vec<NodeID>,
+    weights: Vec<f32>,
+    lens: Vec<usize>
 }
 
-/// We extract the gradients for each unique feature
-fn extract_grads(
-    graph: &Graph, 
-    grads: &mut HashMap<usize, Vec<f32>>, 
-    vars: impl Iterator<Item=(usize, (ANode, usize))>
-) {
-    for (feat_id, (var, _)) in vars {
-        if grads.contains_key(&feat_id) { continue }
+impl WalkLibrary {
+    fn new(num_nodes: usize, k: usize) -> Self {
+        let nodes = vec![0; num_nodes * k];
+        let weights = vec![0f32; num_nodes * k];
+        let lens = vec![0; num_nodes];
+        WalkLibrary { k, nodes, weights, lens }
+    }
 
-        if let Some(grad) = graph.get_grad(&var) {
-            if grad.iter().all(|gi| !(gi.is_nan() || gi.is_infinite())) {
-                // Can get some nans in weird cases, such as the distance between
-                // a node and it's reconstruction when it shares all features.
-                // Since that's not all that helpful anyways, we simply ignore it and move on
-                grads.insert(feat_id, grad.to_vec());
-            }
-        }
+    fn set(&mut self, node_id: NodeID, nodes: &[NodeID], weights: &[f32]) {
+        let offset = node_id * self.k;
+        self.lens[node_id] = weights.len().min(self.k); 
+        nodes.iter().zip(weights.iter()).take(self.k).enumerate()
+            .for_each(|(i, (ni, wi))| {
+                let idx = offset + i;
+                self.nodes[idx] = *ni;
+                self.weights[idx] = *wi;
+            });
+    }
+
+    fn get(&self, node_id: NodeID) -> (&[NodeID], &[f32]) {
+        let offset:usize = node_id * self.k;
+        let len = self.lens[node_id];
+        let ns = &self.nodes[offset..(offset+len)];
+        let ws = &self.weights[offset..(offset+len)];
+        (ns, ws)
     }
 }
 
@@ -424,6 +450,19 @@ mod ep_tests {
         let mut feature_store = FeatureStore::new(ccsr.len(), "feat".to_string());
         feature_store.fill_missing_nodes();
 
+    }
+
+    #[test]
+    fn test_walk_library() {
+        let mut walk_lib = WalkLibrary::new(10, 5);
+        let (ns, ws) = walk_lib.get(3);
+        assert_eq!(ns, vec![0;0]);
+        assert_eq!(ws, vec![0.;0]);
+
+        walk_lib.set(3, &[1, 2], &[1., 2.]);
+        let (ns, ws) = walk_lib.get(3);
+        assert_eq!(ns, &[1, 2]);
+        assert_eq!(ws, &[1., 2.]);
     }
 
 }

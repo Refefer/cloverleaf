@@ -326,7 +326,7 @@ impl EmbeddingPropagation {
 }
 
 /// We extract the gradients for each unique feature
-fn extract_grads(
+pub fn extract_grads(
     graph: &Graph, 
     grads: &mut HashMap<usize, Vec<f32>>, 
     vars: impl Iterator<Item=(usize, (ANode, usize))>
