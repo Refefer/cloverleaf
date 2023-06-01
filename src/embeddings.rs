@@ -20,7 +20,7 @@ pub enum Entity<'a> {
 }
 
 /// Defines different distance metrics such that a distance of zero is perfect.
-#[derive(Copy,Clone)]
+#[derive(Copy,Clone,Debug)]
 pub enum Distance {
     /// A* using Landmark Triangulation
     ALT,

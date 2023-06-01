@@ -1550,6 +1550,8 @@ struct PprRankLearner {
     steps: Steps,
     walks: usize,
     k: usize,
+    num_features: Option<usize>,
+    compression: f32,
     valid_pct: f32,
     beta: f32
 }
@@ -1579,16 +1581,22 @@ impl PprRankLearner {
 
         //
         k: usize,
+
+        // Number of  negatives, produced from random walks.  The quality of these deeply
+        // depend on the quality of the graph
+        negatives: usize,
+
+        //
+        compression: Option<f32>,
         
         //
         beta: Option<f32>,
 
+        num_features: Option<usize>,
+
         // Percentage of nodes to use for validation
         valid_pct: Option<f32>,
 
-        // Number of  negatives, produced from random walks.  The quality of these deeply
-        // depend on the quality of the graph
-        negatives: usize
     ) -> PyResult<Self> {
 
         let steps = if steps >= 1. {
@@ -1608,6 +1616,8 @@ impl PprRankLearner {
             negatives,
             walks,
             k,
+            num_features,
+            compression: compression.unwrap_or(1f32),
             valid_pct: valid_pct.unwrap_or(0.1),
             beta: beta.unwrap_or(0.8)
         })
@@ -1633,6 +1643,8 @@ impl PprRankLearner {
             num_walks: self.walks,
             beta: self.beta,
             k: self.k,
+            num_features: self.num_features,
+            compression: self.compression,
             valid_pct: self.valid_pct,
             indicator: indicator.unwrap_or(true),
             seed: seed.unwrap_or(SEED)

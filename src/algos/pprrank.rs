@@ -56,6 +56,12 @@ pub struct PprRank {
     /// Number of items to select from the RWR algorithm for optimization
     pub k: usize,
 
+    /// Randomly selects K features
+    pub num_features: Option<usize>,
+
+    /// Compresses or flattens distribution
+    pub compression: f32,
+
     /// Random seed
     pub seed: u64,
 
@@ -137,6 +143,9 @@ impl PprRank {
 
         // Generate the top K for each node once
         let walk_list = self.generate_random_walks(graph, self.seed+1,);
+
+        println!("{} -> {:?}", 0, walk_list[0]);
+        println!("");
         
         for pass in 1..(self.passes + 1) {
 
@@ -216,13 +225,15 @@ impl PprRank {
                     let sampler = (&valid_random_sampler).initialize_batch(&nodes, graph, features);
 
                     nodes.par_iter().map(|node_id| {
-                        let mut rng = XorShiftRng::seed_from_u64(self.seed - 1);
+                        let mut rng = XorShiftRng::seed_from_u64(self.seed + **node_id as u64);
                         let loss = self.run_forward_pass(
                             graph, **node_id, &walk_list, &features, &feature_embeddings, 
                             &sampler, &mut rng).0;
 
                         loss.value()[0]
-                    }).sum::<f32>()
+                    })
+                    .filter(|l| !l.is_infinite())
+                    .sum::<f32>()
                 }).sum::<f32>();
                 
                 valid_error = valid_errors / valid_idxs.len() as f32;
@@ -243,7 +254,7 @@ impl PprRank {
             node_id, 
             feature_store,
             feature_embeddings,
-            None,
+            self.num_features,
             rng)
     }
 
@@ -263,10 +274,15 @@ impl PprRank {
             let scores = rwr.sample(graph, &Weighted, node_id).into_iter();
             let mut scores: Vec<_> = scores.collect();
             scores.sort_by_key(|(_k, v)| FloatOrd(-*v));
-            scores.into_iter()
+            let mut s = scores.into_iter()
                 .filter(|(k,_v)| *k != node_id)
+                .map(|(k, v)| (k, v.powf(self.compression)))
                 .take(self.k)
-                .collect()
+                .collect::<Vec<_>>();
+
+            let sum = s.iter().map(|(_k, v)| v).sum::<f32>();
+            s.iter_mut().for_each(|(_k, v)| *v /= sum);
+            s
         }).collect()
     }
 
@@ -290,7 +306,7 @@ impl PprRank {
         
         // Sample random negatives
         sampler.sample_negatives(graph, node, &mut negatives, self.negatives, rng);
-        negatives.into_iter().map(|n| ranked_ids.push((n, 0f32)));
+        negatives.into_iter().for_each(|n| ranked_ids.push((n, 0f32)));
 
         // Create the embeddings
         let mut ranked_embeddings = Vec::with_capacity(ranked_ids.len());
@@ -317,18 +333,20 @@ impl PprRank {
         node_weights: &[(NodeID, f32)]
     ) -> ANode {
 
-        // Compute cosine score, then the softmax
-        let qn_norm = il2norm(query_node);
+        // Compute dot score, then the softmax
         let scores = ranked_nodes.iter().map(|n| {
-            let n_norm = il2norm(n);
-            qn_norm.dot(&n_norm)
+            query_node.dot(n)
         }).collect::<Vec<_>>().concat();
 
         let sm_scores = softmax(scores);
-        let ordered = (0..ranked_nodes.len()).map(|idx| {
-            let k = sm_scores.slice(idx, 1);
-            k.ln() * node_weights[idx].1 
-        }).collect::<Vec<ANode>>();
+        //println!("{:?} -> {:?}", node_weights, sm_scores.value());
+        let ordered = (0..ranked_nodes.len())
+            .filter(|idx| node_weights[*idx].1 > 0f32)
+            .map(|idx| {
+                let s = node_weights[idx].1;
+                let k = sm_scores.slice(idx, 1);
+                k.ln() * s
+            }).collect::<Vec<ANode>>();
 
         -ordered.sum_all()
     }
