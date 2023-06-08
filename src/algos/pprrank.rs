@@ -322,8 +322,9 @@ impl PprRank {
         ranked_scores.extend_from_slice(scores);
 
         // Sample random negatives
-        sampler.sample_negatives(graph, node, &mut ranked_ids, self.negatives, rng);
-        (0..self.negatives).for_each(|_|ranked_scores.push(0.));
+        let mut negatives = Vec::with_capacity(self.negatives);
+        sampler.sample_negatives(graph, node, &mut negatives, self.negatives, rng);
+        negatives.into_iter().for_each(|node_id|{ ranked_scores.push(0.); ranked_ids.push(node_id)});
 
         // Create the embeddings
         let mut ranked_embeddings = Vec::with_capacity(ranked_ids.len());
@@ -343,13 +344,12 @@ impl PprRank {
         (loss, feat_maps)
     }
 
-    fn loss(
+    fn softmax_loss(
         &self,
         query_node: &ANode,
         ranked_nodes: &[ANode],
         node_weights: &[f32]
     ) -> ANode {
-
         // Compute dot score, then the softmax
         let scores = ranked_nodes.iter().map(|n| {
             query_node.dot(n)
@@ -365,6 +365,60 @@ impl PprRank {
             }).collect::<Vec<ANode>>();
 
         -ordered.sum_all()
+    }
+
+    fn approx_rank(pos: usize, scores: &ANode, temp: f32) -> ANode {
+        let len = scores.value().len();
+        let mut acc = Vec::with_capacity(len - 1);
+        let yi_hat = scores.slice(pos, 1);
+        (0..len).for_each(|i| {
+            if i != pos {
+                let yj_hat = scores.slice(i, 1);
+                let rank = 1f32 / (1f32 + (-(yj_hat - &yi_hat)/temp).exp());
+                acc.push(rank);
+            }
+        });
+        acc.sum_all() + 1f32
+    }
+
+    fn approx_ndcg_dist(
+        query_node: &ANode,
+        ranked_nodes: &[ANode],
+        node_weights: &[f32]
+    ) -> ANode {
+        let scores = ranked_nodes.iter().map(|n| {
+            query_node.dot(n)
+        }).collect::<Vec<_>>().concat();
+        
+        PprRank::approx_ndcg(scores, node_weights)
+
+    }
+
+    fn approx_ndcg(
+        scores: ANode,
+        node_weights: &[f32]
+    ) -> ANode {
+
+        let mut dcg = Vec::with_capacity(node_weights.len());
+
+        node_weights.iter().enumerate().for_each(|(i, yi)| {
+            let pi_i = PprRank::approx_rank(i, &scores, 0.1);
+            let res = (2f32.powf(*yi) - 1f32) / ((1. + pi_i).ln() / 2f32.ln());
+            dcg.push(res);
+        });
+
+        -dcg.sum_all()
+    }
+
+
+    #[inline]
+    fn loss(
+        &self,
+        query_node: &ANode,
+        ranked_nodes: &[ANode],
+        node_weights: &[f32]
+    ) -> ANode {
+        PprRank::approx_ndcg_dist(query_node, ranked_nodes, node_weights)
     }
 
     fn extract_gradients(
@@ -463,6 +517,16 @@ mod ep_tests {
         let (ns, ws) = walk_lib.get(3);
         assert_eq!(ns, &[1, 2]);
         assert_eq!(ws, &[1., 2.]);
+    }
+
+    #[test]
+    fn test_approx_ndcg() {
+        let y = vec! [0.59870815, 0.15387154, 0.07759616, 0.05473616, 0.053229664, 0.033005692, 0.028852655, 0.0, 0.0, 0.0, 0.0, 0.0]; 
+        let y_hat = vec![0.008049689, -0.00904851, 0.0062145106, 0.024905892, -0.009456335, 0.002339241, 0.004515061, 0.0010441049, -0.028835557, 0.027277855, -0.0017797453, -0.020151302];
+        let scores = Variable::pooled(&y_hat);
+        let results = PprRank::approx_ndcg(scores, &y);
+        assert_eq!(results.value()[0], 0.27863874786568293);
+
     }
 
 }
