@@ -13,4 +13,5 @@ pub mod feat_propagation;
 pub mod alignment;
 pub mod pprrank;
 pub mod ann;
+pub mod emb_aligner;
 mod grad_utils;

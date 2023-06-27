@@ -1440,6 +1440,87 @@ impl NeighborhoodAligner {
 
 }
 
+/// Aligns an adhoc embedding to a transform embedding state, typically from Neighborhood
+/// transforms
+#[pyclass]
+struct EmbeddingAligner {
+    num_nodes: usize
+}
+
+#[pymethods]
+impl EmbeddingAligner {
+    #[new]
+    pub fn new(num_nodes: usize) -> Self {
+        EmbeddingAligner { num_nodes }
+    }
+
+    pub fn align(&self, 
+        orig_embeddings: &NodeEmbeddings, 
+        orig_ann: &EmbAnn,
+        new_embeddings: &NodeEmbeddings,
+        emb: &Query
+    ) -> PyResult<Vec<f32>> {
+        let query_embedding = lookup_embedding(emb, new_embeddings)?;
+        
+        // Get the original neighbors and distances
+        let neighbors = orig_ann.ann.predict(&orig_embeddings.embeddings, query_embedding);
+
+        // Get the new embeddings
+        let n_embs: Vec<_> = neighbors.iter().map(|nd| {
+            let (node_id, _dist) = nd.to_tup();
+
+            let old_embedding = orig_embeddings.embeddings.get_embedding(node_id);
+            let euc_dist = EDist::Euclidean.compute(&query_embedding, old_embedding);
+            
+            // Translate the node id from one vocab to the other
+            let (node_type, node_name) = orig_embeddings.vocab.get_name(node_id)?;
+
+            let node_id = get_node_id(new_embeddings.vocab.deref(), (*node_type).clone(), (*node_name).clone())
+                .ok()?;
+            let emb = new_embeddings.embeddings.get_embedding(node_id);
+            Some((emb, euc_dist))
+        }).filter(|x| x.is_some()).map(|x| x.unwrap()).take(self.num_nodes).collect();
+
+        let new_emb = crate::algos::emb_aligner::align_embedding(&query_embedding, n_embs.as_slice(), 1e-1, 1e-2);
+
+        Ok(new_emb)
+    }
+
+    /*
+    /// Since embeddings can be large, also allows streaming them to disk instead of in memory.
+    pub fn align_to_disk(
+        &self, 
+        path: &str,
+        embeddings: &NodeEmbeddings, 
+        graph: &Graph,
+        chunk_size: Option<usize>
+    ) -> PyResult<()> {
+       
+        let mut writer = EmbeddingWriter::new(path, embeddings.vocab.as_ref())
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        let cs = chunk_size.unwrap_or(10_000);
+        let mut buffer = vec![vec![0.; embeddings.embeddings.dims()]; cs];
+        let mut ids = Vec::with_capacity(cs);
+        for chunk in &(0..graph.nodes()).chunks(cs) {
+            ids.clear();
+            chunk.for_each(|id| ids.push(id));
+
+            ids.par_iter().zip(buffer.par_iter_mut()).for_each(|(node, new_emb)| {
+                new_emb.iter_mut().for_each(|wi| *wi = 0f32);
+                self.aligner.align(&(*graph.graph), &embeddings.embeddings, *node, new_emb);
+            });
+
+            writer.stream(ids.iter().copied().zip(buffer.iter()).take(ids.len()))?;
+        }
+        Ok(())
+    }
+    */
+
+
+}
+
+
 /// Wrapper for the relatively crappy ANN solution.
 #[pyclass]
 struct GraphAnn {
@@ -1800,6 +1881,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<RandomWalker>()?;
     m.add_class::<BiasedRandomWalker>()?;
     m.add_class::<NeighborhoodAligner>()?;
+    m.add_class::<EmbeddingAligner>()?;
     m.add_class::<PprRankLearner>()?;
     m.add_class::<Smci>()?;
     Ok(())

@@ -43,7 +43,7 @@ pub enum Distance {
 }
 
 impl Distance {
-    fn compute(&self, e1: &[f32], e2: &[f32]) -> f32 {
+    pub fn compute(&self, e1: &[f32], e2: &[f32]) -> f32 {
         match &self {
             Distance::ALT => e1.iter().zip(e2.iter())
                 .map(|(ei, ej)| (*ei - *ej).abs())

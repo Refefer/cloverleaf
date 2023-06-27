@@ -1,10 +1,9 @@
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
-use float_ord::FloatOrd;
 
 use crate::graph::NodeID;
-use crate::embeddings::EmbeddingStore;
+use crate::embeddings::{EmbeddingStore,Entity};
 use crate::algos::graph_ann::NodeDistance;
 
 struct Hyperplane {
@@ -45,10 +44,8 @@ impl Tree {
             match node {
                 Tree::Leaf { indices } => {
                     return indices.par_iter().map(|idx| {
-                        let e2 = es.get_embedding(*idx);
-                        let d = emb.iter().zip(e2.iter())
-                            .map(|(e1i, e2i)| (e1i - e2i).powf(2.))
-                            .sum::<f32>().sqrt();
+                        let d = es.compute_distance(&Entity::Node(*idx), 
+                                                    &Entity::Embedding(emb));
                         (*idx, d)
                     }).collect()
                 },
@@ -85,7 +82,7 @@ impl Ann {
         trees.par_iter_mut().enumerate().for_each(|(idx, tree) | {
             let indices = (0..es.len()).collect::<Vec<_>>();
             let mut rng = XorShiftRng::seed_from_u64(seed + idx as u64);
-            *tree = self.fit_group_(es, indices, max_nodes_per_leaf, &mut rng)
+            *tree = self.fit_group_(1, es, indices, max_nodes_per_leaf, &mut rng)
         });
 
         self.trees = trees;
@@ -94,13 +91,14 @@ impl Ann {
 
     fn fit_group_(
         &self, 
+        depth: usize,
         es: &EmbeddingStore,
         indices: Vec<NodeID>,
         max_nodes_per_leaf: usize,
         rng: &mut impl Rng
     ) -> Tree {
         if indices.len() < max_nodes_per_leaf {
-            return Tree::Leaf { indices: indices.to_vec() }
+            return Tree::Leaf { indices: indices }
         }
 
         // Pick two point
@@ -134,10 +132,15 @@ impl Ann {
             }
         });
 
-        let above_node = self.fit_group_(es, above, max_nodes_per_leaf, rng);
-        let below_node = self.fit_group_(es, below, max_nodes_per_leaf, rng);
+        if above.len() > 0 && below.len() > 0 {
+            let above_node = self.fit_group_(depth+1, es, above, max_nodes_per_leaf, rng);
+            let below_node = self.fit_group_(depth+1, es, below, max_nodes_per_leaf, rng);
 
-        Tree::Split { hp: hp, above: Box::new(above_node), below: Box::new(below_node) }
+            Tree::Split { hp: hp, above: Box::new(above_node), below: Box::new(below_node) }
+        } else {
+            let idxs = if above.len() == 0 { below } else { above };
+            Tree::Leaf { indices: idxs }
+        }
 
     }
 
