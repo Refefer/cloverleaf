@@ -7,7 +7,7 @@ use rand::prelude::*;
 use crate::graph::NodeID;
 use crate::bitset::BitSet;
 use crate::hogwild::Hogwild;
-use crate::algos::ann::{TopK,NodeDistance};
+use crate::algos::graph_ann::{TopK,NodeDistance};
 
 /// Entity allows for adhoc embeddings versus looking up by NodeID within the embedding set
 #[derive(Clone,Copy,Debug)]

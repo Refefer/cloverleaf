@@ -62,12 +62,13 @@ use crate::algos::ep::EmbeddingPropagation;
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
 use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
-use crate::algos::ann::NodeDistance;
+use crate::algos::graph_ann::NodeDistance;
 use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
 use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::smci::SupervisedMCIteration;
 use crate::algos::pprrank::PprRank;
+use crate::algos::ann::Ann;
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
@@ -1226,6 +1227,16 @@ impl NodeEmbeddings {
         self.embeddings.len()
     }
 
+    pub fn l2norm(&self) {
+        (0..self.embeddings.len()).into_par_iter().for_each(|idx| {
+            let mut e = self.embeddings.get_embedding_mut_hogwild(idx);
+            let norm = e.iter().map(|ei| ei.powf(2.)).sum::<f32>().sqrt();
+            e.iter_mut().for_each(|ei| {
+                *ei /= norm;
+            });
+        });
+    }
+
     pub fn save(&self, path: &str) -> PyResult<()> {
         let mut writer = EmbeddingWriter::new(path, self.vocab.as_ref())
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -1431,17 +1442,17 @@ impl NeighborhoodAligner {
 
 /// Wrapper for the relatively crappy ANN solution.
 #[pyclass]
-struct Ann {
+struct GraphAnn {
     graph: Arc<CumCSR>,
     vocab: Arc<Vocab>,
     max_steps: usize
 }
 
 #[pymethods]
-impl Ann {
+impl GraphAnn {
     #[new]
     pub fn new(graph: &Graph, max_steps: Option<usize>) -> Self {
-        Ann {
+        GraphAnn {
             graph: graph.graph.clone(),
             vocab: graph.vocab.clone(),
             max_steps: max_steps.unwrap_or(1000),
@@ -1458,12 +1469,48 @@ impl Ann {
     ) -> PyResult<Vec<((String, String), f32)>> {
         let query_embedding = lookup_embedding(query, embeddings)?;
         let seed = seed.unwrap_or(SEED + 10);
-        let ann = algos::ann::Ann::new(k, self.max_steps + k, seed);
+        let ann = algos::graph_ann::Ann::new(k, self.max_steps + k, seed);
         let nodes = ann.find(query_embedding, &(*self.graph), &embeddings.embeddings);
         Ok(convert_node_distance(&self.vocab, nodes))
     }
 }
 
+/// Wrapper for a much better ANN solution for embeddings
+#[pyclass]
+struct EmbAnn {
+    ann: Ann
+}
+
+#[pymethods]
+impl EmbAnn {
+    #[new]
+    pub fn new(
+        embs: &NodeEmbeddings, 
+        n_trees: usize,
+        max_nodes_per_leaf: usize,
+        seed: Option<u64>
+    ) -> Self {
+        let mut ann = Ann::new();
+        let seed = seed.unwrap_or(SEED + 10);
+        ann.fit(&embs.embeddings, n_trees, max_nodes_per_leaf, seed);
+
+        EmbAnn { ann: ann }
+
+    }
+
+    pub fn find(
+        &self, 
+        embeddings: &NodeEmbeddings,
+        query: &Query
+    ) -> PyResult<Vec<((String, String), f32)>> {
+        let query_embedding = lookup_embedding(query, embeddings)?;
+        let nodes = self.ann.predict(&embeddings.embeddings, query_embedding);
+        Ok(convert_node_distance(&embeddings.vocab, nodes))
+    }
+}
+
+
+///
 /// Wrapper for the Supervised Monte-Carlo Iteration.  It stores the reward maps on the struct.
 #[pyclass]
 struct Smci {
@@ -1743,7 +1790,8 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<NodeEmbeddings>()?;
     m.add_class::<VocabIterator>()?;
     m.add_class::<EPLoss>()?;
-    m.add_class::<Ann>()?;
+    m.add_class::<GraphAnn>()?;
+    m.add_class::<EmbAnn>()?;
     m.add_class::<FeatureSet>()?;
     m.add_class::<FeaturePropagator>()?;
     m.add_class::<NodeEmbedder>()?;
