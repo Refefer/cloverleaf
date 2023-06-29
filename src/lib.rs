@@ -45,8 +45,12 @@ use rayon::prelude::*;
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError};
+use pyo3::types::PyList;
 use itertools::Itertools;
 use fast_float::parse;
+use rand::prelude::*;
+use rand_xorshift::XorShiftRng;
+use rand_distr::Uniform;
 
 use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID,CDFtoP};
 use crate::vocab::Vocab;
@@ -62,12 +66,13 @@ use crate::algos::ep::EmbeddingPropagation;
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
 use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
-use crate::algos::ann::NodeDistance;
+use crate::algos::graph_ann::NodeDistance;
 use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
 use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::smci::SupervisedMCIteration;
 use crate::algos::pprrank::PprRank;
+use crate::algos::ann::Ann;
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
@@ -123,6 +128,40 @@ fn get_node_id(vocab: &Vocab, node_type: String, node: String) -> PyResult<NodeI
         Err(PyKeyError::new_err(format!(" Node '{}:{}' does not exist!", node_type, node)))
     }
 }
+
+
+#[derive(Clone)]
+enum QueryType {
+    Node(String, String),
+    Embedding(Vec<f32>)
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct Query {
+    qt: QueryType
+}
+
+#[pymethods]
+impl Query {
+
+    #[staticmethod]
+    pub fn node(
+        node_type: String,
+        node_name: String
+    ) -> Self {
+        Query { qt: QueryType::Node(node_type, node_name) }
+    }
+
+    #[staticmethod]
+    pub fn embedding(
+        emb: Vec<f32>
+    ) -> Self {
+        Query { qt: QueryType::Embedding(emb) }
+    }
+
+}
+
 
 /// This maps our python definition to an internal ADT for embedding distnaces
 #[pyclass]
@@ -1226,6 +1265,16 @@ impl NodeEmbeddings {
         self.embeddings.len()
     }
 
+    pub fn l2norm(&self) {
+        (0..self.embeddings.len()).into_par_iter().for_each(|idx| {
+            let mut e = self.embeddings.get_embedding_mut_hogwild(idx);
+            let norm = e.iter().map(|ei| ei.powf(2.)).sum::<f32>().sqrt();
+            e.iter_mut().for_each(|ei| {
+                *ei /= norm;
+            });
+        });
+    }
+
     pub fn save(&self, path: &str) -> PyResult<()> {
         let mut writer = EmbeddingWriter::new(path, self.vocab.as_ref())
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -1308,6 +1357,75 @@ impl NodeEmbeddings {
         Ok(ne)
     }
 }
+
+/// Allows the user to build a graph incrementally before converting it into a proper CSR graph
+#[pyclass]
+struct NodeEmbeddingsBuilder {
+    vocab: Vocab,
+    distance: Distance,
+    embeddings: Vec<Vec<f32>>
+}
+
+#[pymethods]
+impl NodeEmbeddingsBuilder {
+    #[new]
+    pub fn new(dist: Distance) -> Self {
+        NodeEmbeddingsBuilder {
+            distance: dist,
+            vocab: Vocab::new(),
+            embeddings: Vec::new()
+        }
+    }
+
+    pub fn add_embedding(
+        &mut self, 
+        node: (String, String), 
+        embedding: Vec<f32>
+    ) -> PyResult<()> {
+
+        let n = self.embeddings.len();
+        if n > 1 && self.embeddings[0].len() != embedding.len() {
+            return Err(PyValueError::new_err("Embedding dimensions mismatch!"));
+        }
+
+        let node_id = self.vocab.get_or_insert(node.0, node.1);
+        if node_id < self.embeddings.len() {
+            self.embeddings[node_id] = embedding;
+        } else {
+            self.embeddings.push(embedding);
+        }
+        Ok(())
+    }
+
+    pub fn build(&mut self) -> Option<NodeEmbeddings> {
+        if self.embeddings.len() == 0 {
+            return None
+        }
+        // We swap the internal buffers with new buffers; we do this to preserve memory whenever
+        // possible.
+        let mut vocab = Vocab::new(); 
+        let mut embeddings = Vec::new();
+        std::mem::swap(&mut vocab, &mut self.vocab);
+        std::mem::swap(&mut embeddings, &mut self.embeddings);
+
+        let mut es = EmbeddingStore::new(embeddings.len(), 
+                                         embeddings[0].len(),
+                                         self.distance.to_edist());
+        embeddings.par_iter_mut().enumerate().for_each(|(i, emb)| {
+            let e = es.get_embedding_mut_hogwild(i);
+            e.iter_mut().zip(emb.iter()).for_each(|(ei, emb_i)| {
+                *ei = *emb_i;
+            });
+        });
+        Some(NodeEmbeddings {
+            vocab: Arc::new(vocab),
+            embeddings: es
+        })
+    }
+
+}
+
+
 
 /// Reads a line and converts it to a node type, node name, and embedding.
 /// Blows up if it doesn't meet the formatting.
@@ -1429,19 +1547,107 @@ impl NeighborhoodAligner {
 
 }
 
+/// Aligns an adhoc embedding to a transform embedding state, typically from Neighborhood
+/// transforms
+#[pyclass]
+struct EmbeddingAligner {
+    num_nodes: usize,
+    random_nodes: usize
+}
+
+#[pymethods]
+impl EmbeddingAligner {
+    #[new]
+    pub fn new(num_nodes: usize, random_nodes: Option<usize>) -> Self {
+        EmbeddingAligner { num_nodes, random_nodes: random_nodes.unwrap_or(0) }
+    }
+
+    pub fn align(&self, 
+        orig_embeddings: &NodeEmbeddings, 
+        orig_ann: &EmbAnn,
+        translated_embeddings: &NodeEmbeddings,
+        emb: &Query,
+        seed: Option<u64>
+    ) -> PyResult<Vec<f32>> {
+        let query_embedding = lookup_embedding(emb, translated_embeddings)?;
+        
+        // Get the original neighbors and distances
+        let neighbors = orig_ann.ann.predict(&orig_embeddings.embeddings, query_embedding);
+        let rand_neighbors = if self.random_nodes > 0 {
+            let mut rng = XorShiftRng::seed_from_u64(seed.unwrap_or(SEED + 123123));
+
+            let dist = Uniform::new(0, orig_embeddings.embeddings.len());
+            (0..self.random_nodes).map(|_| (dist.sample(&mut rng), 0.)).collect()
+        } else {
+            Vec::with_capacity(0)
+        };
+
+        // Find the closest embeddings
+        let n_embs: Vec<_> = neighbors.iter()
+            .filter(|nd| {
+                let (node_id, _dist) = nd.to_tup();
+                if let Some((node_type, node_name)) = orig_embeddings.vocab.get_name(node_id) {
+                    get_node_id(translated_embeddings.vocab.deref(), 
+                           (*node_type).clone(), (*node_name).clone()).is_ok()
+                } else {
+                    false
+                }
+            })
+            .take(self.num_nodes)
+            .map(|nd| nd.to_tup())
+            .chain(rand_neighbors.into_iter())
+            .map(|(node_id, _dist)| {
+
+                let old_embedding = orig_embeddings.embeddings.get_embedding(node_id);
+                let euc_dist = EDist::Euclidean.compute(&query_embedding, old_embedding);
+                
+                // Translate the node id from one vocab to the other
+                let (node_type, node_name) = orig_embeddings.vocab.get_name(node_id)?;
+
+                let node_id = get_node_id(translated_embeddings.vocab.deref(), 
+                                          (*node_type).clone(), (*node_name).clone()).ok()?;
+                let emb = translated_embeddings.embeddings.get_embedding(node_id);
+                Some((emb, euc_dist))
+            }).filter(|x| x.is_some())
+            .map(|x| x.unwrap())
+            .collect();
+
+        let new_emb = crate::algos::emb_aligner::align_embedding(&query_embedding, n_embs.as_slice(), 1e-1, 1e-2);
+
+        Ok(new_emb)
+    }
+
+    pub fn bulk_align(&self, 
+        orig_embeddings: &NodeEmbeddings, 
+        orig_ann: &EmbAnn,
+        translated_embeddings: &NodeEmbeddings,
+        queries: Vec<Query>,
+        seed: Option<u64>
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let results: PyResult<Vec<_>> = queries.into_par_iter().map(|query| {
+            self.align(orig_embeddings, orig_ann, translated_embeddings, &query, seed)
+        }).collect();
+
+        results
+    }
+
+
+}
+
+
 /// Wrapper for the relatively crappy ANN solution.
 #[pyclass]
-struct Ann {
+struct GraphAnn {
     graph: Arc<CumCSR>,
     vocab: Arc<Vocab>,
     max_steps: usize
 }
 
 #[pymethods]
-impl Ann {
+impl GraphAnn {
     #[new]
     pub fn new(graph: &Graph, max_steps: Option<usize>) -> Self {
-        Ann {
+        GraphAnn {
             graph: graph.graph.clone(),
             vocab: graph.vocab.clone(),
             max_steps: max_steps.unwrap_or(1000),
@@ -1458,12 +1664,52 @@ impl Ann {
     ) -> PyResult<Vec<((String, String), f32)>> {
         let query_embedding = lookup_embedding(query, embeddings)?;
         let seed = seed.unwrap_or(SEED + 10);
-        let ann = algos::ann::Ann::new(k, self.max_steps + k, seed);
+        let ann = algos::graph_ann::Ann::new(k, self.max_steps + k, seed);
         let nodes = ann.find(query_embedding, &(*self.graph), &embeddings.embeddings);
         Ok(convert_node_distance(&self.vocab, nodes))
     }
 }
 
+/// Wrapper for a much better ANN solution for embeddings
+#[pyclass]
+struct EmbAnn {
+    ann: Ann
+}
+
+#[pymethods]
+impl EmbAnn {
+    #[new]
+    pub fn new(
+        embs: &NodeEmbeddings, 
+        n_trees: usize,
+        max_nodes_per_leaf: usize,
+        seed: Option<u64>
+    ) -> Self {
+        let mut ann = Ann::new();
+        let seed = seed.unwrap_or(SEED + 10);
+        ann.fit(&embs.embeddings, n_trees, max_nodes_per_leaf, seed);
+
+        EmbAnn { ann: ann }
+
+    }
+
+    pub fn find(
+        &self, 
+        embeddings: &NodeEmbeddings,
+        query: &Query
+    ) -> PyResult<Vec<((String, String), f32)>> {
+        let query_embedding = lookup_embedding(query, embeddings)?;
+        let nodes = self.ann.predict(&embeddings.embeddings, query_embedding);
+        Ok(convert_node_distance(&embeddings.vocab, nodes))
+    }
+
+    pub fn depth(&self) -> Vec<usize> {
+        self.ann.depth()
+    }
+}
+
+
+///
 /// Wrapper for the Supervised Monte-Carlo Iteration.  It stores the reward maps on the struct.
 #[pyclass]
 struct Smci {
@@ -1687,36 +1933,6 @@ fn lookup_embedding<'a>(
     }
 }
 
-enum QueryType {
-    Node(String, String),
-    Embedding(Vec<f32>)
-}
-
-#[pyclass]
-pub struct Query {
-    qt: QueryType
-}
-
-#[pymethods]
-impl Query {
-
-    #[staticmethod]
-    pub fn node(
-        node_type: String,
-        node_name: String
-    ) -> Self {
-        Query { qt: QueryType::Node(node_type, node_name) }
-    }
-
-    #[staticmethod]
-    pub fn embedding(
-        emb: Vec<f32>
-    ) -> Self {
-        Query { qt: QueryType::Embedding(emb) }
-    }
-
-}
-
 fn convert_node_distance(
     vocab: &Vocab, 
     dists: Vec<NodeDistance>
@@ -1743,7 +1959,8 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<NodeEmbeddings>()?;
     m.add_class::<VocabIterator>()?;
     m.add_class::<EPLoss>()?;
-    m.add_class::<Ann>()?;
+    m.add_class::<GraphAnn>()?;
+    m.add_class::<EmbAnn>()?;
     m.add_class::<FeatureSet>()?;
     m.add_class::<FeaturePropagator>()?;
     m.add_class::<NodeEmbedder>()?;
@@ -1752,6 +1969,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<RandomWalker>()?;
     m.add_class::<BiasedRandomWalker>()?;
     m.add_class::<NeighborhoodAligner>()?;
+    m.add_class::<EmbeddingAligner>()?;
     m.add_class::<PprRankLearner>()?;
     m.add_class::<Smci>()?;
     Ok(())

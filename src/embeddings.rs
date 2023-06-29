@@ -7,7 +7,7 @@ use rand::prelude::*;
 use crate::graph::NodeID;
 use crate::bitset::BitSet;
 use crate::hogwild::Hogwild;
-use crate::algos::ann::{TopK,NodeDistance};
+use crate::algos::graph_ann::{TopK,NodeDistance};
 
 /// Entity allows for adhoc embeddings versus looking up by NodeID within the embedding set
 #[derive(Clone,Copy,Debug)]
@@ -43,7 +43,7 @@ pub enum Distance {
 }
 
 impl Distance {
-    fn compute(&self, e1: &[f32], e2: &[f32]) -> f32 {
+    pub fn compute(&self, e1: &[f32], e2: &[f32]) -> f32 {
         match &self {
             Distance::ALT => e1.iter().zip(e2.iter())
                 .map(|(ei, ej)| (*ei - *ej).abs())
