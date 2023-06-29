@@ -14,4 +14,5 @@ pub mod alignment;
 pub mod pprrank;
 pub mod ann;
 pub mod emb_aligner;
+pub mod pagerank;
 mod grad_utils;

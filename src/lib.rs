@@ -1197,6 +1197,40 @@ impl SLPAEmbedder {
 
 }
 
+/// Struct for learning Speaker-Listener multi-cluster embeddings.  Uses Hamming Distance for
+/// distance.
+#[pyclass]
+struct PageRank {
+    iterations: usize,
+    damping: f32, 
+    eps: f32
+}
+
+#[pymethods]
+impl PageRank {
+    #[new]
+    pub fn new(iterations: usize, damping: Option<f32>, eps: Option<f32>) -> Self {
+        PageRank {iterations, damping: damping.unwrap_or(0.85), eps: eps.unwrap_or(1e-5) }
+    }
+
+    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
+        let page_rank = crate::algos::pagerank::PageRank::new(self.iterations, self.damping, self.eps);
+        let scores = page_rank.compute(graph.graph.as_ref());
+        let mut es = EmbeddingStore::new(graph.graph.len(), 1, EDist::Euclidean);
+        scores.par_iter().enumerate().for_each(|(node_id, score)| {
+            let e1 = es.get_embedding_mut_hogwild(node_id);
+            e1[0] = *score;
+        });
+        NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings: es
+        }
+    }
+
+}
+
+
+
 /// Wrapper for EmbeddingStore.
 #[pyclass]
 pub struct NodeEmbeddings {
@@ -1971,6 +2005,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<NeighborhoodAligner>()?;
     m.add_class::<EmbeddingAligner>()?;
     m.add_class::<PprRankLearner>()?;
+    m.add_class::<PageRank>()?;
     m.add_class::<Smci>()?;
     Ok(())
 }
