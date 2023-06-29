@@ -19,7 +19,7 @@ pub fn align_embedding(
 
         let buff: Vec<_> = embs.iter().zip(t_embeddings.iter()).enumerate().map(|(pos, (e, (_, d)))| {
             let euc_dist = (e.clone() - &ne).pow(2.).sum().pow(0.5);
-            (euc_dist - *d).pow(2.) / (pos + 1).sqrt() as f32
+            (euc_dist - *d).pow(2.) / ((pos + 1) as f32).sqrt()
         }).collect();
 
         let loss = buff.sum_all();
@@ -33,7 +33,6 @@ pub fn align_embedding(
         });
 
         let cur_err = loss.value()[0];
-        println!("CurError: {}", cur_err);
         if (last_err - cur_err).abs() / last_err < eps {
             break
         }

@@ -45,8 +45,12 @@ use rayon::prelude::*;
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError};
+use pyo3::types::PyList;
 use itertools::Itertools;
 use fast_float::parse;
+use rand::prelude::*;
+use rand_xorshift::XorShiftRng;
+use rand_distr::Uniform;
 
 use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID,CDFtoP};
 use crate::vocab::Vocab;
@@ -124,6 +128,40 @@ fn get_node_id(vocab: &Vocab, node_type: String, node: String) -> PyResult<NodeI
         Err(PyKeyError::new_err(format!(" Node '{}:{}' does not exist!", node_type, node)))
     }
 }
+
+
+#[derive(Clone)]
+enum QueryType {
+    Node(String, String),
+    Embedding(Vec<f32>)
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct Query {
+    qt: QueryType
+}
+
+#[pymethods]
+impl Query {
+
+    #[staticmethod]
+    pub fn node(
+        node_type: String,
+        node_name: String
+    ) -> Self {
+        Query { qt: QueryType::Node(node_type, node_name) }
+    }
+
+    #[staticmethod]
+    pub fn embedding(
+        emb: Vec<f32>
+    ) -> Self {
+        Query { qt: QueryType::Embedding(emb) }
+    }
+
+}
+
 
 /// This maps our python definition to an internal ADT for embedding distnaces
 #[pyclass]
@@ -1320,6 +1358,75 @@ impl NodeEmbeddings {
     }
 }
 
+/// Allows the user to build a graph incrementally before converting it into a proper CSR graph
+#[pyclass]
+struct NodeEmbeddingsBuilder {
+    vocab: Vocab,
+    distance: Distance,
+    embeddings: Vec<Vec<f32>>
+}
+
+#[pymethods]
+impl NodeEmbeddingsBuilder {
+    #[new]
+    pub fn new(dist: Distance) -> Self {
+        NodeEmbeddingsBuilder {
+            distance: dist,
+            vocab: Vocab::new(),
+            embeddings: Vec::new()
+        }
+    }
+
+    pub fn add_embedding(
+        &mut self, 
+        node: (String, String), 
+        embedding: Vec<f32>
+    ) -> PyResult<()> {
+
+        let n = self.embeddings.len();
+        if n > 1 && self.embeddings[0].len() != embedding.len() {
+            return Err(PyValueError::new_err("Embedding dimensions mismatch!"));
+        }
+
+        let node_id = self.vocab.get_or_insert(node.0, node.1);
+        if node_id < self.embeddings.len() {
+            self.embeddings[node_id] = embedding;
+        } else {
+            self.embeddings.push(embedding);
+        }
+        Ok(())
+    }
+
+    pub fn build(&mut self) -> Option<NodeEmbeddings> {
+        if self.embeddings.len() == 0 {
+            return None
+        }
+        // We swap the internal buffers with new buffers; we do this to preserve memory whenever
+        // possible.
+        let mut vocab = Vocab::new(); 
+        let mut embeddings = Vec::new();
+        std::mem::swap(&mut vocab, &mut self.vocab);
+        std::mem::swap(&mut embeddings, &mut self.embeddings);
+
+        let mut es = EmbeddingStore::new(embeddings.len(), 
+                                         embeddings[0].len(),
+                                         self.distance.to_edist());
+        embeddings.par_iter_mut().enumerate().for_each(|(i, emb)| {
+            let e = es.get_embedding_mut_hogwild(i);
+            e.iter_mut().zip(emb.iter()).for_each(|(ei, emb_i)| {
+                *ei = *emb_i;
+            });
+        });
+        Some(NodeEmbeddings {
+            vocab: Arc::new(vocab),
+            embeddings: es
+        })
+    }
+
+}
+
+
+
 /// Reads a line and converts it to a node type, node name, and embedding.
 /// Blows up if it doesn't meet the formatting.
 fn line_to_embedding(line: String) -> Option<(String,String,Vec<f32>)> {
@@ -1444,78 +1551,85 @@ impl NeighborhoodAligner {
 /// transforms
 #[pyclass]
 struct EmbeddingAligner {
-    num_nodes: usize
+    num_nodes: usize,
+    random_nodes: usize
 }
 
 #[pymethods]
 impl EmbeddingAligner {
     #[new]
-    pub fn new(num_nodes: usize) -> Self {
-        EmbeddingAligner { num_nodes }
+    pub fn new(num_nodes: usize, random_nodes: Option<usize>) -> Self {
+        EmbeddingAligner { num_nodes, random_nodes: random_nodes.unwrap_or(0) }
     }
 
     pub fn align(&self, 
         orig_embeddings: &NodeEmbeddings, 
         orig_ann: &EmbAnn,
-        new_embeddings: &NodeEmbeddings,
-        emb: &Query
+        translated_embeddings: &NodeEmbeddings,
+        emb: &Query,
+        seed: Option<u64>
     ) -> PyResult<Vec<f32>> {
-        let query_embedding = lookup_embedding(emb, new_embeddings)?;
+        let query_embedding = lookup_embedding(emb, translated_embeddings)?;
         
         // Get the original neighbors and distances
         let neighbors = orig_ann.ann.predict(&orig_embeddings.embeddings, query_embedding);
+        let rand_neighbors = if self.random_nodes > 0 {
+            let mut rng = XorShiftRng::seed_from_u64(seed.unwrap_or(SEED + 123123));
 
-        // Get the new embeddings
-        let n_embs: Vec<_> = neighbors.iter().map(|nd| {
-            let (node_id, _dist) = nd.to_tup();
+            let dist = Uniform::new(0, orig_embeddings.embeddings.len());
+            (0..self.random_nodes).map(|_| (dist.sample(&mut rng), 0.)).collect()
+        } else {
+            Vec::with_capacity(0)
+        };
 
-            let old_embedding = orig_embeddings.embeddings.get_embedding(node_id);
-            let euc_dist = EDist::Euclidean.compute(&query_embedding, old_embedding);
-            
-            // Translate the node id from one vocab to the other
-            let (node_type, node_name) = orig_embeddings.vocab.get_name(node_id)?;
+        // Find the closest embeddings
+        let n_embs: Vec<_> = neighbors.iter()
+            .filter(|nd| {
+                let (node_id, _dist) = nd.to_tup();
+                if let Some((node_type, node_name)) = orig_embeddings.vocab.get_name(node_id) {
+                    get_node_id(translated_embeddings.vocab.deref(), 
+                           (*node_type).clone(), (*node_name).clone()).is_ok()
+                } else {
+                    false
+                }
+            })
+            .take(self.num_nodes)
+            .map(|nd| nd.to_tup())
+            .chain(rand_neighbors.into_iter())
+            .map(|(node_id, _dist)| {
 
-            let node_id = get_node_id(new_embeddings.vocab.deref(), (*node_type).clone(), (*node_name).clone())
-                .ok()?;
-            let emb = new_embeddings.embeddings.get_embedding(node_id);
-            Some((emb, euc_dist))
-        }).filter(|x| x.is_some()).map(|x| x.unwrap()).take(self.num_nodes).collect();
+                let old_embedding = orig_embeddings.embeddings.get_embedding(node_id);
+                let euc_dist = EDist::Euclidean.compute(&query_embedding, old_embedding);
+                
+                // Translate the node id from one vocab to the other
+                let (node_type, node_name) = orig_embeddings.vocab.get_name(node_id)?;
+
+                let node_id = get_node_id(translated_embeddings.vocab.deref(), 
+                                          (*node_type).clone(), (*node_name).clone()).ok()?;
+                let emb = translated_embeddings.embeddings.get_embedding(node_id);
+                Some((emb, euc_dist))
+            }).filter(|x| x.is_some())
+            .map(|x| x.unwrap())
+            .collect();
 
         let new_emb = crate::algos::emb_aligner::align_embedding(&query_embedding, n_embs.as_slice(), 1e-1, 1e-2);
 
         Ok(new_emb)
     }
 
-    /*
-    /// Since embeddings can be large, also allows streaming them to disk instead of in memory.
-    pub fn align_to_disk(
-        &self, 
-        path: &str,
-        embeddings: &NodeEmbeddings, 
-        graph: &Graph,
-        chunk_size: Option<usize>
-    ) -> PyResult<()> {
-       
-        let mut writer = EmbeddingWriter::new(path, embeddings.vocab.as_ref())
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+    pub fn bulk_align(&self, 
+        orig_embeddings: &NodeEmbeddings, 
+        orig_ann: &EmbAnn,
+        translated_embeddings: &NodeEmbeddings,
+        queries: Vec<Query>,
+        seed: Option<u64>
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let results: PyResult<Vec<_>> = queries.into_par_iter().map(|query| {
+            self.align(orig_embeddings, orig_ann, translated_embeddings, &query, seed)
+        }).collect();
 
-        let cs = chunk_size.unwrap_or(10_000);
-        let mut buffer = vec![vec![0.; embeddings.embeddings.dims()]; cs];
-        let mut ids = Vec::with_capacity(cs);
-        for chunk in &(0..graph.nodes()).chunks(cs) {
-            ids.clear();
-            chunk.for_each(|id| ids.push(id));
-
-            ids.par_iter().zip(buffer.par_iter_mut()).for_each(|(node, new_emb)| {
-                new_emb.iter_mut().for_each(|wi| *wi = 0f32);
-                self.aligner.align(&(*graph.graph), &embeddings.embeddings, *node, new_emb);
-            });
-
-            writer.stream(ids.iter().copied().zip(buffer.iter()).take(ids.len()))?;
-        }
-        Ok(())
+        results
     }
-    */
 
 
 }
@@ -1587,6 +1701,10 @@ impl EmbAnn {
         let query_embedding = lookup_embedding(query, embeddings)?;
         let nodes = self.ann.predict(&embeddings.embeddings, query_embedding);
         Ok(convert_node_distance(&embeddings.vocab, nodes))
+    }
+
+    pub fn depth(&self) -> Vec<usize> {
+        self.ann.depth()
     }
 }
 
@@ -1813,36 +1931,6 @@ fn lookup_embedding<'a>(
         },
         QueryType::Embedding(ref emb) => Ok(emb)
     }
-}
-
-enum QueryType {
-    Node(String, String),
-    Embedding(Vec<f32>)
-}
-
-#[pyclass]
-pub struct Query {
-    qt: QueryType
-}
-
-#[pymethods]
-impl Query {
-
-    #[staticmethod]
-    pub fn node(
-        node_type: String,
-        node_name: String
-    ) -> Self {
-        Query { qt: QueryType::Node(node_type, node_name) }
-    }
-
-    #[staticmethod]
-    pub fn embedding(
-        emb: Vec<f32>
-    ) -> Self {
-        Query { qt: QueryType::Embedding(emb) }
-    }
-
 }
 
 fn convert_node_distance(

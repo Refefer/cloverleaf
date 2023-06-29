@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
@@ -43,15 +45,25 @@ impl Tree {
         loop {
             match node {
                 Tree::Leaf { indices } => {
+                    let qemb = Entity::Embedding(emb);
                     return indices.par_iter().map(|idx| {
-                        let d = es.compute_distance(&Entity::Node(*idx), 
-                                                    &Entity::Embedding(emb));
+                        let d = es.compute_distance(&Entity::Node(*idx), &qemb);
                         (*idx, d)
                     }).collect()
                 },
                 Tree::Split { hp, above, below } => {
                     node = if hp.point_is_above(emb) { &above } else { &below };
                 }
+            }
+        }
+    }
+
+    fn depth(&self, d: usize) -> usize {
+        let mut node = self;
+        match node {
+            Tree::Leaf { indices } =>  d,
+            Tree::Split { hp, above, below } => {
+                above.depth(d + 1).max(below.depth(d + 1))
             }
         }
     }
@@ -89,6 +101,10 @@ impl Ann {
 
     }
 
+    pub fn depth(&self) -> Vec<usize> {
+        self.trees.par_iter().map(|t| t.depth(0)).collect()
+    }
+
     fn fit_group_(
         &self, 
         depth: usize,
@@ -102,21 +118,36 @@ impl Ann {
         }
 
         // Pick two point
-        let idx_1 = indices.choose(rng).unwrap();
-        let mut idx_2 = indices.choose(rng).unwrap();
-        while idx_1 == idx_2 {
-            idx_2 = indices.choose(rng).unwrap();
+        let mut best = (0i8, None);
+        for _ in 0..5 {
+            let idx_1 = indices.choose(rng).unwrap();
+            let mut idx_2 = indices.choose(rng).unwrap();
+            while idx_1 == idx_2 {
+                idx_2 = indices.choose(rng).unwrap();
+            }
+
+            let pa = es.get_embedding(*idx_1); 
+            let pb = es.get_embedding(*idx_2); 
+
+            let diff: Vec<_> = pa.iter().zip(pb.iter()).map(|(pai, pbi)| pai - pbi).collect();
+            let bias: f32 = diff.iter().zip(pa.iter().zip(pb.iter()))
+                .map(|(d, (pai, pbi))| d * (pai + pbi) / 2.)
+                .sum();
+
+            let hp = Hyperplane::new(diff, bias);
+            let mut s = 0i8;
+            for _ in 0..30 {
+                let idx = indices.choose(rng).unwrap();
+                let emb = es.get_embedding(*idx);
+                if hp.point_is_above(emb) { s += 1; } 
+            }
+            let score = (s - 15).abs();
+            if best.0 > score || best.1.is_none() {
+                best = (score, Some(hp));
+            }
         }
 
-        let pa = es.get_embedding(*idx_1); 
-        let pb = es.get_embedding(*idx_2); 
-
-        let diff: Vec<_> = pa.iter().zip(pb.iter()).map(|(pai, pbi)| pai - pbi).collect();
-        let bias: f32 = diff.iter().zip(pa.iter().zip(pb.iter()))
-            .map(|(d, (pai, pbi))| d * (pai + pbi) / 2.)
-            .sum();
-
-        let hp = Hyperplane::new(diff, bias);
+        let hp = best.1.unwrap();
         let scores = indices.par_iter().map(|idx| {
             hp.point_is_above(es.get_embedding(*idx))
         }).collect::<Vec<_>>();
@@ -153,6 +184,7 @@ impl Ann {
             tree.predict(es, emb)
         }).collect::<Vec<_>>();
 
+
         let n = scores.iter().map(|x| x.len()).sum::<usize>();
         let mut all_scores = Vec::with_capacity(n);
         scores.into_iter().for_each(|subset| {
@@ -161,7 +193,7 @@ impl Ann {
             });
         });
 
-        all_scores.sort();
+        all_scores.par_sort();
 
         let mut cur_pointer = 1;
         let mut cur_node_id = all_scores[0].1;
