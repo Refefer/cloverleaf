@@ -8,6 +8,7 @@ pub fn align_embedding(
     alpha: f32,
     eps: f32
 ) -> Vec<f32> {
+    use_shared_pool(false);
     let embs: Vec<_> = t_embeddings.iter().map(|(e, d)| {
         Constant::new(e.to_vec())
     }).collect();

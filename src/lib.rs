@@ -1084,6 +1084,19 @@ impl NodeEmbedder {
         Ok(embedding)
     }
 
+    pub fn bulk_embed_adhoc(&self, 
+        features_set: Vec<Vec<(String, String)>>,
+        feature_embeddings: &NodeEmbeddings,
+        strict: Option<bool>
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let results: PyResult<Vec<_>> = features_set.into_par_iter().map(|features| {
+            self.embed_adhoc(features, feature_embeddings, strict)
+        }).collect();
+
+        results
+    }
+
+
 }
 
 /// Count the number of lines in an embeddings file so we only have to do one allocation.  If
