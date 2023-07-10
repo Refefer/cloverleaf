@@ -4,6 +4,7 @@ pub mod reweighter;
 pub mod dist;
 pub mod lpa;
 pub mod slpa;
+pub mod rsvd;
 pub mod ep;
 pub mod graph_ann;
 pub mod utils;

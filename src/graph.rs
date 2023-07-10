@@ -42,9 +42,11 @@ pub trait CDFGraph: Graph {}
 /// lists tend to use more memory.
 #[derive(Clone)]
 pub struct CSR {
-    rows: Vec<NodeID>,
-    columns: Vec<NodeID>,
-    weights: Vec<f32>
+    pub rows: Vec<NodeID>,
+    pub columns: Vec<NodeID>,
+    pub weights: Vec<f32>,
+    pub nrows: usize,
+    pub ncols: usize,
 }
 
 impl CSR {
@@ -79,7 +81,21 @@ impl CSR {
             counts[from_node] += 1;
         });
 
-        CSR { rows, columns, weights: data }
+        CSR::new(rows, columns, data)
+    }
+
+    pub fn new_with_shape(rows: Vec<NodeID>, columns: Vec<NodeID>, weights: Vec<f32>, nrows: usize, ncols: usize) -> Self {
+        Self { rows, columns, weights, nrows, ncols, }
+    }
+
+    pub fn new(rows: Vec<NodeID>, columns: Vec<NodeID>, weights: Vec<f32>) -> Self {
+        let nrows = rows.len() - 1;
+        let ncols = columns.iter().max().unwrap() + 1;
+        Self::new_with_shape(rows, columns, weights, nrows, ncols)
+    }
+
+    pub fn shape(&self) -> (usize, usize) {
+        (self.nrows, self.ncols)
     }
 
 }
@@ -185,7 +201,7 @@ impl NormalizedGraph for NormalizedCSR {}
 /// This is the main one used in Cloverleaf - converts CSR formatted graphs into CDF format to make sampling from
 /// edges efficient (log(N)).  
 #[derive(Clone)]
-pub struct CumCSR(CSR);
+pub struct CumCSR(pub CSR);
 
 impl CumCSR {
     pub fn convert(mut csr: CSR) -> Self {
@@ -203,11 +219,7 @@ impl CumCSR {
             Err("weights lengths not equal!")?
         }
 
-        let graph = CSR {
-            rows: self.0.rows.clone(),
-            columns: self.0.columns.clone(),
-            weights: weights
-        };
+        let graph = CSR::new(self.0.rows.clone(), self.0.columns.clone(), weights);
 
         // Test that the weights are properly CDF
         for node_id in 0..graph.len() {

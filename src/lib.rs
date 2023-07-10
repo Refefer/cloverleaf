@@ -1211,6 +1211,45 @@ impl SLPAEmbedder {
 
 }
 
+/// Struct for learning randomized SVD embeddings
+/// Good baseline to compare against
+#[pyclass]
+struct RSVDEmbedder {
+    k: usize,
+    seed: Option<u64>,
+    n_samples: Option<usize>,
+    n_subspace_iters: Option<usize>,
+}
+
+#[pymethods]
+impl RSVDEmbedder {
+    #[new]
+    pub fn new(k: usize, n_samples: Option<usize>, n_subspace_iters: Option<usize>, seed: Option<u64>) -> Self {
+        RSVDEmbedder {
+            k,
+            seed,
+            n_samples,
+            n_subspace_iters,
+        }
+    }
+
+    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
+        let seed = self.seed.unwrap_or(SEED);
+        let es = crate::algos::rsvd::rand_embeddings(
+            &graph.graph.0,
+            self.k,
+            self.n_samples,
+            self.n_subspace_iters,
+            seed
+        );
+        NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings: es
+        }
+    }
+
+}
+
 /// Struct for learning Speaker-Listener multi-cluster embeddings.  Uses Hamming Distance for
 /// distance.
 #[pyclass]
@@ -2051,6 +2090,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<DistanceEmbedder>()?;
     m.add_class::<ClusterLPAEmbedder>()?;
     m.add_class::<SLPAEmbedder>()?;
+    m.add_class::<RSVDEmbedder>()?;
     m.add_class::<NodeEmbeddings>()?;
     m.add_class::<VocabIterator>()?;
     m.add_class::<EPLoss>()?;
