@@ -1964,6 +1964,46 @@ impl PprRankLearner {
 
 }
 
+/// Struct for learning Speaker-Listener multi-cluster embeddings.  Uses Hamming Distance for
+/// distance.
+#[pyclass]
+struct VpcgEmbedder {
+    max_terms: usize, 
+    passes: usize
+}
+
+#[pymethods]
+impl VpcgEmbedder {
+    #[new]
+    pub fn new(max_terms: usize, passes: usize) -> Self {
+        VpcgEmbedder { max_terms, passes }
+    }
+
+    pub fn learn(&self, 
+        graph: &Graph, 
+        features: &mut FeatureSet,
+        start_node_type: String
+    ) -> Vec<Vec<(usize, f32)>> {
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for node_id in 0..graph.graph.len() {
+            let nt = graph.vocab.get_node_type(node_id).unwrap();
+            if nt.as_ref() == &start_node_type {
+                left.push(node_id);
+            } else {
+                right.push(node_id)
+            }
+        }
+
+        features.features.fill_missing_nodes();
+        let vpcg = crate::algos::vpcg::VPCG {
+            max_terms: self.max_terms, 
+            iterations: self.passes
+        };
+        let results = vpcg.learn(graph.graph.as_ref(), &features.features, (&left, &right));
+        results
+    }
+
+}
 
 
 /// Helper method for looking up an embedding.
@@ -2020,6 +2060,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PprRankLearner>()?;
     m.add_class::<PageRank>()?;
     m.add_class::<Smci>()?;
+    m.add_class::<VpcgEmbedder>()?;
     Ok(())
 }
 

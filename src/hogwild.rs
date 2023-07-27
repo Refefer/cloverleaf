@@ -24,6 +24,11 @@ impl<T> Hogwild<T> {
         let ptr = self.0.as_ref().get();
         unsafe { &mut *ptr }
     }
+
+    pub fn into_inner(self) -> Option<T> {
+        Arc::into_inner(self.0).map(|x| x.into_inner())
+    }
+
 }
 
 impl<T> Default for Hogwild<T>
