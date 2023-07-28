@@ -8,11 +8,14 @@ use crate::progress::CLProgressBar;
 use crate::graph::{Graph,NodeID,CDFtoP};
 use crate::feature_store::FeatureStore;
 use crate::hogwild::Hogwild;
+use crate::algos::utils::FeatureHasher;
+use crate::embeddings::{Distance,EmbeddingStore};
 
 type SparseEmbeddings = Vec<Vec<(usize, f32)>>;
 
 pub struct VPCG {
     pub max_terms: usize,
+    pub dims: usize,
     pub iterations: usize
 }
 
@@ -23,7 +26,7 @@ impl VPCG {
         graph: &G,
         features: &FeatureStore,
         mask: (&[NodeID], &[NodeID]),
-    ) -> SparseEmbeddings {
+    ) -> EmbeddingStore {
         
         let mut propagations: SparseEmbeddings = (0..graph.len())
             .map(|node_id| {
@@ -55,36 +58,76 @@ impl VPCG {
             };
 
             // For each node, grab the edges and propagate from them to it
-            node_set.par_iter().enumerate().for_each(|(node_id, mask)| {
-                // Sum up features
-                let mut term_map = HashMap::new();
-                let (edges, weights) = graph.get_edges(node_id);
-                edges.iter().zip(CDFtoP::new(weights)).for_each(|(edge, p)| {
-                    let feats = &propagations.get()[*edge];
-                    for (feat, score) in feats {
-                        let e = term_map.entry(feat).or_insert(0f32);
-                        *e += p * score;
-                    }
+            node_set.par_iter().enumerate().chunks(128).for_each(|chunk| {
+                chunk.par_iter().for_each(|(node_id, mask)| {
+                    // Sum up features
+                    let mut term_map = HashMap::new();
+                    let (edges, weights) = graph.get_edges(*node_id);
+                    edges.iter().zip(CDFtoP::new(weights)).for_each(|(edge, p)| {
+                        let feats = &propagations.get()[*edge];
+                        for (feat, score) in feats {
+                            let e = term_map.entry(feat).or_insert(0f32);
+                            *e += p * score;
+                        }
+                    });
+
+                    // L2 norm
+                    let norm = term_map.par_values().map(|s| s.powf(2.)).sum::<f32>().sqrt();
+                    let mut results = term_map.into_par_iter().map(|(feature, score)| {
+                        (*feature, score / norm)
+                    }).collect::<Vec<_>>();
+                    
+                    // Sort and add to propagations
+                    results.par_sort_unstable_by_key(|(_, s)| FloatOrd(-*s));
+                    let node_feats = &mut propagations.get()[*node_id];
+                    node_feats.clear();
+
+                    results.into_iter().take(self.max_terms).for_each(|ts| node_feats.push(ts));
                 });
-
-                // L2 norm
-                let norm = term_map.par_values().map(|s| s.powf(2.)).sum::<f32>().sqrt();
-                let mut results = term_map.into_par_iter().map(|(feature, score)| {
-                    (*feature, score / norm)
-                }).collect::<Vec<_>>();
-                
-                // Sort and add to propagations
-                results.par_sort_unstable_by_key(|(_, s)| FloatOrd(-*s));
-                let node_feats = &mut propagations.get()[node_id];
-                node_feats.clear();
-
-                results.into_iter().take(self.max_terms).for_each(|ts| node_feats.push(ts));
-                pb.inc(1);
+                pb.inc(chunk.len() as u64);
             });
         }
 
+        // Convert it to an embedding store
         pb.finish();
-        propagations.into_inner().expect("Shouldn't have any other references!")
+        let props = propagations.into_inner().expect("Shouldn't have any other references!");
+        let num_features = features.num_features();
+        self.convert_to_es(num_features, props)
+    }
+
+    fn build_hash_table(
+        &self,
+        num_features: usize,
+    ) -> Vec<[(i8, usize); 3]> {
+        let mut hash_lookups = vec![[(1i8, 0usize); 3]; num_features];
+        let hasher = FeatureHasher::new(self.dims);
+        hash_lookups.par_iter_mut().enumerate().for_each(|(feat_idx, hashes)| {
+            hashes.par_iter_mut().enumerate().for_each(|(hash_num, out)| {
+                *out = hasher.hash(feat_idx, hash_num);
+            });
+        });
+        hash_lookups
+    }
+
+    fn convert_to_es(
+        &self, 
+        num_features: usize, 
+        embeddings: SparseEmbeddings
+    ) -> EmbeddingStore {
+        let hash_table = self.build_hash_table(num_features);
+        embeddings.iter().take(10).for_each(|s| {
+            println!("{:?}", s);
+        });
+        let mut embs = EmbeddingStore::new(embeddings.len(), self.dims, Distance::Cosine);
+        embeddings.into_par_iter().enumerate().for_each(|(node_id, sparse_emb)| {
+            let emb = embs.get_embedding_mut_hogwild(node_id);
+            for (feat, weight) in sparse_emb {
+                for (sign, dim) in hash_table[feat] {
+                    emb[dim] += sign as f32 * weight;
+                }
+            }
+        });
+        embs
     }
 
 }

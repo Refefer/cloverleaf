@@ -1,5 +1,8 @@
 /// Random utility functions
+use std::hash::{Hash,Hasher};
+
 use rand::prelude::*;
+use ahash::AHasher;
 
 /// Counts a set of items by id.  See the test for examples.
 pub struct Counter<'a> {
@@ -57,6 +60,41 @@ pub fn get_best_count<R: Rng>(counts: &[usize], rng: &mut R) -> usize {
         ties[0]
     }
 
+}
+
+pub struct FeatureHasher {
+    dims: usize
+}
+
+impl FeatureHasher {
+
+    pub fn new(dims: usize) -> Self {
+        FeatureHasher { dims }
+    }
+
+    #[inline]
+    pub fn hash(
+        &self,
+        feature: usize, 
+        hash_num: usize
+    ) -> (i8, usize) {
+        self.compute_sign_idx(feature, hash_num)
+    }
+
+    #[inline(always)]
+    fn calculate_hash<T: Hash>(t: T) -> u64 {
+        let mut s = AHasher::default();
+        t.hash(&mut s);
+        s.finish()
+    }
+
+    #[inline]
+    fn compute_sign_idx(&self, feat: usize, hash_num: usize) -> (i8, usize) {
+        let hash = FeatureHasher::calculate_hash((feat, hash_num)) as usize;
+        let sign = (hash & 1) as i8;
+        let idx = (hash >> 1) % self.dims as usize;
+        (2 * sign - 1, idx)
+    }
 }
 
 

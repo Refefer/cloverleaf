@@ -1969,21 +1969,22 @@ impl PprRankLearner {
 #[pyclass]
 struct VpcgEmbedder {
     max_terms: usize, 
-    passes: usize
+    passes: usize,
+    dims: usize
 }
 
 #[pymethods]
 impl VpcgEmbedder {
     #[new]
-    pub fn new(max_terms: usize, passes: usize) -> Self {
-        VpcgEmbedder { max_terms, passes }
+    pub fn new(max_terms: usize, passes: usize, dims: usize) -> Self {
+        VpcgEmbedder { max_terms, passes, dims }
     }
 
     pub fn learn(&self, 
         graph: &Graph, 
         features: &mut FeatureSet,
         start_node_type: String
-    ) -> Vec<Vec<(usize, f32)>> {
+    ) -> NodeEmbeddings  {
         let (mut left, mut right) = (Vec::new(), Vec::new());
         for node_id in 0..graph.graph.len() {
             let nt = graph.vocab.get_node_type(node_id).unwrap();
@@ -1997,10 +1998,16 @@ impl VpcgEmbedder {
         features.features.fill_missing_nodes();
         let vpcg = crate::algos::vpcg::VPCG {
             max_terms: self.max_terms, 
-            iterations: self.passes
+            iterations: self.passes,
+            dims: self.dims
         };
-        let results = vpcg.learn(graph.graph.as_ref(), &features.features, (&left, &right));
-        results
+        let embs = vpcg.learn(graph.graph.as_ref(), &features.features, (&left, &right));
+        let node_embeddings = NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings:embs 
+        };
+
+       node_embeddings 
     }
 
 }
