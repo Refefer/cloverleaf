@@ -8,7 +8,7 @@ pub struct BitSet {
 
 impl BitSet {
     pub fn new(size: usize) -> Self {
-        Self { bitfield: vec![0; (size / 4) + 1] }
+        Self { bitfield: vec![0; (size / 32) + 1] }
     }
 
     fn get_bit_idx(&self, idx: &usize) -> (usize, u32) {
