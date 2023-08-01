@@ -59,4 +59,11 @@ mod bitset_tests {
 
     }
 
+    #[test]
+    fn test_size_of() {
+        let mut bitset = BitSet::new(1201);
+        assert_eq!(bitset.bitfield.len(), 38);
+    }
+
+
 }
