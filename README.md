@@ -18,4 +18,3 @@ TODO
 2. Lots of tests still needed :)
 3. Build examples for each of the methods currently available
 4. Algos: Power Iteration based PageRank optimizer
-5. Algos: VPCG
