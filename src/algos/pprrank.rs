@@ -315,6 +315,7 @@ impl PprRank {
     ) -> (ANode, Vec<NodeCounts>) {
         let mut ranked_ids = Vec::with_capacity(self.k + self.negatives);
         let mut ranked_scores = Vec::with_capacity(self.k + self.negatives);
+        let mut neg_ids = Vec::with_capacity(self.negatives);
 
         // Add the positives
         let (nodes, scores) = walk_lib.get(node);
@@ -322,8 +323,11 @@ impl PprRank {
         ranked_scores.extend_from_slice(scores);
 
         // Sample random negatives
-        sampler.sample_negatives(graph, node, &mut ranked_ids, self.negatives, rng);
-        (0..self.negatives).for_each(|_|ranked_scores.push(0.));
+        sampler.sample_negatives(graph, node, &mut neg_ids, self.negatives, rng);
+        neg_ids.into_iter().for_each(|neg_id| {
+            ranked_ids.push(neg_id);
+            ranked_scores.push(0.);
+        });
 
         // Create the embeddings
         let mut ranked_embeddings = Vec::with_capacity(ranked_ids.len());
@@ -416,7 +420,7 @@ impl WalkLibrary {
     }
 
     fn get(&self, node_id: NodeID) -> (&[NodeID], &[f32]) {
-        let offset:usize = node_id * self.k;
+        let offset: usize = node_id * self.k;
         let len = self.lens[node_id];
         let ns = &self.nodes[offset..(offset+len)];
         let ws = &self.weights[offset..(offset+len)];

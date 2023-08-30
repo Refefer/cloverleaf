@@ -73,7 +73,7 @@ def build_arg_parser():
     parser.add_argument("--max-neighbors",
         dest="max_neighbors",
         type=int,
-        default=10,
+        default=None,
         help="Samples MAX_NEIGHBORS nodes for node reconstruction.")
 
     parser.add_argument("--hard-negatives",
@@ -207,9 +207,16 @@ def main(args):
         temp, negs = args.contrastive
         loss = cloverleaf.EPLoss.contrastive(float(temp), int(negs))
 
+    max_neighbors = args.max_neighbors
+    if args.ep is not None:
+        if args.max_neighbors is None:
+            max_neighbors = 10
+    elif max_neighbors is None:
+        max_neighbors = 1
+
     ep = cloverleaf.EmbeddingPropagator(
         alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
-        passes=args.passes, max_nodes=args.max_neighbors, 
+        passes=args.passes, max_nodes=max_neighbors, 
         max_features=args.max_features, attention=args.attention, 
         attention_heads=args.attention_heads, context_window=args.context_window, 
         noise=args.gradient_noise, hard_negatives=args.hard_negatives, valid_pct=args.valid_pct)
