@@ -2007,7 +2007,7 @@ impl VpcgEmbedder {
             embeddings:embs 
         };
 
-       node_embeddings 
+        node_embeddings 
     }
 
 }

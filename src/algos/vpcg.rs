@@ -115,9 +115,6 @@ impl VPCG {
         embeddings: SparseEmbeddings
     ) -> EmbeddingStore {
         let hash_table = self.build_hash_table(num_features);
-        embeddings.iter().take(10).for_each(|s| {
-            println!("{:?}", s);
-        });
         let mut embs = EmbeddingStore::new(embeddings.len(), self.dims, Distance::Cosine);
         embeddings.into_par_iter().enumerate().for_each(|(node_id, sparse_emb)| {
             let emb = embs.get_embedding_mut_hogwild(node_id);
