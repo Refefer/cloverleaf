@@ -19,30 +19,38 @@ The library is broken up into a few different methods:
     - Approximate Nearest Neighbors (ANN) via Random Projections
     - Neighborhood Alignment
 
-##Data Format
+## Installation
 
+1. Create a new python virtualenv
+2. `pip install maturin numpy`
+3. Ensure you have the latest Rust compiler
+4. `RUSTFLAGS="-C target-cpu=native" maturin develop --release`
+5. Profit!
+
+## Data Format
 
 Graphs can be defined either adhoc or loaded from files.  Notably, Cloverleaf does _not_ allow for live graph updating currently; this allows it to make a number of optimizations to maximize the memory and compute efficiency of the graph.
 
-###Adhoc Graph Definition
-===
+### Adhoc Graph Definition
 
-Cloverleaf provides a GraphBuilder constructor for adhoc building of graphs.  The function `add_edge` adds an edge between two nodes.  Nodes are defined by two attributes: the node_type, and the node_name, which together represent a unique node within the Cloverleaf graph.
+Cloverleaf provides a [GraphBuilder](https://github.com/Refefer/cloverleaf/blob/367ef706e96a6674088882a7c7a0567853329c19/src/lib.rs#L427-L455) helper object for adhoc construction of graphs.  The method `add_edge` adds an edge between two nodes.  Nodes are defined by two attributes: the node_type, and the node_name, which together represent a unique node within the Cloverleaf graph.
 
 #### Parameters
-    1. `from_node` - Fully qualified node tuple - (node_type, node_name)
-    2. `to_node` - Fully qualified node tuple - (node_type, node_name)
-    3. `edge_weight` - Edge weight; used in a variety of algorithms.
-    4. `edge_type` - Directed or Undirected.  Cloverleaf internally stores edges as directed; setting the edge_type as Undirected will create two directed edges between the two nodes.
+
+1. `from_node` - Fully qualified node tuple - (node_type, node_name)
+2. `to_node` - Fully qualified node tuple - (node_type, node_name)
+3. `edge_weight` - Edge weight; used in a variety of algorithms.
+4. `edge_type` - Directed or Undirected.  Cloverleaf internally stores edges as directed; setting the edge_type as Undirected will create two directed edges between the two nodes.
 
 ```python3
->>> import cloverleaf
->>> gb = cloverleaf.GraphBuilder()
->>> gb.add_edge(('query', 'red sox'), ('sku', '15715'), 1, cloverleaf.EdgeType.Undirected)
->>> graph = gb.build_graph()
+import cloverleaf
+
+gb = cloverleaf.GraphBuilder()
+gb.add_edge(('query', 'red sox'), ('sku', '15715'), 1, cloverleaf.EdgeType.Undirected)
+graph = gb.build_graph()
 ```
 
-###Load Graph From Disk
+### Load Graph From Disk
 
 This is the prefered method of loading graphs into Cloverleaf.  The file format is simple, using TSVs for specifying the graphs:
 
@@ -52,15 +60,22 @@ Edges file:
 From_Node_Type<TAB>From_Node_Name<TAB>To_Node_Type<TAB>To_Node_Name<TAB>Edge_Weight\n
 ```
 
+For example:
+
+```
+user	Alice	movie	Dr. Strangelove	5
+user	Bob	movie	Vertigo	4
+```
+
 To load a graph from disk, the `load()` method is invoked:
 
 ```python3
->>> import cloverleaf
->>> graph = cloverleaf.Graph.load("karate.edges", cloverleaf.EdgeType.Undirected)
-Read 34 nodes, 156 edges...
+import cloverleaf
+graph = cloverleaf.Graph.load("karate.edges", cloverleaf.EdgeType.Undirected)
+# Read 34 nodes, 156 edges...
 ```
 
-###Loading Features
+### Loading Features
 
 Some algorithms use node features as part of the optimization step.  FeatureSets can be instantiated in two ways:
 
@@ -70,12 +85,12 @@ Some algorithms use node features as part of the optimization step.  FeatureSets
 It is preferable to instantiate a FeatureSet from a graph for memory efficiency:
 
 ```python3
->>> fs = cloverleaf.FeatureSet.new_from_graph(graph)
->>> fs.get_features(('node', '1'))
-[]
->>> fs.set_features(('node', '1'), ['hello', 'world'])
->>> fs.get_features(('node', '1'))
-['hello', 'world']
+fs = cloverleaf.FeatureSet.new_from_graph(graph)
+fs.get_features(('node', '1'))
+# []
+fs.set_features(('node', '1'), ['hello', 'world'])
+fs.get_features(('node', '1'))
+# ['hello', 'world']
 ```
 
 After instantiating, the `load_into()` can be called to add features to all nodes:
@@ -92,8 +107,7 @@ Invoked with:
 >>> fs.load_into("path")
 ```
 
-Algorithms In Detail
----
+## Algorithms In Detail
 
 ### Label Propagation Algorithm
 
@@ -104,9 +118,10 @@ Cloverleaf implements the algorithm with a few additional features.  First, it a
 The embedder returns a NodeEmbeddings object.
 
 #### Parameters
-    1. `k` - Number of times to rerun LPA
-    2. `passes` - Number of iterations to run each LPA.
-    3. `seed` - Random seed to use.
+
+1. `k` - Number of times to rerun LPA
+2. `passes` - Number of iterations to run each LPA.
+3. `seed` - Random seed to use.
 
 #### Example
 
@@ -272,26 +287,14 @@ A simple random projection based ANN method which can be consumed directly or in
 [(('node', '1'), 0.08715250343084335), (('node', '34'), 0.022087719291448593), (('node', '33'), 0.015960847958922386), (('node', '9'), 0.014207975938916206), (('node', '14'), 0.014015674591064453)]
 ```
 
-
-Install
----
-
-1. Setup a new python virtualenv
-2. pip install maturin numpy
-3. Ensure you have the latest Rust compiler
-4. RUSTFLAGS="-C target-cpu=native" maturin develop --release
-5. Profit!
-
-TODO
----
+## TODO
 
 1. Lots of documentation still needed
 2. Lots of tests still needed :)
 3. Build examples for each of the methods currently available
 4. Algos: Power Iteration based PageRank optimizer
 
-References
----
+## References
 
 1. ZhuЃ, Xiaojin, and Zoubin GhahramaniЃн. "Learning from labeled and unlabeled data with label propagation." ProQuest Number: INFORMATION TO ALL USERS (2002).
 2. Xie, Jierui, Boleslaw K. Szymanski, and Xiaoming Liu. "Slpa: Uncovering overlapping communities in social networks via a speaker-listener interaction dynamic process." 2011 ieee 11th international conference on data mining workshops. IEEE, 2011.
