@@ -60,8 +60,8 @@ impl Reweighter {
             } else {
                 0.5
             };
-            *wi = (1. - alpha) * *wi + alpha * p;
-            //*wi *= (p).powf(alpha);
+            //*wi = (1. - alpha) * *wi + alpha * p;
+            *wi *= (p).powf(alpha);
         });
 
     }

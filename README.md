@@ -233,6 +233,46 @@ Random Walks with Restarts is an algorithm which estimates the stationary distri
 [(('node', '12'), 0.026669999584555626), (('node', '13'), 0.019355567172169685), (('node', '11'), 0.018968328833580017), (('node', '18'), 0.018936293199658394), (('node', '5'), 0.018457578495144844)]
 ```
 
+### Guided Random Walk with Restarts
+Guided Random Walks with Restarts is an algorithm which estimates the stationary distribution from a given node conditioned on a starting node and an embedding context, returning the top K most highest weighted nodes.  GRWR reweights random walks during the estimation process, guiding the walk distribution toward nodes which (ideally) minimize the distance of walked nodes and the context.  This is helpful when additional side information is helpful in guiding the stationary distribution estimate; for example, user personalization embeddings are often useful in combination with random walks.
+
+#### Parameters
+1. `walks` - Number of random walks to perform.  The larger the number, the more accurate the estimation with the expense of latency.
+2. `restarts` - Float defining the termination criteria.  When `restarts` is between (0,1), walk termination is probabilistic.  When `restarts` >=1, it is interpreted as a fixed number of steps (e.g. restarts=3 would indicate walks should be terminated after three steps). 
+3. `beta` - Damping parameter controlling how much to bias toward popular vs rare items. See [6] for more details.
+4. `blend` - This defines how much weight to place on the guidance.  When the blend approaches 0, more weight is placed on the graph topology; when the blend approaches 1, more weight is placed on minimizing embedding distances.
+
+#### Example
+
+```python3
+>>> slpa = cloverleaf.SLPAEmbedder(k=5, threshold=0.1) # This isn't a particularly useful embedding for this application but serves as an example
+>>> embs = slpa.learn(graph)
+>>> brw = cloverleaf.BiasedRandomWalker(walks=100_000, restarts=1/3, beta=0.5, blend=0.8)
+>>> brw.walk(graph, embs, ('node', '1'), context=cloverleaf.Query.node('node', '16'), k=5)
+[(('node', '1'), 0.08715250343084335), (('node', '34'), 0.022087719291448593), (('node', '33'), 0.015960847958922386), (('node', '9'), 0.014207975938916206), (('node', '14'), 0.014015674591064453)]
+```
+
+
+### Approximate Nearest Neighbors
+A simple random projection based ANN method which can be consumed directly or in subsequent algorithms (e.g. Neighborhod Alignment)
+
+#### Parameters
+1. `walks` - Number of random walks to perform.  The larger the number, the more accurate the estimation with the expense of latency.
+2. `restarts` - Float defining the termination criteria.  When `restarts` is between (0,1), walk termination is probabilistic.  When `restarts` >=1, it is interpreted as a fixed number of steps (e.g. restarts=3 would indicate walks should be terminated after three steps). 
+3. `beta` - Damping parameter controlling how much to bias toward popular vs rare items. See [6] for more details.
+4. `blend` - This defines how much weight to place on the guidance.  When the blend approaches 0, more weight is placed on the graph topology; when the blend approaches 1, more weight is placed on minimizing embedding distances.
+
+#### Example
+
+```python3
+>>> slpa = cloverleaf.SLPAEmbedder(k=5, threshold=0.1) # This isn't a particularly useful embedding for this application but serves as an example
+>>> embs = slpa.learn(graph)
+>>> brw = cloverleaf.BiasedRandomWalker(walks=100_000, restarts=1/3, beta=0.5, blend=0.8)
+>>> brw.walk(graph, embs, ('node', '1'), context=cloverleaf.Query.node('node', '16'), k=5)
+[(('node', '1'), 0.08715250343084335), (('node', '34'), 0.022087719291448593), (('node', '33'), 0.015960847958922386), (('node', '9'), 0.014207975938916206), (('node', '14'), 0.014015674591064453)]
+```
+
+
 Install
 ---
 

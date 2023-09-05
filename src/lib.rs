@@ -383,7 +383,8 @@ impl BiasedRandomWalker {
         let steps = if self.restarts >= 1. {
             GSteps::Fixed(self.restarts as usize)
         } else if self.restarts > 0. {
-            GSteps::Probability(self.restarts, (1. / self.restarts).ceil() as usize)
+            let one_percent = 0.01f32.ln() / (1. - self.restarts).ln();
+            GSteps::Probability(self.restarts, (one_percent).ceil() as usize)
         } else {
             return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
         };
