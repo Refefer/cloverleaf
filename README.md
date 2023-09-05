@@ -257,19 +257,16 @@ Guided Random Walks with Restarts is an algorithm which estimates the stationary
 A simple random projection based ANN method which can be consumed directly or in subsequent algorithms (e.g. Neighborhod Alignment)
 
 #### Parameters
-1. `walks` - Number of random walks to perform.  The larger the number, the more accurate the estimation with the expense of latency.
-2. `restarts` - Float defining the termination criteria.  When `restarts` is between (0,1), walk termination is probabilistic.  When `restarts` >=1, it is interpreted as a fixed number of steps (e.g. restarts=3 would indicate walks should be terminated after three steps). 
-3. `beta` - Damping parameter controlling how much to bias toward popular vs rare items. See [6] for more details.
-4. `blend` - This defines how much weight to place on the guidance.  When the blend approaches 0, more weight is placed on the graph topology; when the blend approaches 1, more weight is placed on minimizing embedding distances.
-
-#### Example
+1. `embs` - Embeddings to indext
+2. `n_trees` - Number of random projection trees to use.  More trees increase accuracy at the expense of compute. 
+3. `max_nodes_per_leaf` - Cloverleaf will keep splitting trees until each leaf node contains less than or equal to max_nodes_per_leaf.
+4. `seed` - Random seed to use for choosing hyperlanes.
 
 ```python3
 >>> slpa = cloverleaf.SLPAEmbedder(k=5, threshold=0.1) # This isn't a particularly useful embedding for this application but serves as an example
 >>> embs = slpa.learn(graph)
->>> brw = cloverleaf.BiasedRandomWalker(walks=100_000, restarts=1/3, beta=0.5, blend=0.8)
->>> brw.walk(graph, embs, ('node', '1'), context=cloverleaf.Query.node('node', '16'), k=5)
-[(('node', '1'), 0.08715250343084335), (('node', '34'), 0.022087719291448593), (('node', '33'), 0.015960847958922386), (('node', '9'), 0.014207975938916206), (('node', '14'), 0.014015674591064453)]
+>>> ann = cloverleaf.EmbAnn(embs, 5, 10)
+>>> ann.find(embs, cloverleaf.Query.node('user', '1'))
 ```
 
 
