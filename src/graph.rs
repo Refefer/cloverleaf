@@ -42,13 +42,17 @@ pub trait CDFGraph: Graph {}
 /// lists tend to use more memory.
 #[derive(Clone)]
 pub struct CSR {
-    rows: Vec<NodeID>,
-    columns: Vec<NodeID>,
-    weights: Vec<f32>
+    pub(crate) rows: Vec<NodeID>,
+    pub(crate) columns: Vec<NodeID>,
+    pub(crate) weights: Vec<f32>,
 }
 
 impl CSR {
-    pub fn construct_from_edges(edges: Vec<(NodeID, NodeID, f32)>) -> Self {
+    pub fn construct_from_edges(mut edges: Vec<(NodeID, NodeID, f32)>) -> Self {
+
+        // ensure uniqueness of edges
+        edges.sort_by_key(|(n1,n2,_)| (*n1,*n2));
+        edges.dedup();
 
         // Determine the number of rows in the adjacency graph
         let max_node = edges.iter().map(|(from_node, to_node, _)| {
@@ -185,7 +189,7 @@ impl NormalizedGraph for NormalizedCSR {}
 /// This is the main one used in Cloverleaf - converts CSR formatted graphs into CDF format to make sampling from
 /// edges efficient (log(N)).  
 #[derive(Clone)]
-pub struct CumCSR(CSR);
+pub struct CumCSR(pub(crate) CSR);
 
 impl CumCSR {
     pub fn convert(mut csr: CSR) -> Self {

@@ -16,4 +16,7 @@ pub mod ann;
 pub mod emb_aligner;
 pub mod pagerank;
 pub mod vpcg;
+pub mod prone;
+pub mod fast_random_projection;
 mod grad_utils;
+mod rsvd;

@@ -41,6 +41,7 @@ use std::ops::Deref;
 use std::fs::File;
 use std::io::{Write,BufWriter,BufReader,BufRead};
 
+use nalgebra_sparse::CsrMatrix;
 use rayon::prelude::*;
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
@@ -206,6 +207,16 @@ impl Graph {
             graph: Arc::new(CumCSR::convert(graph)),
             vocab: Arc::new(vocab)
         }
+    }
+
+    // get the underlying CSR data
+    // returns (data, indices, indptr)
+    // This is useful for processing/debugging in Python
+    fn get_csr_data(&self) -> (Vec<f32>, Vec<usize>, Vec<usize>) {
+        let data = self.graph.0.weights.clone();
+        let indices = self.graph.0.columns.clone();
+        let indptr = self.graph.0.rows.clone();
+        (data, indices, indptr)
     }
 
     pub fn contains_node(&self, name: (String, String)) -> bool {
@@ -1211,6 +1222,168 @@ impl SLPAEmbedder {
 
 }
 
+// Convert graph's CSR memory into nalgebra CSR format
+fn make_nalgebra_csr(graph: &Graph) -> CsrMatrix<f32> {
+
+    // clone graph's memory into a separate CSR matrix 
+    let indptr      = graph.graph.0.rows.clone();
+    let mut indices = graph.graph.0.columns.clone();
+    let mut data    = graph.graph.0.weights.clone();
+
+    // ensure that indices are sorted for canonical CSR format
+    csr_sort_indices(indptr.len()-1, &indptr, &mut indices, &mut data);
+
+    let n = indptr.len() - 1;
+
+    let adj_mat = CsrMatrix::try_from_csr_data(
+        n,n,
+        indptr,
+        indices,
+        data,
+    ).unwrap();
+
+    return adj_mat;
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UFPair {
+    pub i: usize,
+    pub d: f32,
+}
+
+impl UFPair {
+    fn new(i: usize, d: f32) -> Self {
+        Self { i,d }
+    }
+}
+
+/// sort indices and data of a CSR matrix in place
+fn csr_sort_indices(
+    n_row: usize,
+    indptr: &[usize],
+    indices: &mut [usize],
+    data: &mut [f32]
+) {
+    let mut temp = vec![];
+    for i in 0..n_row {
+        let s = indptr[i];
+        let e = indptr[i+1];
+        temp.resize(e - s, UFPair::new(0, 0.0));
+        for (n, jj) in (s..e).enumerate() {
+            temp[n].i = indices[jj];
+            temp[n].d = data[jj];
+        }
+        temp.sort_by(|a,b| a.i.cmp(&b.i));
+        for (n, jj) in (s..e).enumerate() {
+            indices[jj] = temp[n].i;
+            data[jj] = temp[n].d;
+        }
+    }
+}
+
+#[pyclass]
+struct FastRandomProjectionEmbedder {
+    dims: usize,
+    weights: Vec<f32>,
+    norm_powers: bool,
+    seed: u64,
+}
+
+#[pymethods]
+impl FastRandomProjectionEmbedder {
+    #[new]
+    pub fn new(
+        dims: usize,
+        weights: Vec<f32>,
+        norm_powers: Option<bool>,
+        seed: Option<u64>,
+    ) -> Self {
+        Self {
+            dims,
+            weights,
+            norm_powers: norm_powers.unwrap_or(true),
+            seed: seed.unwrap_or(SEED),
+        }
+    }
+
+    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
+        let adj_mat = make_nalgebra_csr(&graph);
+
+        let es = crate::algos::fast_random_projection::get_fastrp_embeddings(
+            &adj_mat,
+            self.dims,
+            &self.weights,
+            self.norm_powers,
+            self.seed,
+        );
+
+        NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings: es
+        }
+    }
+}
+
+#[pyclass]
+struct ProneEmbedder {
+    dims: usize,
+    n_samples: Option<usize>,
+    n_subspace_iters: Option<usize>,
+    order: usize,
+    mu: f32,
+    theta: f32,
+    seed: u64,
+}
+
+#[pymethods]
+impl ProneEmbedder {
+
+    #[new]
+    pub fn new(
+        dims: usize,
+        n_samples: Option<usize>,
+        n_subspace_iters: Option<usize>,
+        order: usize,
+        mu: f32,
+        theta: f32,
+        seed: Option<u64>
+    ) -> Self {
+        let seed = seed.unwrap_or(SEED);
+        Self {
+            dims,
+            seed,
+            n_samples,
+            n_subspace_iters,
+            order,
+            mu,
+            theta,
+        }
+    }
+
+    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
+
+        let adj_mat = make_nalgebra_csr(&graph);
+        
+        let es = crate::algos::prone::get_prone_embeddings(
+            &adj_mat,
+            self.dims,
+            self.n_samples,
+            self.n_subspace_iters,
+            self.order,
+            self.mu,
+            self.theta,
+            self.seed,
+        );
+
+        NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings: es
+        }
+
+    }
+
+}
+
 /// Struct for learning Speaker-Listener multi-cluster embeddings.  Uses Hamming Distance for
 /// distance.
 #[pyclass]
@@ -2051,6 +2224,8 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<DistanceEmbedder>()?;
     m.add_class::<ClusterLPAEmbedder>()?;
     m.add_class::<SLPAEmbedder>()?;
+    m.add_class::<ProneEmbedder>()?;
+    m.add_class::<FastRandomProjectionEmbedder>()?;
     m.add_class::<NodeEmbeddings>()?;
     m.add_class::<VocabIterator>()?;
     m.add_class::<EPLoss>()?;
