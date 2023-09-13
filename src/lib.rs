@@ -1226,11 +1226,11 @@ impl SLPAEmbedder {
 fn make_nalgebra_csr(graph: &Graph) -> CsrMatrix<f32> {
 
     // clone graph's memory into a separate CSR matrix 
-    let indptr      = graph.graph.0.rows.clone();
-    let mut indices = graph.graph.0.columns.clone();
-    let mut data    = graph.graph.0.weights.clone();
-
+    let indptr = graph.graph.0.rows.clone();
+    let indices = graph.graph.0.columns.clone();
+    let data = graph.graph.0.weights.clone();
     let n = indptr.len() - 1;
+
     let adj_mat = CsrMatrix::try_from_csr_data(
         n,n,
         indptr,
