@@ -1230,11 +1230,7 @@ fn make_nalgebra_csr(graph: &Graph) -> CsrMatrix<f32> {
     let mut indices = graph.graph.0.columns.clone();
     let mut data    = graph.graph.0.weights.clone();
 
-    // ensure that indices are sorted for canonical CSR format
-    csr_sort_indices(indptr.len()-1, &indptr, &mut indices, &mut data);
-
     let n = indptr.len() - 1;
-
     let adj_mat = CsrMatrix::try_from_csr_data(
         n,n,
         indptr,
@@ -1243,42 +1239,6 @@ fn make_nalgebra_csr(graph: &Graph) -> CsrMatrix<f32> {
     ).unwrap();
 
     return adj_mat;
-}
-
-#[derive(Clone, Copy, Debug)]
-struct UFPair {
-    pub i: usize,
-    pub d: f32,
-}
-
-impl UFPair {
-    fn new(i: usize, d: f32) -> Self {
-        Self { i,d }
-    }
-}
-
-/// sort indices and data of a CSR matrix in place
-fn csr_sort_indices(
-    n_row: usize,
-    indptr: &[usize],
-    indices: &mut [usize],
-    data: &mut [f32]
-) {
-    let mut temp = vec![];
-    for i in 0..n_row {
-        let s = indptr[i];
-        let e = indptr[i+1];
-        temp.resize(e - s, UFPair::new(0, 0.0));
-        for (n, jj) in (s..e).enumerate() {
-            temp[n].i = indices[jj];
-            temp[n].d = data[jj];
-        }
-        temp.sort_by(|a,b| a.i.cmp(&b.i));
-        for (n, jj) in (s..e).enumerate() {
-            indices[jj] = temp[n].i;
-            data[jj] = temp[n].d;
-        }
-    }
 }
 
 #[pyclass]
