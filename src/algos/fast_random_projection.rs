@@ -94,7 +94,7 @@ fn fast_random_projection(
         pb.update_message(|msg| {msg.clear(); write!(msg, "Iter {}/{}", i, k).expect("failed to update message"); });
         power_k = &M * power_k;
         out += if norm_powers {
-            l2_normalize(&mut power_k) * weights[i]
+            l2_normalize(&power_k) * weights[i]
         } else {
             &power_k * weights[i]
         };
