@@ -33,19 +33,11 @@ pub fn get_fastrp_embeddings(
     seed: u64,
 ) -> EmbeddingStore {
     let mut rng = XorShiftRng::seed_from_u64(seed);
-    let k = weights.len();
 
-    let pb = CLProgressBar::new(100, true);
-    pb.update_message(|msg| { msg.clear(); write!(msg, "Stage 1/2").expect("Error writing out indicator message!"); });
-
-    let ulist = fast_random_projection(
-        A, dims, k, &mut rng
+    let embeddings = fast_random_projection(
+        A, dims, weights, norm_powers, &mut rng
     );
-    pb.inc(20);
-    
-    pb.update_message(|msg| { msg.clear(); write!(msg, "Stage 2/2").expect("Error writing out indicator message!"); });
-    let embeddings = merge_matrices(ulist, weights, norm_powers);
-    pb.inc(80);
+
     let mut es = EmbeddingStore::new(A.nrows(), dims, Distance::Cosine);
     embeddings.row_iter()
     .into_iter()
@@ -60,11 +52,15 @@ pub fn get_fastrp_embeddings(
 fn fast_random_projection(
     A: &CsrMatrix<f32>,
     dim: usize,
-    k: usize,
+    weights: &[f32],
+    norm_powers: bool,
     rng: &mut impl Rng
-) -> Vec<DMatrix<f32>> {
+) -> DMatrix<f32> {
 
+    let k = weights.len();
     let mut a_sum = csr_row_sum(&A);
+    
+    // FIXME: there is a possibility for division by zero here
     a_sum.iter_mut().for_each(|x| *x = 1.0 / *x);
     let normalizer = diag(a_sum);
 
@@ -81,28 +77,30 @@ fn fast_random_projection(
         rng
     );
 
+    let pb = CLProgressBar::new(k as u64, true);
+    
     // powers of the transition matrix by chain matrix multiplication
-    let initial = convert_csr_dense(&(&M * projection_matrix.transpose()));
-    let mut ulist = vec![initial];
-    for _ in 2..(k+1) {
-        let prev = &ulist[ulist.len()-1];
-        ulist.push(&M * prev);
-    }
-    return ulist;
-}
+    // for memory efficiency we interleave power computation
+    // with calculating the final output.
+    let mut power_k = convert_csr_dense(&(&M * projection_matrix.transpose()));
+    let mut out = if norm_powers { 
+        l2_normalize(&power_k) * weights[0]
+    } else {
+        &power_k * weights[0]
+    };
+    pb.inc(1);
 
-// linearly combine a list of matrices using the given weights
-// optionally L2-normalizes them before merging
-fn merge_matrices(mut ulist: Vec<DMatrix<f32>>, weights: &[f32], norm_powers: bool) -> DMatrix<f32> {
-    if norm_powers {
-        ulist.iter_mut().for_each(|u| l2_normalize(u));
+    for i in 1..k {
+        pb.update_message(|msg| {msg.clear(); write!(msg, "Iter {}/{}", i, k).expect("failed to update message"); });
+        power_k = &M * power_k;
+        out += if norm_powers {
+            l2_normalize(&mut power_k) * weights[i]
+        } else {
+            &power_k * weights[i]
+        };
+        pb.inc(1);
     }
-    let (m,n) = (ulist[0].nrows(), ulist[0].ncols());
-    let mut embeddings = DMatrix::zeros(m, n);
-    for i in 0..ulist.len() {
-        embeddings += &ulist[i] * weights[i];
-    }
-    return embeddings;
+    return out;
 }
 
 /// minimum dimension for embedding by Johnson–Lindenstrauss lemma
@@ -225,7 +223,8 @@ fn diag(diag_data: Vec<f32>) -> CsrMatrix<f32> {
 }
 
 // row-wise l2-normalization of matrix
-fn l2_normalize(
+// operates inplace
+fn l2_normalize_inplace(
     data: &mut DMatrix<f32>,
 ) {
     for mut row in data.row_iter_mut() {
@@ -235,6 +234,16 @@ fn l2_normalize(
         }
         row.normalize_mut();
     }
+}
+
+// row-wise l2-normalization of matrix
+// returns a new matrix
+fn l2_normalize(
+    data: &DMatrix<f32>,
+) -> DMatrix<f32> {
+    let mut copy = data.clone();
+    l2_normalize_inplace(&mut copy);
+    return copy;
 }
 
 #[cfg(test)]
@@ -284,28 +293,17 @@ mod tests {
     fn test_fast_random_projection() {
         let mut rng = XorShiftRng::seed_from_u64(1337);
         let A = get_csr();
-        let ulist = fast_random_projection(&A, 3, 3, &mut rng);
-        assert_eq!(ulist.len(), 3);
-    }
-
-    #[test]
-    fn test_merge_matrices() {
-        let mut rng = XorShiftRng::seed_from_u64(1337);
-        let A = get_csr();
-        let weights = [0.333, 0.333, 0.333];
-        let ulist = fast_random_projection(&A, 3, 3, &mut rng);
-        let actual = merge_matrices(ulist, &weights, true);
+        let ws = [0.33, 0.33, 0.33];
+        let embeddings = fast_random_projection(&A, 3, &ws, true, &mut rng);
         let expected = DMatrix::from_column_slice(7, 3, &[
-            0.1006749, 0.043618284, -0.2715608,
-            -0.1293677, -0.1293677, -0.6631907,
-            -0.6199818, -0.31000823, 0.3510673,
-            0.26653367, -0.36758113, -0.36758113,
-            -0.6631907, -0.6199818, 0.0,
+            0.09976793, 0.04322534, -0.26911432,
+            -0.12820223, -0.12820223, -0.6572161,
+            -0.61439645, -0.30721542, 0.3479045,
+            0.26413253, -0.36426955, -0.36426955,
+            -0.6572161, -0.61439645, 0.0,
             0.0, 0.0, 0.0,
-            0.0, -0.19225764, -0.3845153
-        ]);
-        assert_eq!(actual.nrows(), 7);
-        assert_eq!(actual.ncols(), 3);
-        assert_eq!(actual, expected);
+            0.0, -0.19052559, -0.38105118]
+        );
+        assert_eq!(embeddings, expected);
     }
 }
