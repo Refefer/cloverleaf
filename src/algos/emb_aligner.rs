@@ -1,7 +1,5 @@
 use simple_grad::*;
 
-use crate::embeddings::Distance;
-
 pub fn align_embedding(
     embedding: &[f32],
     t_embeddings: &[(&[f32], f32)],
@@ -9,7 +7,7 @@ pub fn align_embedding(
     eps: f32
 ) -> Vec<f32> {
     use_shared_pool(false);
-    let embs: Vec<_> = t_embeddings.iter().map(|(e, d)| {
+    let embs: Vec<_> = t_embeddings.iter().map(|(e, _d)| {
         Constant::new(e.to_vec())
     }).collect();
 

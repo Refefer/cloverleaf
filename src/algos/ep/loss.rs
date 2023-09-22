@@ -4,7 +4,6 @@
 use simple_grad::*;
 use rand::prelude::*;
 use rand_distr::{Distribution,Uniform};
-use hashbrown::HashMap;
 
 use crate::EmbeddingStore;
 use crate::FeatureStore;
@@ -121,12 +120,15 @@ impl Loss {
             }
 
             Loss::RankLoss(tau, _)  => {
+                //let hvn = il2norm(&hv);
                 // Get the dot products
                 let mut ds: Vec<_> = hus.iter().map(|hu| {
+                    //il2norm(hu).dot(&hvn)
                     hu.dot(&hv)
                 }).collect();
                 
                 // Add the positive example
+                //ds.push(hvn.dot(&il2norm(&thv)));
                 ds.push(hv.dot(&thv));
                 let len = ds.len();
                 let dsc = ds.concat();
@@ -157,40 +159,6 @@ impl Loss {
                 model.reconstruct_node_embedding(
                     graph, node, feature_store, feature_embeddings, rng)
             },
-            /*
-            Loss::Contrastive(_,_) | Loss::RankLoss(_,_) | Loss::RankSpace (_,_) => {
-                // Select random out edge
-                let edges = graph.get_edges(node).0;
-
-                // If it has no out edges, nothing to really do.  We can't build a comparison.
-                let choice = *edges.choose(rng).unwrap_or(&node);
-                model.construct_node_embedding(
-                    choice, feature_store, feature_embeddings, rng)
-            },
-            Loss::StarSpace(_, positive, _)  => {
-                // Select random out edge
-                let edges = graph.get_edges(node).0;
-
-                let mut counts = HashMap::new();
-                let mut nodes = Vec::with_capacity(*positive);
-                for num_pos in 0..*positive {
-                    // If it has no out edges, nothing to really do.  We can't build a comparison.
-                    let choice = *edges.choose(rng).unwrap_or(&node);
-                    let (ncs, node) = model.construct_node_embedding(
-                        choice, feature_store, feature_embeddings, rng);
-
-                    ncs.into_iter().for_each(|(key, (n, count))| {
-                        counts.entry(key)
-                            .and_modify(|(node, num)| {
-                                *num += count;
-                            })
-                            .or_insert((n, count));
-                    });
-                    nodes.push(node)
-                }
-                (counts, nodes.sum_all())
-            }
-            */
             Loss::PPR(_, num, restart_p) => {
                 let mut nodes = Vec::with_capacity(*num);
                 for _ in 0..(*num) {

@@ -44,8 +44,7 @@ use std::io::{Write,BufWriter,BufReader,BufRead};
 use rayon::prelude::*;
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError};
-use pyo3::types::PyList;
+use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError};
 use itertools::Itertools;
 use fast_float::parse;
 use rand::prelude::*;
@@ -744,7 +743,8 @@ impl FeatureSet {
             }
             let bow = pieces[2].split_whitespace()
                 .map(|s| s.to_string()).collect();
-            self.set_features((pieces[0].to_string(), pieces[1].to_string()), bow);
+            let _ = self.set_features((pieces[0].to_string(), pieces[1].to_string()), bow);
+                
         }
         Ok(())
     }
@@ -835,16 +835,19 @@ pub struct FeatureAggregator {
 #[pymethods]
 impl FeatureAggregator {
 
+    #[allow(non_snake_case)]
     #[staticmethod]
     pub fn Averaged() -> Self {
         FeatureAggregator { at: AggregatorType::Averaged }
     }
 
+    #[allow(non_snake_case)]
     #[staticmethod]
     pub fn Attention(num_heads: usize, d_k: usize, window: Option<usize>) -> Self {
         FeatureAggregator { at: AggregatorType::Attention {num_heads, d_k, window} }
     }
 
+    #[allow(non_snake_case)]
     #[staticmethod]
     pub fn Weighted(alpha: f32, fs: &FeatureSet) -> Self {
         let unigrams = Arc::new(UnigramProbability::new(&fs.features));
@@ -1230,7 +1233,7 @@ impl PageRank {
     pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
         let page_rank = crate::algos::pagerank::PageRank::new(self.iterations, self.damping, self.eps);
         let scores = page_rank.compute(graph.graph.as_ref());
-        let mut es = EmbeddingStore::new(graph.graph.len(), 1, EDist::Euclidean);
+        let es = EmbeddingStore::new(graph.graph.len(), 1, EDist::Euclidean);
         scores.par_iter().enumerate().for_each(|(node_id, score)| {
             let e1 = es.get_embedding_mut_hogwild(node_id);
             e1[0] = *score;
@@ -1313,9 +1316,27 @@ impl NodeEmbeddings {
         self.embeddings.len()
     }
 
+    pub fn __len__(&self) -> PyResult<usize> {
+        Ok(self.embeddings.len())
+    }
+
+    pub fn __getitem__(&self, mut idx: isize) -> PyResult<((String, String), Vec<f32>)> {
+        let len = self.embeddings.len() as isize;
+        if idx < 0 {
+            idx += len;
+        }
+        if idx >= len {
+            return Err(PyIndexError::new_err(format!("Index larger than embedding store!")));
+        }
+
+        let emb = self.embeddings.get_embedding(idx as usize).to_vec();
+        let (nn, nt) = self.vocab.get_name(idx as usize).expect("Already validated bounds, something borked");
+        Ok((((*nn).clone(), (*nt).clone()), emb))
+    }
+
     pub fn l2norm(&self) {
         (0..self.embeddings.len()).into_par_iter().for_each(|idx| {
-            let mut e = self.embeddings.get_embedding_mut_hogwild(idx);
+            let e = self.embeddings.get_embedding_mut_hogwild(idx);
             let norm = e.iter().map(|ei| ei.powf(2.)).sum::<f32>().sqrt();
             e.iter_mut().for_each(|ei| {
                 *ei /= norm;
@@ -1456,7 +1477,7 @@ impl NodeEmbeddingsBuilder {
         std::mem::swap(&mut vocab, &mut self.vocab);
         std::mem::swap(&mut embeddings, &mut self.embeddings);
 
-        let mut es = EmbeddingStore::new(embeddings.len(), 
+        let es = EmbeddingStore::new(embeddings.len(), 
                                          embeddings[0].len(),
                                          self.distance.to_edist());
         embeddings.par_iter_mut().enumerate().for_each(|(i, emb)| {
@@ -1971,14 +1992,28 @@ impl PprRankLearner {
 struct VpcgEmbedder {
     max_terms: usize, 
     passes: usize,
-    dims: usize
+    dims: usize,
+    alpha: f32,
+    err: f32
 }
 
 #[pymethods]
 impl VpcgEmbedder {
     #[new]
-    pub fn new(max_terms: usize, passes: usize, dims: usize) -> Self {
-        VpcgEmbedder { max_terms, passes, dims }
+    pub fn new(
+        max_terms: usize, 
+        passes: usize, 
+        dims: usize, 
+        alpha: Option<f32>, 
+        err: Option<f32>
+    ) -> Self {
+        VpcgEmbedder { 
+            max_terms, 
+            passes, 
+            dims,
+            alpha: alpha.unwrap_or(1f32),
+            err: err.unwrap_or(1e-5f32)
+        }
     }
 
     pub fn learn(&self, 
@@ -2000,7 +2035,9 @@ impl VpcgEmbedder {
         let vpcg = crate::algos::vpcg::VPCG {
             max_terms: self.max_terms, 
             iterations: self.passes,
-            dims: self.dims
+            dims: self.dims,
+            alpha: self.alpha,
+            err: self.err
         };
         let embs = vpcg.learn(graph.graph.as_ref(), &features.features, (&left, &right));
         let node_embeddings = NodeEmbeddings {

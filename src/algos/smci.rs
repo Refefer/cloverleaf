@@ -113,7 +113,7 @@ impl SupervisedMCIteration {
                         if !seen.contains(node) {
                             seen.insert(*node);
                             let r = actual_reward * self.discount.powf((traj_len - i) as f32);
-                            let mut agg = &mut h_v_state.get()[*node];
+                            let agg = &mut h_v_state.get()[*node];
                             agg.0 += r;
                             agg.1 += 1;
                         }

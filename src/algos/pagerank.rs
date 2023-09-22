@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use rayon::prelude::*;
 
-use crate::graph::{CDFGraph, NodeID, CDFtoP};
+use crate::graph::{CDFGraph, CDFtoP};
 use crate::progress::CLProgressBar;
 
 pub struct PageRank {
@@ -25,7 +25,7 @@ impl PageRank {
 
         let pb = CLProgressBar::new(self.iterations as u64, true);
         let mut err = std::f32::INFINITY;
-        for iter in 0..self.iterations {
+        for _iter in 0..self.iterations {
             pb.update_message(|msg| {
                 msg.clear();
                 write!(msg, "Error: {:.5}", err).expect("Should never fail!");

@@ -1,12 +1,14 @@
 //! Speaker-Listener LPA algorithm.  This allows us to detect overlapping communities and is
 //! conveniently parallel.  Another good baseline which is typically a strong performer.
+use std::fmt::Write;
+
 use rand::prelude::*;
 use rand_distr::{Distribution,Uniform};
 use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
 
 use crate::graph::Graph;
-
+use crate::progress::CLProgressBar;
 use crate::embeddings::{EmbeddingStore, Distance};
 use crate::algos::utils::{get_best_count,Counter};
 
@@ -31,6 +33,8 @@ pub fn construct_slpa_embedding(
     for i in 0..graph.len() {
         clusters[i*k] = i;
     }
+    let pb = CLProgressBar::new(k as u64, true);
+    pb.update_message(|msg| { write!(msg, "Clustering...").expect("Should never hit"); });
 
     // Temporary cluster assignment
     let mut buffer = vec![0; graph.len()];
@@ -59,7 +63,9 @@ pub fn construct_slpa_embedding(
         buffer.par_iter().zip(clusters.par_iter_mut().chunks(k)).for_each(|(cluster_id, mut emb)| {
             *emb[pass] = *cluster_id;
         });
+        pb.inc(1);
     }
+    pb.finish();
 
     // Threshold is the l1norm score
     let min_count = (threshold * k as f32).ceil() as usize;

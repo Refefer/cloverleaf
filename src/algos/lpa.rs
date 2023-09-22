@@ -1,13 +1,13 @@
 //! Classic label propagation algorithm for learning clusters based on the graph.  Not much to say;
 //! it's single threaded, fast, and a bit finicky on the number of passes (overfitting can produce
 //! worse clusters), but it's a good baseline.
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::fmt::Write;
 
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
 
+use crate::progress::CLProgressBar;
 use crate::graph::Graph;
 use crate::embeddings::{EmbeddingStore,Distance};
 use crate::algos::utils::get_best_count;
@@ -55,25 +55,23 @@ pub fn construct_lpa_embedding(
     seed: u64
 ) -> EmbeddingStore {
     let es = EmbeddingStore::new(graph.len(), k, Distance::Hamming);
-    let mes = Mutex::new(es);
 
     println!("k={},passes={},seed={}", k, passes, seed);
-    let count = AtomicUsize::new(0);
+    let work = passes * k;
+    let pb = CLProgressBar::new(work as u64, true);
+    pb.update_message(|msg| { write!(msg, "Clustering...").expect("Should never hit"); });
+
     // Compute LPA in parallel
     (0..k).into_par_iter().for_each(|k_idx| {
         let clusters = lpa(graph, passes, seed + k_idx as u64);
-        {
-            let mut embeddings = mes.lock().unwrap();
-            clusters.into_iter().enumerate().for_each(|(idx, cluster)| {
-                let embedding = embeddings.get_embedding_mut(idx);
-                embedding[k_idx] = cluster as f32;
-            });
-        }
-        let num_done = count.fetch_add(1, Ordering::Relaxed);
-        println!("Finished {}/{}", num_done + 1, k);
+        pb.inc(passes as u64);
+        clusters.into_iter().enumerate().for_each(|(idx, cluster)| {
+            let embedding = es.get_embedding_mut_hogwild(idx);
+            embedding[k_idx] = cluster as f32;
+        });
     });
-
-    mes.into_inner().expect("No references should be left!")
+    pb.finish();
+    es
 
 }
 

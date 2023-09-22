@@ -17,47 +17,6 @@ pub trait Optimizer {
 
 }
 
-/// Nesterov-momentum based optimizer.
-pub struct MomentumOptimizer {
-    gamma: f32,
-    mom: EmbeddingStore
-}
-
-impl MomentumOptimizer {
-    pub fn new(gamma: f32, dims: usize, length: usize) -> Self {
-        let mom = EmbeddingStore::new(length, dims, Distance::Cosine);
-        MomentumOptimizer {gamma, mom}
-    }
-}
-
-impl Optimizer for MomentumOptimizer {
-
-    fn update(
-        &self, 
-        feature_embeddings: &EmbeddingStore,
-        grads: CHashMap<usize, Vec<f32>>,
-        alpha: f32,
-        _t: f32
-    ) {
-        for (feat_id, grad) in grads.into_iter() {
-
-            let emb = feature_embeddings.get_embedding_mut_hogwild(feat_id);
-            let mom = self.mom.get_embedding_mut_hogwild(feat_id);
-
-            if grad.iter().all(|gi| !gi.is_nan()) {
-                // Can get some nans in weird cases, such as the distance between
-                // a node and it's reconstruction when it shares all features.
-                // We just skip over those weird ones.
-                emb.iter_mut().zip(grad.iter().zip(mom.iter_mut())).for_each(|(ei, (gi, mi))| {
-                    *mi = self.gamma * *mi + *gi;
-                    *ei -= alpha * *mi;
-                });
-            }
-        }
-    }
-
-}
-
 /// Adam Optimizer.  Should basically be always preferred over momentum due to better performance
 /// in almost all cases.  Momentum _can_ be used when memory is at a premium - Adam requires 3x the
 /// learnable parmeters (aka all the feature embeddings) where ask momentum only needs 1x.  In

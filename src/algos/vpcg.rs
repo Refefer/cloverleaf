@@ -14,8 +14,19 @@ use crate::embeddings::{Distance,EmbeddingStore};
 type SparseEmbeddings = Vec<Vec<(usize, f32)>>;
 
 pub struct VPCG {
+    // Maximum number of terms to retain
     pub max_terms: usize,
+
+    // Dimensions of the hashed space
     pub dims: usize,
+
+    // Blend coefficient
+    pub alpha: f32,
+
+    // Suppress terms under err
+    pub err: f32,
+
+    // Number of passes to run
     pub iterations: usize
 }
 
@@ -28,7 +39,7 @@ impl VPCG {
         mask: (&[NodeID], &[NodeID]),
     ) -> EmbeddingStore {
         
-        let mut propagations: SparseEmbeddings = (0..graph.len())
+        let propagations: SparseEmbeddings = (0..graph.len())
             .map(|node_id| {
                 let mut fs = Vec::with_capacity(self.max_terms);
                 let feats = features.get_features(node_id);
@@ -51,24 +62,31 @@ impl VPCG {
                     .expect("Error writing out indicator message!");
             });
 
-            let node_set = if iter % 2 == 0 {
-                &left
-            } else {
-                &right
-            };
+            // Take turns propagating
+            let node_set = if iter % 2 == 0 { &left } else { &right };
 
             // For each node, grab the edges and propagate from them to it
             node_set.par_iter().enumerate().chunks(128).for_each(|chunk| {
-                chunk.par_iter().for_each(|(node_id, mask)| {
+                chunk.par_iter().for_each(|(node_id, _mask)| {
+                    
                     // Sum up features
                     let mut term_map = HashMap::new();
+
+                    if self.alpha < 1f32 {
+                        let feats = &propagations.get()[*node_id];
+                        feats.iter().for_each(|(feat, score)| {
+                            let e = term_map.entry(feat).or_insert(0f32);
+                            *e += (1f32 - self.alpha) * score;
+                        });
+                    }
+
                     let (edges, weights) = graph.get_edges(*node_id);
                     edges.iter().zip(CDFtoP::new(weights)).for_each(|(edge, p)| {
                         let feats = &propagations.get()[*edge];
-                        for (feat, score) in feats {
+                        feats.iter().for_each(|(feat, score)| {
                             let e = term_map.entry(feat).or_insert(0f32);
-                            *e += p * score;
-                        }
+                            *e += self.alpha * p * score;
+                        });
                     });
 
                     // L2 norm
@@ -82,7 +100,9 @@ impl VPCG {
                     let node_feats = &mut propagations.get()[*node_id];
                     node_feats.clear();
 
-                    results.into_iter().take(self.max_terms).for_each(|ts| node_feats.push(ts));
+                    results.into_iter().take(self.max_terms)
+                        .filter(|(_t, s)| *s > self.err)
+                        .for_each(|ts| node_feats.push(ts));
                 });
                 pb.inc(chunk.len() as u64);
             });
@@ -115,7 +135,7 @@ impl VPCG {
         embeddings: SparseEmbeddings
     ) -> EmbeddingStore {
         let hash_table = self.build_hash_table(num_features);
-        let mut embs = EmbeddingStore::new(embeddings.len(), self.dims, Distance::Cosine);
+        let embs = EmbeddingStore::new(embeddings.len(), self.dims, Distance::Cosine);
         embeddings.into_par_iter().enumerate().for_each(|(node_id, sparse_emb)| {
             let emb = embs.get_embedding_mut_hogwild(node_id);
             for (feat, weight) in sparse_emb {

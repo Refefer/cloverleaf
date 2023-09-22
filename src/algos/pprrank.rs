@@ -7,7 +7,6 @@ use rayon::prelude::*;
 use hashbrown::HashMap;
 use std::collections::{HashMap as CHashMap};
 use rand::prelude::*;
-use rand_distr::StandardNormal;
 use rand_xorshift::XorShiftRng;
 use simple_grad::*;
 
@@ -342,7 +341,7 @@ impl PprRank {
         feat_maps.push(fm);
         
         // Compute error
-        let loss = self.loss(&query_node, &ranked_embeddings, &ranked_scores);
+        let loss = self.loss(&query_node, &ranked_embeddings, &ranked_scores, node);
 
         (loss, feat_maps)
     }
@@ -351,24 +350,36 @@ impl PprRank {
         &self,
         query_node: &ANode,
         ranked_nodes: &[ANode],
-        node_weights: &[f32]
+        node_weights: &[f32],
+        node_id: NodeID
     ) -> ANode {
 
         // Compute dot score, then the softmax
+        let qn = il2norm(query_node);
         let scores = ranked_nodes.iter().map(|n| {
-            query_node.dot(n)
-        }).collect::<Vec<_>>().concat();
+            qn.dot(&il2norm(n))
+        }).collect::<Vec<_>>().concat() * 5f32;
 
         let sm_scores = softmax(scores);
-        //println!("{:?} -> {:?}", node_weights, sm_scores.value());
         let ordered = node_weights.iter().enumerate()
-            .filter(|(i, s)| **s > 0f32)
+            .filter(|(i, s)| {
+                **s > 0f32 && sm_scores.value()[*i] <= **s
+            })
             .map(|(idx, s)| {
                 let k = sm_scores.slice(idx, 1);
                 k.ln() * *s
             }).collect::<Vec<ANode>>();
 
-        -ordered.sum_all()
+        if ordered.len() == 0 {
+            println!("Node:{}, {:?} -> {:?}", node_id, node_weights, sm_scores.value());
+            Constant::scalar(0f32)
+        } else {
+            let loss = -ordered.sum_all();
+            if node_id == 0 {
+                println!("loss:{}, {:?} -> {:?}", loss.value()[0], node_weights, sm_scores.value());
+            }
+            loss
+        }
     }
 
     fn extract_gradients(
@@ -392,6 +403,15 @@ impl PprRank {
     }
 
 }
+
+fn il2norm(v: &ANode) -> ANode {
+    v / l2norm(v.clone())
+}
+
+fn l2norm(v: ANode) -> ANode {
+    v.pow(2f32).sum().pow(0.5)
+}
+
 
 struct WalkLibrary {
     k: usize,

@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
@@ -59,10 +57,9 @@ impl Tree {
     }
 
     fn depth(&self, d: usize) -> usize {
-        let mut node = self;
-        match node {
-            Tree::Leaf { indices } =>  d,
-            Tree::Split { hp, above, below } => {
+        match self {
+            Tree::Leaf { indices: _ } =>  d,
+            Tree::Split { hp: _, above, below } => {
                 above.depth(d + 1).max(below.depth(d + 1))
             }
         }
