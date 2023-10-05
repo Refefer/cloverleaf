@@ -359,6 +359,14 @@ impl <'a> CDFtoP<'a> {
     pub fn new(weights: &'a [f32]) -> Self {
         CDFtoP { cdf: weights, idx: 0 }
     }
+
+    pub fn prob(&self, idx: usize) -> f32 {
+        if idx == 0 {
+            self.cdf[idx]
+        } else {
+            self.cdf[idx] - self.cdf[idx - 1]
+        }
+    }
 }
 
 impl <'a> Iterator for CDFtoP<'a> {

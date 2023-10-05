@@ -270,6 +270,7 @@ impl PprRank {
         };
 
         let pb = CLProgressBar::new(graph.len() as u64, self.indicator);
+        pb.update_message(|msg| write!(msg, "Computing random walks...").unwrap());
         let idxs = (0..graph.len()).collect::<Vec<_>>();
         idxs.chunks(1024).for_each(|node_ids| {
             let groups: Vec<_> = node_ids.par_iter().map(|node_id| {

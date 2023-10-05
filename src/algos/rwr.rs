@@ -3,10 +3,11 @@
 use hashbrown::HashMap;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
+use rand_distr::{Distribution,Uniform};
 use rayon::prelude::*;
 
-use crate::graph::{Graph,NodeID};
-use crate::sampler::Sampler;
+use crate::graph::{Graph,NodeID,CDFtoP,CDFGraph};
+use crate::sampler::{Sampler, weighted_sample_cdf};
 
 // Fixed step or random restarts
 #[derive(Clone,Copy)]
@@ -33,29 +34,102 @@ impl RWR {
         sampler: &impl Sampler<G>,
         start_node: NodeID
     ) -> HashMap<NodeID, f32> {
-       let mut ret = (0..self.walks).into_par_iter()
-           .map(|idx| {
-               let mut rng = XorShiftRng::seed_from_u64(self.seed + idx as u64);
-               self.walk(graph, sampler, start_node, &mut rng) 
-           }).fold(|| HashMap::new(), |mut acc, node_id| {
-               *acc.entry(node_id).or_insert(0f32) += 1.; 
-               acc
-           }).reduce(|| HashMap::new(),|mut hm1, hm2| {
-               hm2.into_iter().for_each(|(k, v)| {
-                   let e = hm1.entry(k).or_insert(0f32); 
-                   *e = *e + v;
-               });
-               hm1
-           });
+        let mut ret = (0..self.walks).into_par_iter()
+            .map(|idx| {
+                let mut rng = XorShiftRng::seed_from_u64(self.seed + idx as u64);
+                self.walk(graph, sampler, start_node, &mut rng) 
+            }).fold(|| HashMap::new(), |mut acc, node_id| {
+                *acc.entry(node_id).or_insert(0f32) += 1.; 
+                acc
+            }).reduce(|| HashMap::new(),|mut hm1, hm2| {
+                hm2.into_iter().for_each(|(k, v)| {
+                    let e = hm1.entry(k).or_insert(0f32); 
+                    *e = *e + v;
+                });
+                hm1
+            });
 
-       ret.par_iter_mut()
-           .for_each(|(k, v)| {
-               let d = (graph.degree(*k) as f32).powf(self.beta);
-               *v /= (self.walks as f32) * d;
-           });
-       ret
+        ret.par_iter_mut()
+            .for_each(|(k, v)| {
+                let d = (graph.degree(*k) as f32).powf(self.beta);
+                *v /= (self.walks as f32) * d;
+            });
+        ret
     }
 
+    pub fn sample_level<G: CDFGraph + Send + Sync>(
+        &self, 
+        graph: &G, 
+        start_node: NodeID,
+        walks: usize,
+        rng: &mut impl Rng,
+        entries: &mut HashMap<NodeID, usize>
+    ) {
+
+        let (edges, weights) = graph.get_edges(start_node);
+        let probs = CDFtoP::new(weights);
+        let mut cur_idx = weighted_sample_cdf(weights, rng);
+        let dist = Uniform::new(0, edges.len());
+        for _ in 0..walks {
+            let candidate = dist.sample(rng);
+            let cur_p = probs.prob(cur_idx);
+            let new_p = probs.prob(candidate);
+            if rng.gen::<f32>() < new_p / cur_p {
+                cur_idx = candidate;
+            }
+            *entries.entry(edges[cur_idx]).or_insert(0) += 1;
+        }
+    }
+
+    pub fn sample_bfs<G: CDFGraph + Send + Sync>(
+        &self, 
+        graph: &G, 
+        start_node: NodeID
+    ) -> HashMap<NodeID, f32> {
+        let mut rng = XorShiftRng::seed_from_u64(self.seed as u64);
+        let mut ret = HashMap::new();
+
+        let mut counts = HashMap::new();
+        counts.insert(start_node, self.walks);
+        let mut pass = 1;
+        loop {
+            if counts.len() == 0 { break }
+            let mut next_counts = HashMap::new();
+            counts.into_iter().for_each(|(node_id, num_walks)| {
+                self.sample_level(graph, node_id, num_walks, &mut rng, &mut next_counts);
+            });
+
+            match self.steps {
+                Steps::Fixed(max_pass) => {
+                    if max_pass == pass {
+                        std::mem::swap(&mut ret, &mut next_counts);
+                        counts = HashMap::new();
+                    } else {
+                        counts = next_counts;
+                    }
+                },
+                Steps::Probability(p) => {
+                    counts = next_counts.into_iter().map(|(node_id, count)| {
+                        let discount = (count as f32 * p).ceil() as usize;
+                        let rem = count - discount;
+                        *ret.entry(node_id).or_insert(0usize) += discount;
+                        (node_id, rem)
+                    })
+                    .filter(|(_, c)| *c > 0)
+                    .collect();
+                }
+            }
+            pass += 1;
+        }
+        ret.into_par_iter()
+            .map(|(k, v)| {
+                let d = (graph.degree(k) as f32).powf(self.beta);
+                let v = v as f32 / (self.walks as f32) * d;
+                (k, v)
+            })
+            .collect()
+    }
+    
     /// Runs a random walk, returning the terminal node.
     pub fn walk<G: Graph + Send + Sync>(
         &self, 

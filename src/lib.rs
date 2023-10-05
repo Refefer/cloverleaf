@@ -72,27 +72,11 @@ use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::smci::SupervisedMCIteration;
 use crate::algos::pprrank::PprRank;
 use crate::algos::ann::Ann;
+use crate::algos::pprembed::PPREmbed;
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
 const SEED: u64 = 20222022;
-
-/// Simple method for taking an iterator of edges and constructing a CSR graph and associated vocab
-fn build_csr(edges: impl Iterator<Item=((String,String),(String,String),f32)>) -> (CSR, Vocab) {
-    
-    // Convert to NodeIDs
-    let mut vocab = Vocab::new();
-    eprintln!("Constructing vocab...");
-    let edges: Vec<_> = edges.map(|((f_nt, f_n), (t_nt, t_n), w)| {
-        let f_id = vocab.get_or_insert(f_nt, f_n);
-        let t_id = vocab.get_or_insert(t_nt, t_n);
-        (f_id, t_id, w)
-    }).collect();
-
-    eprintln!("Constructing CSR...");
-    let csr = CSR::construct_from_edges(edges);
-    (csr, vocab)
-}
 
 /// Maps an iterator of node ids and scores back to their pretty names with optional top K and
 /// filtering by node types.
@@ -196,16 +180,6 @@ pub struct Graph {
 
 #[pymethods]
 impl Graph {
-
-    #[new]
-    fn new(edges: Vec<((String,String),(String,String),f32)>) -> Self {
-        let (graph, vocab) = build_csr(edges.into_iter());
-        eprintln!("Converting to CDF format...");
-        Graph {
-            graph: Arc::new(CumCSR::convert(graph)),
-            vocab: Arc::new(vocab)
-        }
-    }
 
     pub fn contains_node(&self, name: (String, String)) -> bool {
         get_node_id(self.vocab.deref(), name.0, name.1).is_ok()
@@ -320,7 +294,8 @@ impl RandomWalker {
         node: (String, String), 
         seed: Option<u64>, 
         k: Option<usize>, 
-        filter_type: Option<String>
+        filter_type: Option<String>,
+        single_threaded: Option<bool>
     ) -> PyResult<Vec<((String,String), f32)>> {
 
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
@@ -340,7 +315,11 @@ impl RandomWalker {
             seed: seed.unwrap_or(SEED)
         };
 
-        let results = rwr.sample(graph.graph.as_ref(), &Weighted, node_id);
+        let results = if single_threaded.unwrap_or(false) {
+            rwr.sample(graph.graph.as_ref(), &Weighted, node_id)
+        } else {
+            rwr.sample_bfs(graph.graph.as_ref(), node_id)
+        };
 
         Ok(convert_scores(&graph.vocab, results.into_iter(), k, filter_type))
     }
@@ -438,7 +417,7 @@ impl GraphBuilder {
             edges: Vec::new()
         }
     }
-
+ 
     pub fn add_edge(
         &mut self, 
         from_node: (String, String), 
@@ -454,7 +433,10 @@ impl GraphBuilder {
         }
     }
 
-    pub fn build_graph(&mut self) -> Graph {
+    pub fn build_graph(&mut self) -> Option<Graph> {
+        if self.edges.len() == 0 {
+            return None
+        }
         // We swap the internal buffers with new buffers; we do this to preserve memory whenever
         // possible.
         let mut vocab = Vocab::new(); 
@@ -464,10 +446,10 @@ impl GraphBuilder {
 
         let graph = CSR::construct_from_edges(edges);
 
-        Graph {
+        Some(Graph {
             graph: Arc::new(CumCSR::convert(graph)),
             vocab: Arc::new(vocab)
-        }
+        })
     }
 
 }
@@ -1230,9 +1212,9 @@ impl PageRank {
         PageRank {iterations, damping: damping.unwrap_or(0.85), eps: eps.unwrap_or(1e-5) }
     }
 
-    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
+    pub fn learn(&self, graph: &Graph, indicator: Option<bool>) -> NodeEmbeddings {
         let page_rank = crate::algos::pagerank::PageRank::new(self.iterations, self.damping, self.eps);
-        let scores = page_rank.compute(graph.graph.as_ref());
+        let scores = page_rank.compute(graph.graph.as_ref(), indicator.unwrap_or(true));
         let es = EmbeddingStore::new(graph.graph.len(), 1, EDist::Euclidean);
         scores.par_iter().enumerate().for_each(|(node_id, score)| {
             let e1 = es.get_embedding_mut_hogwild(node_id);
@@ -1986,8 +1968,7 @@ impl PprRankLearner {
 
 }
 
-/// Struct for learning Speaker-Listener multi-cluster embeddings.  Uses Hamming Distance for
-/// distance.
+/// Learns VPCG vectors on a graph.
 #[pyclass]
 struct VpcgEmbedder {
     max_terms: usize, 
@@ -2050,6 +2031,72 @@ impl VpcgEmbedder {
 
 }
 
+/// Learns VPCG vectors on a graph.
+#[pyclass]
+struct PPREmbedder {
+    dims: usize,
+    num_walks: usize,
+    steps: f32,
+    beta: f32,
+    eps: f32
+}
+
+#[pymethods]
+impl PPREmbedder {
+    #[new]
+    pub fn new(
+        dims: usize,
+        num_walks: usize, 
+        steps: f32, 
+        beta: Option<f32>, 
+        eps: Option<f32>
+    ) -> Self {
+        PPREmbedder { 
+            dims,
+            num_walks,
+            steps,
+            beta: beta.unwrap_or(0.8),
+            eps: eps.unwrap_or(1e-5)
+        }
+    }
+
+    pub fn learn(&self, 
+        graph: &Graph, 
+        features: &mut FeatureSet,
+        seed: Option<u64>
+    ) -> PyResult<NodeEmbeddings> {
+        features.features.fill_missing_nodes();
+
+        let steps = if self.steps >= 1. {
+            Steps::Fixed(self.steps as usize)
+        } else if self.steps > 0. {
+            Steps::Probability(self.steps)
+        } else {
+            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
+        };
+
+        let embedder = PPREmbed {
+            dims: self.dims,
+            num_walks: self.num_walks,
+            steps: steps,
+            beta: self.beta,
+            eps: self.eps,
+            seed: seed.unwrap_or(SEED)
+        };
+
+        let embs = embedder.learn(graph.graph.as_ref(), &features.features);
+        
+        let node_embeddings = NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings:embs 
+        };
+
+        Ok(node_embeddings)
+    }
+
+}
+
+
 
 /// Helper method for looking up an embedding.
 fn lookup_embedding<'a>(
@@ -2106,6 +2153,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PageRank>()?;
     m.add_class::<Smci>()?;
     m.add_class::<VpcgEmbedder>()?;
+    m.add_class::<PPREmbedder>()?;
     Ok(())
 }
 

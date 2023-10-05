@@ -24,7 +24,7 @@ impl <S: CDFGraph> Sampler<S> for Weighted {
 }
 
 #[inline]
-fn weighted_sample_cdf<R: Rng>(weights: &[f32], rng: &mut R) -> usize {
+pub fn weighted_sample_cdf<R: Rng>(weights: &[f32], rng: &mut R) -> usize {
     let p: f32 = rng.gen();
     match weights.binary_search_by_key(&FloatOrd(p), |w| FloatOrd(*w)) {
         Ok(idx) => idx,

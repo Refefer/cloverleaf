@@ -17,13 +17,13 @@ impl PageRank {
         PageRank {damping, iterations, eps}
     }
 
-    pub fn compute(&self, graph: &impl CDFGraph) -> Vec<f32> {
+    pub fn compute(&self, graph: &impl CDFGraph, indicator: bool) -> Vec<f32> {
         let n = graph.len();
         let mut policy = vec![1. / n as f32; n];
 
         let mut next_policy = vec![0.; n];
 
-        let pb = CLProgressBar::new(self.iterations as u64, true);
+        let pb = CLProgressBar::new(self.iterations as u64, indicator);
         let mut err = std::f32::INFINITY;
         for _iter in 0..self.iterations {
             pb.update_message(|msg| {
