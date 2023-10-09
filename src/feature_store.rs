@@ -35,14 +35,14 @@ impl FeatureStore {
 
     fn set_nt_features(&mut self, node: NodeID, namespace: String, node_features: Vec<String>) {
         let ns = Arc::new(namespace);
-        let fs = node_features.into_iter().map(|f| Arc::new(f));
+        let fs = node_features.iter().map(|f| f.as_str());
         self.set_nt_features_shared(node, ns, fs);
     }
 
-    fn set_nt_features_shared(&mut self, 
+    fn set_nt_features_shared<'a>(&mut self, 
         node: NodeID, 
         namespace: Arc<String>, 
-        node_features: impl Iterator<Item=Arc<String>>
+        node_features: impl Iterator<Item=&'a str>
     ) {
         self.features[node] = node_features
             .map(|f| self.feature_vocab.get_or_insert_shared(namespace.clone(), f))
@@ -63,7 +63,7 @@ impl FeatureStore {
 
     fn get_pretty_feature(&self, feat_id: usize) -> String {
         let (_nt, name) = self.feature_vocab.get_name(feat_id).unwrap();
-        (*name).clone()
+        name.to_string()
     }
 
     pub fn get_pretty_features(&self, node: NodeID) -> Vec<String> {

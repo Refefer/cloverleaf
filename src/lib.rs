@@ -94,7 +94,7 @@ fn convert_scores(
     scores.into_iter()
         .map(|(node_id, w)| {
             let (node_type, name) = vocab.get_name(node_id).unwrap();
-            (((*node_type).clone(), (*name).clone()), w)
+            (((*node_type).clone(), name.to_string()), w)
         })
         .filter(|((node_type, _node_name), _w)| {
             filtered_node_type.as_ref().map(|nt| nt == node_type).unwrap_or(true)
@@ -199,7 +199,7 @@ impl Graph {
         let names = edges.into_iter()
             .map(|node_id| {
                 let (nt, n) = self.vocab.get_name(*node_id).unwrap();
-                ((*nt).clone(), (*n).clone())
+                ((*nt).clone(), n.to_string())
             }).collect();
         Ok((names, weights.to_vec()))
     }
@@ -1312,8 +1312,8 @@ impl NodeEmbeddings {
         }
 
         let emb = self.embeddings.get_embedding(idx as usize).to_vec();
-        let (nn, nt) = self.vocab.get_name(idx as usize).expect("Already validated bounds, something borked");
-        Ok((((*nn).clone(), (*nt).clone()), emb))
+        let (nt, nn) = self.vocab.get_name(idx as usize).expect("Already validated bounds, something borked");
+        Ok((((*nt).clone(), nn.to_string()), emb))
     }
 
     pub fn l2norm(&self) {
@@ -1522,7 +1522,7 @@ impl VocabIterator {
             if slf.cur_idx < slf.vocab.len() {
                 let (node_type, name) = slf.vocab.get_name(slf.cur_idx).unwrap();
                 let node_type = (*node_type).clone().into_py(py);
-                let name = (*name).clone().into_py(py);
+                let name = name.to_string().into_py(py);
                 slf.cur_idx += 1;
                 Some((node_type, name).into_py(py))
             } else {
@@ -1639,7 +1639,7 @@ impl EmbeddingAligner {
                 let (node_id, _dist) = nd.to_tup();
                 if let Some((node_type, node_name)) = orig_embeddings.vocab.get_name(node_id) {
                     get_node_id(translated_embeddings.vocab.deref(), 
-                           (*node_type).clone(), (*node_name).clone()).is_ok()
+                           (*node_type).clone(), node_name.to_string()).is_ok()
                 } else {
                     false
                 }
@@ -1656,7 +1656,7 @@ impl EmbeddingAligner {
                 let (node_type, node_name) = orig_embeddings.vocab.get_name(node_id)?;
 
                 let node_id = get_node_id(translated_embeddings.vocab.deref(), 
-                                          (*node_type).clone(), (*node_name).clone()).ok()?;
+                                          (*node_type).clone(), node_name.to_string()).ok()?;
                 let emb = translated_embeddings.embeddings.get_embedding(node_id);
                 Some((emb, euc_dist))
             }).filter(|x| x.is_some())
@@ -2121,7 +2121,7 @@ fn convert_node_distance(
             let (node_id, dist) = n.to_tup();
             let (node_type, name) = vocab.get_name(node_id)
                 .expect("Can't find node id in vocab!");
-            (((*node_type).clone(), (*name).clone()), dist)
+            (((*node_type).clone(), name.to_string()), dist)
         }).collect()
 }
 

@@ -1,3 +1,4 @@
+use lasso::{Rodeo,Spur};
 use hashbrown::HashMap;
 use crate::graph::NodeID;
 use std::sync::Arc;
@@ -9,9 +10,10 @@ pub type TranslationTable = Vec<Option<NodeID>>;
 
 #[derive(Clone,Debug)]
 pub struct Vocab {
+    interner: Rodeo,
     vocab_id: usize,
-    vocab_to_idx: HashMap<(usize, Arc<String>), NodeID>,
-    node_id_to_node: Vec<(usize,Arc<String>)>,
+    vocab_to_idx: HashMap<(usize, Spur), NodeID>,
+    node_id_to_node: Vec<(usize,Spur)>,
     node_type_to_id: HashMap<Arc<String>, usize>,
     id_to_node_type: Vec<Arc<String>>,
 }
@@ -20,6 +22,7 @@ impl Vocab {
     pub fn new() -> Self {
         let vocab_id = VOCAB_ID.fetch_add(1, Ordering::SeqCst);
         Vocab { 
+            interner: Rodeo::default(),
             vocab_id: vocab_id,
             node_type_to_id: HashMap::new(),
             id_to_node_type: Vec::new(),
@@ -33,12 +36,14 @@ impl Vocab {
     }
 
     pub fn get_node_id(&self, node_type: String, name: String) -> Option<NodeID> {
-        self.get_node_id_int(&Arc::new(node_type), &Arc::new(name))
+        self.get_node_id_int(&Arc::new(node_type), &name)
     }
 
-    fn get_node_id_int(&self, node_type: &Arc<String>, name: &Arc<String>) -> Option<NodeID> {
+    fn get_node_id_int(&self, node_type: &Arc<String>, name: &str) -> Option<NodeID> {
         self.node_type_to_id.get(node_type).and_then(|nt_id| {
-            self.vocab_to_idx.get(&(*nt_id, (*name).clone())).map(|n| n.clone())
+            self.interner.get(name).and_then(|key| {
+                self.vocab_to_idx.get(&(*nt_id, key)).map(|n| n.clone())
+            })
         })
     }
 
@@ -60,12 +65,13 @@ impl Vocab {
     }
 
     pub fn get_or_insert(&mut self, node_type: String, name: String) -> NodeID {
-        self.get_or_insert_shared(Arc::new(node_type), Arc::new(name))
+        self.get_or_insert_shared(Arc::new(node_type), &name)
     }
 
-    pub fn get_or_insert_shared(&mut self, node_type: Arc<String>, name: Arc<String>) -> NodeID {
+    pub fn get_or_insert_shared(&mut self, node_type: Arc<String>, name: &str) -> NodeID {
         let nt_id = self.get_or_insert_node_type(node_type);
-        let t = (nt_id, name);
+        let name_key = self.interner.get_or_intern(name);
+        let t = (nt_id, name_key);
         if let Some(node_id) = self.vocab_to_idx.get(&t) {
             node_id.clone()
         } else {
@@ -77,9 +83,10 @@ impl Vocab {
  
     }
 
-    pub fn get_name(&self, node: NodeID) -> Option<(Arc<String>, Arc<String>)> {
+    pub fn get_name(&self, node: NodeID) -> Option<(Arc<String>, &str)> {
         self.node_id_to_node.get(node).map(|(nt_id, name)| {
-            (self.id_to_node_type[*nt_id].clone(), name.clone())
+            let nn = self.interner.resolve(name);
+            (self.id_to_node_type[*nt_id].clone(), nn)
         })
     }
 
@@ -91,9 +98,8 @@ impl Vocab {
         if self.is_identical(other) {
             Some(other_node_id)
         } else {
-            other.node_id_to_node.get(other_node_id).and_then(|(node_type_id, node_name)| {
-                let node_type = &other.id_to_node_type[*node_type_id];
-                self.get_node_id_int(node_type, &node_name)
+            other.get_name(other_node_id).and_then(|(node_type, node_name)| {
+                self.get_node_id_int(&node_type, node_name)
             })
         }
     }
@@ -104,7 +110,8 @@ impl Vocab {
         } else {
             self.node_id_to_node.iter().map(|(node_type_id, node_name)| {
                 let node_type = &self.id_to_node_type[*node_type_id];
-                to_vocab.get_node_id_int(node_type, node_name)
+                let name = self.interner.resolve(node_name);
+                to_vocab.get_node_id_int(node_type, name)
             }).collect()
         }
     }
