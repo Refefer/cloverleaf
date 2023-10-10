@@ -143,7 +143,7 @@ mod vocab_tests {
             assert_eq!(expected, ret);
 
             // Assert node ids retrieve the correct node type/name
-            let expected = Some((Arc::new((*nt).clone()), Arc::new((*n).clone())));
+            let expected = Some((Arc::new((*nt).clone()), n.as_str()));
             let ret = vocab.get_name(*node_id);
             assert_eq!(expected, ret);
         });
