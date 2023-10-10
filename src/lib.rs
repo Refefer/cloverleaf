@@ -53,7 +53,7 @@ use rand_distr::Uniform;
 
 use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID,CDFtoP};
 use crate::vocab::Vocab;
-use crate::sampler::Weighted;
+use crate::sampler::{Weighted,Unweighted};
 use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
 use crate::feature_store::FeatureStore;
 use crate::io::EmbeddingWriter;
@@ -299,7 +299,7 @@ impl RandomWalker {
         seed: Option<u64>, 
         k: Option<usize>, 
         filter_type: Option<String>,
-        single_threaded: Option<bool>
+        weighted: Option<bool>
     ) -> PyResult<Vec<((String,String), f32)>> {
 
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
@@ -319,10 +319,10 @@ impl RandomWalker {
             seed: seed.unwrap_or(SEED)
         };
 
-        let results = if single_threaded.unwrap_or(false) {
-            rwr.sample(graph.graph.as_ref(), &Weighted, node_id)
-        } else {
+        let results = if weighted.unwrap_or(true) {
             rwr.sample_bfs(graph.graph.as_ref(), node_id)
+        } else {
+            rwr.sample(graph.graph.as_ref(), &Unweighted, node_id)
         };
 
         Ok(convert_scores(&graph.vocab, results.into_iter(), k, filter_type))
