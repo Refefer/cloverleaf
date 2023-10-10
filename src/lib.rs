@@ -229,6 +229,10 @@ impl Graph {
         }
         Ok(())
     }
+
+    pub fn __len__(&self) -> PyResult<usize> {
+        Ok(self.nodes())
+    }
     
     /// Loads a graph from disk
     #[staticmethod]
@@ -1460,14 +1464,16 @@ impl NodeEmbeddingsBuilder {
         std::mem::swap(&mut embeddings, &mut self.embeddings);
 
         let es = EmbeddingStore::new(embeddings.len(), 
-                                         embeddings[0].len(),
-                                         self.distance.to_edist());
+                                     embeddings[0].len(),
+                                     self.distance.to_edist());
+
         embeddings.par_iter_mut().enumerate().for_each(|(i, emb)| {
             let e = es.get_embedding_mut_hogwild(i);
             e.iter_mut().zip(emb.iter()).for_each(|(ei, emb_i)| {
                 *ei = *emb_i;
             });
         });
+
         Some(NodeEmbeddings {
             vocab: Arc::new(vocab),
             embeddings: es

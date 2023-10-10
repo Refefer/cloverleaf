@@ -90,12 +90,12 @@ impl RWR {
         let mut ret = HashMap::new();
 
         let mut counts = HashMap::new();
+        let mut next_counts = HashMap::new();
         counts.insert(start_node, self.walks);
         let mut pass = 1;
         loop {
             if counts.len() == 0 { break }
-            let mut next_counts = HashMap::new();
-            counts.into_iter().for_each(|(node_id, num_walks)| {
+            counts.drain().for_each(|(node_id, num_walks)| {
                 self.sample_level(graph, node_id, num_walks, &mut rng, &mut next_counts);
             });
 
@@ -103,20 +103,19 @@ impl RWR {
                 Steps::Fixed(max_pass) => {
                     if max_pass == pass {
                         std::mem::swap(&mut ret, &mut next_counts);
-                        counts = HashMap::new();
                     } else {
-                        counts = next_counts;
+                        std::mem::swap(&mut next_counts, &mut counts);
                     }
                 },
                 Steps::Probability(p) => {
-                    counts = next_counts.into_iter().map(|(node_id, count)| {
+                    next_counts.drain().map(|(node_id, count)| {
                         let discount = (count as f32 * p).ceil() as usize;
                         let rem = count - discount;
                         *ret.entry(node_id).or_insert(0usize) += discount;
                         (node_id, rem)
                     })
                     .filter(|(_, c)| *c > 0)
-                    .collect();
+                    .for_each(|(n, c)| { counts.insert(n, c); });
                 }
             }
             pass += 1;
@@ -124,7 +123,7 @@ impl RWR {
         ret.into_par_iter()
             .map(|(k, v)| {
                 let d = (graph.degree(k) as f32).powf(self.beta);
-                let v = v as f32 / (self.walks as f32) * d;
+                let v = v as f32 / ((self.walks as f32) * d);
                 (k, v)
             })
             .collect()
