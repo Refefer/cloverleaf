@@ -12,6 +12,8 @@ The library is broken up into a few different methods:
     - Walk Distance Embeddings
     - Vector Propagation on Click Graphs (VPCG)
     - Embedding Propagation with several novel extensions
+    - PPR Embeddings
+    - Instant Embeddings
 3. Random Walks
     - Random Walks with Restarts
     - Guided Random Walks with Restarts
@@ -231,6 +233,53 @@ The result of the optimization phase is feature embeddings, which can be used to
 
 Due to the extensive number of options, the reader is encouraged to read `scripts/learn.py` which provides a convenient entry into the Embedding Propagation methods.
 
+
+### Instant Embeddings
+
+Instant Embeddings is an approach which uses an estimate of a nodes personalized page rank to compute a node embedding.  It combines a blend of local neighborhood topology
+and the hashing trick to compressing a nodes local neighborhood to a fixed dimension vector.  In practice, this scales to a large number of nodes efficiently and shows
+competitive performance with other node embedding algorithms at a fraction of the computational cost.
+
+Unlike in the original paper, we use random walks to estimate the personalized page rank for a node; it's slightly slower than the sparse method they use but offers increased
+flexibility in neighborhood control.
+
+#### Parameters
+1. `dims` - Number of dimensions for each node embedding.
+2. `num_walks` - Number of walks to use to estimate the PPR.
+3. `hashes` - Number of hash functions to use for hashign trick.  3 is a good default.
+4. `steps` - Defines the number of steps to use.  If between (0,1), treats it as a telportation probability.  If > 1, uses fixed length walks of size `steps`.
+5. `beta` - Beta parameter that biases toward or away from rarer nodes.
+
+#### Example
+
+```python3
+>>> graph = cloverleaf.Graph.load("graph.edges", cloverleaf.EdgeType.Undirected)
+>>> ie_embedder = cloverleaf.InstantEmbeddings(dims=512, num_walks=10_000, hashes=3, steps=1/3, beta=0.8)
+>>> embs = ie_embedder.learn(graph)
+```
+
+
+### PPR Embed
+
+PPR Embed is an extension of Instant Embeddings which, instead of hashing the node ids, hashes features associated with those nodes.  It allows for a content based hashing rather
+than a structural version.  Unlike VPCG, this is flexible to all types of graphs rather than just bipartite.
+
+#### Parameters
+1. `dims` - Number of dimensions for each node embedding.
+2. `num_walks` - Number of walks to use to estimate the PPR.
+3. `steps` - Defines the number of steps to use.  If between (0,1), treats it as a telportation probability.  If > 1, uses fixed length walks of size `steps`.
+4. `beta` - Beta parameter that biases toward or away from rarer nodes.
+5. `eps` - Minimum weight to require for a feature to be hashed.
+
+#### Example
+
+```python3
+>>> graph = cloverleaf.Graph.load("graph.edges", cloverleaf.EdgeType.Undirected)
+>>> node_features = cloverleaf.FeatureSet.new_from_graph(graph)
+>>> node_features.load_into("graph.features")
+>>> ppr_embedder = cloverleaf.PPREmbedder(dims=512, num_walks=10_000, steps=1/3, beta=0.8, eps=1e-3)
+>>> embs = ppr_embedder.learn(graph, node_features)
+```
 
 ### Random Walk with Restarts
 Random Walks with Restarts is an algorithm which estimates the stationary distribution from a given node, returning the top K most highest weighted nodes with respect to starting context.  
