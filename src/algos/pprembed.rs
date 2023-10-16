@@ -62,12 +62,13 @@ impl PPREmbed {
                 });
 
             let emb = embs.get_embedding_mut_hogwild(node_id);
+            let n = graph.len();
             feat_maps.into_iter()
                 .filter(|(_,w)| *w > self.eps)
                 .for_each(|(feat_id, weight)| {
                 for hash_num in 0..3 {
                     let (sign, dim) = hasher.hash(feat_id, hash_num);
-                    emb[dim] += sign as f32 * weight;
+                    emb[dim] += sign as f32 * (weight * n as f32).ln().max(0f32);
                 }
             });
 

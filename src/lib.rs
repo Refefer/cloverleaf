@@ -73,6 +73,7 @@ use crate::algos::smci::SupervisedMCIteration;
 use crate::algos::pprrank::PprRank;
 use crate::algos::ann::Ann;
 use crate::algos::pprembed::PPREmbed;
+use crate::algos::instantembedding::{InstantEmbeddings as IE};
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
@@ -2037,7 +2038,7 @@ impl VpcgEmbedder {
 
 }
 
-/// Learns VPCG vectors on a graph.
+/// Computes embeddings from features using PPR
 #[pyclass]
 struct PPREmbedder {
     dims: usize,
@@ -2102,6 +2103,69 @@ impl PPREmbedder {
 
 }
 
+/// Computes node embeddings using InstantEmbeddings
+#[pyclass]
+struct InstantEmbeddings {
+    dims: usize,
+    num_walks: usize,
+    hashes: usize,
+    steps: f32,
+    beta: f32
+}
+
+#[pymethods]
+impl InstantEmbeddings {
+    #[new]
+    pub fn new(
+        dims: usize,
+        num_walks: usize, 
+        hashes: usize,
+        steps: f32, 
+        beta: Option<f32>,
+    ) -> Self {
+        InstantEmbeddings { 
+            dims,
+            num_walks,
+            steps,
+            hashes,
+            beta: beta.unwrap_or(0.8)
+        }
+    }
+
+    pub fn learn(&self, 
+        graph: &Graph, 
+        seed: Option<u64>
+    ) -> PyResult<NodeEmbeddings> {
+        let steps = if self.steps >= 1. {
+            Steps::Fixed(self.steps as usize)
+        } else if self.steps > 0. {
+            Steps::Probability(self.steps)
+        } else {
+            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
+        };
+
+        let embedder = IE {
+            dims: self.dims,
+            walks: self.num_walks,
+            steps: steps,
+            beta: self.beta,
+            hashes: self.hashes,
+            seed: seed.unwrap_or(SEED)
+        };
+
+        let embs = embedder.learn(graph.graph.as_ref());
+        
+        let node_embeddings = NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings:embs 
+        };
+
+        Ok(node_embeddings)
+    }
+
+}
+
+
 
 
 /// Helper method for looking up an embedding.
@@ -2160,6 +2224,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Smci>()?;
     m.add_class::<VpcgEmbedder>()?;
     m.add_class::<PPREmbedder>()?;
+    m.add_class::<InstantEmbeddings>()?;
     Ok(())
 }
 

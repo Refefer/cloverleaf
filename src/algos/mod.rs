@@ -17,4 +17,5 @@ pub mod emb_aligner;
 pub mod pagerank;
 pub mod vpcg;
 pub mod pprembed;
+pub mod instantembedding;
 mod grad_utils;
