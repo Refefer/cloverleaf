@@ -350,3 +350,4 @@ A simple random projection based ANN method which can be consumed directly or in
 6. Christoffel, Fabian, et al. "Blockbusters and wallflowers: Accurate, diverse, and scalable recommendations with random walks." Proceedings of the 9th ACM Conference on Recommender Systems. 2015.
 7. Eksombatchai, Chantat, et al. "Pixie: A system for recommending 3+ billion items to 200+ million users in real-time." Proceedings of the 2018 world wide web conference. 2018.
 8. Recht, Benjamin, et al. "Hogwild!: A lock-free approach to parallelizing stochastic gradient descent." Advances in neural information processing systems 24 (2011).
+9. Postăvaru, Ştefan, et al. "InstantEmbedding: Efficient local node representations." arXiv preprint arXiv:2010.06992 (2020).
