@@ -1,6 +1,6 @@
 //! Classic Random walk with Restarts.  This uses the Rp3b algorithm to allow biasing toward/away
 //! from popular nodes to rarer nodes.  
-use hashbrown::HashMap;
+use hashbrown::{HashMap,HashSet};
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use rand_distr::{Distribution,Uniform};
@@ -189,6 +189,41 @@ pub fn rollout<G: Graph + Send + Sync>(
            output.push(cur_node);
        }
    };
+}
+
+pub fn ppr_estimate<G: Graph>(
+    graph: &G,
+    start_node: NodeID,
+    alpha: f32,
+    eps: f32,
+) -> HashMap<NodeID, f32> {
+    let mut r = HashMap::new();
+    let mut pi = HashMap::new();
+    let mut push_set = HashSet::new();
+    let mut push = Vec::new();
+    r.insert(start_node, 1f32);
+    push_set.insert(start_node);
+    push.push(start_node);
+    while let Some(w) = push.pop() {
+        push_set.remove(&w);
+        let r_hat = r[&w];
+        *pi.entry(w).or_insert(0f32) += alpha * r_hat;
+        *r.entry(w).or_insert(0f32) = (1f32 - alpha) * r_hat / 2f32;
+        let (edges, weights) = graph.get_edges(w);
+        if r[&w] > eps * edges.len() as f32{
+            push_set.insert(w);
+            push.push(w);
+        }
+        edges.iter().zip(CDFtoP::new(weights)).for_each(|(ui, uwi)| {
+            let ru = *r.get(ui).unwrap_or(&0f32) + uwi * (1f32 - alpha) * r_hat / 2f32;
+            r.insert(*ui, ru);
+            if ru > eps * graph.degree(*ui) as f32 && !push_set.contains(ui) {
+                push_set.insert(*ui);
+                push.push(*ui);
+            }
+        });
+    }
+    pi
 }
 
 

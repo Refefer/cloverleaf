@@ -2,18 +2,29 @@
 use rayon::prelude::*;
 
 use crate::algos::utils::FeatureHasher;
-use crate::algos::rwr::{Steps,RWR};
+use crate::algos::rwr::{Steps,RWR,ppr_estimate};
 use crate::graph::{Graph as CGraph, CDFGraph};
 use crate::embeddings::{EmbeddingStore,Distance};
 use crate::progress::CLProgressBar;
 
+#[derive(Clone,Copy)]
+pub enum Estimator {
+    RandomWalk {
+        steps: Steps,
+        walks: usize,
+        beta: f32,
+        seed: u64
+    },
+    SparsePPR {
+        p: f32,
+        eps: f32
+    }
+}
+
 pub struct InstantEmbeddings {
+    pub estimator: Estimator,
     pub dims: usize,
-    pub hashes: usize,
-    pub steps: Steps,
-    pub walks: usize,
-    pub beta: f32,
-    pub seed: u64
+    pub hashes: usize
 }
 
 impl InstantEmbeddings {
@@ -28,14 +39,20 @@ impl InstantEmbeddings {
         let fh = FeatureHasher::new(self.dims);
         let pb = CLProgressBar::new(n as u64, true);
         (0..graph.len()).into_par_iter().for_each(|node_id| {
-            let rwr = RWR {
-                steps: self.steps,
-                walks: self.walks,
-                beta: self.beta,
-                seed: self.seed + node_id as u64
-            };
+            let ppr = match self.estimator {
+                Estimator::RandomWalk {steps, walks, beta, seed} => {
+                    let rwr = RWR {
+                        steps: steps,
+                        walks: walks,
+                        beta: beta,
+                        seed: seed + node_id as u64
+                    };
 
-            let ppr = rwr.sample_bfs(graph, node_id);
+                    rwr.sample_bfs(graph, node_id)
+                },
+                Estimator::SparsePPR { p, eps } => ppr_estimate(graph, node_id, p, eps)
+            };
+            
             let embs = es.get_embedding_mut_hogwild(node_id);
             ppr.into_iter().for_each(|(node_id, weight)| {
                 for hi in 0..self.hashes {
@@ -49,5 +66,5 @@ impl InstantEmbeddings {
         pb.finish();
         es
     }
-
 }
+

@@ -58,7 +58,7 @@ use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
 use crate::feature_store::FeatureStore;
 use crate::io::EmbeddingWriter;
 
-use crate::algos::rwr::{Steps,RWR};
+use crate::algos::rwr::{Steps,RWR,ppr_estimate};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
 use crate::algos::ep::EmbeddingPropagation;
@@ -73,7 +73,7 @@ use crate::algos::smci::SupervisedMCIteration;
 use crate::algos::pprrank::PprRank;
 use crate::algos::ann::Ann;
 use crate::algos::pprembed::PPREmbed;
-use crate::algos::instantembedding::{InstantEmbeddings as IE};
+use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
@@ -397,6 +397,42 @@ impl BiasedRandomWalker {
 
 
 }
+
+/// Computes a SparsePPR
+#[pyclass]
+#[derive(Clone)]
+struct SparsePPR {
+    restarts: f32,
+    eps: f32
+}
+
+#[pymethods]
+impl SparsePPR {
+
+    #[new]
+    fn new(restarts: f32, eps: Option<f32>) -> PyResult<Self> {
+        if restarts <= 0f32 || restarts >= 1f32 {
+            return Err(PyValueError::new_err("restarts must be between (0, 1)"))
+        }
+        Ok(SparsePPR { restarts, eps: eps.unwrap_or(1e-5) })
+    }
+
+    pub fn compute(
+        &self, 
+        graph: &Graph,
+        node: (String, String), 
+        k: Option<usize>, 
+        filter_type: Option<String>
+    ) -> PyResult<Vec<((String,String), f32)>> {
+
+        let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
+        let results = ppr_estimate(graph.graph.as_ref(), node_id, self.restarts, self.eps);
+
+        Ok(convert_scores(&graph.vocab, results.into_iter(), k, filter_type))
+    }
+
+}
+
 
 /// Type of edge.  Undirected edges internally get converted to two directed edges.
 #[pyclass]
@@ -2107,50 +2143,74 @@ impl PPREmbedder {
 #[pyclass]
 struct InstantEmbeddings {
     dims: usize,
-    num_walks: usize,
     hashes: usize,
-    steps: f32,
-    beta: f32
+    estimator: Estimator
 }
 
 #[pymethods]
 impl InstantEmbeddings {
-    #[new]
-    pub fn new(
+
+    #[staticmethod]
+    pub fn random_walk(
         dims: usize,
-        num_walks: usize, 
         hashes: usize,
+        num_walks: usize, 
         steps: f32, 
         beta: Option<f32>,
-    ) -> Self {
-        InstantEmbeddings { 
+        seed: Option<u64>
+    ) -> PyResult<Self> {
+        let steps = if steps >= 1. {
+            Steps::Fixed(steps as usize)
+        } else if steps > 0. {
+            Steps::Probability(steps)
+        } else {
+            return Err(PyValueError::new_err("Steps must be between [0, inf)"))
+        };
+
+        let ie = InstantEmbeddings { 
             dims,
-            num_walks,
-            steps,
             hashes,
-            beta: beta.unwrap_or(0.8)
+            estimator: Estimator::RandomWalk {
+                walks: num_walks,
+                steps,
+                beta: beta.unwrap_or(0.8),
+                seed: seed.unwrap_or(SEED)
+            }
+        };
+        Ok(ie)
+    }
+
+    #[staticmethod]
+    pub fn sparse_ppr(
+        dims: usize,
+        hashes: usize,
+        steps: f32, 
+        eps: Option<f32>
+    ) -> PyResult<Self> {
+        if steps <= 0f32 || steps >= 1f32 {
+            return Err(PyValueError::new_err("Steps must be between (0, 1)"))
         }
+
+        let ie = InstantEmbeddings { 
+            dims,
+            hashes,
+            estimator: Estimator::SparsePPR {
+                p: steps,
+                eps: eps.unwrap_or(1e-5)
+            }
+        };
+
+        Ok(ie)
     }
 
     pub fn learn(&self, 
         graph: &Graph, 
-        seed: Option<u64>
     ) -> PyResult<NodeEmbeddings> {
-        let steps = if self.steps >= 1. {
-            Steps::Fixed(self.steps as usize)
-        } else if self.steps > 0. {
-            Steps::Probability(self.steps)
-        } else {
-            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
-        };
 
         let embedder = IE {
             dims: self.dims,
-            walks: self.num_walks,
-            steps: steps,
-            beta: self.beta,
             hashes: self.hashes,
-            seed: seed.unwrap_or(SEED)
+            estimator: self.estimator
         };
 
         let embs = embedder.learn(graph.graph.as_ref());
@@ -2164,9 +2224,6 @@ impl InstantEmbeddings {
     }
 
 }
-
-
-
 
 /// Helper method for looking up an embedding.
 fn lookup_embedding<'a>(
@@ -2217,6 +2274,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Query>()?;
     m.add_class::<RandomWalker>()?;
     m.add_class::<BiasedRandomWalker>()?;
+    m.add_class::<SparsePPR>()?;
     m.add_class::<NeighborhoodAligner>()?;
     m.add_class::<EmbeddingAligner>()?;
     m.add_class::<PprRankLearner>()?;
