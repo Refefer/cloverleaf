@@ -70,7 +70,7 @@ use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregat
 use crate::algos::feat_propagation::propagate_features;
 use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::smci::SupervisedMCIteration;
-use crate::algos::pprrank::PprRank;
+use crate::algos::pprrank::{PprRank, Loss as PprLoss};
 use crate::algos::ann::Ann;
 use crate::algos::pprembed::PPREmbed;
 use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
@@ -120,6 +120,7 @@ enum QueryType {
     Embedding(Vec<f32>)
 }
 
+/// Type of Query to issue: a direct node lookup or an embedding
 #[pyclass]
 #[derive(Clone)]
 pub struct Query {
@@ -129,6 +130,18 @@ pub struct Query {
 #[pymethods]
 impl Query {
 
+    ///    Creates a query using a node type and name as lookup.
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    node_type : str 
+    ///        The type of node.
+    ///    node_name : str
+    ///        The name of the node
+    ///
+    ///    Returns
+    ///    -------
+    ///    Query
     #[staticmethod]
     pub fn node(
         node_type: String,
@@ -136,6 +149,17 @@ impl Query {
     ) -> Self {
         Query { qt: QueryType::Node(node_type, node_name) }
     }
+
+    ///    Creates a query using a provided embedding.
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    emb :  List[float]
+    ///        A list of floating point numbers to lookup.
+    ///
+    ///    Returns
+    ///    -------
+    ///    Query
 
     #[staticmethod]
     pub fn embedding(
@@ -147,15 +171,28 @@ impl Query {
 }
 
 
-/// This maps our python definition to an internal ADT for embedding distnaces
+///    Contains the set of distance metrics used by NodeEmbeddings, typically application
+///    dependent.
+///
 #[pyclass]
 #[derive(Clone)]
 pub enum Distance {
+    /// Uses Cosine distance - useful for general embedding problems.
     Cosine,
+    
+    /// Euclidean distance
     Euclidean,
+
+    /// Simple un-normalized dot products.
     Dot,
+
+    /// Landmark triangulation distance, useful for Distance embeddingsji
     ALT,
+
+    /// Computes the jaccard between embeddings, treating each value as a discrete class
     Jaccard,
+
+    /// Computes the hamming distance between embeddings, treating each value as a discrete class
     Hamming
 }
 
@@ -172,7 +209,17 @@ impl Distance {
     }
 }
 
-/// Main python wrapper for graphs
+/// 
+/// Core Graph library in Cloverleaf.
+///
+/// Graphs contain a list of nodes, defined by their type and their name, and a list of directional edges
+/// and corresponding weights that describe node connections.  
+///
+/// Graphs are encoded using Compressed Sparse Row Format to minimize
+/// memory costs and allow for large graphs to be constructed on commodity systems.  Further, edge
+/// weights are encoded using CDF format to optimizes certain access patterns, such as weighted
+/// random walks.The downside is this makes graphs immutable: there are no update or delete methods available 
+/// for defined graphs.
 #[pyclass]
 pub struct Graph {
     graph: Arc<CumCSR>,
@@ -182,18 +229,60 @@ pub struct Graph {
 #[pymethods]
 impl Graph {
 
+    ///    Checks if a node is defined within the graph.
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    name :  (String,String)
+    ///        A tuple containing the (node_type, node_name) to lookup.
+    ///
+    ///    Returns
+    ///    -------
+    ///    bool
+    ///     Returns True if the node is defined in the graph, False otherwise
     pub fn contains_node(&self, name: (String, String)) -> bool {
         get_node_id(self.vocab.deref(), name.0, name.1).is_ok()
     }
 
+    ///    Returns the number of nodes that are defined in the graph
+    ///
+    ///    Parameters
+    ///    ----------
+    ///
+    ///    Returns
+    ///    -------
+    ///    Int
     pub fn nodes(&self) -> usize {
         self.graph.len()
     }
 
+    ///    Returns the number of edges defined in the graph.
+    ///
+    ///    Parameters
+    ///    ----------
+    ///
+    ///    Returns
+    ///    -------
+    ///    Int
+    ///     
     pub fn edges(&self) -> usize {
         self.graph.edges()
     }
 
+    ///    Returns the set of outbound nodes and corresponding edge weights for a given node in the Graph.
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    node: (String, String)
+    ///        A tuple containing the (node_type, node_name) to lookup.
+    ///
+    ///    Returns
+    ///    -------
+    ///    (List[(str, str)], List[float])
+    ///     Set of edges and the corresponding set of weights.
+    ///
+    ///     Throws a KeyError if the node doesn't exist in the graph
+    ///     
     pub fn get_edges(&self, node: (String,String)) -> PyResult<(Vec<(String, String)>, Vec<f32>)> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         let (edges, weights) = self.graph.get_edges(node_id);
@@ -205,11 +294,30 @@ impl Graph {
         Ok((names, weights.to_vec()))
     }
 
+    ///    Returns an interator to the nodes defined in the graph
+    ///
+    ///    Parameters
+    ///    ----------
+    ///
+    ///    Returns
+    ///    -------
+    ///    Iterator[(str, str)]
+    ///         An iterator emitting node types and node names defined in the graph.
+    ///     
     pub fn vocab(&self) -> VocabIterator {
         VocabIterator::new(self.vocab.clone())
     }
 
-    /// Saves a graph to disk
+    ///    Saves a graph to disk at the provided path.
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    path : String
+    ///     Where to save the the graph.
+    ///
+    ///    Returns
+    ///    -------
+    ///     
     pub fn save(&self, path: &str) -> PyResult<()> {
         let f = File::create(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -231,12 +339,26 @@ impl Graph {
         Ok(())
     }
 
+    /// Returns the number of nodes in the graph
     pub fn __len__(&self) -> PyResult<usize> {
         Ok(self.nodes())
     }
     
-    /// Loads a graph from disk
     #[staticmethod]
+    ///    Loads a graph from disk
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    path : str
+    ///        Path to load graph from, in graph format.
+    ///    
+    ///    edge_type : EdgeType
+    ///        EdgeType to use, either Directed or Undirected
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self - Can throw exception
+    ///        
     pub fn load(path: &str, edge_type: EdgeType) -> PyResult<Self> {
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -288,11 +410,61 @@ struct RandomWalker {
 #[pymethods]
 impl RandomWalker {
 
+    ///    Instantiates a random walker instance which can perform random walks on a graph.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    restarts : Float
+    ///        If restarts is ~ (0,1), performs probabalistic termination (ie. pagewalk).  If
+    ///        restarts is [1,inf], performs fixed length walks (ie. rp3b, pixie).
+    ///    
+    ///    walks : Int
+    ///        Number of random walks to perform.  The higher the number, the higher the fidelity
+    ///        of local neighborhood at the expense of more compute.  100_000 is usually a good
+    ///        number to start with.
+    ///    
+    ///    beta : Float - Optional
+    ///        If provided, beta ~ [0,1] specifes how much to discount node impact as a function of its degree.
+    ///        Higher betas discount popular nodes more, biasing toward rarer nodes.  Lower betas
+    ///        reinforce popular nodes more.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
     #[new]
     fn new(restarts: f32, walks: usize, beta: Option<f32>) -> Self {
         RandomWalker { restarts, walks, beta }
     }
 
+    ///    Performs a random walk on a graph, returning a list of nodes and their approxmiate
+    ///    scores where higher scores indicate a higher likelihood to terminate on those nodes.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to perform random walks on
+    ///    
+    ///    node : (String, String)
+    ///        Fully qualified node: (NodeType, NodeName)
+    ///    
+    ///    seed : Int - Optional
+    ///        If provided, sets the random seed.  Otherwise, uses a global fixed seed.
+    ///    
+    ///    k : Int - Optional
+    ///        If provided, truncates the list to the top K.
+    ///    
+    ///    filter_type : String - Optional
+    ///        If provided, only returns nodes that match the provided node type.
+    ///    
+    ///    weighted : Bool - Optional
+    ///        If provided, performs weighted random walks.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[((String,String), Float)] - Can throw exception
+    ///        List of fully qualified nodes and their fractional scores.
+    ///
     pub fn walk(
         &self, 
         graph: &Graph,
@@ -345,10 +517,79 @@ struct BiasedRandomWalker {
 impl BiasedRandomWalker {
 
     #[new]
+    ///    Creates a BiasedRandomWalker instance.
+    ///
+    ///    BiasedRandomWalkers perform random walks while allowing external embeddings to influence
+    ///    the direction a random walker takes.  When two nodes have a closer distance, the
+    ///    randomwalker will reweight scores to explore in that direction more often.  This is
+    ///    helpful when wanting to perform a random walk but also have it focus on areas compatible
+    ///    with embeddings - for example, random walks between queries and products, where the
+    ///    embeddings represent user preferences.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    restarts : Float
+    ///        If restarts is ~ (0,1), performs probabalistic termination (ie. pagewalk).  If
+    ///        restarts is [1,inf], performs fixed length walks (ie. rp3b, pixie).
+    ///    
+    ///    walks : Int
+    ///        Number of random walks to perform.  The higher the number, the higher the fidelity
+    ///        of local neighborhood at the expense of more compute.  100_000 is usually a good
+    ///        number to start with.
+    ///    
+    ///    beta : Float - Optional
+    ///        If provided, beta ~ [0,1] specifes how much to discount node impact as a function of its degree.
+    ///        Higher betas discount popular nodes more, biasing toward rarer nodes.  Lower betas
+    ///        reinforce popular nodes more.
+    ///    
+    ///    blend : Float - Optional
+    ///        If provided, determines how much the embedding influences the direction of the
+    ///        random walk
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
     fn new(restarts: f32, walks: usize, beta: Option<f32>, blend: Option<f32>) -> Self {
         BiasedRandomWalker { restarts, walks, beta, blend }
     }
 
+    ///    Performs the random walk with both starting node and bias context.  Further, a rerank
+    ///    context can be provided to rerank the final results by yet an additional context.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to perform random walks on
+    ///    
+    ///    embeddings : NodeEmbeddings
+    ///        Set of embeddings which reference nodes within the graph.
+    ///    
+    ///    node : (String, String)
+    ///        Fully qualified node: (NodeType, NodeName)
+    ///    
+    ///    context : Query
+    ///        Context, which can be either an embedding or a node lookup, for which to perform
+    ///        distances against.  
+    ///
+    ///    seed : Int - Optional
+    ///        If provided, sets the random seed.  Otherwise, uses a global fixed seed.
+    ///    
+    ///    k : Int - Optional
+    ///        If provided, truncates the list to the top K.
+    ///    
+    ///    rerank_context : Query - Optional
+    ///        If provided, reranks the final result set by the rerank context.
+    ///    
+    ///    filter_type : String - Optional
+    ///        If provided, only returns nodes that match the provided node type.
+    ///    
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[((String,String), Float)] - Can throw exception
+    ///        List of fully qualified nodes and their fractional scores.
+    ///        
     pub fn walk(
         &self, 
         graph: &Graph,
@@ -1418,8 +1659,8 @@ impl NodeEmbeddings {
 
             // Parse lines
             buffer.par_drain(..).map(|line| {
-                line_to_embedding(line)
-                    .ok_or_else(|| PyValueError::new_err("Error parsing line"))
+                line_to_embedding(&line)
+                    .ok_or_else(|| PyValueError::new_err(format!("Error parsing line: {}", line)))
             }).collect_into_vec(&mut p_buffer);
 
             for record in p_buffer.drain(..) {
@@ -1523,7 +1764,7 @@ impl NodeEmbeddingsBuilder {
 
 /// Reads a line and converts it to a node type, node name, and embedding.
 /// Blows up if it doesn't meet the formatting.
-fn line_to_embedding(line: String) -> Option<(String,String,Vec<f32>)> {
+fn line_to_embedding(line: &String) -> Option<(String,String,Vec<f32>)> {
     let pieces:Vec<_> = line.split('\t').collect();
     if pieces.len() != 3 {
         return None
@@ -1887,6 +2128,8 @@ struct PprRankLearner {
     dims: usize,
     passes: usize,
     negatives: usize,
+    loss: String,
+    weight_decay: f32,
     steps: Steps,
     walks: usize,
     k: usize,
@@ -1919,20 +2162,25 @@ impl PprRankLearner {
         // Number of walks per node
         walks: usize,
 
-        //
+        // Number of neighbors to extract from random walk
         k: usize,
 
         // Number of  negatives, produced from random walks.  The quality of these deeply
         // depend on the quality of the graph
         negatives: usize,
 
-        //
+        // Loss to use
+        loss: Option<String>,
+
+        // The PPR scores are either accentuated or depressed by the compression factor
         compression: Option<f32>,
         
-        //
+        // How much to benefit rarer/popular items
         beta: Option<f32>,
 
         num_features: Option<usize>,
+
+        weight_decay: Option<f32>, 
 
         // Percentage of nodes to use for validation
         valid_pct: Option<f32>,
@@ -1957,6 +2205,8 @@ impl PprRankLearner {
             walks,
             k,
             num_features,
+            weight_decay: weight_decay.unwrap_or(0f32),
+            loss: loss.unwrap_or_else(||"listnet".into()),
             compression: compression.unwrap_or(1f32),
             valid_pct: valid_pct.unwrap_or(0.1),
             beta: beta.unwrap_or(0.8)
@@ -1972,13 +2222,19 @@ impl PprRankLearner {
         seed: Option<u64>
     ) -> NodeEmbeddings {
 
-        
+        let loss = if self.loss == "listnet" {
+            PprLoss::ListNet { passive: true, weight_decay: self.weight_decay }
+        } else {
+            PprLoss::ListMLE { weight_decay: self.weight_decay }
+        };
+
         let ppr_rank = PprRank {
             alpha: self.alpha,
             batch_size: self.batch_size,
             dims: self.dims,
             passes: self.passes,
             steps: self.steps,
+            loss: loss,
             negatives: self.negatives,
             num_walks: self.walks,
             beta: self.beta,
