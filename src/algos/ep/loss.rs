@@ -110,13 +110,19 @@ impl Loss {
 
                 let mut ds: Vec<_> = hus.iter().map(|hu| {
                     let hu_norm = il2norm(hu);
-                    (cosine(thv_norm.clone(), hu_norm) / *tau).exp()
+                    cosine(thv_norm.clone(), hu_norm) / *tau
                 }).collect();
 
                 let d1 = cosine(thv_norm, hv_norm) / *tau;
-                let d1_exp = d1.exp();
-                ds.push(d1_exp.clone());
-                -(d1_exp / ds.sum_all()).ln()
+                let mut mask = vec![0f32; ds.len()];
+                ds.push(d1);
+                mask.push(1f32);
+                let ds = ds.concat();
+
+                let ds_exp = (&ds).exp();
+
+                let nom = (ds * mask - (1f32 + ds_exp).ln()).sum();
+                -&nom / nom.value().len() as f32
             }
 
             Loss::RankLoss(tau, _)  => {
@@ -198,8 +204,8 @@ fn random_walk<R: Rng, G: CGraph>(
         }
         let dist = Uniform::new(0, edges.len());
         node = edges[dist.sample(rng)];
-        // We want at least two steps in our walk
-        // before exiting since 1 step guarantees an anchor
+        // We want at least one step in our walk
+        // before exiting since zero-steps guarantees an anchor
         // edge
         if i > 1 && rng.gen::<f32>() < restart_p && node != anchor { break }
     }

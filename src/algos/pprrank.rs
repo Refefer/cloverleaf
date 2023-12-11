@@ -23,8 +23,17 @@ use crate::algos::grad_utils::node_sampler::{RandomWalkHardStrategy,NodeSampler,
 use crate::algos::grad_utils::optimizer::{Optimizer,AdamOptimizer};
 use crate::algos::grad_utils::scheduler::LRScheduler;
 
+#[derive(Copy,Clone)]
+pub enum Loss {
+    ListNet { passive:bool, weight_decay: f32 },
+    ListMLE { weight_decay: f32 }
+}
+
 /// Defines PPR Rank
 pub struct PprRank {
+    /// Optimization to use for computing loss
+    pub loss: Loss,
+
     /// Learning rate for updating feature embeddings
     pub alpha: f32,
 
@@ -127,7 +136,10 @@ impl PprRank {
         let lr_scheduler = {
             let warm_up_steps = (total_updates as f32 / 5f32) as usize;
             let max_steps = self.passes * steps_per_pass;
+            let min_alpha = self.alpha / 100f32; 
+            let gamma = (min_alpha.ln() / max_steps as f32).exp();
             LRScheduler::cos_decay(self.alpha / 100f32, self.alpha, warm_up_steps, max_steps)
+            //LRScheduler::exp_decay(min_alpha, self.alpha, gamma)
         };
 
         // Initialize samplers for negatives.
@@ -342,29 +354,44 @@ impl PprRank {
         feat_maps.push(fm);
         
         // Compute error
-        let loss = self.loss(&query_node, &ranked_embeddings, &ranked_scores, node);
+        let loss = match self.loss {
+            Loss::ListNet { passive, weight_decay } => {
+                let mut list_loss = self.listnet_loss(&query_node, &ranked_embeddings, &ranked_scores, node, passive);
+                if weight_decay > 0f32 {
+                    list_loss = list_loss + weight_decay * comp_weight_decay(&query_node, &ranked_embeddings, 1f32)
+                }
+                list_loss
+            },
+            Loss::ListMLE { weight_decay } => {
+                let mut list_loss = self.list_mle_loss(&query_node, &ranked_embeddings, &ranked_scores, node);
+                if weight_decay > 0f32 {
+                    list_loss = list_loss + weight_decay * comp_weight_decay(&query_node, &ranked_embeddings, 1f32)
+                }
+                list_loss
+            }
+        };
 
         (loss, feat_maps)
     }
 
-    fn loss(
+    fn listnet_loss(
         &self,
         query_node: &ANode,
         ranked_nodes: &[ANode],
         node_weights: &[f32],
-        node_id: NodeID
+        node_id: NodeID,
+        passive: bool
     ) -> ANode {
 
-        // Compute dot score, then the softmax
-        let qn = il2norm(query_node);
-        let scores = ranked_nodes.iter().map(|n| {
-            qn.dot(&il2norm(n))
-        }).collect::<Vec<_>>().concat() * 5f32;
-
+        let scores = compute_distances(query_node, ranked_nodes, false);
         let sm_scores = softmax(scores);
+
         let ordered = node_weights.iter().enumerate()
             .filter(|(i, s)| {
-                **s > 0f32 && sm_scores.value()[*i] <= **s
+                let nonzero = **s > 0f32;
+                if passive {
+                    nonzero && sm_scores.value()[*i] <= **s
+                } else { nonzero }
             })
             .map(|(idx, s)| {
                 let k = sm_scores.slice(idx, 1);
@@ -378,6 +405,37 @@ impl PprRank {
             let loss = -ordered.sum_all();
             if node_id == 0 {
                 println!("loss:{}, {:?} -> {:?}", loss.value()[0], node_weights, sm_scores.value());
+            }
+            loss
+        }
+    }
+
+    fn list_mle_loss(
+        &self,
+        query_node: &ANode,
+        ranked_nodes: &[ANode],
+        node_weights: &[f32],
+        node_id: NodeID
+    ) -> ANode {
+
+        let yi = compute_distances(query_node, ranked_nodes, false);
+
+        // Compute the plackett luce model for each score
+        let n = ranked_nodes.len();
+        let pl: Vec<_> = (0..n).map(|i| {
+            yi.slice(i,1) / yi.slice(i, n - i).sum()
+        }).collect();
+
+        let pl_loss = pl.iter().fold(Constant::scalar(1f32), |acc, x| acc * x);
+
+        let loss = -pl_loss.ln();
+        if loss.value()[0].is_nan() || loss.value()[0].is_infinite() {
+            println!("yi: {:?}",yi.value());
+            println!("pl: {:?}", pl.concat().value());
+            Constant::scalar(0f32)
+        } else {
+            if node_id == 0 {
+                println!("loss:{}, {:?} -> {:?}", loss.value()[0], node_weights, yi.value());
             }
             loss
         }
@@ -405,14 +463,40 @@ impl PprRank {
 
 }
 
-fn il2norm(v: &ANode) -> ANode {
-    v / l2norm(v.clone())
+fn compute_distances(query_node: &ANode, ranked_nodes: &[ANode], cosine: bool) -> ANode {
+    if cosine {
+        // Compute the dot products to construct our yis
+        let qn = il2norm(query_node);
+        (ranked_nodes.iter().map(|n| {
+            qn.dot(&il2norm(n))
+        }).collect::<Vec<_>>().concat() * 5f32).exp()
+    } else {
+        ranked_nodes.iter().map(|n| {
+            query_node.dot(n)
+        }).collect::<Vec<_>>().concat().exp()
+    }
 }
 
-fn l2norm(v: ANode) -> ANode {
+fn il2norm(v: &ANode) -> ANode {
+    v / l2norm(v)
+}
+
+fn l2norm(v: &ANode) -> ANode {
     v.pow(2f32).sum().pow(0.5)
 }
 
+fn comp_weight_decay(query_node: &ANode, ranked_nodes: &[ANode], threshold: f32) -> ANode {
+    let t = Constant::scalar(threshold);
+    let mut mag = Vec::with_capacity(ranked_nodes.len() + 1);
+    mag.push(l2norm(query_node));
+    ranked_nodes.iter().for_each(|n| {
+        let nn = n.pow(2f32).sum() - &t;
+        if nn.value()[0] > 0f32 {
+            mag.push(nn)
+        }
+    });
+    mag.concat().sum()
+}
 
 struct WalkLibrary {
     k: usize,

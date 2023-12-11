@@ -76,6 +76,17 @@ def build_arg_parser():
         default=None,
         help="If provided, embeds features from the given file instead of training set.")
 
+    parser.add_argument("--weight-decay",
+        dest="weight_decay",
+        type=float,
+        default=0,
+        help="Adds l2 loss to the embeddings")
+
+    parser.add_argument("--loss",
+        choices=('listnet', 'listmle'),
+        default='listnet',
+        help='Which loss to optimize.')
+
     parser.add_argument("--negatives",
         dest="negatives",
         default=5,
@@ -146,6 +157,8 @@ def main(args):
         walks=args.walks,
         steps=args.steps,
         k=args.k,
+        weight_decay=args.weight_decay,
+        loss=args.loss,
         compression=args.compression,
         num_features=args.num_features,
         valid_pct=args.valid_pct)

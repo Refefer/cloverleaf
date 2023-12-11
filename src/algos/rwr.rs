@@ -69,15 +69,19 @@ impl RWR {
         let (edges, weights) = graph.get_edges(start_node);
         let probs = CDFtoP::new(weights);
         let mut cur_idx = weighted_sample_cdf(weights, rng);
-        let dist = Uniform::new(0, edges.len());
-        for _ in 0..walks {
-            let candidate = dist.sample(rng);
-            let cur_p = probs.prob(cur_idx);
-            let new_p = probs.prob(candidate);
-            if rng.gen::<f32>() < new_p / cur_p {
-                cur_idx = candidate;
+        if edges.len() > 0 {
+            let dist = Uniform::new(0, edges.len());
+            for _ in 0..walks {
+                let candidate = dist.sample(rng);
+                let cur_p = probs.prob(cur_idx);
+                let new_p = probs.prob(candidate);
+                if rng.gen::<f32>() < new_p / cur_p {
+                    cur_idx = candidate;
+                }
+                *entries.entry(edges[cur_idx]).or_insert(0) += 1;
             }
-            *entries.entry(edges[cur_idx]).or_insert(0) += 1;
+        } else {
+            *entries.entry(start_node).or_insert(0) += 1;
         }
     }
 
