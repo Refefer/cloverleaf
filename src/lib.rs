@@ -650,6 +650,29 @@ struct SparsePPR {
 #[pymethods]
 impl SparsePPR {
 
+    ///    Creates a Sparse Personalized Page Rank.  Unlike sampling approaches used by
+    ///    RandomWalker, this uses a different personalized page rank estimator controllable by a
+    ///    provided error.  In general, it's less flexible than sampling based approaches but can
+    ///    be substantially faster for graphs with low degree counts.
+    ///
+    ///    In cases where degree count can be high, can be substantially slower than estimate based
+    ///    approaches.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    restarts : Float
+    ///        restarts ~ (0,1), determines the probability a random walk will terminate with
+    ///        lower restarts resulting in longer walks.
+    ///    
+    ///    eps : Float - Optional
+    ///        If provided, specifies the tolerable error rate allowed for the estimation.  Default
+    ///        is 1e-5.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self - Can throw exception
+    ///        
+    ///    
     #[new]
     fn new(restarts: f32, eps: Option<f32>) -> PyResult<Self> {
         if restarts <= 0f32 || restarts >= 1f32 {
@@ -658,6 +681,27 @@ impl SparsePPR {
         Ok(SparsePPR { restarts, eps: eps.unwrap_or(1e-5) })
     }
 
+    ///    Computes the personalized page rank estimate for a given node
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to perform the PPR on
+    ///    
+    ///    node : (String, String)
+    ///        Starting node for PPR.
+    ///    
+    ///    k : Int - Optional
+    ///        If provided, returns only the top K nodes and scores; otherwise provides all.
+    ///    
+    ///    filter_type : String - Optional
+    ///        If provided, filters out nodes that do not match the provided filter_type.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[((String,String), f32)] - Can throw exception
+    ///        List of fully qualified nodes and their fractional scores
+    ///    
     pub fn compute(
         &self, 
         graph: &Graph,
@@ -692,6 +736,14 @@ struct GraphBuilder {
 
 #[pymethods]
 impl GraphBuilder {
+    ///    Creates a new graph builder instance.  This allows for the programatic construction of
+    ///    graphs, creating a fully fledged and optimized graph at the end.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new() -> Self {
         GraphBuilder {
@@ -700,6 +752,23 @@ impl GraphBuilder {
         }
     }
  
+    ///    Adds an edge to the graph.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    from_node : (String, String)
+    ///        Originating node.
+    ///    
+    ///    to_node : (String,String)
+    ///        Destination Node
+    ///    
+    ///    weight : Float
+    ///        Associated Edge weight, if application
+    ///    
+    ///    node_type : EdgeType
+    ///        If Directed, only creates the edge in one direction.  If undirected, creates two
+    ///        edges from from_node -> to_node and to_node -> from_node, each with the same weight.
+    ///    
     pub fn add_edge(
         &mut self, 
         from_node: (String, String), 
@@ -715,6 +784,13 @@ impl GraphBuilder {
         }
     }
 
+    ///    Constructs the graph
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Graph - Optional
+    ///        Creates a Graph for usage.  If no edges have been specified, returns None.
+    ///    
     pub fn build_graph(&mut self) -> Option<Graph> {
         if self.edges.len() == 0 {
             return None
@@ -746,31 +822,132 @@ struct EPLoss {
 #[pymethods]
 impl EPLoss {
 
+    ///    Uses thresholded Margin loss for Embedding Propagation.  This is equivalent to the loss
+    ///    used in the Embedding Propagation paper.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    gamma : Float
+    ///        Threshold for which to ignore distance computation.
+    ///    
+    ///    negatives : Int - Optional
+    ///        If provided, the number of negatives samples to use.  Default is 1
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[staticmethod]
     pub fn margin(gamma: f32, negatives: Option<usize>) -> Self {
         EPLoss { loss: Loss::MarginLoss(gamma, negatives.unwrap_or(1)) }
     }
 
+    ///    Uses temperature controlled contrastive loss with cosine similarity for optimization.
+    /// 
+    ///    Parameters
+    ///    ----------
+    ///    temperature : Float
+    ///        Temperature to control the influence of high values.  Higher temperatures reduce the
+    ///        impact of larger deltas
+    ///    
+    ///    negatives : Int
+    ///        If provided, the number of negatives samples to use.  Default is 1.
+    ///     
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[staticmethod]
     pub fn contrastive(temperature: f32, negatives: usize) -> Self {
         EPLoss { loss: Loss::Contrastive(temperature, negatives.max(1)) }
     }
 
+    ///    Uses the Starspace loss for optimization, as seen in the Starspace paper.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    gamma : Float
+    ///        Margin threshold.  Higher values spend less time optimizing scores which are
+    ///        relatively close to the margin
+    ///    
+    ///    negatives : Int
+    ///        If provided, the number of negatives samples to use.  Default is 1.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[staticmethod]
     pub fn starspace(gamma: f32, negatives: usize) -> Self {
         EPLoss { loss: Loss::StarSpace(gamma, negatives.max(1)) }
     }
 
+    ///    Optimizes for the NLL of a 1-N classification task.  This is also known as ListNet,
+    ///    except with a margin.  Uses dot products for similarity.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    tau : Float
+    ///        Tau serves as the margin threshold parameter
+    ///    
+    ///    negatives : Int
+    ///        If provided, the number of negatives samples to use.  Default is 1.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[staticmethod]
     pub fn rank(tau: f32, negatives: usize) -> Self {
         EPLoss { loss: Loss::RankLoss(tau, negatives.max(1)) }
     }
 
+    ///    Combines Starspace and RankLoss losses as an aggregate.  Starspace better regulates
+    ///    magnitude of embeddings while RankLoss better organizes positive to negative sets.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    tau : Float
+    ///        Serves as the threshold parameter for both StarSpace and RankLoss.
+    ///    
+    ///    negatives : Int
+    ///        If provided, the number of negatives samples to use.  Default is 1.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[staticmethod]
     pub fn rankspace(tau: f32, negatives: usize) -> Self {
         EPLoss { loss: Loss::RankSpace(tau, negatives.max(1)) }
     }
 
+    ///    PPR is an interesting loss.  Unlike the other losses, it constructs the positive node
+    ///    embedding via a personalized random walks instead of just the immediate neighbors.  This
+    ///    has the effect of learning a smoothed node embedding.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    gamma : Float
+    ///        Margin parameter
+    ///    
+    ///    negatives : Int
+    ///        Number of walks and number of negatives to use for constructing positive and
+    ///        negative examples.
+    ///    
+    ///    restart_p : Float
+    ///        Restart probability ~ [0,1]
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[staticmethod]
     pub fn ppr(gamma: f32, negatives: usize, restart_p: f32) -> Self {
         EPLoss { loss: Loss::PPR(gamma, negatives.max(1), restart_p) }
@@ -793,6 +970,82 @@ struct EmbeddingPropagator {
 
 #[pymethods]
 impl EmbeddingPropagator {
+    ///    Instantiates a new EmbeddingPropagator.  This is a fairly complex method and more
+    ///    details on many of the parameters are found in the original paper.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    alpha : Float - Optional
+    ///        If provided, the starting learning rate used.  Default is 9e-1.
+    ///    
+    ///    loss : EPLoss - Optional
+    ///        Loss function to use.  This defines both the distance function as well as the loss
+    ///        function.  Default is Margin(1, 1).
+    ///    
+    ///    batch_size : Int - Optional
+    ///        Batch size to use.  Higher batch sizes are slower and have fewer update steps but
+    ///        offer lower variance gradients.  Default is 50.
+    ///    
+    ///    dims : Int - Optional
+    ///        Embedding dimentions for both features as well node embeddings.  Default is 100.
+    ///    
+    ///    passes : Int - Optional
+    ///        Number of passes to run over the graph.  Default is 100.
+    ///    
+    ///    seed : Int - Optional
+    ///        Random seed to use for optimization.  Default is a global constant.
+    ///    
+    ///    max_nodes : Int - Optional
+    ///        Number of neighbor nodes to use for reconstructing the the node embedding estimate.
+    ///        The larger the number, the better the estimate, but is more computationally
+    ///        expensive.  These nodes are randomly selected each pass. Default is all.
+    ///    
+    ///    max_features : Int - Optional
+    ///        Maximum number of features to use to construct a node embedding.  These features
+    ///        will be randomly selected every node construction.  Default is all.
+    ///    
+    ///    valid_pct : Float - Optional
+    ///        Takes a percentage of the nodes in the graph and uses them to measure validation.
+    ///        Not very useful right now, default is 0.1
+    ///    
+    ///    hard_negatives : Int - Optional
+    ///        Finds hard negatives by performing a random walk in the neighborhood and using it to
+    ///        select a negative.  Default is 0
+    ///    
+    ///    indicator : Bool - Optional
+    ///        Shows a progress bar.  Default is True
+    ///    
+    ///    attention : Int - Optional
+    ///        If provided, uses softmax attention to construct node embeddings.  If provided, this
+    ///        adds to the `dim` space into query, key, and value functions.  This specifies the
+    ///        size used for Query and Value, resulting in an embedding that is "2*`attention` +
+    ///        dim".
+    ///
+    ///        Note: while this functionality is here, it is _incredibly_ computationally expensive
+    ///        to do on CPU.  Useful only for small graphs or extreme patience.
+    ///
+    ///        Default is 0.
+    ///    
+    ///    attention_heads : Int - Optional
+    ///        Number of heads to use.  This expands the model size even more.
+    ///
+    ///        Default is 1.
+    ///    
+    ///    context_window : Int - Optional
+    ///        If provided, uses sliding attention which can be helpful for NLP node features
+    ///
+    ///        Default is None
+    ///    
+    ///    noise : Float - Optional
+    ///        If added, injects gaussian noise into the gradients to help with generalization.  
+    ///
+    ///        Default is None.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(
         // Learning rate
@@ -872,7 +1125,24 @@ impl EmbeddingPropagator {
         EmbeddingPropagator{ ep, model }
     }
 
-    /// The big one - kicks off learning the features used to construct nodes.
+    ///    Learns the features from a given graph
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to learn against.
+    ///    
+    ///    features : FeatureSet
+    ///        FeatureSet for nodes in the graph
+    ///    
+    ///    feature_embeddings : mut NodeEmbeddings - Optional
+    ///        If not provided, creates a new randomized feature_embedding set.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings
+    ///        A mapping from features -> embedding
+    ///    
     pub fn learn_features(
         &mut self, 
         graph: &Graph, 
@@ -949,7 +1219,26 @@ impl FeatureSet {
 #[pymethods]
 impl FeatureSet {
 
-    // Loads features tied to a graph
+    ///    Creates a FeatureSet tied to a graph.  We do this to minimize duplicate vocabularies and
+    ///    guaranteed 1:1 mapping of nodes to features
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to construct FeatureSet for
+    ///    
+    ///    path : String - Optional
+    ///        If provided, reads features from a file.  If not, creates a FeatureSet which is
+    ///        empty.
+    ///    
+    ///    namespace : String - Optional
+    ///        If provided, overrides the default 'node type' for a feature.  Default is 'feat'.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self - Can throw exception
+    ///        
+    ///    
     #[staticmethod]
     pub fn new_from_graph(graph: &Graph, path: Option<String>, namespace: Option<String>) -> PyResult<Self> {
 
@@ -966,6 +1255,22 @@ impl FeatureSet {
     }
 
     // Loads features tied to a graph
+    ///    Loads a feature set from file.  This is less memory efficient than using
+    ///    `new_from_graph`.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    path : String
+    ///        Path to load features from.
+    ///    
+    ///    namespace : String - Optional
+    ///        If provided, overrides the default 'node type' for a feature.  Default is 'feat'.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self - Can throw exception
+    ///        
+    ///    
     #[staticmethod]
     pub fn new_from_file(path: String, namespace: Option<String>) -> PyResult<Self> {
 
@@ -982,18 +1287,56 @@ impl FeatureSet {
         Ok(fs)
     }
 
+    ///    Sets the features for a Node.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    node : (String,String)
+    ///        Fully qualified Node.
+    ///    
+    ///    features : List[String]
+    ///        Features to set for this node.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    () - Can throw exception
+    ///        
+    ///    
     pub fn set_features(&mut self, node: (String,String), features: Vec<String>) -> PyResult<()> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         self.features.set_features(node_id, features);
         Ok(())
     }
 
+    ///    Retrieves the set of features defined for a node.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    node : (String,String)
+    ///        Fully qualified Node.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[String] - Can throw exception
+    ///        Set of features specified for node
+    ///    
     pub fn get_features(&self, node: (String,String)) -> PyResult<Vec<String>> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         Ok(self.features.get_pretty_features(node_id))
     }
 
-    /// Loads features from a graph, constructing a new vocabulary
+    ///    Loads a file defining fully qualified nodes to features into a feature set.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    path : String
+    ///        Path point to features definitions.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    () - Can throw exception
+    ///        
+    ///    
     pub fn load_into(&mut self, path: String) -> PyResult<()> {
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -1013,18 +1356,50 @@ impl FeatureSet {
         Ok(())
     }
 
+    ///    Returns the number of nodes in the feature set.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Int
+    ///    
     pub fn nodes(&self) -> usize {
         self.vocab.len()
     }
 
+    ///    Returns the number of unique features defined in the featureset
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Int
+    ///        
+    ///    
     pub fn num_features(&self) -> usize {
         self.features.num_features()
     }
 
+    ///    Iterator over fully qualified nodes.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    VocabIterator
+    ///        
+    ///    
     pub fn vocab(&self) -> VocabIterator {
         VocabIterator::new(self.vocab.clone())
     }
 
+    ///    Returns a new featureset with only features greater than `count`.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    count : Int
+    ///        Filtering threshhold.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     pub fn prune_min_count(&self, count: usize) -> Self {
         FeatureSet {
             features: self.features.prune_min_count(count),
@@ -1049,6 +1424,26 @@ pub struct FeaturePropagator {
 
 #[pymethods]
 impl FeaturePropagator {
+    ///    Uses a limited form of propagation to fill in FeatureSets where node features are
+    ///    missing.  Of limited value in many cases but can be helpful for extremely large graphs
+    ///    in some cases.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    k : Int
+    ///        Max number of nodes to use.
+    ///    
+    ///    threshold : Float - Optional
+    ///        if the count / norm is less than threshold, filters out the feature.  Default is 0.
+    ///    
+    ///    max_iters : Int - Optional
+    ///        Number of passes to run.  Default is 20.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(k: usize, threshold: Option<f32>, max_iters: Option<usize>) -> Self {
         FeaturePropagator { 
@@ -1058,6 +1453,16 @@ impl FeaturePropagator {
         }
     }
 
+    ///    Propagates features throughout the graph.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to propagate.
+    ///    
+    ///    features : mut FeatureSet
+    ///        Features to modify.
+    ///    
     pub fn propagate(&self,
         graph: &Graph,
         features: &mut FeatureSet
