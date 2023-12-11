@@ -1504,18 +1504,58 @@ pub struct FeatureAggregator {
 #[pymethods]
 impl FeatureAggregator {
 
+    ///    Averages features together to create node embeddings.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[allow(non_snake_case)]
     #[staticmethod]
     pub fn Averaged() -> Self {
         FeatureAggregator { at: AggregatorType::Averaged }
     }
 
+    ///    Uses attention across features to construct the node embeddings.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    num_heads : Int
+    ///        Number of attention heads.
+    ///    
+    ///    d_k : Int
+    ///        Dimension of the Query and Key fields.
+    ///    
+    ///    window : Int - Optional
+    ///        If provided, uses sliding window attention.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[allow(non_snake_case)]
     #[staticmethod]
     pub fn Attention(num_heads: usize, d_k: usize, window: Option<usize>) -> Self {
         FeatureAggregator { at: AggregatorType::Attention {num_heads, d_k, window} }
     }
 
+    ///    Uses weights derived from feature frequency to bias node embeddings to rarer features.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    alpha : Float
+    ///        Amount to bias weights.
+    ///    
+    ///    fs : FeatureSet
+    ///        FeatureSet to learn weights from, using unigram probability.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[allow(non_snake_case)]
     #[staticmethod]
     pub fn Weighted(alpha: f32, fs: &FeatureSet) -> Self {
@@ -1524,8 +1564,19 @@ impl FeatureAggregator {
         FeatureAggregator { at: AggregatorType::Weighted {alpha, vocab, unigrams} }
     }
 
-    /// Write the details to disk.  We should use a proper serialization library instead of the hot
-    /// non-sense currently used.
+    ///    Write the Aggregator to disk.  Stores any learned parameter, such as from Weighted, in
+    ///    the data format
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    path : str
+    ///        Path to write aggregator to.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    () - Can throw exception
+    ///        
+    ///    
     pub fn save(&self, path: &str) -> PyResult<()> {
         let f = File::create(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -1565,6 +1616,18 @@ impl FeatureAggregator {
         Ok(())
     }
 
+    ///    Loads an Aggregator from file.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    path : String
+    ///        Path to the serialized aggregator.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self - Can throw exception
+    ///        
+    ///    
     #[staticmethod]
     pub fn load(path: String) -> PyResult<Self> {
         let f = File::open(path)
@@ -1691,12 +1754,39 @@ impl NodeEmbedder {
 
 #[pymethods]
 impl NodeEmbedder {
+    ///    Creates a new Embedder which takes a FeatureSet and Feature embeddings to construct a
+    ///    node embeddings.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    feat_agg : FeatureAggregator
+    ///        Feature aggregator method to use.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(feat_agg: FeatureAggregator) -> Self {
         NodeEmbedder { feat_agg }
     }
 
-    /// Embeds a full featureset into NodeEmbeddings
+    ///    Embeds a full feature set into an set of Embeddings.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    feat_set : FeatureSet
+    ///        Feature set to embed.
+    ///    
+    ///    feature_embeddings : NodeEmbeddings
+    ///        Feature embeddings.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings
+    ///        
+    ///    
     pub fn embed_feature_set(
         &self, 
         feat_set: &FeatureSet, 
@@ -1731,7 +1821,27 @@ impl NodeEmbedder {
         }
     }
 
-    /// Embeds a set of features into a Node Embedding.
+    ///    Embeds an adhoc feature set into an embedding.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    features : List[(String,String)]
+    ///        List of fully qualified features to embed.  Usually 'feat' is the type.
+    ///    
+    ///    feature_embeddings : NodeEmbeddings
+    ///        Feature embeddings.
+    ///    
+    ///    strict : Bool - Optional
+    ///        If true, requires all features to exist in the embedding or throws an error.  If
+    ///        false, will create an embedding only from such features that are defined.  
+    ///
+    ///        Default is True.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[Float] - Can throw exception
+    ///        Embedding
+    ///    
     pub fn embed_adhoc(
         &self, 
         features: Vec<(String, String)>,
@@ -1757,6 +1867,29 @@ impl NodeEmbedder {
         Ok(embedding)
     }
 
+    ///    Same as embed_adhoc but with multiple feature sets.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    features_set : List[List[(String,String)]]
+    ///        Adhoc feature sets to use.
+    ///    
+    ///    feature_embeddings : NodeEmbeddings
+    ///        Feature embeddings.
+    ///        
+    ///    
+    ///    strict : Bool - Optional
+    ///        If true, requires all features to exist in the embedding or throws an error.  If
+    ///        false, will create an embedding only from such features that are defined.  
+    ///
+    ///        Default is True.
+    ///        
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[List[Float]] - Can throw exception
+    ///        
+    ///    
     pub fn bulk_embed_adhoc(&self, 
         features_set: Vec<Vec<(String, String)>>,
         feature_embeddings: &NodeEmbeddings,
@@ -1804,6 +1937,33 @@ struct DistanceEmbedder {
 
 #[pymethods]
 impl DistanceEmbedder {
+    ///    Creates a Distance embedding.  Distance embedding uses a method called landmark
+    ///    triangulation to compute a "Distance" embedding.  The procedure works as follows:
+    ///
+    ///    1. Select K landmarks.
+    ///    2. Compute the distance from each of those landmarks to every node in the graph.
+    ///    3. Create an embedding which is the distance for each node.
+    ///    4. Compute distances between modes using an algorithm called ALT (A* landmark
+    ///       triangulation).
+    ///
+    ///    It's very fast and can encode useful properties of a graph, but does require a fully
+    ///    connected graph.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    n_landmarks : Int
+    ///        Number of landmarks to use.  The larger the landmark size, the greater the fidelity
+    ///        of the embedding.
+    ///    
+    ///    seed : Int - Optional
+    ///        If provided, randomly selects landmarks randomly rather than using the top K
+    ///        landmarks by degree.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(n_landmarks: usize, seed: Option<u64>) -> Self {
         let ls = if let Some(seed) = seed {
@@ -1818,6 +1978,18 @@ impl DistanceEmbedder {
 
     }
 
+    ///    Learns distance embeddings for a graph.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to learn distance embeddings.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings
+    ///        Embedding set, using the Distance.ALT method for similarity.
+    ///    
     pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
         let es = crate::algos::dist::construct_walk_distances(graph.graph.as_ref(), self.n_landmarks, self.landmarks);
         NodeEmbeddings {
@@ -1837,6 +2009,27 @@ struct ClusterLPAEmbedder{
 
 #[pymethods]
 impl ClusterLPAEmbedder {
+    ///    Creates a ClusterLPAEmbedder.
+    ///
+    ///    ClusterLPAEmbedder runs the LPA algoritm K times with different random seeds and creates
+    ///    a HammingDistance NodeEmbedding set.  Very fast.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    k : Int
+    ///        Number of dimensions in NodeEmbeddings.
+    ///    
+    ///    passes : Int
+    ///        Number of passes to run LPA.
+    ///    
+    ///    seed : Int - Optional
+    ///        If provide, use the provided seed.  Default is global seed.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(k: usize, passes: usize, seed: Option<u64>) -> Self {
         ClusterLPAEmbedder {
@@ -1844,6 +2037,18 @@ impl ClusterLPAEmbedder {
         }
     }
 
+    ///    Learns NodeEmebddings on the provided graph.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to use.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings
+    ///        Set of NodeEmbeddings with Distance.Hamming.
+    ///    
     pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
         let seed = self.seed.unwrap_or(SEED);
         let es = crate::algos::lpa::construct_lpa_embedding(graph.graph.as_ref(), self.k, self.passes, seed);
@@ -1865,6 +2070,25 @@ struct SLPAEmbedder {
 
 #[pymethods]
 impl SLPAEmbedder {
+    ///    Creates a Speaker-Listener multi-cluster embedder.  Somewhat better than clustering LPA
+    ///    by allowing overlapping communities in a more principaled way.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    k : Int
+    ///        Maximum number of clusters to preserve for each Node
+    ///    
+    ///    threshold : Float
+    ///        Filtering threshold: clusters which have a weight less than threshold are truncated.
+    ///    
+    ///    seed : Int - Optional
+    ///        If provided, use this seed.  Default is global seed.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(k: usize, threshold: f32, seed: Option<u64>) -> Self {
         SLPAEmbedder {
@@ -1872,6 +2096,18 @@ impl SLPAEmbedder {
         }
     }
 
+    ///    Learn SLPA Embeddings
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to learn embeddings.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings
+    ///        
+    ///    
     pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
         let seed = self.seed.unwrap_or(SEED);
         let es = crate::algos::slpa::construct_slpa_embedding(graph.graph.as_ref(), self.k, self.threshold, seed);
@@ -1883,8 +2119,7 @@ impl SLPAEmbedder {
 
 }
 
-/// Struct for learning Speaker-Listener multi-cluster embeddings.  Uses Hamming Distance for
-/// distance.
+/// Computes the PageRank for all nodes in the graph.
 #[pyclass]
 struct PageRank {
     iterations: usize,
@@ -1894,11 +2129,48 @@ struct PageRank {
 
 #[pymethods]
 impl PageRank {
+    ///    Initializes a PageRank struct.  It uses the power iteration approach for learning
+    ///    results.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    iterations : Int
+    ///        Number of iterations to run the PageRank algorithm.
+    ///    
+    ///    damping : Float - Optional
+    ///        If provided, sets the restart probability to (1 - damping).  Higher Damping leads to
+    ///        more global stationary distributions.  Lower damping preserves more local structure.
+    ///
+    ///        Default is 0.85
+    ///    
+    ///    eps : Float - Optional
+    ///        Early termination if the page rank scores are less than EPS.  Default is 1e-5.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(iterations: usize, damping: Option<f32>, eps: Option<f32>) -> Self {
         PageRank {iterations, damping: damping.unwrap_or(0.85), eps: eps.unwrap_or(1e-5) }
     }
 
+    ///    Computes PageRank on a graph
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to use.
+    ///    
+    ///    indicator : Bool - Optional
+    ///        If provided, uses an indicator.  Default is True
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings
+    ///        NodeEmbeddings of dimension=1, where the value is the page rank score.
+    ///    
     pub fn learn(&self, graph: &Graph, indicator: Option<bool>) -> NodeEmbeddings {
         let page_rank = crate::algos::pagerank::PageRank::new(self.iterations, self.damping, self.eps);
         let scores = page_rank.compute(graph.graph.as_ref(), indicator.unwrap_or(true));
@@ -1926,6 +2198,24 @@ pub struct NodeEmbeddings {
 
 #[pymethods]
 impl NodeEmbeddings {
+    ///    Creates a NodeEmbedding set from a given graph.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to use.
+    ///    
+    ///    dims : Int
+    ///        Number of dimensions for each embedding.
+    ///    
+    ///    distance : Distance
+    ///        Distance metric for computing distances.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(graph: &Graph, dims: usize, distance: Distance) -> Self {
         let dist = distance.to_edist();
@@ -1937,15 +2227,54 @@ impl NodeEmbeddings {
         }
     }
 
+    ///    Checks if a Node exists within the NodeEmbeddings.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    node : (String, String)
+    ///        Fully qualified node.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Bool
+    ///        True if it exists, False otherwise.
+    ///    
     pub fn contains(&self, node: (String, String)) -> bool {
         get_node_id(self.vocab.deref(), node.0, node.1).is_ok()
     }
 
+    ///    Returns the Embedding defined for a fully qualified Node.
+    ///     
+    ///    Parameters
+    ///    ----------
+    ///    node : (String,String)
+    ///        Fully qualified Node
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[Float] - Can throw exception
+    ///        Embedding associated with the Node
+    ///    
     pub fn get_embedding(&mut self, node: (String,String)) -> PyResult<Vec<f32>> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         Ok(self.embeddings.get_embedding(node_id).to_vec())
     }
 
+    ///    Sets the given embedding.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    node : (String,String)
+    ///        Fully qualified Node
+    ///    
+    ///    embedding : List[Float]
+    ///        Embedding to set it to.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    () - Can throw exception
+    ///        
+    ///    
     pub fn set_embedding(&mut self, node: (String,String), embedding: Vec<f32>) -> PyResult<()> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         let es = &mut self.embeddings;
@@ -1953,10 +2282,35 @@ impl NodeEmbeddings {
         Ok(())
     }
 
+    ///    Iterates over the Nodes defined in the NodeEmbeddings.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    VocabIterator
+    ///        
+    ///    
     pub fn vocab(&self) -> VocabIterator {
         VocabIterator::new(self.vocab.clone())
     }
 
+    ///    Using a provided embedding, finds the nearest K neighbors to that embedding.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    emb : List[Float]
+    ///        Embedding to nearest neighbor
+    ///    
+    ///    k : Int
+    ///        Top K items to return
+    ///    
+    ///    filter_type : String - Optional
+    ///        If provided, filters out nodes that don't match the filter_type
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[((String,String), f32)]
+    ///        Set of fully qualified nodes and distances.
+    ///    
     pub fn nearest_neighbor(
         &self, 
         emb: Vec<f32>, 
