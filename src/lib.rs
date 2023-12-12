@@ -2331,18 +2331,51 @@ impl NodeEmbeddings {
         convert_node_distance(&self.vocab, dists)
     }
 
+    ///    Returns the number of dimensions for an embedding.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Int
+    ///        
+    ///    
     pub fn dims(&self) -> usize {
         self.embeddings.dims()
     }
 
+    ///    Returns the number of nodes in the embedding set.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Int
+    ///        
+    ///    
     pub fn len(&self) -> usize {
         self.embeddings.len()
     }
 
+    ///    Returns the number of nodes in the embedding set.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Int - Can throw exception
+    ///        
+    ///    
     pub fn __len__(&self) -> PyResult<usize> {
         Ok(self.embeddings.len())
     }
 
+    ///    Returns the node and embedding at internal index `idx`.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    idx : isize
+    ///        Internal index.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    ((String, String), List[Float]) - Can throw exception
+    ///        
+    ///    
     pub fn __getitem__(&self, mut idx: isize) -> PyResult<((String, String), Vec<f32>)> {
         let len = self.embeddings.len() as isize;
         if idx < 0 {
@@ -2357,6 +2390,8 @@ impl NodeEmbeddings {
         Ok((((*nt).clone(), nn.to_string()), emb))
     }
 
+    ///    L2Norms the embeddings, useful for cosine similarity.
+    ///    
     pub fn l2norm(&self) {
         (0..self.embeddings.len()).into_par_iter().for_each(|idx| {
             let e = self.embeddings.get_embedding_mut_hogwild(idx);
@@ -2367,6 +2402,18 @@ impl NodeEmbeddings {
         });
     }
 
+    ///    Saves the NodeEmbeddings to disk
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    path : str
+    ///        Path to store NodeEmbeddings.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    () - Can throw exception
+    ///        
+    ///    
     pub fn save(&self, path: &str) -> PyResult<()> {
         let mut writer = EmbeddingWriter::new(path, self.vocab.as_ref())
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -2380,14 +2427,40 @@ impl NodeEmbeddings {
         Ok(())
     }
 
+    ///    Loads NodeEmbeddings from disk.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    path : str
+    ///        Path where NodeEmbeddings are stored.
+    ///    
+    ///    distance : Distance
+    ///        Distance method to use for computing embedding similarity.
+    ///    
+    ///    filter_type : String - Optional
+    ///        If provided, only loads embeddings which match the provided node type.
+    ///    
+    ///        Default is None.
+    ///
+    ///    chunk_size : Int - Optional
+    ///        If provided, changes the chunk size.  Larger chunk sizes lets Cloverleaf load
+    ///        embeddings with greater parallelism at the expense of more memory.
+    ///
+    ///        Default is 1_000.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self - Can throw exception
+    ///        
+    ///    
     #[staticmethod]
     pub fn load(
         path: &str, 
         distance: Distance, 
-        node_type: Option<String>, 
+        filter_type: Option<String>, 
         chunk_size: Option<usize>
     ) -> PyResult<Self> {
-        let num_embeddings = count_lines(path, &node_type)
+        let num_embeddings = count_lines(path, &filter_type)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
         let f = File::open(path)
@@ -2398,7 +2471,7 @@ impl NodeEmbeddings {
         
         // Place holder
         let mut es = EmbeddingStore::new(0, 0, EDist::Cosine);
-        let filter_node = node_type.as_ref();
+        let filter_node = filter_type.as_ref();
         let mut i = 0;
         let mut buffer = Vec::with_capacity(chunk_size.unwrap_or(1_000));
         let mut p_buffer = Vec::with_capacity(buffer.capacity());
@@ -2450,7 +2523,7 @@ impl NodeEmbeddings {
     }
 }
 
-/// Allows the user to build a graph incrementally before converting it into a proper CSR graph
+/// Allows the user to build NodeEmbeddings incrementally.
 #[pyclass]
 struct NodeEmbeddingsBuilder {
     vocab: Vocab,
@@ -2460,6 +2533,18 @@ struct NodeEmbeddingsBuilder {
 
 #[pymethods]
 impl NodeEmbeddingsBuilder {
+    ///    Creates a NodeEmbeddingBuilder.  Allows progressive addition of nodes and embeddings.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    dist : Distance
+    ///        Distance to construct the NodeEmbeddings.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(dist: Distance) -> Self {
         NodeEmbeddingsBuilder {
@@ -2469,6 +2554,21 @@ impl NodeEmbeddingsBuilder {
         }
     }
 
+    ///    Adds a fully qualified node and associated embedding to the buffer.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    node : (String, String)
+    ///        Fully qualified Node
+    ///    
+    ///    embedding : List[Float]
+    ///        Associated embedding
+    ///    
+    ///    Returns
+    ///    -------
+    ///    () - Can throw exception
+    ///        
+    ///    
     pub fn add_embedding(
         &mut self, 
         node: (String, String), 
@@ -2489,6 +2589,13 @@ impl NodeEmbeddingsBuilder {
         Ok(())
     }
 
+    ///    Creates the NodeEmbeddings.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings - Optional
+    ///        If Embeddings have been added, creates the NodeEmbeddings.  Otherwise returns None.
+    ///    
     pub fn build(&mut self) -> Option<NodeEmbeddings> {
         if self.embeddings.len() == 0 {
             return None
@@ -2518,8 +2625,6 @@ impl NodeEmbeddingsBuilder {
     }
 
 }
-
-
 
 /// Reads a line and converts it to a node type, node name, and embedding.
 /// Blows up if it doesn't meet the formatting.
@@ -2583,12 +2688,48 @@ struct NeighborhoodAligner {
 
 #[pymethods]
 impl NeighborhoodAligner {
+    ///    Creates a new NeighborhoodAligner.  NeighborhoodAligner adjusts provided NodeEmbeddings
+    ///    to capture graph structure, which can be useful for capturing popularity and reinforces
+    ///    community.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    alpha : Float - Optional
+    ///        If provided, alpha ~ [0,1] adjust how much influence to place on graph structure
+    ///        versus the original embedding.  Higher values of alpha result in more preference
+    ///        toward the original embedding, whereas lower values bias more toward graph structure
+    ///    
+    ///    max_neighbors : Int - Optional
+    ///        Number of neighbors to consider for alignment.
+    ///
+    ///        Default is All.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(alpha: Option<f32>, max_neighbors: Option<usize>) -> Self {
         let aligner = NA::new(alpha, max_neighbors);
         NeighborhoodAligner {aligner}
     }
 
+    ///    Creates a new NodeEmbeddings which is the result of neighborhood alignment.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    embeddings : NodeEmbeddings
+    ///        Original NodeEmbeddings
+    ///    
+    ///    graph : Graph
+    ///        Graph structure to use for influencing a Node Embedding.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings
+    ///        
+    ///    
     pub fn align(&self, 
         embeddings: &NodeEmbeddings, 
         graph: &Graph
@@ -2609,7 +2750,32 @@ impl NeighborhoodAligner {
         }
     }
 
-    /// Since embeddings can be large, also allows streaming them to disk instead of in memory.
+    ///    Instead of aligning embeddings in memory, instead progressively writes them out.  This
+    ///    is key for managing extremely large graphs with large numbers of nodes, where memory is
+    ///    dominated by the afforementioned items.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    path : str
+    ///        Path to align nodes to
+    ///    
+    ///    embeddings : NodeEmbeddings
+    ///        Original NodeEmbeddings
+    ///    
+    ///    graph : Graph
+    ///        Graph to use for neighborhood structure
+    ///    
+    ///    chunk_size : Int - Optional
+    ///        Chunk size to do in parallel.  Higher numbers spend more time in multithreaded
+    ///        computation at the expense of memory.
+    ///
+    ///        Default is 10_000
+    ///    
+    ///    Returns
+    ///    -------
+    ///    () - Can throw exception
+    ///        
+    ///    
     pub fn align_to_disk(
         &self, 
         path: &str,
@@ -2651,11 +2817,62 @@ struct EmbeddingAligner {
 
 #[pymethods]
 impl EmbeddingAligner {
+    ///    Creates a new EmbeddingAligner.
+    ///
+    ///    This allows for adjusting an adhoc embedding which doesn't exist in the original graph.
+    ///    It does this by first constructing a set of nearest nodes via the original node
+    ///    embeddings, computing their relative distances, and then attempting to preserve them in
+    ///    the transformed space.
+    ///
+    ///    The idea is that nodes that were close in the original space should still roughly be
+    ///    close in the transformed space.
+    ///
+    ///    It uses approximate nearest neighbors to make it tractable.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    num_nodes : Int
+    ///        Closest K nodes to consider to learn mapping.
+    ///    
+    ///    random_nodes : Int - Optional
+    ///        If provided, also samples random nodes for distances.
+    ///
+    ///        Default is 0.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(num_nodes: usize, random_nodes: Option<usize>) -> Self {
         EmbeddingAligner { num_nodes, random_nodes: random_nodes.unwrap_or(0) }
     }
 
+    ///    Transforms an embedding to the post neighborhood aligned space.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    orig_embeddings : NodeEmbeddings
+    ///        Original embeddings.
+    ///    
+    ///    orig_ann : EmbAnn
+    ///        Approximate Nearest Neighbor instance to find nearest neighbors.
+    ///    
+    ///    translated_embeddings : NodeEmbeddings
+    ///        Translated NodeEmbeddings.
+    ///    
+    ///    emb : Query
+    ///        Embedding to use
+    ///    
+    ///    seed : Int - Optional
+    ///        If provided, uses the random seed.  Default is global seed
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[Float] - Can throw exception
+    ///        Returns the new embedding
+    ///
     pub fn align(&self, 
         orig_embeddings: &NodeEmbeddings, 
         orig_ann: &EmbAnn,
@@ -2711,6 +2928,30 @@ impl EmbeddingAligner {
         Ok(new_emb)
     }
 
+    ///    Transforms a set of embeddings to the post neighborhood aligned space.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    orig_embeddings : NodeEmbeddings
+    ///        Original embeddings.
+    ///    
+    ///    orig_ann : EmbAnn
+    ///        Approximate Nearest Neighbor instance to find nearest neighbors.
+    ///    
+    ///    translated_embeddings : NodeEmbeddings
+    ///        Translated NodeEmbeddings.
+    ///    
+    ///    emb : List[Query]
+    ///        Set of embeddings to use
+    ///    
+    ///    seed : Int - Optional
+    ///        If provided, uses the random seed.  Default is global seed
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[List[Float]] - Can throw exception
+    ///        
+    ///    
     pub fn bulk_align(&self, 
         orig_embeddings: &NodeEmbeddings, 
         orig_ann: &EmbAnn,
@@ -2728,7 +2969,6 @@ impl EmbeddingAligner {
 
 }
 
-
 /// Wrapper for the relatively crappy ANN solution.
 #[pyclass]
 struct GraphAnn {
@@ -2739,6 +2979,26 @@ struct GraphAnn {
 
 #[pymethods]
 impl GraphAnn {
+    ///    Creates a Graph Approximate Nearest Neighbor instance.  GraphANN uses random walks and
+    ///    A* to climb areas in the graph that are likely to lead to neighbors relatively close to
+    ///    the desired provided embedding.
+    ///
+    ///    It's ok.  It highly depends on the quality of the Graph and how likely nodes of
+    ///    interest are homopholous.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to explore
+    ///    
+    ///    max_steps : Int - Optional
+    ///        Maximum number of steps in graph space to explore.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(graph: &Graph, max_steps: Option<usize>) -> Self {
         GraphAnn {
@@ -2749,6 +3009,27 @@ impl GraphAnn {
 
     }
 
+    ///    Attempts to find approximate nearest neighbors in graph space
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    query : Query
+    ///        Embedding to look for. 
+    ///    
+    ///    embeddings : NodeEmbeddings
+    ///        Set of embeddings defining a distance metric which is used for A*.
+    ///    
+    ///    k : Int
+    ///        Top K items to return from the walk.
+    ///    
+    ///    seed : Int - Optional
+    ///        If provided, uses the provided seed.  Otherwise uses the global seed.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[((String, String), f32)] - Can throw exception
+    ///        Set of fully qualified nodes and associated scores.
+    ///    
     pub fn find(
         &self, 
         query: &Query,
@@ -2772,6 +3053,31 @@ struct EmbAnn {
 
 #[pymethods]
 impl EmbAnn {
+
+    ///    Creates an ANN on a set of node embeddings.  This uses the random projection trees to
+    ///    construct a relatively fast ANN lookup.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    embs : NodeEmbeddings
+    ///        Node embedding set for building the ANN 
+    ///    
+    ///    n_trees : Int
+    ///        Number of trees to build.  The more trees, the better the accuracy at the expense of
+    ///        memory and compute.
+    ///    
+    ///    max_nodes_per_leaf : Int
+    ///        Determines whether a node should split.  Lower max nodes per leaf creates deeper,
+    ///        more accurate trees, at the expense of more memory.
+    ///    
+    ///    seed : Int - Optional
+    ///        If provided, uses this seed for randomization.  Otherwise uses the global seed.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(
         embs: &NodeEmbeddings, 
@@ -2787,6 +3093,21 @@ impl EmbAnn {
 
     }
 
+    ///    Find the nearest neighbors of a provided embedding using the EmbANN index.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    embeddings : NodeEmbeddings
+    ///        Embeddings used in constructing the trees.
+    ///    
+    ///    query : Query
+    ///        Query of item to look for
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[((String, String), f32)] - Can throw exception
+    ///        List of fully qualified nodes and their associated distances.
+    ///    
     pub fn find(
         &self, 
         embeddings: &NodeEmbeddings,
@@ -3038,6 +3359,39 @@ struct VpcgEmbedder {
 
 #[pymethods]
 impl VpcgEmbedder {
+    ///    Creates a VPCGEmbedder.  VPCG uses bipartite graphs with features to learn embeddings
+    ///    that attempt to bridge the semantic gap.  It is highly effective on Search and
+    ///    Recommendation problems.
+    ///
+    ///    The graph needs to be a bipartite graph where one side of the graph has a distinct type
+    ///    from the other side.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    max_terms : Int
+    ///        Max terms to store on each node during propagation.
+    ///    
+    ///    passes : Int
+    ///        Number of passes to perform.  A good starting point is 10
+    ///    
+    ///    dims : Int
+    ///        Number of dimensions for the final NodeEmbeddings.
+    ///    
+    ///    alpha : Float - Optional
+    ///        If provided, alpha ~ [0,1] allows nodes to reinforce their own features over the propagated
+    ///        features.  Higher alphas rely more on propagated features whereas lower alphas
+    ///        attempt to preserve the original feature set more.
+    ///
+    ///        Default is 1.
+    ///    
+    ///    err : Float - Optional
+    ///        Suppresses terms with a weight of less than err.  Default is 1e-5
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(
         max_terms: usize, 
@@ -3055,6 +3409,24 @@ impl VpcgEmbedder {
         }
     }
 
+    ///    Learns VPCG embeddings on the graph.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to use for bipartite structure
+    ///    
+    ///    features : FeatureSet
+    ///        Features to propagate between nodes
+    ///    
+    ///    start_node_type : String
+    ///        Starting node type for propagation.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings
+    ///        New NodeEmbeddings capturing the VPCG Embeddings.
+    ///    
     pub fn learn(&self, 
         graph: &Graph, 
         features: &mut FeatureSet,
@@ -3101,6 +3473,36 @@ struct PPREmbedder {
 
 #[pymethods]
 impl PPREmbedder {
+    ///    Creates a PPREmbedder.  PPREmbedder constructs the local personal page rank for a node
+    ///    and then performs a weighted blend of those features to construct a new embedding.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    dims : Int
+    ///        Dimension of the embedding space
+    ///    
+    ///    num_walks : Int
+    ///        Number of walks for sampling the local neighborhood
+    ///    
+    ///    steps : Float
+    ///        if steps ~ [0,1), uses restart probabilities to terminate. if steps ~[1, inf], uses
+    ///        fixed length walks.
+    ///    
+    ///    beta : Float - Optional
+    ///        Beta parameter to suppress higher degree nodes.
+    ///
+    ///        Default is 0.8
+    ///    
+    ///    eps : Float - Optional
+    ///        Suppresses terms under eps.  
+    ///
+    ///        Default is 1e-5
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
     #[new]
     pub fn new(
         dims: usize,
@@ -3118,6 +3520,23 @@ impl PPREmbedder {
         }
     }
 
+    ///    Constructs Node Embeddings.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to use.
+    ///    
+    ///    features : FeatureSet
+    ///        FeatureSet with original features for propagation.
+    ///    
+    ///    seed : Int - Optional
+    ///        If provided, uses the random seed.  Otherwise, uses global seed.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings - Can throw exception
+    ///    
     pub fn learn(&self, 
         graph: &Graph, 
         features: &mut FeatureSet,
@@ -3165,6 +3584,41 @@ struct InstantEmbeddings {
 #[pymethods]
 impl InstantEmbeddings {
 
+    ///    Creates an InstantEmbeddings instance.  Instance embeddings construct topological
+    ///    embeddings in graphs by using random walks to capturing local neighborhoods.  They're
+    ///    fast, scalable, and perform well in practice.
+    ///
+    ///    This variant uses sampling to construct the local neighborhood, which can be faster when
+    ///    nodes exist with high degree counts.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    dims : Int
+    ///        Dimension of the InstantEmbeddings.
+    ///    
+    ///    hashes : Int
+    ///        Number of hashes to use for mapping a Node to embedding space.
+    ///    
+    ///    num_walks : Int
+    ///        Number of walks to perform for sampling InstantEmbeddings.
+    ///    
+    ///    steps : Float
+    ///        If steps ~ [0,1), uses restart probabilities to terminate. if steps ~[1, inf], uses
+    ///        fixed length walks.
+    ///    
+    ///    beta : Float - Optional
+    ///        Beta parameter to suppress higher degree nodes.
+    ///
+    ///        Default is 0.8
+    ///    
+    ///    seed : Int - Optional
+    ///        
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self - Can throw exception
+    ///        
+    ///    
     #[staticmethod]
     pub fn random_walk(
         dims: usize,
@@ -3195,6 +3649,32 @@ impl InstantEmbeddings {
         Ok(ie)
     }
 
+    ///    Creates an InstantEmbedding implementation using a sparse PPR estimation which is
+    ///    deterministic.  This is usually faster (assuming a reasonable EPS) when the degree count
+    ///    of the nodes are relatively low; when nodes have large numbers of degrees, it can be
+    ///    substantially slower than sampling based approaches.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    dims : Int
+    ///        Dimension of the InstantEmbeddings.
+    ///    
+    ///    hashes : Int
+    ///        Number of hashes to use for mapping a Node to embedding space.
+    ///    
+    ///    steps : Float
+    ///        Restart probability for random walks.
+    ///    
+    ///    eps : Float - Optional
+    ///        Tolerable error in PPR estimates.  
+    ///
+    ///        Default is 1e-5
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self - Can throw exception
+    ///        
+    ///    
     #[staticmethod]
     pub fn sparse_ppr(
         dims: usize,
@@ -3218,6 +3698,18 @@ impl InstantEmbeddings {
         Ok(ie)
     }
 
+    ///    Learns Instant Embeddings.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to learn instant embeddings on.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings - Can throw exception
+    ///        
+    ///    
     pub fn learn(&self, 
         graph: &Graph, 
     ) -> PyResult<NodeEmbeddings> {
