@@ -3222,11 +3222,84 @@ struct PprRankLearner {
 #[pymethods]
 impl PprRankLearner {
 
+    ///    Createsa a PPR Rank Learner.  PPR Rank Learner optimizes similarities based on a nodes
+    ///    local neighborhood:
+    ///
+    ///    1. For each node, compute their top K local neighborhood based on sampling, including
+    ///       relative weight.
+    ///    2. During optimization, sample N negatives
+    ///    3. Optimize a listwise lost which pushes the local neighborhood higher than the randomly
+    ///       sampled negatives.
+    ///
+    ///    This has some interesting dynamics.  Unlike EmbeddingPropagation, this captures
+    ///    neighborhoods and local clusters instead of just immediate neighbors; this allows the
+    ///    algorithm to better bias toward local topologies rather than basic connections.
+    ///    It also is able to use ranking listwise metrics for optimization since the PPR estimate
+    ///    gives an ordering to nodes.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    alpha : Float
+    ///        Learning Rate
+    ///    
+    ///    batch_size : Int
+    ///        Batch size
+    ///    
+    ///    dims : Int
+    ///        Dimension of the feature and eventual node embeddings.
+    ///    
+    ///    passes : Int
+    ///        Number of passes to use
+    ///    
+    ///    steps : Float
+    ///        Restart probability.  When steps ~ [0,1), it results in a restart probability.  When
+    ///        steps ~ [1,inf], it is treated as a fixed length walk.
+    ///    
+    ///    walks : Int
+    ///        Number of samples to collect.
+    ///    
+    ///    k : Int
+    ///        Top K nearest neighbors according to PPR estimates.
+    ///    
+    ///    negatives : Int
+    ///        Number of random negatives to use.
+    ///    
+    ///    loss : String - Optional
+    ///        Supports 'listnet' and 'listmle'.
+    ///    
+    ///    compression : Float - Optional
+    ///        This will either accentuate or depress the PPR scores for the local neighborhood.
+    ///        Higher compressions will accentuate, lower compressions will depress.
+    ///    
+    ///    beta : Float - Optional
+    ///        Determines how much to bias toward community structure versus rarer nodes.
+    ///
+    ///        Default is 0.8
+    ///    
+    ///    num_features : Int - Optional
+    ///        How many features to use to construct nodes.  If provided, will randomly sample
+    ///        features each construction.
+    ///
+    ///        Default is all
+    ///    
+    ///    weight_decay : Float - Optional
+    ///        If provided, applies weight decar to feature embeddings.
+    ///
+    ///        Default is 0.
+    ///    
+    ///    valid_pct : Float - Optional
+    ///        If provided, uses a subset of the graph for validation.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self - Can throw exception
+    ///        
+    ///    
     #[new]
     fn new(
          // Learning rate
         alpha: f32, 
-
+ 
         // Batch size 
         batch_size: usize, 
 
@@ -3293,6 +3366,37 @@ impl PprRankLearner {
         })
     }
 
+    ///    Learns the feature embeddings for a given graph.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to use for construction.
+    ///    
+    ///    features : FeatureSet
+    ///        FeatureSet mapping nodes -> features
+    ///    
+    ///    feature_embeddings : mut NodeEmbeddings - Optional
+    ///        If provided, uses the feature_embeddings passed in as a starting point.  Otherwise,
+    ///        creates a new randomly initialized NodeEmbedding.
+    ///
+    ///        Default is new.
+    ///    
+    ///    indicator : Bool - Optional
+    ///        If provided, shows an indicator.
+    ///
+    ///        Default is True
+    ///    
+    ///    seed : Int - Optional
+    ///        If provided, uses the seed for all stochastic processes.
+    ///
+    ///        Default is a fixed global seed.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings
+    ///        Learned Feature Embeddings.
+    ///    
     pub fn learn_features(
         &self, 
         graph: &Graph, 
