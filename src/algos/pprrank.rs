@@ -136,9 +136,9 @@ impl PprRank {
         let lr_scheduler = {
             let warm_up_steps = (total_updates as f32 / 5f32) as usize;
             let max_steps = self.passes * steps_per_pass;
-            let min_alpha = self.alpha / 100f32; 
-            let gamma = (min_alpha.ln() / max_steps as f32).exp();
             LRScheduler::cos_decay(self.alpha / 100f32, self.alpha, warm_up_steps, max_steps)
+            //let min_alpha = self.alpha / 100f32; 
+            //let gamma = (min_alpha.ln() / max_steps as f32).exp();
             //LRScheduler::exp_decay(min_alpha, self.alpha, gamma)
         };
 

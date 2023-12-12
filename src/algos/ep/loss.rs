@@ -126,15 +126,12 @@ impl Loss {
             }
 
             Loss::RankLoss(tau, _)  => {
-                //let hvn = il2norm(&hv);
                 // Get the dot products
                 let mut ds: Vec<_> = hus.iter().map(|hu| {
-                    //il2norm(hu).dot(&hvn)
                     hu.dot(&hv)
                 }).collect();
                 
                 // Add the positive example
-                //ds.push(hvn.dot(&il2norm(&thv)));
                 ds.push(hv.dot(&thv));
                 let len = ds.len();
                 let dsc = ds.concat();
