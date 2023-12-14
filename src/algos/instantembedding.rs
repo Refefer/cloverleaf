@@ -7,7 +7,7 @@ use crate::graph::{Graph as CGraph, CDFGraph};
 use crate::embeddings::{EmbeddingStore,Distance};
 use crate::progress::CLProgressBar;
 
-#[derive(Clone,Copy)]
+#[derive(Clone,Copy, Debug)]
 pub enum Estimator {
     RandomWalk {
         steps: Steps,

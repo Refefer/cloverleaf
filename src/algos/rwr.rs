@@ -10,7 +10,7 @@ use crate::graph::{Graph,NodeID,CDFtoP,CDFGraph};
 use crate::sampler::{Sampler, weighted_sample_cdf};
 
 // Fixed step or random restarts
-#[derive(Clone,Copy)]
+#[derive(Clone,Copy,Debug)]
 pub enum Steps {
     /// Every walk is K steps long
     Fixed(usize),

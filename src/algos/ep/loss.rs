@@ -11,7 +11,7 @@ use crate::graph::{Graph as CGraph,NodeID};
 use super::model::*;
 use super::attention::softmax;
 
-#[derive(Copy,Clone)]
+#[derive(Copy,Clone,Debug)]
 pub enum Loss {
     /// This is the max margin loss with threshold that's common in embedding work.  FaceNet was
     /// one of the first to define it and a good starting point

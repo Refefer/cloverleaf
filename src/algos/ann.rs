@@ -207,4 +207,8 @@ impl Ann {
         all_scores
     }
 
+    pub fn num_trees(&self) -> usize {
+        self.trees.len()
+    }
+
 }

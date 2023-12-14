@@ -147,6 +147,31 @@ impl EmbeddingStore {
         }
     }
 
+    pub fn new_with_vec(
+        nodes: usize, 
+        dims: usize, 
+        distance: Distance,
+        vec: Vec<f32>
+    ) -> Option<Self> {
+        if vec.len() != nodes * dims {
+            None
+        } else {
+            //
+            let mut bitfield = BitSet::new(nodes);
+            (0..nodes).for_each(|node_id| bitfield.set_bit(node_id));
+
+            let es = EmbeddingStore {
+                dims,
+                distance,
+                bitfield: bitfield,
+                embeddings: Hogwild::new(vec),
+                nodes
+            };
+            Some(es)
+        }
+    }
+
+
     pub fn dims(&self) -> usize {
         self.dims
     }

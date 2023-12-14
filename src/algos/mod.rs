@@ -18,4 +18,5 @@ pub mod pagerank;
 pub mod vpcg;
 pub mod pprembed;
 pub mod instantembedding;
+pub mod lsr;
 mod grad_utils;

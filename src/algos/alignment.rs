@@ -9,11 +9,11 @@ use crate::embeddings::EmbeddingStore;
 pub struct NeighborhoodAligner {
     /// Controls how much to bias toward the neighborhood: 0 means fully align, 1 means fully
     /// ignore.  When None, attempts to dynamically set alpha based on the number of neighbors.
-    alpha: Option<f32>,
+    pub alpha: Option<f32>,
 
     /// For super nodes with millions of edges, can be expensive.  max_neighbors takes the K
     /// first edges to construct the embedding on.
-    max_neighbors: Option<usize>
+    pub max_neighbors: Option<usize>
 }
 
 impl NeighborhoodAligner {

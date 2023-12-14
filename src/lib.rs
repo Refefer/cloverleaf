@@ -74,10 +74,14 @@ use crate::algos::pprrank::{PprRank, Loss as PprLoss};
 use crate::algos::ann::Ann;
 use crate::algos::pprembed::PPREmbed;
 use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
+use crate::algos::lsr::{LSR as ALSR};
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
 const SEED: u64 = 20222022;
+
+/// Simplifies a lot of the type signatures
+type FQNode = (String, String);
 
 /// Maps an iterator of node ids and scores back to their pretty names with optional top K and
 /// filtering by node types.
@@ -86,7 +90,7 @@ fn convert_scores(
     scores: impl Iterator<Item=(NodeID, f32)>, 
     k: Option<usize>,
     filtered_node_type: Option<String>
-) -> Vec<((String,String), f32)> {
+) -> Vec<(FQNode, f32)> {
     let mut scores: Vec<_> = scores.collect();
     scores.sort_by_key(|(_k, v)| FloatOrd(-*v));
 
@@ -116,7 +120,7 @@ fn get_node_id(vocab: &Vocab, node_type: String, node: String) -> PyResult<NodeI
 
 #[derive(Clone)]
 enum QueryType {
-    Node(String, String),
+    Node(String,String),
     Embedding(Vec<f32>)
 }
 
@@ -233,14 +237,14 @@ impl Graph {
     ///
     ///    Parameters
     ///    ----------
-    ///    name :  (String,String)
+    ///    name :  FQNode
     ///        A tuple containing the (node_type, node_name) to lookup.
     ///
     ///    Returns
     ///    -------
     ///    bool
     ///     Returns True if the node is defined in the graph, False otherwise
-    pub fn contains_node(&self, name: (String, String)) -> bool {
+    pub fn contains_node(&self, name: FQNode) -> bool {
         get_node_id(self.vocab.deref(), name.0, name.1).is_ok()
     }
 
@@ -273,7 +277,7 @@ impl Graph {
     ///
     ///    Parameters
     ///    ----------
-    ///    node: (String, String)
+    ///    node: FQNode
     ///        A tuple containing the (node_type, node_name) to lookup.
     ///
     ///    Returns
@@ -283,7 +287,7 @@ impl Graph {
     ///
     ///     Throws a KeyError if the node doesn't exist in the graph
     ///     
-    pub fn get_edges(&self, node: (String,String)) -> PyResult<(Vec<(String, String)>, Vec<f32>)> {
+    pub fn get_edges(&self, node: FQNode) -> PyResult<(Vec<FQNode>, Vec<f32>)> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         let (edges, weights) = self.graph.get_edges(node_id);
         let names = edges.into_iter()
@@ -344,6 +348,11 @@ impl Graph {
         Ok(self.nodes())
     }
     
+    /// Simple represetnation of the Graph
+    pub fn __repr__(&self) -> String {
+        format!("Graph<Nodes={}, Edges={}>", self.graph.len(), self.graph.edges())
+    }
+
     #[staticmethod]
     ///    Loads a graph from disk
     ///
@@ -382,8 +391,6 @@ impl Graph {
                 edges.push((t_id, f_id, w));
             }
         }
-        eprintln!("Read {} nodes, {} edges...", vocab.len(), edges.len());
-
         let csr = CSR::construct_from_edges(edges);
 
         let g = Graph {
@@ -437,6 +444,11 @@ impl RandomWalker {
         RandomWalker { restarts, walks, beta }
     }
 
+    /// Simple representation of the RandomWalker
+    pub fn __repr__(&self) -> String {
+        format!("RandomWalker<restarts={}, walks={}, beta={:?}>", self.restarts, self.walks, self.beta)
+    }
+
     ///    Performs a random walk on a graph, returning a list of nodes and their approxmiate
     ///    scores where higher scores indicate a higher likelihood to terminate on those nodes.
     ///    
@@ -445,7 +457,7 @@ impl RandomWalker {
     ///    graph : Graph
     ///        Graph to perform random walks on
     ///    
-    ///    node : (String, String)
+    ///    node : FQNode
     ///        Fully qualified node: (NodeType, NodeName)
     ///    
     ///    seed : Int - Optional
@@ -462,18 +474,18 @@ impl RandomWalker {
     ///    
     ///    Returns
     ///    -------
-    ///    List[((String,String), Float)] - Can throw exception
+    ///    List[(FQNode, Float)] - Can throw exception
     ///        List of fully qualified nodes and their fractional scores.
     ///
     pub fn walk(
         &self, 
         graph: &Graph,
-        node: (String, String), 
+        node: FQNode, 
         seed: Option<u64>, 
         k: Option<usize>, 
         filter_type: Option<String>,
         weighted: Option<bool>
-    ) -> PyResult<Vec<((String,String), f32)>> {
+    ) -> PyResult<Vec<(FQNode, f32)>> {
 
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
         
@@ -554,6 +566,11 @@ impl BiasedRandomWalker {
         BiasedRandomWalker { restarts, walks, beta, blend }
     }
 
+    /// Simple representation of the BiasedRandomWalker
+    pub fn __repr__(&self) -> String {
+        format!("BiasedRandomWalker<restarts={}, walks={}, beta={:?}, blend={:?}>", self.restarts, self.walks, self.beta, self.blend)
+    }
+ 
     ///    Performs the random walk with both starting node and bias context.  Further, a rerank
     ///    context can be provided to rerank the final results by yet an additional context.
     ///    
@@ -565,7 +582,7 @@ impl BiasedRandomWalker {
     ///    embeddings : NodeEmbeddings
     ///        Set of embeddings which reference nodes within the graph.
     ///    
-    ///    node : (String, String)
+    ///    node : FQNode
     ///        Fully qualified node: (NodeType, NodeName)
     ///    
     ///    context : Query
@@ -587,20 +604,20 @@ impl BiasedRandomWalker {
     ///    
     ///    Returns
     ///    -------
-    ///    List[((String,String), Float)] - Can throw exception
+    ///    List[(FQNode, Float)] - Can throw exception
     ///        List of fully qualified nodes and their fractional scores.
     ///        
     pub fn walk(
         &self, 
         graph: &Graph,
         embeddings: &NodeEmbeddings,
-        node: (String,String), 
+        node: FQNode, 
         context: &Query,
         k: Option<usize>, 
         seed: Option<u64>, 
         rerank_context: Option<&Query>,
         filter_type: Option<String>
-    ) -> PyResult<Vec<((String,String), f32)>> {
+    ) -> PyResult<Vec<(FQNode, f32)>> {
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
         let g_emb = lookup_embedding(context, embeddings)?;
         
@@ -681,6 +698,11 @@ impl SparsePPR {
         Ok(SparsePPR { restarts, eps: eps.unwrap_or(1e-5) })
     }
 
+    /// Simple representation of the SparsePPR
+    pub fn __repr__(&self) -> String {
+        format!("SparsePPR<restarts={}, eps={}>", self.restarts, self.eps)
+    }
+
     ///    Computes the personalized page rank estimate for a given node
     ///    
     ///    Parameters
@@ -688,7 +710,7 @@ impl SparsePPR {
     ///    graph : Graph
     ///        Graph to perform the PPR on
     ///    
-    ///    node : (String, String)
+    ///    node : FQNode
     ///        Starting node for PPR.
     ///    
     ///    k : Int - Optional
@@ -699,16 +721,16 @@ impl SparsePPR {
     ///    
     ///    Returns
     ///    -------
-    ///    List[((String,String), f32)] - Can throw exception
+    ///    List[(FQNode, f32)] - Can throw exception
     ///        List of fully qualified nodes and their fractional scores
     ///    
     pub fn compute(
         &self, 
         graph: &Graph,
-        node: (String, String), 
+        node: FQNode, 
         k: Option<usize>, 
         filter_type: Option<String>
-    ) -> PyResult<Vec<((String,String), f32)>> {
+    ) -> PyResult<Vec<(FQNode, f32)>> {
 
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
         let results = ppr_estimate(graph.graph.as_ref(), node_id, self.restarts, self.eps);
@@ -751,15 +773,20 @@ impl GraphBuilder {
             edges: Vec::new()
         }
     }
+    
+    /// Simple representation of the GraphBuilder
+    pub fn __repr__(&self) -> String {
+        format!("GraphBuilder<Nodes={}, Edges={}>", self.vocab.len(), self.edges.len())
+    }
  
     ///    Adds an edge to the graph.
     ///    
     ///    Parameters
     ///    ----------
-    ///    from_node : (String, String)
+    ///    from_node : FQNode
     ///        Originating node.
     ///    
-    ///    to_node : (String,String)
+    ///    to_node : FQNode
     ///        Destination Node
     ///    
     ///    weight : Float
@@ -771,8 +798,8 @@ impl GraphBuilder {
     ///    
     pub fn add_edge(
         &mut self, 
-        from_node: (String, String), 
-        to_node: (String,String),
+        from_node: FQNode, 
+        to_node: FQNode,
         weight: f32, 
         node_type: EdgeType
     ) {
@@ -951,6 +978,11 @@ impl EPLoss {
     #[staticmethod]
     pub fn ppr(gamma: f32, negatives: usize, restart_p: f32) -> Self {
         EPLoss { loss: Loss::PPR(gamma, negatives.max(1), restart_p) }
+    }
+    
+    /// Simple representation of the GraphBuilder
+    pub fn __repr__(&self) -> String {
+        format!("EPLoss<{:?}>", self.loss)
     }
 
 }
@@ -1187,6 +1219,12 @@ impl EmbeddingPropagator {
         feature_embeddings
 
     }
+    
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("{:?}", self.ep)
+    }
+
 }
 
 /// Defines the FeatureSet class, which allows setting discrete features for a node
@@ -1291,7 +1329,7 @@ impl FeatureSet {
     ///    
     ///    Parameters
     ///    ----------
-    ///    node : (String,String)
+    ///    node : FQNode
     ///        Fully qualified Node.
     ///    
     ///    features : List[String]
@@ -1302,7 +1340,7 @@ impl FeatureSet {
     ///    () - Can throw exception
     ///        
     ///    
-    pub fn set_features(&mut self, node: (String,String), features: Vec<String>) -> PyResult<()> {
+    pub fn set_features(&mut self, node: FQNode, features: Vec<String>) -> PyResult<()> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         self.features.set_features(node_id, features);
         Ok(())
@@ -1312,7 +1350,7 @@ impl FeatureSet {
     ///    
     ///    Parameters
     ///    ----------
-    ///    node : (String,String)
+    ///    node : FQNode
     ///        Fully qualified Node.
     ///    
     ///    Returns
@@ -1320,7 +1358,7 @@ impl FeatureSet {
     ///    List[String] - Can throw exception
     ///        Set of features specified for node
     ///    
-    pub fn get_features(&self, node: (String,String)) -> PyResult<Vec<String>> {
+    pub fn get_features(&self, node: FQNode) -> PyResult<Vec<String>> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         Ok(self.features.get_pretty_features(node_id))
     }
@@ -1406,6 +1444,11 @@ impl FeatureSet {
             vocab: self.vocab.clone()
         }
     }
+    
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("FeatureSet<Nodes={},UniqueFeatures={}>", self.vocab.len(), self.features.num_features())
+    }
 
 }
 
@@ -1451,6 +1494,11 @@ impl FeaturePropagator {
             threshold: threshold.unwrap_or(0.),
             max_iters: max_iters.unwrap_or(20)
         }
+    }
+    
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("FeaturePropagator<k={},threshold={},max_iters={}>", self.k, self.threshold, self.max_iters)
     }
 
     ///    Propagates features throughout the graph.
@@ -1515,6 +1563,16 @@ impl FeatureAggregator {
     #[staticmethod]
     pub fn Averaged() -> Self {
         FeatureAggregator { at: AggregatorType::Averaged }
+    }
+
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        let t = match &self.at {
+            AggregatorType::Averaged => "Averaged".into(),
+            AggregatorType::Weighted {alpha, vocab: _, unigrams: _} => format!("Weighted<alpha={}>", alpha),
+            AggregatorType::Attention {num_heads, d_k, window} => format!("Attention<num_heads={},d_k={},window={:?}", num_heads, d_k, window)
+        };
+        format!("FeatureAggregator<{}>", t)
     }
 
     ///    Uses attention across features to construct the node embeddings.
@@ -1772,6 +1830,11 @@ impl NodeEmbedder {
         NodeEmbedder { feat_agg }
     }
 
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("NodeEmbedder<aggregator={}>", self.feat_agg.__repr__())
+    }
+
     ///    Embeds a full feature set into an set of Embeddings.
     ///    
     ///    Parameters
@@ -1825,7 +1888,7 @@ impl NodeEmbedder {
     ///    
     ///    Parameters
     ///    ----------
-    ///    features : List[(String,String)]
+    ///    features : List[FQNode]
     ///        List of fully qualified features to embed.  Usually 'feat' is the type.
     ///    
     ///    feature_embeddings : NodeEmbeddings
@@ -1844,7 +1907,7 @@ impl NodeEmbedder {
     ///    
     pub fn embed_adhoc(
         &self, 
-        features: Vec<(String, String)>,
+        features: Vec<FQNode>,
         feature_embeddings: &NodeEmbeddings,
         strict: Option<bool>
     ) -> PyResult<Vec<f32>> {
@@ -1871,7 +1934,7 @@ impl NodeEmbedder {
     ///    
     ///    Parameters
     ///    ----------
-    ///    features_set : List[List[(String,String)]]
+    ///    features_set : List[List[FQNode]]
     ///        Adhoc feature sets to use.
     ///    
     ///    feature_embeddings : NodeEmbeddings
@@ -1891,7 +1954,7 @@ impl NodeEmbedder {
     ///        
     ///    
     pub fn bulk_embed_adhoc(&self, 
-        features_set: Vec<Vec<(String, String)>>,
+        features_set: Vec<Vec<FQNode>>,
         feature_embeddings: &NodeEmbeddings,
         strict: Option<bool>
     ) -> PyResult<Vec<Vec<f32>>> {
@@ -1977,6 +2040,12 @@ impl DistanceEmbedder {
         }
 
     }
+    
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("DistanceEmbedder<landmarks={:?}, n_landmarks={}>", self.landmarks, self.n_landmarks)
+    }
+
 
     ///    Learns distance embeddings for a graph.
     ///    
@@ -2037,6 +2106,12 @@ impl ClusterLPAEmbedder {
         }
     }
 
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("ClusterLPAEmbedder<k={}, passes={}, seed={:?}>", self.k, self.passes, self.seed)
+    }
+
+
     ///    Learns NodeEmebddings on the provided graph.
     ///    
     ///    Parameters
@@ -2094,6 +2169,11 @@ impl SLPAEmbedder {
         SLPAEmbedder {
             k, threshold, seed
         }
+    }
+
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("SLPAEmbedder<k={}, threshold={}, seed={:?}>", self.k, self.threshold, self.seed)
     }
 
     ///    Learn SLPA Embeddings
@@ -2154,6 +2234,11 @@ impl PageRank {
     #[new]
     pub fn new(iterations: usize, damping: Option<f32>, eps: Option<f32>) -> Self {
         PageRank {iterations, damping: damping.unwrap_or(0.85), eps: eps.unwrap_or(1e-5) }
+    }
+
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("PageRank<iterations={}, damping={}, eps={}>", self.iterations, self.damping, self.eps)
     }
 
     ///    Computes PageRank on a graph
@@ -2227,11 +2312,17 @@ impl NodeEmbeddings {
         }
     }
 
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("NodeEmbeddings<Nodes={}, Dims={}, Distance={:?}>", self.embeddings.len(), 
+                self.embeddings.dims(), self.embeddings.distance())
+    }
+
     ///    Checks if a Node exists within the NodeEmbeddings.
     ///    
     ///    Parameters
     ///    ----------
-    ///    node : (String, String)
+    ///    node : FQNode
     ///        Fully qualified node.
     ///    
     ///    Returns
@@ -2239,7 +2330,7 @@ impl NodeEmbeddings {
     ///    Bool
     ///        True if it exists, False otherwise.
     ///    
-    pub fn contains(&self, node: (String, String)) -> bool {
+    pub fn contains(&self, node: FQNode) -> bool {
         get_node_id(self.vocab.deref(), node.0, node.1).is_ok()
     }
 
@@ -2247,7 +2338,7 @@ impl NodeEmbeddings {
     ///     
     ///    Parameters
     ///    ----------
-    ///    node : (String,String)
+    ///    node : FQNode
     ///        Fully qualified Node
     ///    
     ///    Returns
@@ -2255,7 +2346,7 @@ impl NodeEmbeddings {
     ///    List[Float] - Can throw exception
     ///        Embedding associated with the Node
     ///    
-    pub fn get_embedding(&mut self, node: (String,String)) -> PyResult<Vec<f32>> {
+    pub fn get_embedding(&mut self, node: FQNode) -> PyResult<Vec<f32>> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         Ok(self.embeddings.get_embedding(node_id).to_vec())
     }
@@ -2264,7 +2355,7 @@ impl NodeEmbeddings {
     ///    
     ///    Parameters
     ///    ----------
-    ///    node : (String,String)
+    ///    node : FQNode
     ///        Fully qualified Node
     ///    
     ///    embedding : List[Float]
@@ -2275,7 +2366,7 @@ impl NodeEmbeddings {
     ///    () - Can throw exception
     ///        
     ///    
-    pub fn set_embedding(&mut self, node: (String,String), embedding: Vec<f32>) -> PyResult<()> {
+    pub fn set_embedding(&mut self, node: FQNode, embedding: Vec<f32>) -> PyResult<()> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         let es = &mut self.embeddings;
         es.set_embedding(node_id, &embedding);
@@ -2308,7 +2399,7 @@ impl NodeEmbeddings {
     ///    
     ///    Returns
     ///    -------
-    ///    List[((String,String), f32)]
+    ///    List[(FQNode, f32)]
     ///        Set of fully qualified nodes and distances.
     ///    
     pub fn nearest_neighbor(
@@ -2316,7 +2407,7 @@ impl NodeEmbeddings {
         emb: Vec<f32>, 
         k: usize,
         filter_type: Option<String>
-    ) -> Vec<((String,String), f32)> {
+    ) -> Vec<(FQNode, f32)> {
         let emb = Entity::Embedding(&emb);
         let dists = if let Some(node_type) = filter_type {
             let ant = Arc::new(node_type);
@@ -2373,10 +2464,10 @@ impl NodeEmbeddings {
     ///    
     ///    Returns
     ///    -------
-    ///    ((String, String), List[Float]) - Can throw exception
+    ///    (FQNode, List[Float]) - Can throw exception
     ///        
     ///    
-    pub fn __getitem__(&self, mut idx: isize) -> PyResult<((String, String), Vec<f32>)> {
+    pub fn __getitem__(&self, mut idx: isize) -> PyResult<(FQNode, Vec<f32>)> {
         let len = self.embeddings.len() as isize;
         if idx < 0 {
             idx += len;
@@ -2553,12 +2644,16 @@ impl NodeEmbeddingsBuilder {
             embeddings: Vec::new()
         }
     }
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("NodeEmbeddingsBuilder<Nodes={}, Distance={:?}>", self.vocab.len(), self.distance.to_edist())
+    }
 
     ///    Adds a fully qualified node and associated embedding to the buffer.
     ///    
     ///    Parameters
     ///    ----------
-    ///    node : (String, String)
+    ///    node : FQNode
     ///        Fully qualified Node
     ///    
     ///    embedding : List[Float]
@@ -2571,7 +2666,7 @@ impl NodeEmbeddingsBuilder {
     ///    
     pub fn add_embedding(
         &mut self, 
-        node: (String, String), 
+        node: FQNode, 
         embedding: Vec<f32>
     ) -> PyResult<()> {
 
@@ -2715,6 +2810,11 @@ impl NeighborhoodAligner {
         NeighborhoodAligner {aligner}
     }
 
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("NeighborhoodAligner<Alpha={:?}, MaxNeighbors={:?}>", self.aligner.alpha, self.aligner.max_neighbors)
+    }
+
     ///    Creates a new NodeEmbeddings which is the result of neighborhood alignment.
     ///    
     ///    Parameters
@@ -2847,6 +2947,11 @@ impl EmbeddingAligner {
     #[new]
     pub fn new(num_nodes: usize, random_nodes: Option<usize>) -> Self {
         EmbeddingAligner { num_nodes, random_nodes: random_nodes.unwrap_or(0) }
+    }
+
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("EmbeddingAligner<NumNodes={}, RandomNodes={}>", self.num_nodes, self.random_nodes)
     }
 
     ///    Transforms an embedding to the post neighborhood aligned space.
@@ -3009,6 +3114,11 @@ impl GraphAnn {
 
     }
 
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("GraphANN<MaxSteps={}>", self.max_steps)
+    }
+
     ///    Attempts to find approximate nearest neighbors in graph space
     ///    
     ///    Parameters
@@ -3027,7 +3137,7 @@ impl GraphAnn {
     ///    
     ///    Returns
     ///    -------
-    ///    List[((String, String), f32)] - Can throw exception
+    ///    List[(FQNode, f32)] - Can throw exception
     ///        Set of fully qualified nodes and associated scores.
     ///    
     pub fn find(
@@ -3036,7 +3146,7 @@ impl GraphAnn {
         embeddings: &NodeEmbeddings, 
         k: usize, 
         seed: Option<u64>
-    ) -> PyResult<Vec<((String, String), f32)>> {
+    ) -> PyResult<Vec<(FQNode, f32)>> {
         let query_embedding = lookup_embedding(query, embeddings)?;
         let seed = seed.unwrap_or(SEED + 10);
         let ann = algos::graph_ann::Ann::new(k, self.max_steps + k, seed);
@@ -3093,6 +3203,11 @@ impl EmbAnn {
 
     }
 
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("EmbANN<N_Trees={}>", self.ann.num_trees())
+    }
+
     ///    Find the nearest neighbors of a provided embedding using the EmbANN index.
     ///    
     ///    Parameters
@@ -3105,14 +3220,14 @@ impl EmbAnn {
     ///    
     ///    Returns
     ///    -------
-    ///    List[((String, String), f32)] - Can throw exception
+    ///    List[(FQNode, f32)] - Can throw exception
     ///        List of fully qualified nodes and their associated distances.
     ///    
     pub fn find(
         &self, 
         embeddings: &NodeEmbeddings,
         query: &Query
-    ) -> PyResult<Vec<((String, String), f32)>> {
+    ) -> PyResult<Vec<(FQNode, f32)>> {
         let query_embedding = lookup_embedding(query, embeddings)?;
         let nodes = self.ann.predict(&embeddings.embeddings, query_embedding);
         Ok(convert_node_distance(&embeddings.vocab, nodes))
@@ -3147,8 +3262,8 @@ impl Smci {
 
     pub fn add_reward(
         &mut self, 
-        from_node: (String, String), 
-        to_node: (String, String), 
+        from_node: FQNode, 
+        to_node: FQNode, 
         reward: f32
     ) -> PyResult<()> {
         let f_n = get_node_id(self.vocab.deref(), from_node.0, from_node.1)?;
@@ -3201,7 +3316,7 @@ impl Smci {
 
 /// 
 #[pyclass]
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 struct PprRankLearner {
     alpha: f32,
     batch_size: usize,
@@ -3365,6 +3480,11 @@ impl PprRankLearner {
             beta: beta.unwrap_or(0.8)
         })
     }
+    
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("{:?}", self)
+    }
 
     ///    Learns the feature embeddings for a given graph.
     ///    
@@ -3513,6 +3633,12 @@ impl VpcgEmbedder {
         }
     }
 
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("VPCGEmbedder<MaxTerms={}, Passes={}, Dims={}, Alpha={}, Err={}>",
+                self.max_terms, self.passes, self.dims, self.alpha, self.err)
+    }
+
     ///    Learns VPCG embeddings on the graph.
     ///    
     ///    Parameters
@@ -3622,6 +3748,12 @@ impl PPREmbedder {
             beta: beta.unwrap_or(0.8),
             eps: eps.unwrap_or(1e-5)
         }
+    }
+
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("PPREmbedder<Dims={}, NumWalks={}, Steps={}, Beta={}, EPS={}>",
+                self.dims, self.num_walks, self.steps, self.beta, self.eps)
     }
 
     ///    Constructs Node Embeddings.
@@ -3834,6 +3966,202 @@ impl InstantEmbeddings {
         Ok(node_embeddings)
     }
 
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("InstantEmbeddings<Dims={}, Hashes={}, Estimator={:?}>",
+                self.dims, self.hashes, self.estimator)
+    }
+
+}
+
+#[pyclass]
+struct TournamentBuilder {
+    gb: GraphBuilder,
+    degrees: Vec<f32>
+}
+
+#[pymethods]
+impl TournamentBuilder {
+    ///    Creates a new tournament builder.  This will create a special graph which can be used to
+    ///    compute Plakett-luce models.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
+    #[new]
+    pub fn new() -> Self {
+        TournamentBuilder {
+            gb: GraphBuilder::new(),
+            degrees: Vec::new()
+        }
+    }
+
+    ///    Adds an outcome with a winner and a loser as well as its associated weight.  
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    winner : FQNode
+    ///        Winner node.
+    ///    
+    ///    loser : FQNode
+    ///        Loser node
+    ///    
+    ///    weight : Float
+    ///        Relative weight
+    ///    
+    pub fn add_outcome(
+        &mut self,
+        winner: FQNode,
+        loser: FQNode,
+        weight: f32
+    ) {
+        let mut v_len = self.gb.vocab.len();
+        let d = weight / 2f32;
+        // Add edge from loser to winner
+        self.gb.add_edge( loser.clone(), winner, d, EdgeType::Directed);
+
+        
+        while v_len < self.gb.vocab.len() {
+            self.degrees.push(1f32);
+            v_len += 1;
+        }
+        
+        // Update norm
+        let node_id = self.gb.vocab.get_node_id(loser.0, loser.1)
+            .expect("Should never fail!");
+
+        self.degrees[node_id] += d;
+    }
+
+    ///    Builds the tournament.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Tournament - Optional
+    ///        Tournament object capturing orderings.
+    ///    
+    pub fn build(
+        &mut self
+    ) -> Option<Tournament> {
+        if let Some(graph) = self.gb.build_graph() {
+            let mut degrees = Vec::with_capacity(0);
+            std::mem::swap(&mut degrees, &mut self.degrees);
+            let es = EmbeddingStore::new_with_vec(graph.nodes(), 1, EDist::Euclidean, degrees)
+                .expect("Should be correct");
+
+            let embs = NodeEmbeddings {
+                vocab: graph.vocab.clone(),
+                embeddings: es
+            };
+            Some(Tournament { graph: graph, norms: embs })
+        } else {
+            None
+        }
+    }
+
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("TournamentBuilder<Nodes={}, Outcomes={}>",
+                self.gb.vocab.len(), self.gb.edges.len())
+    }
+
+}
+
+#[pyclass]
+struct Tournament {
+    graph: Graph,
+    norms: NodeEmbeddings
+}
+
+#[pymethods]
+impl Tournament {
+
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("Tournament<Nodes={}, Outcomes={}>",
+                self.graph.graph.len(), self.graph.graph.edges())
+    }
+
+}
+
+#[pyclass]
+struct LSR {
+    passes: usize
+}
+
+#[pymethods]
+impl LSR {
+
+    ///    Initializes a Luce Spectral Ranker instance.  Luce Spectral Ranking, or LSR, is a method
+    ///    for learning placket-luce models from a given tournament. It's fast, scalable, and can
+    ///    recover the original parameters with low error.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    passes : Int
+    ///        
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///        
+    ///    
+    #[new]
+    pub fn new(passes: usize) -> Self {
+        LSR { passes }
+    }
+    
+    /// Simple Python representation 
+    pub fn __repr__(&self) -> String {
+        format!("LSR<Passes={}>", self.passes)
+    }
+
+    ///    Fits a Placket-Luce model to the provided tournament.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph representing the markovian state used by LSR models.  This graph is
+    ///        constructed via the TournamentBuilder instance.
+    ///    
+    ///    team_norms : NodeEmbeddings
+    ///        Captures the 
+    ///    
+    ///    indicator : Bool - Optional
+    ///        
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings 
+    ///        Logits for rankings
+    ///    
+    pub fn learn(
+        &self,
+        tournament: &Tournament,
+        indicator: Option<bool>
+    ) -> NodeEmbeddings {
+        let g = tournament.graph.graph.as_ref();
+        let norms = &tournament.norms.embeddings;
+        let lsr = ALSR { passes: self.passes };
+        let scores = lsr.compute(g, norms, indicator.unwrap_or(true));
+        // Find the page rank of the tournament graph
+
+        let embs = EmbeddingStore::new(g.len(), 1, EDist::Euclidean);
+        scores.par_iter().enumerate().for_each(|(node_id, score)| {
+            let e1 = embs.get_embedding_mut_hogwild(node_id);
+            e1[0] = *score;
+        });
+
+        let node_embeddings = NodeEmbeddings {
+            vocab: tournament.graph.vocab.clone(),
+            embeddings: embs 
+        };
+
+        node_embeddings
+       
+    }
 }
 
 /// Helper method for looking up an embedding.
@@ -3853,7 +4181,7 @@ fn lookup_embedding<'a>(
 fn convert_node_distance(
     vocab: &Vocab, 
     dists: Vec<NodeDistance>
-) -> Vec<((String, String), f32)> {
+) -> Vec<(FQNode, f32)> {
     dists.into_iter()
         .map(|n| {
             let (node_id, dist) = n.to_tup();
@@ -3894,6 +4222,9 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<VpcgEmbedder>()?;
     m.add_class::<PPREmbedder>()?;
     m.add_class::<InstantEmbeddings>()?;
+    m.add_class::<LSR>()?;
+    m.add_class::<TournamentBuilder>()?;
+    m.add_class::<Tournament>()?;
     Ok(())
 }
 

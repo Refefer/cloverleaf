@@ -34,16 +34,26 @@ impl PageRank {
 
             for node_id in 0..n {
                 let (edges, weights) = graph.get_edges(node_id);
-                for (edge, pr_k) in edges.iter().zip(CDFtoP::new(weights)) {
-                    next_policy[*edge] += pr_k * policy[node_id];
+                // Uniformly teleport to all nodes if we're at a dead end
+                if edges.len() == 0 {
+                    let weight = policy[node_id] / next_policy.len() as f32;
+                    next_policy.par_iter_mut().for_each(|e| {
+                        *e += weight;
+                    });
+                } else {
+                    for (edge, pr_k) in edges.iter().zip(CDFtoP::new(weights)) {
+                        next_policy[*edge] += pr_k * policy[node_id];
+                    }
                 }
             }
 
+            // Random teleportation based on damping
             let s = next_policy.par_iter_mut().map(|pi| {
-                *pi = *pi * self.damping + 1f32 / n as f32;
+                *pi = *pi * self.damping + (1f32 - self.damping) / n as f32;
                 *pi
             }).sum::<f32>();
 
+            // Error is the difference between the original and next policy
             err = next_policy.par_iter_mut().zip(policy.par_iter()).map(|(npi, pi)| {
                 *npi /= s;
                 (*npi - *pi).powf(2.)

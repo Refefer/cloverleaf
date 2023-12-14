@@ -28,6 +28,7 @@ use self::loss::*;
 use self::model::{Model,NodeCounts};
 
 /// Defines the propagator
+#[derive(Debug)]
 pub struct EmbeddingPropagation {
     /// Learning rate for updating feature embeddings
     pub alpha: f32,
