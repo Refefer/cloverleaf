@@ -17,7 +17,9 @@ The library is broken up into a few different methods:
 3. Random Walks
     - Random Walks with Restarts
     - Guided Random Walks with Restarts
-4. Utilities
+4. Tournaments
+    - Luce Spectral Ranking
+5. Utilities
     - Approximate Nearest Neighbors (ANN) via Random Projections
     - Neighborhood Alignment
 
@@ -351,3 +353,4 @@ A simple random projection based ANN method which can be consumed directly or in
 7. Eksombatchai, Chantat, et al. "Pixie: A system for recommending 3+ billion items to 200+ million users in real-time." Proceedings of the 2018 world wide web conference. 2018.
 8. Recht, Benjamin, et al. "Hogwild!: A lock-free approach to parallelizing stochastic gradient descent." Advances in neural information processing systems 24 (2011).
 9. Postăvaru, Ştefan, et al. "InstantEmbedding: Efficient local node representations." arXiv preprint arXiv:2010.06992 (2020).
+10. Maystre, Lucas, and Matthias Grossglauser. "Fast and accurate inference of Plackett–Luce models." Advances in neural information processing systems 28 (2015).

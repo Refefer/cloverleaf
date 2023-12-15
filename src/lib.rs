@@ -756,6 +756,28 @@ struct GraphBuilder {
     edges: Vec<(NodeID, NodeID, f32)>
 }
 
+impl GraphBuilder {
+    fn compact_edges(edges: &mut Vec<(NodeID, NodeID, f32)>) {
+        edges.par_sort_by_key(|(f_n, t_n, _)| (*f_n, *t_n));
+        let mut cur_record = 0;
+        let mut idx = 1;
+        while idx < edges.len() {
+            let (f_n, t_n, w) = edges[idx];
+            let c_r = edges[cur_record];
+            // Same edge, add the weights.
+            if f_n == c_r.0 && t_n == c_r.1 {
+                (&mut edges[cur_record]).2 += w;
+            } else {
+                // Different record, move it
+                cur_record += 1;
+                edges[cur_record] = edges[idx];
+            }
+            idx += 1;
+        }
+        edges.truncate(cur_record + 1);
+    }
+}
+
 #[pymethods]
 impl GraphBuilder {
     ///    Creates a new graph builder instance.  This allows for the programatic construction of
@@ -829,6 +851,7 @@ impl GraphBuilder {
         std::mem::swap(&mut vocab, &mut self.vocab);
         std::mem::swap(&mut edges, &mut self.edges);
 
+        GraphBuilder::compact_edges(&mut edges);
         let graph = CSR::construct_from_edges(edges);
 
         Some(Graph {
@@ -4034,6 +4057,34 @@ impl TournamentBuilder {
 
         self.degrees[node_id] += d;
     }
+
+    ///    Adds a ordered list where teams in earlier positions out competed teams in later
+    ///    positions.  For example, [Racer1, Racer3, Racer2], gets contructed as:
+    ///    1. Racer1 > Racer3
+    ///    2. Racer1 > Racer2
+    ///    3. Racer3 > Racer1
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    order : List[FQNode]
+    ///        Ordered list of fully qualified nodes where position demarcates ranking in
+    ///        comparison to other nodes in the list.
+    ///    
+    ///    weight : Float
+    ///        Overall weight to give list
+    ///    
+    pub fn add_ranked_outcomes(
+        &mut self,
+        order: Vec<FQNode>,
+        weight: f32
+    ) {
+        for i in 0..order.len() {
+            for j in 1..order.len() {
+                self.add_outcome(order[i].clone(), order[j].clone(), weight)
+            }
+        }
+    }
+
 
     ///    Builds the tournament.
     ///    
