@@ -318,6 +318,26 @@ Guided Random Walks with Restarts is an algorithm which estimates the stationary
 [(('node', '1'), 0.08715250343084335), (('node', '34'), 0.022087719291448593), (('node', '33'), 0.015960847958922386), (('node', '9'), 0.014207975938916206), (('node', '14'), 0.014015674591064453)]
 ```
 
+### Luce Spectral Ranking
+Luce Spectral Ranking is an approach for learning the parameters of a Plackett-Luce model by leveraging properties of random walks.  It's fast, scales well, and has great error rates compared to ground truths, outperforming most bradley-terry models and logistic regression variants.
+
+Because it requires the graph to be constructed in a particular way, and with additional bookkeeping, LSR uses the TournamentBuilder to construct the underlying representations.
+
+#### Parameters
+1. `passes` - Maximum number of passes to run the algorithm.  More passes, the lower the error.
+
+#### Example
+```python3 
+>>> tb = cloverleaf.TournamentBuilder()
+>>> with open('prefs') as f:
+...  for line in f:
+...   winner, loser = line.strip().split()
+...   tb.add_outcome(('n', winner), ('n', loser), 1)
+...
+>>> tournament = tb.build()
+>>> lsr = cloverleaf.LSR(20)
+>>> pl = lsr.learn(tournament)
+```
 
 ### Approximate Nearest Neighbors
 A simple random projection based ANN method which can be consumed directly or in subsequent algorithms (e.g. Neighborhod Alignment)
