@@ -3256,6 +3256,22 @@ impl EmbAnn {
         Ok(convert_node_distance(&embeddings.vocab, nodes))
     }
 
+    pub fn find_leaf_indices(
+        &self, 
+        query: Vec<f32>
+    ) -> PyResult<Vec<usize>> {
+        let nodes = self.ann.predict_leaf_indices(&query);
+        Ok(nodes)
+    }
+
+    pub fn find_leaf_paths(
+        &self, 
+        query: Vec<f32>
+    ) -> PyResult<Vec<Vec<usize>>> {
+        let nodes = self.ann.predict_leaf_paths(&query);
+        Ok(nodes)
+    }
+
     pub fn depth(&self) -> Vec<usize> {
         self.ann.depth()
     }
