@@ -19,4 +19,5 @@ pub mod vpcg;
 pub mod pprembed;
 pub mod instantembedding;
 pub mod lsr;
+pub mod connected;
 mod grad_utils;

@@ -11,6 +11,10 @@ impl BitSet {
         Self { bitfield: vec![0; (size / 32) + 1] }
     }
 
+    pub fn reset(&mut self) {
+        self.bitfield.iter_mut().for_each(|bs| *bs = 0);
+    }
+
     fn get_bit_idx(&self, idx: &usize) -> (usize, u32) {
         let field_offset = idx / 32;
         let bit_offset = idx % 32;

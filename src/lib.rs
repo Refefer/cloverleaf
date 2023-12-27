@@ -75,6 +75,7 @@ use crate::algos::ann::Ann;
 use crate::algos::pprembed::PPREmbed;
 use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
 use crate::algos::lsr::{LSR as ALSR};
+use crate::algos::connected::find_connected_components;
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
@@ -4231,6 +4232,37 @@ impl LSR {
     }
 }
 
+#[pyclass]
+struct ConnectedComponents {}
+
+#[pymethods]
+impl ConnectedComponents {
+
+    ///    Computes the graph, looking for connected components.  This is only guaranteed to work
+    ///    correctly for undirected graphs.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to find connected components in
+    ///    
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings
+    ///        NodeEmbeddings of 1 dimension where the value of the embedding references the
+    ///        component id.  All nodes sharing the same component id are connected.
+    ///    
+    #[staticmethod]
+    pub fn learn(graph: &Graph) -> NodeEmbeddings {
+        let es = find_connected_components(graph.graph.as_ref());
+        NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings: es
+        }
+    }
+}
+
+
 /// Helper method for looking up an embedding.
 fn lookup_embedding<'a>(
     query: &'a Query, 
@@ -4292,6 +4324,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<LSR>()?;
     m.add_class::<TournamentBuilder>()?;
     m.add_class::<Tournament>()?;
+    m.add_class::<ConnectedComponents>()?;
     Ok(())
 }
 
