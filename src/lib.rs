@@ -46,7 +46,6 @@ use float_ord::FloatOrd;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError};
 use itertools::Itertools;
-use fast_float::parse;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use rand_distr::Uniform;
@@ -56,7 +55,7 @@ use crate::vocab::Vocab;
 use crate::sampler::{Weighted,Unweighted};
 use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
 use crate::feature_store::FeatureStore;
-use crate::io::EmbeddingWriter;
+use crate::io::{EmbeddingWriter,EmbeddingReader};
 
 use crate::algos::rwr::{Steps,RWR,ppr_estimate};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
@@ -1992,29 +1991,6 @@ impl NodeEmbedder {
 
 }
 
-/// Count the number of lines in an embeddings file so we only have to do one allocation.  If
-/// NodeEmbeddings internal memory structure changes, such as using slabs, this might be less
-/// relevant.
-fn count_lines(path: &str, node_type: &Option<String>) -> std::io::Result<usize> {
-    let f = File::open(path)
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-
-    let br = BufReader::new(f);
-    let mut count = 0;
-    let filter_node = node_type.as_ref();
-    for line in br.lines() {
-        let line = line?;
-        if let Some(p) = filter_node {
-            if line.starts_with(p) {
-                count += 1;
-            }
-        } else {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 /// Struct for defining ALT embeddings
 #[pyclass]
 struct DistanceEmbedder {
@@ -2336,6 +2312,33 @@ impl NodeEmbeddings {
         }
     }
 
+    #[staticmethod]
+    pub fn new_from_list(
+        list: Vec<((String, String), Vec<f32>)>, 
+        distance: Distance
+    ) -> Self {
+        let mut vocab = Vocab::new();
+        let mut embs = Vec::with_capacity(list.len());
+        let mut max_emb_size = 0;
+
+        // Add to vocab
+        list.into_iter().for_each(|((node_type, node_name), emb)| {
+            let node_id = vocab.get_or_insert(node_type, node_name);
+            max_emb_size = max_emb_size.max(emb.len());
+            embs.push((node_id, emb))
+        });
+
+        // Update embeddings
+        let mut es = EmbeddingStore::new(vocab.len(), max_emb_size, distance.to_edist());
+        embs.into_iter().for_each(|(node_id, emb)| {
+            es.set_embedding(node_id, &emb);
+        });
+        NodeEmbeddings {
+            vocab: Arc::new(vocab),
+            embeddings: es
+        }
+    }
+
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
         format!("NodeEmbeddings<Nodes={}, Dims={}, Distance={:?}>", self.embeddings.len(), 
@@ -2575,60 +2578,8 @@ impl NodeEmbeddings {
         filter_type: Option<String>, 
         chunk_size: Option<usize>
     ) -> PyResult<Self> {
-        let num_embeddings = count_lines(path, &filter_type)
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-        let f = File::open(path)
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-
-        let br = BufReader::new(f);
-        let mut vocab = Vocab::new();
-        
-        // Place holder
-        let mut es = EmbeddingStore::new(0, 0, EDist::Cosine);
-        let filter_node = filter_type.as_ref();
-        let mut i = 0;
-        let mut buffer = Vec::with_capacity(chunk_size.unwrap_or(1_000));
-        let mut p_buffer = Vec::with_capacity(buffer.capacity());
-        for chunk in &br.lines().map(|l| l.unwrap()).chunks(buffer.capacity()) {
-            buffer.clear();
-            p_buffer.clear();
-            
-            // Read lines into a buffer for parallelizing
-            chunk.filter(|line| {
-                // If it doesn't match the pattern, move along
-                if let Some(node_type) = filter_node {
-                    line.starts_with(node_type)
-                } else {
-                    true
-                }
-            }).for_each(|l| buffer.push(l));
-
-            // Parse lines
-            buffer.par_drain(..).map(|line| {
-                line_to_embedding(&line)
-                    .ok_or_else(|| PyValueError::new_err(format!("Error parsing line: {}", line)))
-            }).collect_into_vec(&mut p_buffer);
-
-            for record in p_buffer.drain(..) {
-                let (node_type, node_name, emb) = record?;
-
-                if i == 0 {
-                    es = EmbeddingStore::new(num_embeddings, emb.len(), distance.to_edist());
-                }
-
-                let node_id = vocab.get_or_insert(node_type, node_name);
-                if node_id < i {
-                    return Err(PyKeyError::new_err(format!("found duplicate node at {}!", i)));
-                }
-                let m = es.get_embedding_mut(node_id);
-                if m.len() != emb.len() {
-                    return Err(PyValueError::new_err("Embeddings have different sizes!"));
-                }
-                m.copy_from_slice(&emb);
-                i += 1;
-            }
-        }
+        let (vocab, es) = EmbeddingReader::load(path, distance.to_edist(), filter_type, chunk_size)?;
 
         let ne = NodeEmbeddings {
             vocab: Arc::new(vocab),
@@ -2743,23 +2694,6 @@ impl NodeEmbeddingsBuilder {
         })
     }
 
-}
-
-/// Reads a line and converts it to a node type, node name, and embedding.
-/// Blows up if it doesn't meet the formatting.
-fn line_to_embedding(line: &String) -> Option<(String,String,Vec<f32>)> {
-    let pieces:Vec<_> = line.split('\t').collect();
-    if pieces.len() != 3 {
-        return None
-    }
-
-    let node_type = pieces[0];
-    let name = pieces[1];
-    let e = pieces[2];
-    let emb: Result<Vec<f32>,_> = e[1..e.len() - 1].split(',')
-        .map(|wi| parse(wi.trim())).collect();
-
-    emb.ok().map(|e| (node_type.to_string(), name.to_string(), e))
 }
 
 /// Simple iterator over the vocab.
