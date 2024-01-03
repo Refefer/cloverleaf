@@ -4,35 +4,38 @@ use std::fs::File;
 use std::io::{Write,BufWriter,Result as IOResult,BufReader,BufRead};
 use std::convert::AsRef;
 
-use rayon::prelude::*;
-use flate2::read::GzDecoder;
-use ryu::Buffer;
 use fast_float::parse;
-use pyo3::prelude::PyResult;
-use pyo3::exceptions::{PyValueError,PyKeyError,PyIOError};
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use itertools::Itertools;
+use pyo3::exceptions::{PyValueError,PyKeyError,PyIOError};
+use pyo3::prelude::{PyResult,PyErr};
+use rayon::prelude::*;
+use ryu::Buffer;
 
 use crate::vocab::Vocab;
 use crate::embeddings::{EmbeddingStore,Distance};
+use crate::graph::CumCSR;
+use crate::{CSR,EdgeType};
 
 /// Streaming writer for NodeEmbeddings.  Since Embeddings are often gigantic, creating them adhoc
 /// then streaming them to disk is beneficial.
 pub struct EmbeddingWriter<'a> {
     vocab: &'a Vocab,
-    output: BufWriter<File>,
+    output: Box<dyn Write>,
     buffer: String
 }
 
 impl <'a> EmbeddingWriter<'a> {
 
-    pub fn new(path: &str, vocab: &'a Vocab) -> IOResult<Self> {
-        let f = File::create(path)?;
-        let bw = BufWriter::new(f);
-
+    pub fn new(path: &str, vocab: &'a Vocab, comp_level: Option<u32>) -> IOResult<Self> {
+        let level = comp_level.map(|l| Compression::new(l));
+        let encoder = open_file_for_writing(path, level)?;
         let s = String::new();
         Ok(EmbeddingWriter { 
             vocab,
-            output: bw,
+            output: encoder,
             buffer: s
         })
     }
@@ -72,6 +75,49 @@ impl <'a> EmbeddingWriter<'a> {
     }
 }
 
+struct RecordReader {
+    chunk_size: usize,
+}
+
+impl RecordReader {
+    pub fn new(chunk_size: usize) -> Self {
+        RecordReader { chunk_size }
+    }
+
+    pub fn read<F: Sync,D,A:Send + Sync,E>(
+        &self, 
+        it: impl Iterator<Item=String>,
+        mapper: F,
+        mut drain: D
+    ) -> Result<(),E>
+        where F: Fn(usize, String) -> Option<A>,
+              D: FnMut(usize, A) -> Result<(),E>
+    {
+        let mut i = 0;
+        let mut buffer = Vec::with_capacity(self.chunk_size);
+        let mut p_buffer = Vec::with_capacity(self.chunk_size);
+        for chunk in &(it).chunks(self.chunk_size) {
+            buffer.clear();
+            
+            // Read lines into a buffer for parallelizing
+            chunk.for_each(|l| buffer.push(l));
+
+            buffer.par_drain(..).enumerate().map(|(idx, line)| {
+                mapper(i+idx, line)
+            }).collect_into_vec(&mut p_buffer);
+
+            for r in p_buffer.drain(..) {
+                if let Some(record) = r {
+                    drain(i, record)?;
+                }
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+}
+
 pub struct EmbeddingReader; 
 
 impl EmbeddingReader {
@@ -92,31 +138,22 @@ impl EmbeddingReader {
         
         // Place holder
         let mut es = EmbeddingStore::new(0, 0, Distance::Cosine);
-        let filter_node = filter_type.as_ref();
+        let rr = RecordReader::new(chunk_size.unwrap_or(1_000));
         let mut i = 0;
-        let mut buffer = Vec::with_capacity(chunk_size.unwrap_or(1_000));
-        let mut p_buffer = Vec::with_capacity(buffer.capacity());
-        for chunk in &reader.lines().map(|l| l.unwrap()).chunks(buffer.capacity()) {
-            buffer.clear();
-            p_buffer.clear();
-            
-            // Read lines into a buffer for parallelizing
-            chunk.filter(|line| {
-                // If it doesn't match the pattern, move along
-                if let Some(node_type) = filter_node {
-                    line.starts_with(node_type)
-                } else {
-                    true
-                }
-            }).for_each(|l| buffer.push(l));
+        
+        let filter_node = filter_type.as_ref();
+        rr.read(reader.lines().map(|l| l.unwrap()),
+            |_, line| {
+               if let Some(node_type) = filter_node {
+                   if !line.starts_with(node_type) {
+                       return None
+                   }
+               }
 
-            // Parse lines
-            buffer.par_drain(..).map(|line| {
-                line_to_embedding(&line)
-                    .ok_or_else(|| PyValueError::new_err(format!("Error parsing line: {}", line)))
-            }).collect_into_vec(&mut p_buffer);
-
-            for record in p_buffer.drain(..) {
+               Some(line_to_embedding(&line)
+                    .ok_or_else(|| PyValueError::new_err(format!("Error parsing line: {}", line))))
+            },
+            |_, record| {
                 let (node_type, node_name, emb) = record?;
 
                 if i == 0 {
@@ -133,8 +170,8 @@ impl EmbeddingReader {
                 }
                 m.copy_from_slice(&emb);
                 i += 1;
-            }
-        }
+                Ok(())
+            })?;
 
         Ok((vocab, es))
     }
@@ -152,6 +189,19 @@ fn open_file_for_reading(path: &str) -> IOResult<Box<dyn BufRead>> {
     };
     Ok(result)
 }
+
+fn open_file_for_writing(path: &str, compression: Option<Compression>) -> IOResult<Box<dyn Write>> {
+    let f = File::create(path)?;
+    let bw = BufWriter::new(f);
+    let encoder: Box<dyn Write> = if path.ends_with(".gz") {
+        let e = GzEncoder::new(bw, compression.unwrap_or(Compression::fast()));
+        Box::new(e)
+    } else {
+        Box::new(bw)
+    };
+    Ok(encoder)
+}
+
 
 /// Count the number of lines in an embeddings file so we only have to do one allocation.  If
 /// NodeEmbeddings internal memory structure changes, such as using slabs, this might be less
@@ -190,3 +240,49 @@ fn line_to_embedding(line: &String) -> Option<(String,String,Vec<f32>)> {
     emb.ok().map(|e| (node_type.to_string(), name.to_string(), e))
 }
 
+pub struct GraphReader; 
+
+impl GraphReader {
+    pub fn load(
+        path: &str, 
+        edge_type: EdgeType,
+        chunk_size: usize
+    ) -> PyResult<(Vocab,CumCSR)> {
+        let reader = open_file_for_reading(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?
+            .lines().map(|l| l.unwrap());
+
+        let mut vocab = Vocab::new();
+        let mut edges = Vec::new();
+        let rr = RecordReader::new(chunk_size);
+        rr.read(reader,
+            |i, line| {
+                let pieces: Vec<_> = line.split('\t').collect();
+                if pieces.len() != 5 {
+                    return Some(Err(PyValueError::new_err(format!("{}: Malformed graph file: Expected 5 fields!", i))))
+                }
+                let from_node = (pieces[0].to_string(), pieces[1].to_string());
+                let to_node = (pieces[2].to_string(), pieces[3].to_string());
+                let w = pieces[4].parse::<f32>();
+                if let Err(e) = w {
+                    return Some(Err(PyValueError::new_err(format!("{}: Malformed graph file! {} - {:?}", i, e, pieces[4]))));
+                }
+                let w = w.expect("Already checked for w");
+                Some(Ok((from_node, to_node, w)))
+            },
+            |_i, record| {
+                let (from_node, to_node, w) = record?;
+                let f_id = vocab.get_or_insert(from_node.0, from_node.1);
+                let t_id = vocab.get_or_insert(to_node.0, to_node.1);
+                edges.push((f_id, t_id, w));
+                if matches!(edge_type, EdgeType::Undirected) {
+                    edges.push((t_id, f_id, w));
+                }
+                Ok::<(), PyErr>(())
+            })?;
+        
+        let csr = CSR::construct_from_edges(edges);
+
+        Ok((vocab, CumCSR::convert(csr)))
+    }
+}

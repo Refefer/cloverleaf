@@ -55,7 +55,7 @@ use crate::vocab::Vocab;
 use crate::sampler::{Weighted,Unweighted};
 use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
 use crate::feature_store::FeatureStore;
-use crate::io::{EmbeddingWriter,EmbeddingReader};
+use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader};
 
 use crate::algos::rwr::{Steps,RWR,ppr_estimate};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
@@ -369,6 +369,7 @@ impl Graph {
     ///    Self - Can throw exception
     ///        
     pub fn load(path: &str, edge_type: EdgeType) -> PyResult<Self> {
+        /*
         let f = File::open(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
@@ -392,13 +393,16 @@ impl Graph {
             }
         }
         let csr = CSR::construct_from_edges(edges);
+        */
+        let (vocab, csr) = GraphReader::load(path, edge_type, 10_000)?;
 
         let g = Graph {
-            graph: Arc::new(CumCSR::convert(csr)),
+            graph: Arc::new(csr),
             vocab: Arc::new(vocab)
         };
 
         Ok(g)
+
 
     }
 
@@ -2532,8 +2536,8 @@ impl NodeEmbeddings {
     ///    () - Can throw exception
     ///        
     ///    
-    pub fn save(&self, path: &str) -> PyResult<()> {
-        let mut writer = EmbeddingWriter::new(path, self.vocab.as_ref())
+    pub fn save(&self, path: &str, comp_level: Option<u32>) -> PyResult<()> {
+        let mut writer = EmbeddingWriter::new(path, self.vocab.as_ref(), comp_level)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
         let it = (0..self.vocab.len())
@@ -2839,10 +2843,11 @@ impl NeighborhoodAligner {
         path: &str,
         embeddings: &NodeEmbeddings, 
         graph: &Graph,
-        chunk_size: Option<usize>
+        chunk_size: Option<usize>,
+        comp_level: Option<u32>
     ) -> PyResult<()> {
        
-        let mut writer = EmbeddingWriter::new(path, embeddings.vocab.as_ref())
+        let mut writer = EmbeddingWriter::new(path, embeddings.vocab.as_ref(), comp_level)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
         let cs = chunk_size.unwrap_or(10_000);
