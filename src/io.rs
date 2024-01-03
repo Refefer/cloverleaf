@@ -76,7 +76,7 @@ impl <'a> EmbeddingWriter<'a> {
 }
 
 struct RecordReader {
-    chunk_size: usize,
+    chunk_size: usize
 }
 
 impl RecordReader {
@@ -94,23 +94,31 @@ impl RecordReader {
               D: FnMut(usize, A) -> Result<(),E>
     {
         let mut i = 0;
-        let mut buffer = Vec::with_capacity(self.chunk_size);
-        let mut p_buffer = Vec::with_capacity(self.chunk_size);
-        for chunk in &(it).chunks(self.chunk_size) {
-            buffer.clear();
-            
-            // Read lines into a buffer for parallelizing
-            chunk.for_each(|l| buffer.push(l));
-
-            buffer.par_drain(..).enumerate().map(|(idx, line)| {
-                mapper(i+idx, line)
-            }).collect_into_vec(&mut p_buffer);
-
-            for r in p_buffer.drain(..) {
-                if let Some(record) = r {
-                    drain(i, record)?;
+        if self.chunk_size <= 1 {
+            for (i, line) in it.enumerate() {
+                if let Some(record) = mapper(i, line) {
+                    drain(i, record)?
                 }
-                i += 1;
+            }
+        } else {
+            let mut buffer = Vec::with_capacity(self.chunk_size);
+            let mut p_buffer = Vec::with_capacity(self.chunk_size);
+            for chunk in &(it).chunks(self.chunk_size) {
+                buffer.clear();
+                
+                // Read lines into a buffer for parallelizing
+                chunk.for_each(|l| buffer.push(l));
+
+                buffer.par_drain(..).enumerate().map(|(idx, line)| {
+                    mapper(i+idx, line)
+                }).collect_into_vec(&mut p_buffer);
+
+                for r in p_buffer.drain(..) {
+                    if let Some(record) = r {
+                        drain(i, record)?;
+                    }
+                    i += 1;
+                }
             }
         }
         Ok(())
