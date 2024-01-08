@@ -123,6 +123,10 @@ def build_arg_parser():
         default=None,
         help="If provided, embeds features from the given file instead of training set.")
 
+    parser.add_argument("--compress",
+        action="store_true",
+        help="If provided, compresses the embeddings.")
+
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--embedding-propagation",
         dest="ep",
@@ -231,8 +235,19 @@ def main(args):
 
     eTime = time.time() - sTime
 
+    feature_suffix = ".feature-embeddings"
+    node_suffix = ".node-embeddings"
+    node_orig_suffix = ".node-embeddings.orig"
+    if args.compress:
+        feature_suffix += ".gz"
+        node_suffix += ".gz"
+        node_orig_suffix += ".gz"
+
     print("Time to learn:{}, Nodes/sec:{}".format(eTime, (graph.nodes() * 50) / eTime, file=sys.stderr))
-    feature_embeddings.save(args.output + '.feature-embeddings')
+
+    # Save features to disk
+    print("Saving feature embeddings...")
+    feature_embeddings.save(args.output + feature_suffix)
 
     print("Constructing nodes...")
     if args.attention is not None:
@@ -244,16 +259,23 @@ def main(args):
 
     embedder = cloverleaf.NodeEmbedder(aggregator)
     if args.full_features:
+        print("Loading larger feature set...")
         features = cloverleaf.FeatureSet.new_from_file(args.full_features)
 
+    # Construct the node embeddings from features
     node_embeddings = embedder.embed_feature_set(features, feature_embeddings)
 
     if args.neighborhood_alignment is None:
-        node_embeddings.save(args.output + '.node-embeddings')
+        node_embeddings.save(args.output + node_suffix)
     else:
-        node_embeddings.save(args.output + '.node-embeddings.orig')
+        # Save the original embeddings
+        print("Saving original node embeddings...")
+        node_embeddings.save(args.output + node_orig_suffix)
+
+        # Construct the aligned node embeddings
+        print("Constructing aligned node embeddings...")
         aligner = cloverleaf.NeighborhoodAligner(args.neighborhood_alignment)
-        aligner.align_to_disk(args.output + '.node-embeddings', node_embeddings, graph)
+        aligner.align_to_disk(args.output + node_suffix, node_embeddings, graph)
 
     aggregator.save(args.output + '.embedder')
 

@@ -229,6 +229,20 @@ impl EmbeddingStore {
         self.distance.compute(e1, e2)
     }
 
+    pub fn score_all<'a>(
+        &self, 
+        q: &Entity<'a>
+    ) -> EmbeddingStore {
+        let es = EmbeddingStore::new(self.len(), 1, self.distance.clone());
+
+        let query_emb = self.extract_vec(q);
+        (0..self.len()).into_par_iter().for_each(|node_id| {
+            let e2 = self.get_embedding(node_id);
+            es.get_embedding_mut_hogwild(node_id)[0] = self.distance.compute(query_emb, e2);
+        });
+        es
+    }
+
     pub fn nearest_neighbor<'a,F>(
         &self, 
         q: &Entity<'a>, 

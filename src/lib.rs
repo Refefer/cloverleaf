@@ -2118,8 +2118,8 @@ impl ClusterLPAEmbedder {
 /// distance.
 #[pyclass]
 struct SLPAEmbedder {
-    k: usize, 
-    threshold: f32, 
+    t: usize, 
+    threshold: usize, 
     seed: Option<u64>
 }
 
@@ -2130,10 +2130,10 @@ impl SLPAEmbedder {
     ///    
     ///    Parameters
     ///    ----------
-    ///    k : Int
-    ///        Maximum number of clusters to preserve for each Node
+    ///    t : Int
+    ///        Number of passes to run.
     ///    
-    ///    threshold : Float
+    ///    threshold : Int
     ///        Filtering threshold: clusters which have a weight less than threshold are truncated.
     ///    
     ///    seed : Int - Optional
@@ -2145,15 +2145,17 @@ impl SLPAEmbedder {
     ///        
     ///    
     #[new]
-    pub fn new(k: usize, threshold: f32, seed: Option<u64>) -> Self {
+    pub fn new(t: usize, threshold: usize, seed: Option<u64>) -> Self {
         SLPAEmbedder {
-            k, threshold, seed
+            t: t.max(1), 
+            threshold, 
+            seed
         }
     }
 
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
-        format!("SLPAEmbedder<k={}, threshold={}, seed={:?}>", self.k, self.threshold, self.seed)
+        format!("SLPAEmbedder<t={}, threshold={}, seed={:?}>", self.t, self.threshold, self.seed)
     }
 
     ///    Learn SLPA Embeddings
@@ -2170,7 +2172,7 @@ impl SLPAEmbedder {
     ///    
     pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
         let seed = self.seed.unwrap_or(SEED);
-        let es = crate::algos::slpa::construct_slpa_embedding(graph.graph.as_ref(), self.k, self.threshold, seed);
+        let es = crate::algos::slpa::construct_slpa_embedding(graph.graph.as_ref(), self.t, self.threshold, seed);
         NodeEmbeddings {
             vocab: graph.vocab.clone(),
             embeddings: es
