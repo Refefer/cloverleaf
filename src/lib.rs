@@ -368,9 +368,19 @@ impl Graph {
     ///    -------
     ///    Self - Can throw exception
     ///        
-    pub fn load(path: &str, edge_type: EdgeType, chunk_size: Option<usize>) -> PyResult<Self> {
+    pub fn load(
+        path: &str, 
+        edge_type: EdgeType, 
+        chunk_size: Option<usize>,
+        skip_rows: Option<usize>
+        ) -> PyResult<Self> {
 
-        let (vocab, csr) = GraphReader::load(path, edge_type, chunk_size.unwrap_or(1))?;
+        let (vocab, csr) = GraphReader::load(
+            path, 
+            edge_type, 
+            chunk_size.unwrap_or(1),
+            skip_rows
+        )?;
 
         let g = Graph {
             graph: Arc::new(csr),
@@ -2558,10 +2568,17 @@ impl NodeEmbeddings {
         path: &str, 
         distance: Distance, 
         filter_type: Option<String>, 
-        chunk_size: Option<usize>
+        chunk_size: Option<usize>,
+        skip_rows: Option<usize>
     ) -> PyResult<Self> {
 
-        let (vocab, es) = EmbeddingReader::load(path, distance.to_edist(), filter_type, chunk_size)?;
+        let (vocab, es) = EmbeddingReader::load(
+            path, 
+            distance.to_edist(), 
+            filter_type, 
+            chunk_size, 
+            skip_rows
+        )?;
 
         let ne = NodeEmbeddings {
             vocab: Arc::new(vocab),

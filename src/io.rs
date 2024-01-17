@@ -76,23 +76,27 @@ impl <'a> EmbeddingWriter<'a> {
 }
 
 struct RecordReader {
-    chunk_size: usize
+    chunk_size: usize,
+    skip: usize
 }
 
 impl RecordReader {
-    pub fn new(chunk_size: usize) -> Self {
-        RecordReader { chunk_size }
+    pub fn new(chunk_size: usize, skip: usize) -> Self {
+        RecordReader { chunk_size, skip }
     }
 
     pub fn read<F: Sync,D,A:Send + Sync,E>(
         &self, 
-        it: impl Iterator<Item=String>,
+        mut it: impl Iterator<Item=String>,
         mapper: F,
         mut drain: D
     ) -> Result<(),E>
         where F: Fn(usize, String) -> Option<A>,
               D: FnMut(usize, A) -> Result<(),E>
     {
+        // Skip records, such as headers of tsvs
+        (&mut it).take(self.skip).for_each(|_|{});
+
         let mut i = 0;
         if self.chunk_size <= 1 {
             for (i, line) in it.enumerate() {
@@ -134,7 +138,8 @@ impl EmbeddingReader {
         path: &str, 
         distance: Distance, 
         filter_type: Option<String>, 
-        chunk_size: Option<usize>
+        chunk_size: Option<usize>,
+        skip_rows: Option<usize>
     ) -> PyResult<(Vocab, EmbeddingStore)> {
         let num_embeddings = count_lines(path, &filter_type)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -146,7 +151,7 @@ impl EmbeddingReader {
         
         // Place holder
         let mut es = EmbeddingStore::new(0, 0, Distance::Cosine);
-        let rr = RecordReader::new(chunk_size.unwrap_or(1_000));
+        let rr = RecordReader::new(chunk_size.unwrap_or(1_000), skip_rows.unwrap_or(0));
         let mut i = 0;
         
         let filter_node = filter_type.as_ref();
@@ -254,7 +259,8 @@ impl GraphReader {
     pub fn load(
         path: &str, 
         edge_type: EdgeType,
-        chunk_size: usize
+        chunk_size: usize,
+        skip_rows: Option<usize>
     ) -> PyResult<(Vocab,CumCSR)> {
         let reader = open_file_for_reading(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?
@@ -262,7 +268,7 @@ impl GraphReader {
 
         let mut vocab = Vocab::new();
         let mut edges = Vec::new();
-        let rr = RecordReader::new(chunk_size);
+        let rr = RecordReader::new(chunk_size, skip_rows.unwrap_or(0));
         rr.read(reader,
             |i, line| {
                 let pieces: Vec<_> = line.split('\t').collect();
