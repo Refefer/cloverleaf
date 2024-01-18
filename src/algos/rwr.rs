@@ -23,12 +23,26 @@ pub struct RWR {
     pub steps: Steps,
     pub walks: usize,
     pub beta: f32,
+    pub single_threaded: bool,
     pub seed: u64
 }
 
 impl RWR {
 
     pub fn sample<G: Graph + Send + Sync>(
+        &self, 
+        graph: &G, 
+        sampler: &impl Sampler<G>,
+        start_node: NodeID
+    ) -> HashMap<NodeID, f32> {
+        if self.single_threaded {
+            self.sample_st(graph, sampler, start_node)
+        } else {
+            self.sample_mt(graph, sampler, start_node)
+        }
+    }
+
+    fn sample_mt<G: Graph + Send + Sync>(
         &self, 
         graph: &G, 
         sampler: &impl Sampler<G>,
@@ -57,7 +71,29 @@ impl RWR {
         ret
     }
 
-    pub fn sample_level<G: CDFGraph + Send + Sync>(
+    fn sample_st<G: Graph + Send + Sync>(
+        &self, 
+        graph: &G, 
+        sampler: &impl Sampler<G>,
+        start_node: NodeID
+    ) -> HashMap<NodeID, f32> {
+        let mut counts = HashMap::new();
+        let mut rng = XorShiftRng::seed_from_u64(self.seed);
+
+        (0..self.walks).for_each(|_| {
+            let node = self.walk(graph, sampler, start_node, &mut rng);
+            *counts.entry(node).or_insert(0f32) += 1f32; 
+        });
+
+        counts.iter_mut()
+            .for_each(|(k, v)| {
+                let d = (graph.degree(*k) as f32).powf(self.beta);
+                *v /= (self.walks as f32) * d;
+            });
+        counts 
+    }
+
+    fn sample_level<G: CDFGraph + Send + Sync>(
         &self, 
         graph: &G, 
         start_node: NodeID,
@@ -124,7 +160,7 @@ impl RWR {
             }
             pass += 1;
         }
-        ret.into_par_iter()
+        ret.into_iter()
             .map(|(k, v)| {
                 let d = (graph.degree(k) as f32).powf(self.beta);
                 let v = v as f32 / ((self.walks as f32) * d);

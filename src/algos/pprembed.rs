@@ -48,6 +48,7 @@ impl PPREmbed {
                 steps: self.steps,
                 walks: self.num_walks,
                 beta: self.beta,
+                single_threaded: false,
                 seed: self.seed + node_id as u64
             };
 

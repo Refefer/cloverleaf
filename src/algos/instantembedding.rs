@@ -45,6 +45,7 @@ impl InstantEmbeddings {
                         steps: steps,
                         walks: walks,
                         beta: beta,
+                        single_threaded: false,
                         seed: seed + node_id as u64
                     };
 

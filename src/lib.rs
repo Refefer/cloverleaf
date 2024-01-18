@@ -474,6 +474,7 @@ impl RandomWalker {
         seed: Option<u64>, 
         k: Option<usize>, 
         filter_type: Option<String>,
+        single_threaded: Option<bool>,
         weighted: Option<bool>
     ) -> PyResult<Vec<(FQNode, f32)>> {
 
@@ -491,6 +492,7 @@ impl RandomWalker {
             steps: steps,
             walks: self.walks,
             beta: self.beta.unwrap_or(0.5),
+            single_threaded: single_threaded.unwrap_or(false),
             seed: seed.unwrap_or(SEED)
         };
 

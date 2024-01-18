@@ -278,6 +278,7 @@ impl PprRank {
             steps: self.steps.clone(),
             walks: self.num_walks,
             beta: self.beta,
+            single_threaded: false,
             seed: seed + 13
         };
 

@@ -127,6 +127,11 @@ def build_arg_parser():
         action="store_true",
         help="If provided, compresses the embeddings.")
 
+    parser.add_argument("--skip-headers",
+        dest="skip_headers",
+        action="store_true",
+        help="If provided, Graph file considered to have a header row to be skipped.")
+
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--embedding-propagation",
         dest="ep",
@@ -173,7 +178,8 @@ def main(args):
     f_name = args.features
     
     print("Loading graph...")
-    graph = cloverleaf.Graph.load(g_name, cloverleaf.EdgeType.Undirected)
+    skip_rows = 1 if args.skip_headers else 0
+    graph = cloverleaf.Graph.load(g_name, cloverleaf.EdgeType.Undirected, skip_rows=skip_rows)
     print("Nodes={},Edges={}".format(graph.nodes(), graph.edges()), file=sys.stderr)
     print('Loading features...')
     features = cloverleaf.FeatureSet.new_from_graph(graph)
