@@ -267,7 +267,7 @@ impl EmbeddingPropagation {
     ) -> (ANode, NodeCounts, NodeCounts, Vec<NodeCounts>) {
         // h(v)
         let (hv_vars, hv) = model.construct_node_embedding(
-            node, features, &feature_embeddings, rng);
+            node, 1f32, features, &feature_embeddings, rng);
         
         // ~h(v)
         let (thv_vars, thv) = self.loss.construct_positive(
@@ -283,7 +283,7 @@ impl EmbeddingPropagation {
         let mut hu_vars = Vec::with_capacity(negatives.len());
         let mut hus = Vec::with_capacity(negatives.len());
         negatives.into_iter().for_each(|neg_node| {
-            let (hu_var, hu) = model.construct_node_embedding(neg_node, features, &feature_embeddings, rng);
+            let (hu_var, hu) = model.construct_node_embedding(neg_node, 1f32, features, &feature_embeddings, rng);
             hu_vars.push(hu_var);
             hus.push(hu);
         });
@@ -330,7 +330,7 @@ impl EmbeddingPropagation {
 pub fn extract_grads(
     graph: &Graph, 
     grads: &mut HashMap<usize, Vec<f32>>, 
-    vars: impl Iterator<Item=(usize, (ANode, usize))>
+    vars: impl Iterator<Item=(usize, (ANode, f32))>
 ) {
     for (feat_id, (var, _)) in vars {
         if grads.contains_key(&feat_id) { continue }

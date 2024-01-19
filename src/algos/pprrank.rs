@@ -153,8 +153,8 @@ impl PprRank {
         // Generate the top K for each node once
         let walk_lib = self.generate_random_walks(graph, self.seed+1,);
 
-        println!("{} -> {:?}", 0, walk_lib.get(0));
-        println!("");
+        //println!("{} -> {:?}", 0, walk_lib.get(0));
+        //println!("");
         let pb = CLProgressBar::new((self.passes * steps_per_pass) as u64, self.indicator);
         
         for pass in 1..(self.passes + 1) {
@@ -262,6 +262,7 @@ impl PprRank {
     ) -> (NodeCounts, ANode) {
         construct_node_embedding(
             node_id, 
+            1f32,
             feature_store,
             feature_embeddings,
             self.num_features,
@@ -359,14 +360,14 @@ impl PprRank {
             Loss::ListNet { passive, weight_decay } => {
                 let mut list_loss = self.listnet_loss(&query_node, &ranked_embeddings, &ranked_scores, node, passive);
                 if weight_decay > 0f32 {
-                    list_loss = list_loss + weight_decay * comp_weight_decay(&query_node, &ranked_embeddings, 1f32)
+                    list_loss = list_loss + weight_decay * comp_weight_decay(&query_node, &ranked_embeddings, 0.1f32)
                 }
                 list_loss
             },
             Loss::ListMLE { weight_decay } => {
                 let mut list_loss = self.list_mle_loss(&query_node, &ranked_embeddings, &ranked_scores, node);
                 if weight_decay > 0f32 {
-                    list_loss = list_loss + weight_decay * comp_weight_decay(&query_node, &ranked_embeddings, 1f32)
+                    list_loss = list_loss + weight_decay * comp_weight_decay(&query_node, &ranked_embeddings, 0.1f32)
                 }
                 list_loss
             }
@@ -400,7 +401,7 @@ impl PprRank {
             }).collect::<Vec<ANode>>();
 
         if ordered.len() == 0 {
-            println!("Node:{}, {:?} -> {:?}", node_id, node_weights, sm_scores.value());
+            //println!("Node:{}, {:?} -> {:?}", node_id, node_weights, sm_scores.value());
             Constant::scalar(0f32)
         } else {
             let loss = -ordered.sum_all();
@@ -440,6 +441,7 @@ impl PprRank {
             }
             loss
         }
+
     }
 
     fn extract_gradients(
@@ -475,6 +477,10 @@ fn compute_distances(query_node: &ANode, ranked_nodes: &[ANode], cosine: bool) -
         ranked_nodes.iter().map(|n| {
             query_node.dot(n)
         }).collect::<Vec<_>>().concat().exp()
+        //ranked_nodes.iter().map(|n| {
+        //    1f32 / (1f32 + l2norm(&(query_node - n)))
+        //}).collect::<Vec<_>>().concat()
+        
     }
 }
 
@@ -489,7 +495,13 @@ fn l2norm(v: &ANode) -> ANode {
 fn comp_weight_decay(query_node: &ANode, ranked_nodes: &[ANode], threshold: f32) -> ANode {
     let t = Constant::scalar(threshold);
     let mut mag = Vec::with_capacity(ranked_nodes.len() + 1);
-    mag.push(l2norm(query_node));
+
+
+    let qn = query_node.pow(2f32).sum() - &t;
+    if qn.value()[0] > 0f32 {
+        mag.push(qn);
+    }
+
     ranked_nodes.iter().for_each(|n| {
         let nn = n.pow(2f32).sum() - &t;
         if nn.value()[0] > 0f32 {

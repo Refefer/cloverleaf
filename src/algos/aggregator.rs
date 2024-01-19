@@ -141,7 +141,7 @@ impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {
         out.fill(0f32);
         let it = features.iter().map(|feat_id| {
             let e = self.embs.get_embedding(*feat_id); 
-            (Constant::new(e.to_vec()), 1usize)
+            (Constant::new(e.to_vec()), 1f32)
         }).collect::<Vec<_>>();
 
         // No-op RNG

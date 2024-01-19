@@ -166,11 +166,11 @@ impl Loss {
                 let mut nodes = Vec::with_capacity(*num);
                 for _ in 0..(*num) {
                     if let Some(node) = random_walk(node, graph, rng, *restart_p, 10) {
-                        nodes.push(node);
+                        nodes.push((node, 1f32));
                     }
                 }
                 if nodes.len() == 0 {
-                    nodes.push(node);
+                    nodes.push((node, 1f32));
                 }
                 model.construct_from_multiple_nodes(nodes.into_iter(),
                         feature_store, feature_embeddings, rng)

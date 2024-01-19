@@ -84,7 +84,7 @@ impl Attention {
 /// The big chalupa: given attention and a set of vectors, computes the attention according to the
 /// attention type within the MHA parameter.  
 pub fn attention_mean<'a>(
-    it: impl Iterator<Item=&'a (ANode, usize)>,
+    it: impl Iterator<Item=&'a (ANode, f32)>,
     mha: &MultiHeadedAttention,
     rng: &mut impl Rng
 ) -> ANode {
@@ -118,7 +118,7 @@ pub fn attention_mean<'a>(
 
 /// Computes value level attention scaling.
 fn scale_vecs<'a>(
-    items: Vec<(Attention, usize)>, 
+    items: Vec<(Attention, f32)>, 
     sm_att_mat: &'a AttentionMatrix 
 ) -> impl Iterator<Item=ANode> + 'a {
 
@@ -138,7 +138,7 @@ type AttentionMatrix = Vec<Vec<Option<ANode>>>;
 
 #[inline]
 fn compute_attention_matrix(
-    items: &[(Attention, usize)],
+    items: &[(Attention, f32)],
     at: &AttentionType,
     rng: &mut impl Rng
 ) -> AttentionMatrix {
@@ -155,7 +155,7 @@ fn compute_attention_matrix(
 
 // Computes the full N^2 attention matrix.  
 fn compute_full_attention_matrix(
-    items: &[(Attention, usize)]
+    items: &[(Attention, f32)]
 ) -> AttentionMatrix {
     
      // Get the attention for each feature
@@ -167,7 +167,7 @@ fn compute_full_attention_matrix(
             let (at_j, jc) = &items[j];
             let mut dot_i_j = (&at_i.query).dot(&at_j.key);
             let num = ic * jc;
-            if num >= 1 {
+            if num >= 1f32 {
                 dot_i_j = dot_i_j * (num as f32);
             }
             row[j] = Some(dot_i_j);
@@ -178,7 +178,7 @@ fn compute_full_attention_matrix(
 
 // Computes the sliding attention matrix
 fn compute_sliding_attention_matrix(
-    items: &[(Attention, usize)],
+    items: &[(Attention, f32)],
     window: usize
 ) -> AttentionMatrix {
     
@@ -205,7 +205,7 @@ fn compute_sliding_attention_matrix(
 // Computes the random attention matrix.  For each features, we select k random features to attend
 // toward.
 fn compute_random_attention_matrix(
-    items: &[(Attention, usize)],
+    items: &[(Attention, f32)],
     k: usize,
     rng: &mut impl Rng
 ) -> AttentionMatrix {
@@ -283,9 +283,9 @@ mod attention_tests {
             attention_type: AttentionType::Full
         };
         vec![
-            (Attention::new(&Variable::new(vec![-1., -1., 1., 1.]), &mha, 0), 1),
-            (Attention::new(&Variable::new(vec![0., 0., 2., 2.]), &mha, 0), 1),
-            (Attention::new(&Variable::new(vec![1., 1., -1., -1.]), &mha, 0), 1)
+            (Attention::new(&Variable::new(vec![-1., -1., 1., 1.]), &mha, 0), 1f32),
+            (Attention::new(&Variable::new(vec![0., 0., 2., 2.]), &mha, 0), 1f32),
+            (Attention::new(&Variable::new(vec![1., 1., -1., -1.]), &mha, 0), 1f32)
         ]
     }
 

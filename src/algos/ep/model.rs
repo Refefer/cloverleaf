@@ -4,10 +4,11 @@
 use simple_grad::*;
 use hashbrown::HashMap;
 use rand::prelude::*;
+use rand_distr::{Distribution,Uniform};
 
 use crate::FeatureStore;
 use crate::EmbeddingStore;
-use crate::graph::{Graph as CGraph,NodeID};
+use crate::graph::{Graph as CGraph,NodeID, CDFtoP};
 use super::attention::{attention_mean,MultiHeadedAttention};
 
 /// Main interface for model.  Needs to be threadsafe
@@ -17,6 +18,7 @@ pub trait Model: Send + Sync {
     fn construct_node_embedding<R: Rng>(
         &self,
         node: NodeID,
+        weight: f32,
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
@@ -33,7 +35,7 @@ pub trait Model: Send + Sync {
     ) -> (NodeCounts, ANode);
 
     /// Construct multiple node embeddings - we use this for negatives, typically.
-    fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
+    fn construct_from_multiple_nodes<I: Iterator<Item=(NodeID, f32)>, R: Rng>(
         &self,
         nodes: I,
         feature_store: &FeatureStore,
@@ -75,12 +77,14 @@ impl Model for AveragedFeatureModel {
     fn construct_node_embedding<R: Rng>(
         &self,
         node: NodeID,
+        weight: f32,
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
     ) -> (NodeCounts, ANode) {
         construct_node_embedding(
             node,
+            weight,
             feature_store,
             feature_embeddings,
             self.max_features,
@@ -106,7 +110,7 @@ impl Model for AveragedFeatureModel {
             rng)
     }
 
-    fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
+    fn construct_from_multiple_nodes<I: Iterator<Item=(NodeID, f32)>, R: Rng>(
         &self,
         nodes: I,
         feature_store: &FeatureStore,
@@ -161,6 +165,7 @@ impl Model for AttentionFeatureModel {
     fn construct_node_embedding<R: Rng>(
         &self,
         node: NodeID,
+        weight: f32,
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
@@ -193,7 +198,7 @@ impl Model for AttentionFeatureModel {
             rng)
     }
 
-    fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
+    fn construct_from_multiple_nodes<I: Iterator<Item=(NodeID, f32)>, R: Rng>(
         &self,
         nodes: I,
         feature_store: &FeatureStore,
@@ -224,11 +229,12 @@ impl Model for AttentionFeatureModel {
 /// We track the number of times a features has been seen to help reduce the gradient graph we need
 /// to compute.  It's a bit of a headache for the book keeping but the speed up is worth it.  Could
 /// probably be abstracted better.
-pub type NodeCounts = HashMap<usize, (ANode, usize)>;
+pub type NodeCounts = HashMap<usize, (ANode, f32)>;
 
 /// Gets the feature embeddings for a node, adding or updating the counts
 pub fn collect_embeddings_from_node<R: Rng>(
     node: NodeID,
+    weight: f32,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     feat_map: &mut NodeCounts,
@@ -239,11 +245,11 @@ pub fn collect_embeddings_from_node<R: Rng>(
     let max_features = max_features.unwrap_or(feats.len());
     for feat in feats.choose_multiple(rng, max_features) {
         if let Some((_emb, count)) = feat_map.get_mut(feat) {
-            *count += 1;
+            *count += weight;
         } else {
             let emb = feature_embeddings.get_embedding(*feat);
             let v = Variable::pooled(emb);
-            feat_map.insert(*feat, (v, 1));
+            feat_map.insert(*feat, (v, weight));
         }
     }
 }
@@ -253,13 +259,15 @@ pub fn collect_embeddings_from_node<R: Rng>(
 // to create the node embedding
 pub fn construct_node_embedding<R: Rng>(
     node: NodeID,
+    weight: f32,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     max_features: Option<usize>,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
-    collect_embeddings_from_node(node, feature_store, 
+    collect_embeddings_from_node(node, weight, 
+                                 feature_store, 
                                  feature_embeddings, 
                                  &mut feature_map,
                                  max_features,
@@ -281,7 +289,8 @@ pub fn attention_construct_node_embedding<R: Rng>(
     rng: &mut R
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
-    collect_embeddings_from_node(node, feature_store, 
+    collect_embeddings_from_node(node, 1f32, 
+                                 feature_store, 
                                  feature_embeddings, 
                                  &mut feature_map,
                                  max_features,
@@ -317,17 +326,19 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     mha: Option<MultiHeadedAttention>,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
-    let edges = &graph.get_edges(node).0;
+    let (edges, weights) = &graph.get_edges(node);
     
-    if edges.len() <= max_nodes.unwrap_or(edges.len()) {
-        construct_from_multiple_nodes(edges.iter().cloned(),
+    let mn = max_nodes.unwrap_or(edges.len());
+    if edges.len() <= mn {
+        let it = edges.iter().cloned().zip(CDFtoP::new(weights));
+        construct_from_multiple_nodes(it,
             feature_store,
             feature_embeddings,
             max_features,
             mha,
             rng)
     } else {
-        let it = edges.choose_multiple(rng, max_nodes.unwrap()).cloned();
+        let it = reservoir_sample(edges, weights, mn, rng).into_iter();
         construct_from_multiple_nodes(it,
             feature_store,
             feature_embeddings,
@@ -337,7 +348,27 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     }
 }
 
-fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
+fn reservoir_sample(
+    edges: &[NodeID],
+    weights: &[f32],
+    size: usize,
+    rng: &mut impl Rng
+) -> Vec<(NodeID, f32)> {
+    let mut sample = Vec::with_capacity(size);
+    for (i, n) in edges.iter().cloned().zip(CDFtoP::new(weights)).enumerate() {
+        if i < size {
+            sample.push(n);
+        } else {
+            let idx = Uniform::new(0, i).sample(rng);
+            if idx < size {
+                sample[idx] = n;
+            }
+        }
+    }
+    sample
+}
+
+fn construct_from_multiple_nodes<I: Iterator<Item=(NodeID, f32)>, R: Rng>(
     nodes: I,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
@@ -347,12 +378,12 @@ fn construct_from_multiple_nodes<I: Iterator<Item=NodeID>, R: Rng>(
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
     let mut new_nodes = Vec::with_capacity(0);
-    for node in nodes {
+    for (node, weight) in nodes {
         if mha.is_some() {
             new_nodes.push(node.clone());
         }
 
-        collect_embeddings_from_node(node, feature_store, 
+        collect_embeddings_from_node(node, weight, feature_store, 
                                      feature_embeddings, 
                                      &mut feature_map,
                                      max_features,
@@ -382,8 +413,8 @@ fn attention_multiple(
         let feats = feature_store.get_features(node);
         for feat in feats.iter() {
             if let Some((node, _)) = feature_map.get(feat) {
-                let e = feats_per_node.entry(feat).or_insert_with(|| (node.clone(), 0usize));
-                e.1 += 1;
+                let e = feats_per_node.entry(feat).or_insert_with(|| (node.clone(), 0f32));
+                e.1 += 1f32;
             }
         }
         let it = feats.iter()
@@ -392,19 +423,19 @@ fn attention_multiple(
                 feats_per_node.get(f).expect("Some type of error!")
             });
 
-        output.push((attention_mean(it, &mha, rng), 1))
+        output.push((attention_mean(it, &mha, rng), 1f32))
     }
     mean_embeddings(output.iter())
 }
 
-pub fn mean_embeddings<'a,I: Iterator<Item=&'a (ANode, usize)>>(items: I) -> ANode {
+pub fn mean_embeddings<'a,I: Iterator<Item=&'a (ANode, f32)>>(items: I) -> ANode {
     let mut vs = Vec::new();
-    let mut n = 0;
+    let mut n = 0f32;
     items.for_each(|(emb, count)| {
-        if *count > 1 {
-            vs.push(emb * *count as f32);
-        } else {
+        if *count == 1f32 {
             vs.push(emb.clone());
+        } else {
+            vs.push(emb * *count);
         }
         n += *count;
     });
