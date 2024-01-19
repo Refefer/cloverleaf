@@ -329,8 +329,9 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     let (edges, weights) = &graph.get_edges(node);
     
     let mn = max_nodes.unwrap_or(edges.len());
+    let weights = CDFtoP::new(weights).map(|p| p * edges.len() as f32);
+    let it = edges.iter().cloned().zip(weights);
     if edges.len() <= mn {
-        let it = edges.iter().cloned().zip(CDFtoP::new(weights));
         construct_from_multiple_nodes(it,
             feature_store,
             feature_embeddings,
@@ -338,7 +339,7 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
             mha,
             rng)
     } else {
-        let it = reservoir_sample(edges, weights, mn, rng).into_iter();
+        let it = reservoir_sample(it, mn, rng).into_iter();
         construct_from_multiple_nodes(it,
             feature_store,
             feature_embeddings,
@@ -349,13 +350,12 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
 }
 
 fn reservoir_sample(
-    edges: &[NodeID],
-    weights: &[f32],
+    it: impl Iterator<Item=(NodeID, f32)>,
     size: usize,
     rng: &mut impl Rng
 ) -> Vec<(NodeID, f32)> {
     let mut sample = Vec::with_capacity(size);
-    for (i, n) in edges.iter().cloned().zip(CDFtoP::new(weights)).enumerate() {
+    for (i, n) in it.enumerate() {
         if i < size {
             sample.push(n);
         } else {
@@ -428,11 +428,14 @@ fn attention_multiple(
     mean_embeddings(output.iter())
 }
 
-pub fn mean_embeddings<'a,I: Iterator<Item=&'a (ANode, f32)>>(items: I) -> ANode {
+pub fn mean_embeddings<'a>(
+    items: impl Iterator<Item=&'a (ANode, f32)>
+) -> ANode {
     let mut vs = Vec::new();
     let mut n = 0f32;
     items.for_each(|(emb, count)| {
-        if *count == 1f32 {
+        // Floating point math is pretty meh 
+        if (*count - 1f32).abs() < 1e-6 {
             vs.push(emb.clone());
         } else {
             vs.push(emb * *count);

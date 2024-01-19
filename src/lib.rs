@@ -211,6 +211,29 @@ impl Distance {
             Distance::Jaccard => EDist::Jaccard
         }
     }
+
+    fn from_edist(dist: EDist) -> Distance {
+        match dist {
+            EDist::Cosine => Distance::Cosine,
+            EDist::Dot => Distance::Dot,
+            EDist::Euclidean => Distance::Euclidean,
+            EDist::ALT => Distance::ALT,
+            EDist::Hamming => Distance::Hamming,
+            EDist::Jaccard => Distance::Jaccard  
+        }
+    }
+
+}
+
+#[pymethods]
+impl Distance {
+    pub fn compute(
+        &self,
+        e1: Vec<f32>,
+        e2: Vec<f32>
+    ) -> f32 {
+        self.to_edist().compute(e1.as_slice(), e2.as_slice())
+    }
 }
 
 /// 
@@ -2403,6 +2426,10 @@ impl NodeEmbeddings {
     ///    
     pub fn vocab(&self) -> VocabIterator {
         VocabIterator::new(self.vocab.clone())
+    }
+
+    pub fn get_distance(&self) -> Distance {
+        Distance::from_edist(self.embeddings.distance())
     }
 
     ///    Using a provided embedding, finds the nearest K neighbors to that embedding.
