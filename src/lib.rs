@@ -2503,6 +2503,35 @@ impl NodeEmbeddings {
         Ok(self.embeddings.len())
     }
 
+    ///    Computes the distances between either a qualified node or embedding, using the current
+    ///    distance method.  This is faster than extracting an embedding from the NodeEmbeddings
+    ///    then issuing a distance call due to avoiding serialization (especially problematic for
+    ///    big nodes).
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    e1 : Query
+    ///        Fully Qualified Node or Embedding
+    ///    
+    ///    e2 : Query
+    ///        Fully Qualified Node or Embedding
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Float - Can throw exception
+    ///        Throws an exception if a fully qualified node isn't present in the NodeEmbeddings
+    ///    
+    pub fn compute_distance(
+        &self,
+        e1: &Query,
+        e2: &Query
+    ) -> PyResult<f32> {
+        let e1_emb = lookup_embedding(e1, self)?;
+        let e2_emb = lookup_embedding(e2, self)?;
+        let result = self.embeddings.distance().compute(e1_emb, e2_emb);
+        Ok(result)
+    }
+
     ///    Returns the node and embedding at internal index `idx`.
     ///    
     ///    Parameters

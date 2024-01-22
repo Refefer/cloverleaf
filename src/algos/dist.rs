@@ -3,15 +3,16 @@
 /// the distance between each node in the graph and each landmark.  
 use std::collections::{VecDeque,BinaryHeap};
 use std::cmp::Reverse;
-use std::sync::Mutex;
+use std::fmt::Write;
 
 use rayon::prelude::*;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 
-use crate::graph::{Graph,NodeID};
 use crate::bitset::BitSet;
 use crate::embeddings::{EmbeddingStore,Distance};
+use crate::graph::{Graph,NodeID};
+use crate::progress::CLProgressBar;
 
 #[derive(Copy,Clone,Debug)]
 pub enum LandmarkSelection {
@@ -86,18 +87,19 @@ pub fn construct_walk_distances(
     };
     top_nodes.sort();
 
-    let mes = Mutex::new(es);
+    let pb = CLProgressBar::new(k as u64, true);
+    pb.update_message(|msg| { write!(msg, "Computing Distances...").expect("Should never hit"); });
+
     top_nodes.into_par_iter().enumerate().for_each(|(landmark_i, node_id)| {
         let node_distances = unweighted_walk_distance(graph, node_id);
-        {
-            let mut embeddings = mes.lock().unwrap();
-            node_distances.into_iter().enumerate().for_each(|(idx, d)| {
-                let embedding = embeddings.get_embedding_mut(idx);
-                embedding[landmark_i] = d as f32;
-            });
-        }
+        node_distances.into_par_iter().enumerate().for_each(|(idx, d)| {
+            let embedding = es.get_embedding_mut_hogwild(idx);
+            embedding[landmark_i] = d as f32;
+        });
+        pb.inc(1);
     });
-    mes.into_inner().expect("No references should be left!")
+    pb.finish();
+    es
 }
 
 #[cfg(test)]
