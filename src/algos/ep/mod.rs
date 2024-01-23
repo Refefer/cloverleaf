@@ -27,6 +27,13 @@ use crate::algos::grad_utils::node_sampler::*;
 use self::loss::*;
 use self::model::{Model,NodeCounts};
 
+#[derive(Clone,Copy,Debug)]
+pub enum LossWeighting {
+    DegreeLog,
+    DegreeExponential(f32),
+    None
+}
+
 /// Defines the propagator
 #[derive(Debug)]
 pub struct EmbeddingPropagation {
@@ -48,6 +55,9 @@ pub struct EmbeddingPropagation {
     /// Whether we use hard negatives or not.  We might strip this out since I've had difficulty
     /// using it to improve test loss
     pub hard_negs: usize,
+
+    /// Reweights losses according to the number of outbound edges they have
+    pub loss_weighting: LossWeighting,
 
     /// Random seed
     pub seed: u64,
@@ -172,10 +182,23 @@ impl EmbeddingPropagation {
                 // Compute grads for batch
                 nodes.par_iter().map(|node_id| {
                     let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + **node_id) as u64);
-                    let (loss, hv_vars, thv_vars, hu_vars) = self.run_forward_pass(
+                    let (mut loss, hv_vars, thv_vars, hu_vars) = self.run_forward_pass(
                         graph, **node_id, &features, &feature_embeddings, 
                         model, &sampler, &mut rng);
 
+                    loss = match self.loss_weighting {
+                        LossWeighting::DegreeLog => {
+                            let decrease = (1f32 + graph.degree(**node_id) as f32).ln();
+                            loss / decrease
+                        },
+                        LossWeighting::DegreeExponential(weight) => {
+                            let decrease = (graph.degree(**node_id) as f32).powf(weight);
+                            loss / decrease
+                        },
+                        LossWeighting::None => {
+                            loss
+                        }
+                    };
                     let grads = self.extract_gradients(&loss, hv_vars, thv_vars, hu_vars);
                     (loss.value()[0], grads)
                 }).collect_into_vec(&mut grads);

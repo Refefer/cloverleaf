@@ -1,7 +1,9 @@
+import pprint
 import argparse
 import time
 import sys
 import json
+
 import cloverleaf
 
 def build_arg_parser():
@@ -87,6 +89,12 @@ def build_arg_parser():
         type=int,
         default=1,
         help="If set, filters out features which have fewer than min_count.")
+
+    parser.add_argument("--loss-weighting",
+        dest="loss_weighting",
+        default=['none'],
+        nargs="+",
+        help="Allows either `none`, `log` or `degree <weight>`. Default is `none`")
 
     parser.add_argument("--alpha",
         dest="alpha",
@@ -174,6 +182,7 @@ def build_arg_parser():
 
 def main(args):
 
+    pprint.pprint(args.__dict__)
     g_name = args.edges
     f_name = args.features
     
@@ -224,10 +233,22 @@ def main(args):
     elif max_neighbors is None:
         max_neighbors = 1
 
+    loss_method = args.loss_weighting[0]
+    if loss_method == 'log':
+        loss_weight = cloverleaf.LossWeighting.Log()
+    elif loss_method == 'exponential':
+        weight = float(args.loss_weighting[1])
+        loss_weight = cloverleaf.LossWeighting.Exponential(weight)
+    elif loss_method = 'none':
+        loss_weight = None
+    else:
+        raise TypeError("Illegal loss weighting type `{}`".format(loss_method))
+
     ep = cloverleaf.EmbeddingPropagator(
         alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
         passes=args.passes, max_nodes=max_neighbors, 
-        max_features=args.max_features, attention=args.attention, 
+        max_features=args.max_features, loss_weighting=args.loss_weighting,
+        attention=args.attention, 
         attention_heads=args.attention_heads, context_window=args.context_window, 
         noise=args.gradient_noise, hard_negatives=args.hard_negatives, valid_pct=args.valid_pct)
 

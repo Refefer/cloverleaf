@@ -60,7 +60,7 @@ use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader};
 use crate::algos::rwr::{Steps,RWR,ppr_estimate};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
-use crate::algos::ep::EmbeddingPropagation;
+use crate::algos::ep::{EmbeddingPropagation,LossWeighting as EPLW};
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
 use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
@@ -877,6 +877,29 @@ impl GraphBuilder {
 
 }
 
+#[pyclass]
+#[derive(Clone)]
+struct LossWeighting {
+    loss: EPLW
+}
+
+#[pymethods]
+impl LossWeighting {
+
+    #[allow(non_snake_case)]
+    #[staticmethod]
+    pub fn Log() -> Self {
+        LossWeighting { loss: EPLW::DegreeLog }
+    }
+
+    #[allow(non_snake_case)]
+    #[staticmethod]
+    pub fn Exponential(weight: f32) -> Self {
+        LossWeighting { loss: EPLW::DegreeExponential(weight) }
+    }
+
+}
+
 /// A python wrapper for the internal ADT used for defining losses
 #[pyclass]
 #[derive(Clone)]
@@ -1142,6 +1165,9 @@ impl EmbeddingPropagator {
         // Max features to use for optimization
         max_features: Option<usize>,
 
+        // How to weight the loss in the graph
+        loss_weighting: Option<LossWeighting>,
+
         // Percentage of nodes to use for validation
         valid_pct: Option<f32>,
 
@@ -1164,6 +1190,7 @@ impl EmbeddingPropagator {
         // Use gradient noise where we sample from the normal distribution and blend with `noise`
         noise: Option<f32>
     ) -> Self {
+        let loss_weighting = loss_weighting.map(|lw| lw.loss).unwrap_or(EPLW::None);
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(0.9),
             batch_size: batch_size.unwrap_or(50),
@@ -1171,6 +1198,7 @@ impl EmbeddingPropagator {
             passes: passes.unwrap_or(100),
             loss: loss.map(|l|l.loss).unwrap_or(Loss::MarginLoss(1f32,1)),
             hard_negs: hard_negatives.unwrap_or(0),
+            loss_weighting: loss_weighting,
             valid_pct: valid_pct.unwrap_or(0.1),
             seed: seed.unwrap_or(SEED),
             indicator: indicator.unwrap_or(true),
@@ -2149,12 +2177,21 @@ impl ClusterLPAEmbedder {
     }
 }
 
+#[pyclass]
+#[derive(Clone,Copy)]
+pub enum ListenerRule {
+    Best,
+    Probabilistic
+}
+
 /// Struct for learning Speaker-Listener multi-cluster embeddings.  Uses Hamming Distance for
 /// distance.
 #[pyclass]
 struct SLPAEmbedder {
     t: usize, 
     threshold: usize, 
+    rule: crate::algos::slpa::ListenerRule,
+    memory_size: Option<usize>,
     seed: Option<u64>
 }
 
@@ -2170,6 +2207,12 @@ impl SLPAEmbedder {
     ///    
     ///    threshold : Int
     ///        Filtering threshold: clusters which have a weight less than threshold are truncated.
+    ///
+    ///    memory_size : Int - Optional
+    ///        Each node has a memory of memory_size.  If memory_size is smaller than t, overwrites
+    ///        history.
+    ///
+    ///    rule : 
     ///    
     ///    seed : Int - Optional
     ///        If provided, use this seed.  Default is global seed.
@@ -2180,10 +2223,28 @@ impl SLPAEmbedder {
     ///        
     ///    
     #[new]
-    pub fn new(t: usize, threshold: usize, seed: Option<u64>) -> Self {
+    pub fn new(
+        t: usize, 
+        threshold: usize, 
+        memory_size: Option<usize>, 
+        rule: Option<ListenerRule>,
+        seed: Option<u64>
+    ) -> Self {
+        use crate::algos::slpa::{ListenerRule as SLR};
+        let lr_rule = if let Some(rule) = rule {
+            match rule {
+                ListenerRule::Best => SLR::Best,
+                ListenerRule::Probabilistic => SLR::Probabilistic
+            }
+        } else {
+            SLR::Best
+        };
+
         SLPAEmbedder {
             t: t.max(1), 
+            rule: lr_rule,
             threshold, 
+            memory_size,
             seed
         }
     }
@@ -2207,7 +2268,14 @@ impl SLPAEmbedder {
     ///    
     pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
         let seed = self.seed.unwrap_or(SEED);
-        let es = crate::algos::slpa::construct_slpa_embedding(graph.graph.as_ref(), self.t, self.threshold, seed);
+        let es = crate::algos::slpa::construct_slpa_embedding(
+            graph.graph.as_ref(), 
+            self.rule,
+            self.t, 
+            self.threshold, 
+            self.memory_size.unwrap_or(self.t),
+            seed
+        );
         NodeEmbeddings {
             vocab: graph.vocab.clone(),
             embeddings: es
@@ -4317,6 +4385,8 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<TournamentBuilder>()?;
     m.add_class::<Tournament>()?;
     m.add_class::<ConnectedComponents>()?;
+    m.add_class::<ListenerRule>()?;
+    m.add_class::<LossWeighting>()?;
     Ok(())
 }
 

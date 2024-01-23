@@ -445,5 +445,3 @@ pub fn mean_embeddings<'a>(
     vs.sum_all() / n as f32
 }
 
-
-

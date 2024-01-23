@@ -12,25 +12,42 @@ use crate::progress::CLProgressBar;
 use crate::embeddings::{EmbeddingStore, Distance};
 use crate::algos::utils::{get_best_count,Counter};
 
+#[derive(Clone,Copy)]
+pub enum ListenerRule {
+    Best,
+    Probabilistic
+}
+
 /// Learns the SLPA algorithm
 pub fn construct_slpa_embedding(
+
     graph: &(impl Graph + Send + Sync),
+
+    // Listener rule
+    rule: ListenerRule,
 
     // Number of passes to run
     t: usize,
     
     // Filter out communities with fewer than threshold occurences
     threshold: usize,
+    
+    // Size of the memory
+    memory_size: usize,
 
     // Random seed
     seed: u64
+
+
 ) -> EmbeddingStore {
-    let dims = (t as f32 / threshold as f32).ceil() as usize + 1;
+    println!("t: {}, threshold:{}, seed:{}", t, threshold, seed);
+
+    let dims = (memory_size as f32 / threshold as f32).ceil() as usize + 1;
     let mut es = EmbeddingStore::new(graph.len(), dims, Distance::Jaccard);
 
     // Each node starts in its own cluster
-    let mut memory = vec![0usize; graph.len() * t];
-    memory.par_iter_mut().chunks(t).enumerate().for_each(|(i, mut mem)| {*mem[0] = i;}); 
+    let mut memory = vec![0usize; graph.len() * memory_size];
+    memory.par_iter_mut().chunks(memory_size).enumerate().for_each(|(i, mut mem)| {*mem[0] = i;}); 
 
     let pb = CLProgressBar::new(t as u64, true);
     pb.update_message(|msg| { write!(msg, "Clustering...").expect("Should never hit"); });
@@ -49,28 +66,40 @@ pub fn construct_slpa_embedding(
             // Collect a cluster from each of its reports
             let edges = &graph.get_edges(*node_id).0;
             let mut proposed_clusters: Vec<_> = edges.iter().map(|edge_idx| {
-                let memory_offset = edge_idx * t;
+                let memory_offset = edge_idx * memory_size;
                 
                 // Randomly sample one cluster id from range
-                let idx = Uniform::new(0, pass).sample(&mut rng);
+                let bounds = pass.min(memory_size);
+                let idx = Uniform::new(0, bounds).sample(&mut rng);
                 memory[memory_offset+idx]
             }).collect();
             
-            // Select the "best" cluster
-            proposed_clusters.par_sort_unstable();
-            *new_cluster = get_best_count(&proposed_clusters, &mut rng);
+            // Select the "best" cluster based on a rule
+            *new_cluster = match rule {
+                ListenerRule::Best => {
+                    proposed_clusters.par_sort_unstable();
+                    get_best_count(&proposed_clusters, &mut rng)
+                },
+                ListenerRule::Probabilistic => {
+                    let idx = Uniform::new(0, proposed_clusters.len()).sample(&mut rng);
+                    proposed_clusters[idx]
+                }
+            };
+
         });
 
         // Update entry
         idxs.iter().zip(pass_memory.iter()).for_each(|(node_id, new_cluster)| {
-            memory[node_id * t + pass] = *new_cluster;
+            let offset = node_id * memory_size;
+            let mem_idx = pass % memory_size;
+            memory[offset+mem_idx] = *new_cluster;
         });
         pb.inc(1);
     }
     pb.finish();
 
-    // Threshold is the l1norm score
-    memory.chunks_mut(t).enumerate().for_each(|(node_id, node_clusters)| {
+    // Threshold 
+    memory.chunks_mut(memory_size).enumerate().for_each(|(node_id, node_clusters)| {
         let embedding = es.get_embedding_mut(node_id);
         embedding.iter_mut().for_each(|v| *v = -1.);
         
