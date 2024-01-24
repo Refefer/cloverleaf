@@ -26,6 +26,11 @@ def build_arg_parser():
         default=None,
         help="If provided, loads feature embeddings from a previous run.")
 
+    parser.add_argument("--unweighted",
+        dest="unweighted",
+        action="store_true",
+        help="If provided, loads an unweighted graph")
+
     parser.add_argument("--propagate-features",
         dest="feat_prop",
         type=int,
@@ -188,7 +193,11 @@ def main(args):
     
     print("Loading graph...")
     skip_rows = 1 if args.skip_headers else 0
-    graph = cloverleaf.Graph.load(g_name, cloverleaf.EdgeType.Undirected, skip_rows=skip_rows)
+    graph = cloverleaf.Graph.load(
+            g_name, 
+            cloverleaf.EdgeType.Undirected, 
+            skip_rows=skip_rows, 
+            weighted=not args.unweighted)
     print("Nodes={},Edges={}".format(graph.nodes(), graph.edges()), file=sys.stderr)
     print('Loading features...')
     features = cloverleaf.FeatureSet.new_from_graph(graph)

@@ -260,7 +260,8 @@ impl GraphReader {
         path: &str, 
         edge_type: EdgeType,
         chunk_size: usize,
-        skip_rows: Option<usize>
+        skip_rows: usize,
+        weighted: bool
     ) -> PyResult<(Vocab,CumCSR)> {
         let reader = open_file_for_reading(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?
@@ -268,7 +269,7 @@ impl GraphReader {
 
         let mut vocab = Vocab::new();
         let mut edges = Vec::new();
-        let rr = RecordReader::new(chunk_size, skip_rows.unwrap_or(0));
+        let rr = RecordReader::new(chunk_size, skip_rows);
         rr.read(reader,
             |i, line| {
                 let pieces: Vec<_> = line.split('\t').collect();
@@ -277,11 +278,15 @@ impl GraphReader {
                 }
                 let from_node = (pieces[0].to_string(), pieces[1].to_string());
                 let to_node = (pieces[2].to_string(), pieces[3].to_string());
-                let w = pieces[4].parse::<f32>();
-                if let Err(e) = w {
-                    return Some(Err(PyValueError::new_err(format!("{}: Malformed graph file! {} - {:?}", i, e, pieces[4]))));
-                }
-                let w = w.expect("Already checked for w");
+                let w = if weighted {
+                    let w = pieces[4].parse::<f32>();
+                    match w {
+                        Err(e) => return Some(Err(PyValueError::new_err(format!("{}: Malformed graph file! {} - {:?}", i, e, pieces[4])))),
+                        Ok(w) => w
+                    }
+                } else {
+                    1f32
+                };
                 Some(Ok((from_node, to_node, w)))
             },
             |_i, record| {

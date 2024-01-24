@@ -395,14 +395,16 @@ impl Graph {
         path: &str, 
         edge_type: EdgeType, 
         chunk_size: Option<usize>,
-        skip_rows: Option<usize>
+        skip_rows: Option<usize>,
+        weighted: Option<bool>
         ) -> PyResult<Self> {
 
         let (vocab, csr) = GraphReader::load(
             path, 
             edge_type, 
             chunk_size.unwrap_or(1),
-            skip_rows
+            skip_rows.unwrap_or(0),
+            weighted.unwrap_or(true)
         )?;
 
         let g = Graph {
