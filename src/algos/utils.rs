@@ -1,8 +1,14 @@
 /// Random utility functions
 use std::hash::{Hash,Hasher};
+use std::cmp::{Ordering,PartialOrd,Eq,PartialEq,Reverse};
+use std::collections::BinaryHeap;
 
+use float_ord::FloatOrd;
 use rand::prelude::*;
+use rand_distr::Uniform;
 use ahash::AHasher;
+
+use crate::NodeID;
 
 /// Counts a set of items by id.  See the test for examples.
 pub struct Counter<'a> {
@@ -97,6 +103,62 @@ impl FeatureHasher {
     }
 }
 
+struct OrdFirst<A,B>(A, B);
+
+impl <A:PartialEq,B> PartialEq for OrdFirst<A,B> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl <A:Eq,B> Eq for OrdFirst<A,B> {}
+
+impl <A:PartialOrd,B> PartialOrd for OrdFirst<A,B> {
+    fn partial_cmp(&self, other: &OrdFirst<A,B>) -> Option<Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
+impl <A:Ord,B> Ord for OrdFirst<A,B> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+pub fn reservoir_sample(
+    it: impl Iterator<Item=(NodeID, f32)>,
+    size: usize,
+    rng: &mut impl Rng
+) -> Vec<(NodeID, f32)> {
+    let mut sample = Vec::with_capacity(size);
+    for (i, n) in it.enumerate() {
+        if i < size {
+            sample.push(n);
+        } else {
+            let idx = Uniform::new(0, i).sample(rng);
+            if idx < size {
+                sample[idx] = n;
+            }
+        }
+    }
+    sample
+}
+
+pub fn weighted_reservoir_sample<A>(
+    items: impl Iterator<Item=(A, f32)>,
+    n: usize,
+    rng: &mut impl Rng
+) -> Vec<(A, f32)> {
+    let mut bh = BinaryHeap::with_capacity(n+1);
+    for (i, (item, weight)) in items.enumerate() {
+        let nw = rng.gen::<f32>().powf(weight);
+        bh.push(Reverse(OrdFirst(FloatOrd(nw), (item, weight))));
+        if i >= n {
+            bh.pop();
+        }
+    }
+    bh.into_iter().map(|of| of.0.1).collect()
+}
 
 #[cfg(test)]
 mod utils_tests {

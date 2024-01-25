@@ -1164,6 +1164,12 @@ impl EmbeddingPropagator {
         // Max neighbors to use for reconstructions
         max_nodes: Option<usize>,
 
+        // How we sample neighbors
+        weighted_neighbor_sampling: Option<bool>,
+
+        // How we blend neighbors during reconstruction
+        weighted_neighbor_averaging: Option<bool>,
+
         // Max features to use for optimization
         max_features: Option<usize>,
 
@@ -1207,6 +1213,9 @@ impl EmbeddingPropagator {
             noise: noise.unwrap_or(0.0)
         };
 
+        let wns = weighted_neighbor_sampling.unwrap_or(false);
+        let wna = weighted_neighbor_averaging.unwrap_or(false);
+
         let model = if let Some(d_k) = attention {
             let num_heads = attention_heads.unwrap_or(1);
             let at = if let Some(size) = context_window {
@@ -1217,9 +1226,11 @@ impl EmbeddingPropagator {
                 AttentionType::Full
             };
             let mha = MultiHeadedAttention::new(num_heads, d_k, at);
-            ModelType::Attention(AttentionFeatureModel::new(mha, None, max_nodes))
+            ModelType::Attention(AttentionFeatureModel::new(mha, None, max_nodes, wns))
         } else {
-            ModelType::Averaged(AveragedFeatureModel::new(max_features, max_nodes))
+            ModelType::Averaged(AveragedFeatureModel::new(
+                    max_features, max_nodes, wns, wna
+            ))
         };
 
         EmbeddingPropagator{ ep, model }

@@ -101,6 +101,16 @@ def build_arg_parser():
         nargs="+",
         help="Allows either `none`, `log` or `degree <weight>`. Default is `none`")
 
+    parser.add_argument("--weighted-neighbor-sampling",
+        dest="weighted_neighbor_sampling",
+        action="store_true",
+        help="If provided, samples neighbors proportionally to their edge weight.")
+
+    parser.add_argument("--weighted-neighbor-averaging",
+        dest="weighted_neighbor_averaging",
+        action="store_true",
+        help="If provided, averages neighbors proportionally to their edge weight during reconstruction.")
+
     parser.add_argument("--alpha",
         dest="alpha",
         type=float,
@@ -257,6 +267,8 @@ def main(args):
         alpha=args.lr, loss=loss, batch_size=args.batch_size, dims=args.dims, 
         passes=args.passes, max_nodes=max_neighbors, 
         max_features=args.max_features, loss_weighting=loss_weight,
+        weighted_neighbor_averaging=args.weighted_neighbor_averaging,
+        weighted_neighbor_sampling=args.weighted_neighbor_sampling,
         attention=args.attention, 
         attention_heads=args.attention_heads, context_window=args.context_window, 
         noise=args.gradient_noise, hard_negatives=args.hard_negatives, valid_pct=args.valid_pct)
