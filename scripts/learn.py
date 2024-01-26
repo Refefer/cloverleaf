@@ -188,8 +188,8 @@ def build_arg_parser():
 
     group.add_argument("--contrastive",
         dest="contrastive",
-        nargs=2,
-        metavar=('TEMPERATURE', 'NEGATIVES'),
+        nargs=3,
+        metavar=('POSITIVE_MARGIN', 'NEGATIVE_MARGIN', 'NEGATIVES'),
         help="Optimizes using contrastive loss.")
 
     return parser
@@ -242,8 +242,8 @@ def main(args):
         loss = cloverleaf.EPLoss.rankspace(float(tau), int(negs))
 
     else:
-        temp, negs = args.contrastive
-        loss = cloverleaf.EPLoss.contrastive(float(temp), int(negs))
+        pos_m, neg_m, negs = args.contrastive
+        loss = cloverleaf.EPLoss.contrastive(float(pos_m), float(neg_m), int(negs))
 
     max_neighbors = args.max_neighbors
     if args.ep is not None:

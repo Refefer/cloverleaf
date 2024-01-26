@@ -36,52 +36,6 @@ enum Tree {
     }
 }
 
-impl Tree {
-    /*
-    fn leaf_index(
-        &self,
-        tree_table: &TreeTable,
-        emb: &[f32]
-    ) -> usize {
-        let mut node = 0;
-        loop {
-            match &tree_table[node] {
-                Tree::Leaf { ref indices: _ } => { return node },
-                Tree::Split { ref hp, ref above, ref below } => {
-                    node = if hp.point_is_above(emb) { *above } else { *below };
-                }
-            }
-        }
-    }
-
-    fn leaf_path(
-        &self,
-        tree_table: &TreeTable,
-        emb: &[f32]
-    ) -> Vec<usize> {
-        let mut path = Vec::new();
-        let mut idx = 0;
-        let mut node = 0;
-        loop {
-            match &tree_table[node] {
-                Tree::Leaf { ref indices: _ } => { break },
-                Tree::Split { hp, above, below } => {
-                    node = if hp.point_is_above(emb) { 
-                        idx <<= 1;
-                        *above 
-                    } else { 
-                        idx += 1;
-                        idx <<= 1;
-                        *below 
-                    };
-                }
-            }
-            path.push(node);
-        }
-        path
-    }
-    */
-}
 
 fn tree_predict(
     tree_table: &TreeTable,

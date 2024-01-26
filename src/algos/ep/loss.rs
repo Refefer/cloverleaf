@@ -17,9 +17,9 @@ pub enum Loss {
     /// one of the first to define it and a good starting point
     MarginLoss(f32, usize),
 
-    /// Contrastive Loss is another embedding approach; this one uses tau, or temperature, to
-    /// moderate how much weight to give differences
-    Contrastive(f32, usize),
+    /// Contrastive Loss is another embedding approach; two margins are provided: a positive and a
+    /// negative margin, moderating how much each matters
+    Contrastive(f32, f32, usize),
 
     /// This is loss used in the StarSpace paper.  It's basically max margin loss but using cosine
     /// rather than euclidean distances
@@ -40,7 +40,7 @@ pub enum Loss {
 impl Loss {
     pub fn negatives(&self) -> usize {
         match self {
-            Loss::Contrastive(_, negs) => *negs,
+            Loss::Contrastive(_, _, negs) => *negs,
             Loss::MarginLoss(_, negs)  => *negs,
             Loss::StarSpace(_, negs) => *negs,
             Loss::RankLoss(_, negs) => *negs,
@@ -49,9 +49,9 @@ impl Loss {
         }
     }
 
+    // hv is the embedding constructed from its features
     // thv is the reconstruction of v from its neighbor nodes or 
     // a random positive, depending on the loss
-    // hv is the embedding constructed from its features
     // hu is a random negative node constructed via its neighbors
     pub fn compute(&self, thv: ANode, hv: ANode, hus: &[ANode]) -> ANode {
         match self {
@@ -104,25 +104,28 @@ impl Loss {
                 }
             },
 
-            Loss::Contrastive(tau, _)  => {
+            Loss::Contrastive(pos_margin, neg_margin, _)  => {
                 let thv_norm = il2norm(&thv);
                 let hv_norm  = il2norm(&hv);
 
-                let mut ds: Vec<_> = hus.iter().map(|hu| {
-                    let hu_norm = il2norm(hu);
-                    cosine(thv_norm.clone(), hu_norm) / *tau
-                }).collect();
+                let pos_reconstruction = (pos_margin - cosine(thv_norm, hv_norm.clone())).maximum(0f32);
+                let mut margins: Vec<_> = hus.iter().map(|hu| {
+                        let hu_norm = il2norm(hu);
+                        let cs = cosine(hv_norm.clone(), hu_norm);
+                        (cs - *neg_margin).maximum(0f32)
+                    })
+                    .filter(|v| v.value()[0] > 0f32)
+                    .collect();
 
-                let d1 = cosine(thv_norm, hv_norm) / *tau;
-                let mut mask = vec![0f32; ds.len()];
-                ds.push(d1);
-                mask.push(1f32);
-                let ds = ds.concat();
-
-                let ds_exp = (&ds).exp();
-
-                let nom = (ds * mask - (1f32 + ds_exp).ln()).sum();
-                -&nom / nom.value().len() as f32
+                if pos_reconstruction.value()[0] > 0f32 {
+                    margins.push(pos_reconstruction);
+                }
+                let n = margins.len();
+                if n > 0 {
+                    margins.sum_all() / n as f32
+                } else {
+                    Constant::scalar(0f32)
+                }
             }
 
             Loss::RankLoss(tau, _)  => {
@@ -158,7 +161,7 @@ impl Loss {
         rng: &mut R
     ) -> (NodeCounts,ANode) {
         match self {
-            Loss::MarginLoss(_,_) | Loss::Contrastive(_,_) | Loss::RankLoss(_,_) | Loss::RankSpace (_,_) | Loss::StarSpace(_,_) => {
+            Loss::MarginLoss(_,_) | Loss::Contrastive(_,_,_) | Loss::RankLoss(_,_) | Loss::RankSpace (_,_) | Loss::StarSpace(_,_) => {
                 model.reconstruct_node_embedding(
                     graph, node, feature_store, feature_embeddings, rng)
             },

@@ -937,9 +937,11 @@ impl EPLoss {
     /// 
     ///    Parameters
     ///    ----------
-    ///    temperature : Float
-    ///        Temperature to control the influence of high values.  Higher temperatures reduce the
-    ///        impact of larger deltas
+    ///    positive_margin : Float
+    ///        Margin threshold for positives.  
+    ///    
+    ///    negative_margin : Float
+    ///        Margin threshold for negatives.  
     ///    
     ///    negatives : Int
     ///        If provided, the number of negatives samples to use.  Default is 1.
@@ -950,8 +952,8 @@ impl EPLoss {
     ///        
     ///    
     #[staticmethod]
-    pub fn contrastive(temperature: f32, negatives: usize) -> Self {
-        EPLoss { loss: Loss::Contrastive(temperature, negatives.max(1)) }
+    pub fn contrastive(positive_margin: f32, negative_margin: f32, negatives: usize) -> Self {
+        EPLoss { loss: Loss::Contrastive(positive_margin, negative_margin, negatives.max(1)) }
     }
 
     ///    Uses the Starspace loss for optimization, as seen in the Starspace paper.

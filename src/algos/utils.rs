@@ -151,7 +151,7 @@ pub fn weighted_reservoir_sample<A>(
 ) -> Vec<(A, f32)> {
     let mut bh = BinaryHeap::with_capacity(n+1);
     for (i, (item, weight)) in items.enumerate() {
-        let nw = rng.gen::<f32>().powf(weight);
+        let nw = rng.gen::<f32>().powf(1f32 / weight);
         bh.push(Reverse(OrdFirst(FloatOrd(nw), (item, weight))));
         if i >= n {
             bh.pop();
