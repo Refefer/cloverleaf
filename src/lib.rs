@@ -41,6 +41,7 @@ use std::ops::Deref;
 use std::fs::File;
 use std::io::{Write,BufWriter,BufReader,BufRead};
 
+use nalgebra_sparse::CsrMatrix;
 use rayon::prelude::*;
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
@@ -75,6 +76,7 @@ use crate::algos::pprembed::PPREmbed;
 use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
 use crate::algos::lsr::{LSR as ALSR};
 use crate::algos::connected::find_connected_components;
+use crate::algos::fastrp::get_fastrp_embeddings;
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
@@ -4089,6 +4091,65 @@ impl InstantEmbeddings {
 
 }
 
+fn make_nalgebra_csr(graph: &Graph) -> CsrMatrix<f32> {
+    // clone graph's memory into a separate CSR matrix
+    let indptr = graph.graph.0.rows.clone();
+    let indices = graph.graph.0.columns.clone();
+    let data = graph.graph.0.weights.clone();
+    let n = indptr.len() - 1;
+
+    let adj_mat = CsrMatrix::try_from_csr_data(
+        n,n,
+        indptr,
+        indices,
+        data,
+    ).unwrap();  // FIXME: unwraps are bad
+
+    adj_mat
+
+}
+
+// TODO: BETA parameter (normalization strength)
+#[pyclass]
+struct FRPEmbedder {
+    dims: usize,
+    weights: Vec<f32>,
+    norm_powers: bool,
+    seed: u64,
+}
+
+#[pymethods]
+impl FRPEmbedder {
+
+    #[new]
+    pub fn new(dims: usize, weights: Vec<f32>, norm_powers: Option<bool>, seed: Option<u64>) -> Self {
+        Self {
+            dims,
+            weights,
+            norm_powers: norm_powers.unwrap_or(true),
+            seed: seed.unwrap_or(SEED),
+        }
+    }
+
+    pub fn learn(&self, 
+        graph: &Graph, 
+    ) -> PyResult<NodeEmbeddings> {
+        let adj_mat = make_nalgebra_csr(&graph);
+
+        let es = crate::algos::fastrp::get_fastrp_embeddings(
+            &adj_mat,
+            self.dims,
+            &self.weights,
+            self.norm_powers,
+            self.seed,
+        );
+        Ok(NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings: es
+        })
+    }
+}
+
 #[pyclass]
 struct TournamentBuilder {
     gb: GraphBuilder,
@@ -4393,6 +4454,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PprRankLearner>()?;
     m.add_class::<PageRank>()?;
     m.add_class::<Smci>()?;
+    m.add_class::<FRPEmbedder>()?;
     m.add_class::<VpcgEmbedder>()?;
     m.add_class::<PPREmbedder>()?;
     m.add_class::<InstantEmbeddings>()?;
