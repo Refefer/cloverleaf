@@ -91,8 +91,7 @@ fn fast_random_projection(
     };
     pb.inc(1);
 
-    // note: there's a lot of opportunity here for parallelism
-    // the matrix multiplies themselves are trivially parallelizable
+    // FIXME: reduce allocations with `.mul_to`
     for i in 1..k {
         pb.update_message(|msg| {msg.clear(); write!(msg, "Iter {}/{}", i, k).expect("failed to update message"); });
         Ak = &L * Ak;
