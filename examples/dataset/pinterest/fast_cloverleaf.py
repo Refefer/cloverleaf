@@ -7,6 +7,7 @@ sp_embedder = cl.FRPEmbedder(
     dims=128,
     weights = weights,
     norm_powers = True,
+    beta = -1.5,
 )
 
 res = sp_embedder.learn(graph)

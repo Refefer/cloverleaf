@@ -30,12 +30,13 @@ pub fn get_fastrp_embeddings(
     dims: usize,
     weights: &[f32],
     norm_powers: bool,
+    beta: f32,
     seed: u64,
 ) -> EmbeddingStore {
     let mut rng = XorShiftRng::seed_from_u64(seed);
 
     let embeddings = fast_random_projection(
-        A, dims, weights, norm_powers, &mut rng
+        A, dims, weights, norm_powers, beta, &mut rng
     );
 
     let mut es = EmbeddingStore::new(A.nrows(), dims, Distance::Cosine);
@@ -54,6 +55,7 @@ fn fast_random_projection(
     dim: usize,
     weights: &[f32],
     norm_powers: bool,
+    beta: f32,
     rng: &mut impl Rng
 ) -> DMatrix<f32> {
 
@@ -61,7 +63,7 @@ fn fast_random_projection(
 
     // Compute normalizer matrix (inverse degree matrix)
     let mut a_sum = csr_row_sum(&A);
-    a_sum.iter_mut().for_each(|x| *x = 1.0 / *x); // FIXME: there is a possibility for division by zero here
+    a_sum.iter_mut().for_each(|x| *x = x.powf(beta));  // typically [-1, 0), default is -1
     let normalizer = diag(a_sum);
 
     // the graph transition matrix

@@ -4115,6 +4115,7 @@ struct FRPEmbedder {
     dims: usize,
     weights: Vec<f32>,
     norm_powers: bool,
+    beta: f32,
     seed: u64,
 }
 
@@ -4122,11 +4123,12 @@ struct FRPEmbedder {
 impl FRPEmbedder {
 
     #[new]
-    pub fn new(dims: usize, weights: Vec<f32>, norm_powers: Option<bool>, seed: Option<u64>) -> Self {
+    pub fn new(dims: usize, weights: Vec<f32>, norm_powers: Option<bool>, beta: Option<f32>, seed: Option<u64>) -> Self {
         Self {
             dims,
             weights,
             norm_powers: norm_powers.unwrap_or(true),
+            beta: beta.unwrap_or(-1.0),
             seed: seed.unwrap_or(SEED),
         }
     }
@@ -4141,6 +4143,7 @@ impl FRPEmbedder {
             self.dims,
             &self.weights,
             self.norm_powers,
+            self.beta,
             self.seed,
         );
         Ok(NodeEmbeddings {
