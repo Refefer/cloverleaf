@@ -180,6 +180,7 @@ impl RWR {
        let mut cur_node = start_node;
        match self.steps {
            Steps::Probability(alpha) => loop {
+
                // Sample the next edge
                cur_node = sampler.sample(graph, cur_node, rng)
                    .unwrap_or(start_node);
@@ -187,6 +188,7 @@ impl RWR {
                if rng.gen::<f32>() < alpha {
                    break
                }
+
            },
            Steps::Fixed(steps) => for _ in 0..steps {
                // Sample the next edge
@@ -246,20 +248,23 @@ pub fn ppr_estimate<G: Graph>(
     push.push(start_node);
     while let Some(w) = push.pop() {
         push_set.remove(&w);
+
         let r_hat = r[&w];
         *pi.entry(w).or_insert(0f32) += alpha * r_hat;
-        *r.entry(w).or_insert(0f32) = (1f32 - alpha) * r_hat / 2f32;
+        r.insert(w, (1f32 - alpha) * r_hat / 2f32);
+
         let (edges, weights) = graph.get_edges(w);
-        if r[&w] > eps * edges.len() as f32{
+        if r[&w] > eps * edges.len() as f32 {
             push_set.insert(w);
             push.push(w);
         }
-        edges.iter().zip(CDFtoP::new(weights)).for_each(|(ui, uwi)| {
-            let ru = *r.get(ui).unwrap_or(&0f32) + uwi * (1f32 - alpha) * r_hat / 2f32;
-            r.insert(*ui, ru);
-            if ru > eps * graph.degree(*ui) as f32 && !push_set.contains(ui) {
-                push_set.insert(*ui);
-                push.push(*ui);
+
+        edges.iter().zip( CDFtoP::new(weights) ).for_each(|(u, u_w)| {
+            let r_u = *r.get(u).unwrap_or(&0f32) + u_w * (1f32 - alpha) * r_hat / 2f32;
+            r.insert(*u, r_u);
+            if r_u > eps * graph.degree(*u) as f32 && !push_set.contains(u) {
+                push_set.insert(*u);
+                push.push(*u);
             }
         });
     }

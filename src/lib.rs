@@ -303,6 +303,10 @@ impl Graph {
     ///    node: FQNode
     ///        A tuple containing the (node_type, node_name) to lookup.
     ///
+    ///    normalized: Bool - optional:  
+    ///        If provided, returns transition probability.  If omitted, returns in CDF format
+    ///        which allows for fast weighted random sampling.
+    ///
     ///    Returns
     ///    -------
     ///    (List[(str, str)], List[float])
@@ -310,7 +314,7 @@ impl Graph {
     ///
     ///     Throws a KeyError if the node doesn't exist in the graph
     ///     
-    pub fn get_edges(&self, node: FQNode) -> PyResult<(Vec<FQNode>, Vec<f32>)> {
+    pub fn get_edges(&self, node: FQNode, normalized: Option<bool>) -> PyResult<(Vec<FQNode>, Vec<f32>)> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         let (edges, weights) = self.graph.get_edges(node_id);
         let names = edges.into_iter()
@@ -318,7 +322,12 @@ impl Graph {
                 let (nt, n) = self.vocab.get_name(*node_id).unwrap();
                 ((*nt).clone(), n.to_string())
             }).collect();
-        Ok((names, weights.to_vec()))
+
+        if let Some(true) = normalized {
+            Ok((names, CDFtoP::new(weights).collect()))
+        } else {
+            Ok((names, weights.to_vec()))
+        }
     }
 
     ///    Returns an interator to the nodes defined in the graph
