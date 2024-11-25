@@ -1,7 +1,6 @@
-use std::fmt::Write;
-
 use rayon::prelude::*;
 
+use std::fmt::Write;
 use crate::graph::{CDFGraph, CDFtoP};
 use crate::progress::CLProgressBar;
 
@@ -32,20 +31,26 @@ impl PageRank {
             });
             next_policy.par_iter_mut().for_each(|vi| *vi = 0.);
 
+            let mut dead_end_weight = 0f32;
             for node_id in 0..n {
+
                 let (edges, weights) = graph.get_edges(node_id);
+                
                 // Uniformly teleport to all nodes if we're at a dead end
                 if edges.len() == 0 {
-                    let weight = policy[node_id] / next_policy.len() as f32;
-                    next_policy.par_iter_mut().for_each(|e| {
-                        *e += weight;
-                    });
+                    dead_end_weight += policy[node_id] / next_policy.len() as f32;
                 } else {
                     for (edge, pr_k) in edges.iter().zip(CDFtoP::new(weights)) {
                         next_policy[*edge] += pr_k * policy[node_id];
                     }
                 }
             }
+
+            // Update all dead end weights
+            next_policy.par_iter_mut().for_each(|e| {
+                *e += dead_end_weight;
+            });
+
 
             // Random teleportation based on damping
             let s = next_policy.par_iter_mut().map(|pi| {

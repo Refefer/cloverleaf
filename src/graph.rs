@@ -406,6 +406,29 @@ pub fn convert_edges_to_cdf(weights: &mut [f32]) {
     weights[weights.len() - 1] = 1.;
 }
 
+/// Converts an iterator of weights to CDF
+pub fn collect_weights_into(
+    weights: impl Iterator<Item=f32>,
+    cdf_weights: &mut Vec<f32>
+) {
+    cdf_weights.clear();
+    if let (_, Some(ul)) = weights.size_hint() {
+        cdf_weights.reserve(ul);
+    }
+
+    let mut acc = 0f32;
+    cdf_weights.push(0f32);
+    for wi in weights {
+        acc += wi;
+        cdf_weights.push(acc);
+    }
+    for wi in cdf_weights.iter_mut() {
+        *wi /= acc;
+    }
+    let l = cdf_weights.len();
+    cdf_weights[l - 1] = 1.;
+}
+
 #[cfg(test)]
 mod csr_tests {
     use super::*;

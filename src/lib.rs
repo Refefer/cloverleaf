@@ -57,7 +57,7 @@ use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
 use crate::feature_store::FeatureStore;
 use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader};
 
-use crate::algos::rwr::{Steps,RWR,ppr_estimate};
+use crate::algos::rwr::{Steps,RWR,ppr_estimate,rollout};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
 use crate::algos::ep::{EmbeddingPropagation,LossWeighting as EPLW};
@@ -107,6 +107,15 @@ fn convert_scores(
         .take(k)
         .collect()
 }
+
+fn convert_node_id_to_fqn(
+    vocab: &Vocab,
+    node_id: NodeID
+) -> FQNode {
+    let (node_type, name) = vocab.get_name(node_id).unwrap();
+    ((*node_type).clone(), name.to_string())
+}
+
 
 /// Convenience method for getting an internal node id from pretty name
 fn get_node_id(vocab: &Vocab, node_type: String, node: String) -> PyResult<NodeID> {
@@ -2054,7 +2063,6 @@ impl NodeEmbedder {
 
         results
     }
-
 
 }
 
@@ -4346,6 +4354,84 @@ impl ConnectedComponents {
     }
 }
 
+#[pyclass]
+struct RandomPath {
+    rng: XorShiftRng
+}
+
+#[pymethods]
+impl RandomPath {
+
+    #[new]
+    pub fn new(seed: Option<u64>) -> Self {
+        let rng = XorShiftRng::seed_from_u64(seed.unwrap_or(SEED + 125));
+        RandomPath { rng }
+    }
+    
+    ///    Performs random walks on a graph and returns the full path of nodes visited.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to find connected components in
+    ///
+    ///    node : FQNode
+    ///        Start Node for the random walks
+    ///
+    ///    counts : Positive Int
+    ///        Number of random walks to run
+    ///
+    ///    restarts : Float
+    ///        restarts ~ (0,1), determines the probability a random walk will terminate with
+    ///        lower restarts resulting in longer walks.
+    ///    
+    ///    weighted : Bool 
+    ///        Weighted versus unweighted sampling.
+    ///        
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[List[FQNode]]
+    ///        Provides a list of random walks with nodes traversed in order until termination.
+    ///    
+    pub fn rollout<>(
+        &mut self,
+        graph: &Graph, 
+        node: FQNode,
+        count: usize,
+        restarts: f32, 
+        weighted: bool,
+    ) -> PyResult<Vec<Vec<FQNode>>> {
+        let steps = Steps::from_float(restarts)
+            .ok_or_else(|| PyValueError::new_err("restarts must be between [0, inf)"))?;
+        //let sampler: Box<dyn Sampler<_>> = if weighted { Box::new(Weighted) } else { Box::new(Unweighted) };
+        let g = graph.graph.as_ref();
+
+        let mut outputs: Vec<Vec<NodeID>> = vec![Vec::new(); count];
+        let rngs: Vec<_> = (0..count as u64)
+            .map(|i| XorShiftRng::seed_from_u64(self.rng.gen::<u64>() + i))
+            .collect();
+
+        let vocab = graph.vocab.deref(); 
+        let node_id = get_node_id(vocab, node.0, node.1)?;
+        outputs.par_iter_mut().zip(rngs.into_par_iter()).for_each(|(walk, mut rng)| {
+            walk.push(node_id);
+            if weighted {
+                rollout(g, steps, &Weighted, node_id, &mut rng, walk);
+            } else {
+                rollout(g, steps, &Weighted, node_id, &mut rng, walk);
+            };
+        });
+
+        let it = outputs.into_iter().map(|walk| walk.into_iter().map(|node_id| {
+            convert_node_id_to_fqn(vocab, node_id)
+        }).collect());
+
+        Ok(it.collect())
+    }
+
+}
+
 
 /// Helper method for looking up an embedding.
 fn lookup_embedding<'a>(
@@ -4411,6 +4497,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<ConnectedComponents>()?;
     m.add_class::<ListenerRule>()?;
     m.add_class::<LossWeighting>()?;
+    m.add_class::<RandomPath>()?;
     Ok(())
 }
 

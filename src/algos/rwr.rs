@@ -19,6 +19,18 @@ pub enum Steps {
     Probability(f32)
 }
 
+impl Steps {
+    pub fn from_float(f: f32) -> Option<Steps> {
+        if f >= 1. {
+            Some(Steps::Fixed(f as usize))
+        } else if f > 0. {
+            Some(Steps::Probability(f))
+        } else {
+            None
+        }
+    }
+}
+
 pub struct RWR {
     pub steps: Steps,
     pub walks: usize,
@@ -211,7 +223,6 @@ pub fn rollout<G: Graph + Send + Sync>(
     rng: &mut impl Rng,
     output: &mut Vec<NodeID>
 ) {
-    output.clear();
     let mut cur_node = start_node;
     match steps {
        Steps::Probability(alpha) => loop {
