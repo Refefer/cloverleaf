@@ -55,7 +55,7 @@ use crate::vocab::Vocab;
 use crate::sampler::{Weighted,Unweighted};
 use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
 use crate::feature_store::FeatureStore;
-use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader};
+use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader,open_file_for_reading};
 
 use crate::algos::rwr::{Steps,RWR,ppr_estimate,rollout};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
@@ -503,7 +503,7 @@ impl RandomWalker {
     ///        If provided, only returns nodes that match the provided node type.
     ///    
     ///    weighted : Bool - Optional
-    ///        If provided, performs weighted random walks.
+    ///        Whether to perform a weighted random walk.  Default is True.
     ///    
     ///    Returns
     ///    -------
@@ -1475,11 +1475,10 @@ impl FeatureSet {
     ///        
     ///    
     pub fn load_into(&mut self, path: String) -> PyResult<()> {
-        let f = File::open(path)
+        let reader = open_file_for_reading(&path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-        let br = BufReader::new(f);
-        for line in br.lines() {
+        for line in reader.lines() {
             let line = line.unwrap();
             let pieces: Vec<_> = line.split('\t').collect();
             if pieces.len() != 3 {

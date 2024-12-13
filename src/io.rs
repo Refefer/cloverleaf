@@ -190,7 +190,7 @@ impl EmbeddingReader {
     }
 }
 
-fn open_file_for_reading(path: &str) -> IOResult<Box<dyn BufRead>> {
+pub fn open_file_for_reading(path: &str) -> IOResult<Box<dyn BufRead>> {
     let f = File::open(path)?;
 
     let f = BufReader::new(f);
