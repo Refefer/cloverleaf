@@ -410,6 +410,7 @@ impl Graph {
     ///    Self - Can throw exception
     ///        
     pub fn load(
+        py: Python<'_>,
         path: &str, 
         edge_type: EdgeType, 
         chunk_size: Option<usize>,
@@ -417,21 +418,22 @@ impl Graph {
         weighted: Option<bool>
         ) -> PyResult<Self> {
 
-        let (vocab, csr) = GraphReader::load(
-            path, 
-            edge_type, 
-            chunk_size.unwrap_or(1),
-            skip_rows.unwrap_or(0),
-            weighted.unwrap_or(true)
-        )?;
+        py.allow_threads(move || {
+            let (vocab, csr) = GraphReader::load(
+                path, 
+                edge_type, 
+                chunk_size.unwrap_or(1),
+                skip_rows.unwrap_or(0),
+                weighted.unwrap_or(true)
+            )?;
 
-        let g = Graph {
-            graph: Arc::new(csr),
-            vocab: Arc::new(vocab)
-        };
+            let g = Graph {
+                graph: Arc::new(csr),
+                vocab: Arc::new(vocab)
+            };
 
-        Ok(g)
-
+            Ok(g)
+        })
 
     }
 
@@ -1474,7 +1476,10 @@ impl FeatureSet {
     ///    () - Can throw exception
     ///        
     ///    
-    pub fn load_into(&mut self, path: String) -> PyResult<()> {
+    pub fn load_into(
+        &mut self, 
+        path: String
+    ) -> PyResult<()> {
         let reader = open_file_for_reading(&path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
@@ -2722,26 +2727,28 @@ impl NodeEmbeddings {
     ///    
     #[staticmethod]
     pub fn load(
+        py: Python<'_>,
         path: &str, 
         distance: Distance, 
         filter_type: Option<String>, 
         chunk_size: Option<usize>,
         skip_rows: Option<usize>
     ) -> PyResult<Self> {
+        py.allow_threads(move || {
+            let (vocab, es) = EmbeddingReader::load(
+                path, 
+                distance.to_edist(), 
+                filter_type, 
+                chunk_size, 
+                skip_rows
+            )?;
 
-        let (vocab, es) = EmbeddingReader::load(
-            path, 
-            distance.to_edist(), 
-            filter_type, 
-            chunk_size, 
-            skip_rows
-        )?;
-
-        let ne = NodeEmbeddings {
-            vocab: Arc::new(vocab),
-            embeddings: es
-        };
-        Ok(ne)
+            let ne = NodeEmbeddings {
+                vocab: Arc::new(vocab),
+                embeddings: es
+            };
+            Ok(ne)
+        })
     }
 }
 
