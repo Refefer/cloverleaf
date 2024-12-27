@@ -30,8 +30,7 @@ pub struct EmbeddingWriter<'a> {
 impl <'a> EmbeddingWriter<'a> {
 
     pub fn new(path: &str, vocab: &'a Vocab, comp_level: Option<u32>) -> IOResult<Self> {
-        let level = comp_level.map(|l| Compression::new(l));
-        let encoder = open_file_for_writing(path, level)?;
+        let encoder = open_file_for_writing(path, comp_level)?;
         let s = String::new();
         Ok(EmbeddingWriter { 
             vocab,
@@ -203,11 +202,12 @@ pub fn open_file_for_reading(path: &str) -> IOResult<Box<dyn BufRead>> {
     Ok(result)
 }
 
-fn open_file_for_writing(path: &str, compression: Option<Compression>) -> IOResult<Box<dyn Write>> {
+pub fn open_file_for_writing(path: &str, compression: Option<u32>) -> IOResult<Box<dyn Write>> {
+    let comp_level = compression.map(|l| Compression::new(l));
     let f = File::create(path)?;
     let bw = BufWriter::new(f);
     let encoder: Box<dyn Write> = if path.ends_with(".gz") {
-        let e = GzEncoder::new(bw, compression.unwrap_or(Compression::fast()));
+        let e = GzEncoder::new(bw, comp_level.unwrap_or(Compression::fast()));
         Box::new(e)
     } else {
         Box::new(bw)
@@ -256,6 +256,27 @@ fn line_to_embedding(line: &String) -> Option<(String,String,Vec<f32>)> {
 pub struct GraphReader; 
 
 impl GraphReader {
+    
+    fn deduplicate_edges(
+        edges: &mut Vec<(NodeID, NodeID, f32)>
+    ) -> () {
+        // Sort edges and combine duplicates
+        edges.par_sort_unstable_by_key(|e| (e.0, e.1));
+        let mut i = 0;
+        let mut j = 0;
+        while j < edges.len() {
+            let (from_node, to_node, _) = edges[j];
+            let mut w = 0f32;
+            while j < edges.len() && edges[j].0 == from_node && edges[j].1 == to_node {
+                w += edges[j].2;
+                j += 1
+            }
+            edges[i] = (from_node, to_node, w);
+            i += 1;
+        }
+        edges.truncate(i);
+    }
+
     pub fn load(
         path: &str, 
         edge_type: EdgeType,
@@ -299,7 +320,9 @@ impl GraphReader {
                 }
                 Ok::<(), PyErr>(())
             })?;
-        
+
+        GraphReader::deduplicate_edges(&mut edges);
+
         let csr = CSR::construct_from_edges(edges);
 
         Ok((vocab, CumCSR::convert(csr)))

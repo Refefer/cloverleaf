@@ -55,7 +55,7 @@ use crate::vocab::Vocab;
 use crate::sampler::{Weighted,Unweighted};
 use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
 use crate::feature_store::FeatureStore;
-use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader,open_file_for_reading};
+use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader,open_file_for_reading,open_file_for_writing};
 
 use crate::algos::rwr::{Steps,RWR,ppr_estimate,rollout};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
@@ -363,11 +363,8 @@ impl Graph {
     ///    Returns
     ///    -------
     ///     
-    pub fn save(&self, path: &str) -> PyResult<()> {
-        let f = File::create(path)
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-
-        let mut bw = BufWriter::new(f);
+    pub fn save(&self, path: &str, comp_level: Option<u32>) -> PyResult<()> {
+        let mut bw = open_file_for_writing(path, comp_level)?;
         for node in 0..self.graph.len() {
             let (f_node_type, f_name) = self.vocab.get_name(node)
                 .expect("Programming error!");
