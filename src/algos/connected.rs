@@ -1,6 +1,9 @@
 //! Finds all connected components in the graph and returns a connected component list
+use std::collections::HashSet;
+
+use crate::NodeID;
 use crate::bitset::BitSet;
-use crate::graph::Graph;
+use crate::graph::{Graph,CDFtoP};
 
 use crate::embeddings::{EmbeddingStore, Distance};
 
@@ -47,6 +50,49 @@ pub fn find_connected_components(
     }
     es
 }
+
+fn get_component(
+    embs: &EmbeddingStore, 
+    node_id: NodeID
+) -> usize {
+    embs.get_embedding(node_id)[0] as usize
+}
+
+pub fn prune_graph_components(
+    graph: &impl Graph,
+    k: usize
+) -> Vec<(NodeID,NodeID,f32)> {
+    let es = find_connected_components(graph);
+    
+    // A graph, at worse, has a max of N / 2 components
+    let n = graph.len();
+    let mut counts = vec![0usize; n / 2 + 1];
+
+    for node_id in 0..counts.len() {
+        let component_id = get_component(&es, node_id);
+        counts[component_id] += 1;
+    }
+    let mut idxs = vec![0; n / 2 + 1];
+    idxs.iter_mut().enumerate().for_each(|(i, v)| *v = i);
+    idxs.sort_by_key(|v| counts[*v]);
+    // Grab the top K clusters
+    let clusters = idxs.iter().rev().take(k).collect::<HashSet<_>>();
+
+    let mut subgraph = Vec::new();
+    for node_id in 0..graph.len() {
+        let component_id = get_component(&es, node_id);
+        if clusters.contains(&component_id) {
+            let (edges, weights) = graph.get_edges(node_id);
+            let p = CDFtoP::new(weights);
+            for (edge, weight) in edges.iter().zip(p) {
+                subgraph.push((node_id, *edge, weight));
+            }
+        }
+    }
+
+    subgraph 
+}
+        
 
 #[cfg(test)]
 mod connected_tests {

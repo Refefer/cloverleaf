@@ -74,7 +74,7 @@ use crate::algos::ann::Ann;
 use crate::algos::pprembed::PPREmbed;
 use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
 use crate::algos::lsr::{LSR as ALSR};
-use crate::algos::connected::find_connected_components;
+use crate::algos::connected::{find_connected_components,prune_graph_components};
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
@@ -4355,6 +4355,36 @@ impl ConnectedComponents {
             embeddings: es
         }
     }
+    
+    ///    Creates a subgraph of the largest K connected components.  Only guaranteed to work
+    ///    for undirected graphs or bidirectionally edged graphs
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to find connected components in
+    ///
+    ///    k : Int
+    ///        Graph to find connected components in
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Graph
+    ///        Returns a new graph with only the top K connected components
+    ///    
+    #[staticmethod]
+    pub fn prune_largest_components(graph: &Graph, k: usize) -> Option<Graph> {
+        let vocab = graph.vocab.as_ref();
+        let new_edges = prune_graph_components(graph.graph.as_ref(), k);
+        let mut gb = GraphBuilder::new();
+        for (fnn, tnn, w) in new_edges.into_iter() {
+            let (fnt, fnn) = vocab.get_name(fnn).expect("Shouldn't ever be none!");
+            let (tnt, tnn) = vocab.get_name(tnn).expect("Shouldn't ever be none!");
+            gb.add_edge(((*fnt).clone(), fnn.into()), ((*tnt).clone(), tnn.into()), w, EdgeType::Directed);
+        }
+        gb.build_graph()
+    }
+
 }
 
 #[pyclass]
