@@ -412,7 +412,8 @@ impl Graph {
         edge_type: EdgeType, 
         chunk_size: Option<usize>,
         skip_rows: Option<usize>,
-        weighted: Option<bool>
+        weighted: Option<bool>,
+        deduplicate: Option<bool>
         ) -> PyResult<Self> {
 
         py.allow_threads(move || {
@@ -421,7 +422,8 @@ impl Graph {
                 edge_type, 
                 chunk_size.unwrap_or(1),
                 skip_rows.unwrap_or(0),
-                weighted.unwrap_or(true)
+                weighted.unwrap_or(true),
+                deduplicate.unwrap_or(false)
             )?;
 
             let g = Graph {
@@ -790,28 +792,6 @@ struct GraphBuilder {
     edges: Vec<(NodeID, NodeID, f32)>
 }
 
-impl GraphBuilder {
-    fn compact_edges(edges: &mut Vec<(NodeID, NodeID, f32)>) {
-        edges.par_sort_by_key(|(f_n, t_n, _)| (*f_n, *t_n));
-        let mut cur_record = 0;
-        let mut idx = 1;
-        while idx < edges.len() {
-            let (f_n, t_n, w) = edges[idx];
-            let c_r = edges[cur_record];
-            // Same edge, add the weights.
-            if f_n == c_r.0 && t_n == c_r.1 {
-                (&mut edges[cur_record]).2 += w;
-            } else {
-                // Different record, move it
-                cur_record += 1;
-                edges[cur_record] = edges[idx];
-            }
-            idx += 1;
-        }
-        edges.truncate(cur_record + 1);
-    }
-}
-
 #[pymethods]
 impl GraphBuilder {
     ///    Creates a new graph builder instance.  This allows for the programatic construction of
@@ -874,7 +854,7 @@ impl GraphBuilder {
     ///    Graph - Optional
     ///        Creates a Graph for usage.  If no edges have been specified, returns None.
     ///    
-    pub fn build_graph(&mut self) -> Option<Graph> {
+    pub fn build_graph(&mut self, deduplicate: Option<bool>) -> Option<Graph> {
         if self.edges.len() == 0 {
             return None
         }
@@ -885,8 +865,7 @@ impl GraphBuilder {
         std::mem::swap(&mut vocab, &mut self.vocab);
         std::mem::swap(&mut edges, &mut self.edges);
 
-        GraphBuilder::compact_edges(&mut edges);
-        let graph = CSR::construct_from_edges(edges);
+        let graph = CSR::construct_from_edges(edges, deduplicate.unwrap_or(true));
 
         Some(Graph {
             graph: Arc::new(CumCSR::convert(graph)),
@@ -4208,7 +4187,7 @@ impl TournamentBuilder {
     pub fn build(
         &mut self
     ) -> Option<Tournament> {
-        if let Some(graph) = self.gb.build_graph() {
+        if let Some(graph) = self.gb.build_graph(Some(true)) {
             let mut degrees = Vec::with_capacity(0);
             std::mem::swap(&mut degrees, &mut self.degrees);
             let es = EmbeddingStore::new_with_vec(graph.nodes(), 1, EDist::Euclidean, degrees)
@@ -4382,7 +4361,7 @@ impl ConnectedComponents {
             let (tnt, tnn) = vocab.get_name(tnn).expect("Shouldn't ever be none!");
             gb.add_edge(((*fnt).clone(), fnn.into()), ((*tnt).clone(), tnn.into()), w, EdgeType::Directed);
         }
-        gb.build_graph()
+        gb.build_graph(Some(false))
     }
 
 }

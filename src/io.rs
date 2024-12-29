@@ -257,32 +257,13 @@ pub struct GraphReader;
 
 impl GraphReader {
     
-    fn deduplicate_edges(
-        edges: &mut Vec<(NodeID, NodeID, f32)>
-    ) -> () {
-        // Sort edges and combine duplicates
-        edges.par_sort_unstable_by_key(|e| (e.0, e.1));
-        let mut i = 0;
-        let mut j = 0;
-        while j < edges.len() {
-            let (from_node, to_node, _) = edges[j];
-            let mut w = 0f32;
-            while j < edges.len() && edges[j].0 == from_node && edges[j].1 == to_node {
-                w += edges[j].2;
-                j += 1
-            }
-            edges[i] = (from_node, to_node, w);
-            i += 1;
-        }
-        edges.truncate(i);
-    }
-
     pub fn load(
         path: &str, 
         edge_type: EdgeType,
         chunk_size: usize,
         skip_rows: usize,
-        weighted: bool
+        weighted: bool,
+        deduplicate: bool
     ) -> PyResult<(Vocab,CumCSR)> {
         let reader = open_file_for_reading(path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?
@@ -321,9 +302,7 @@ impl GraphReader {
                 Ok::<(), PyErr>(())
             })?;
 
-        GraphReader::deduplicate_edges(&mut edges);
-
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, deduplicate);
 
         Ok((vocab, CumCSR::convert(csr)))
     }

@@ -4,6 +4,8 @@
 //! defined in here to allow for swapping of edges while minimizing the amount of memory we have to
 //! copy.
 
+use rayon::prelude::ParallelSliceMut;
+
 pub type NodeID = usize;
 
 pub trait Graph {
@@ -48,7 +50,11 @@ pub struct CSR {
 }
 
 impl CSR {
-    pub fn construct_from_edges(edges: Vec<(NodeID, NodeID, f32)>) -> Self {
+    pub fn construct_from_edges(mut edges: Vec<(NodeID, NodeID, f32)>, deduplicate: bool) -> Self {
+
+        if deduplicate {
+            CSR::deduplicate_edges(&mut edges);
+        }
 
         // Determine the number of rows in the adjacency graph
         let max_node = edges.iter().map(|(from_node, to_node, _)| {
@@ -80,6 +86,29 @@ impl CSR {
         });
 
         CSR { rows, columns, weights: data }
+    }
+
+    fn deduplicate_edges(
+        edges: &mut Vec<(NodeID, NodeID, f32)>
+    ) -> () {
+        edges.par_sort_by_key(|(f_n, t_n, _)| (*f_n, *t_n));
+        let mut cur_record = 0;
+        let mut idx = 1;
+        while idx < edges.len() {
+            let (f_n, t_n, w) = edges[idx];
+            let c_r = edges[cur_record];
+            // Same edge, add the weights.
+            if f_n == c_r.0 && t_n == c_r.1 {
+                (&mut edges[cur_record]).2 += w;
+            } else {
+                // Different record, move it
+                cur_record += 1;
+                edges[cur_record] = edges[idx];
+            }
+            idx += 1;
+        }
+        edges.truncate(cur_record + 1);
+
     }
 
 }
