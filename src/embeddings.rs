@@ -43,6 +43,30 @@ pub enum Distance {
 }
 
 impl Distance {
+    
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn fast_cosine_avx2(e1: &[f32], e2: &[f32]) -> f32 {
+        Distance::fast_cosine(e1, e2)
+    }
+
+    fn fast_cosine(e1: &[f32], e2: &[f32]) -> f32 {
+        let mut d1 = 0.;
+        let mut d2 = 0.;
+        let dot = e1.iter().zip(e2.iter()).map(|(ei, ej)| {
+            d1 += ei.powf(2.);
+            d2 += ej.powf(2.);
+            ei * ej
+        }).sum::<f32>();
+        let cosine_score = dot / (d1.sqrt() * d2.sqrt());
+        if cosine_score.is_nan() {
+            std::f32::INFINITY
+        } else {
+            -cosine_score + 1.
+        }
+    }
+
+
     pub fn compute(&self, e1: &[f32], e2: &[f32]) -> f32 {
         match &self {
             Distance::ALT => e1.iter().zip(e2.iter())
@@ -50,19 +74,15 @@ impl Distance {
                 .max_by_key(|v| FloatOrd(*v)).unwrap_or(0.),
 
             Distance::Cosine => {
-                let mut d1 = 0.;
-                let mut d2 = 0.;
-                let dot = e1.iter().zip(e2.iter()).map(|(ei, ej)| {
-                    d1 += ei.powf(2.);
-                    d2 += ej.powf(2.);
-                    ei * ej
-                }).sum::<f32>();
-                let cosine_score = dot / (d1.sqrt() * d2.sqrt());
-                if cosine_score.is_nan() {
-                    std::f32::INFINITY
-                } else {
-                    -cosine_score + 1.
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                {
+                    // Note that this `unsafe` block is safe because we're testing
+                    // that the `avx2` feature is indeed available on our CPU.
+                    if is_x86_feature_detected!("avx2") {
+                        return unsafe { Distance::fast_cosine_avx2(e1, e2) };
+                    }
                 }
+                Distance::fast_cosine(e1, e2)
             },
 
             Distance::Euclidean => {

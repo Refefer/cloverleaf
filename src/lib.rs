@@ -414,7 +414,7 @@ impl Graph {
         skip_rows: Option<usize>,
         weighted: Option<bool>,
         deduplicate: Option<bool>
-        ) -> PyResult<Self> {
+    ) -> PyResult<Self> {
 
         py.allow_threads(move || {
             let (vocab, csr) = GraphReader::load(
@@ -2644,9 +2644,11 @@ impl NodeEmbeddings {
         (0..self.embeddings.len()).into_par_iter().for_each(|idx| {
             let e = self.embeddings.get_embedding_mut_hogwild(idx);
             let norm = e.iter().map(|ei| ei.powf(2.)).sum::<f32>().sqrt();
-            e.iter_mut().for_each(|ei| {
-                *ei /= norm;
-            });
+            if norm > 0f32 {
+                e.iter_mut().for_each(|ei| {
+                    *ei /= norm;
+                });
+            }
         });
     }
 
@@ -2705,7 +2707,7 @@ impl NodeEmbeddings {
     pub fn load(
         py: Python<'_>,
         path: &str, 
-        distance: Distance, 
+        distance: Option<Distance>, 
         filter_type: Option<String>, 
         chunk_size: Option<usize>,
         skip_rows: Option<usize>
@@ -2713,7 +2715,7 @@ impl NodeEmbeddings {
         py.allow_threads(move || {
             let (vocab, es) = EmbeddingReader::load(
                 path, 
-                distance.to_edist(), 
+                distance.unwrap_or(Distance::Cosine).to_edist(), 
                 filter_type, 
                 chunk_size, 
                 skip_rows
@@ -3086,7 +3088,7 @@ impl EmbeddingAligner {
         let query_embedding = lookup_embedding(emb, translated_embeddings)?;
         
         // Get the original neighbors and distances
-        let neighbors = orig_ann.ann.predict(&orig_embeddings.embeddings, query_embedding);
+        let neighbors = orig_ann.ann.predict(&orig_embeddings.embeddings, query_embedding, self.num_nodes, None);
         let rand_neighbors = if self.random_nodes > 0 {
             let mut rng = XorShiftRng::seed_from_u64(seed.unwrap_or(SEED + 123123));
 
@@ -3100,7 +3102,7 @@ impl EmbeddingAligner {
         let n_embs: Vec<_> = neighbors.iter()
             .filter(|nd| {
                 let (node_id, _dist) = nd.to_tup();
-                if let Some((node_type, node_name)) = orig_embeddings.vocab.get_name(node_id) {
+                if let Some((node_type, node_name)) = orig_embeddings.vocab.get_name(*node_id) {
                     get_node_id(translated_embeddings.vocab.deref(), 
                            (*node_type).clone(), node_name.to_string()).is_ok()
                 } else {
@@ -3108,7 +3110,7 @@ impl EmbeddingAligner {
                 }
             })
             .take(self.num_nodes)
-            .map(|nd| nd.to_tup())
+            .map(|nd| nd.to_tup_cloned())
             .chain(rand_neighbors.into_iter())
             .map(|(node_id, _dist)| {
 
@@ -3291,11 +3293,19 @@ impl EmbAnn {
         embs: &NodeEmbeddings, 
         n_trees: usize,
         max_nodes_per_leaf: usize,
+        test_hp_per_split: Option<usize>,
+        num_sampled_nodes_split_test: Option<usize>,
         seed: Option<u64>
     ) -> Self {
         let mut ann = Ann::new();
         let seed = seed.unwrap_or(SEED + 10);
-        ann.fit(&embs.embeddings, n_trees, max_nodes_per_leaf, seed);
+        ann.fit(
+            &embs.embeddings, 
+            n_trees, 
+            max_nodes_per_leaf, 
+            test_hp_per_split,
+            num_sampled_nodes_split_test,
+            seed);
 
         EmbAnn { ann: ann }
 
@@ -3324,10 +3334,12 @@ impl EmbAnn {
     pub fn find(
         &self, 
         embeddings: &NodeEmbeddings,
-        query: &Query
+        query: &Query,
+        k: usize,
+        min_search_size: Option<usize>
     ) -> PyResult<Vec<(FQNode, f32)>> {
         let query_embedding = lookup_embedding(query, embeddings)?;
-        let nodes = self.ann.predict(&embeddings.embeddings, query_embedding);
+        let nodes = self.ann.predict(&embeddings.embeddings, query_embedding, k, min_search_size);
         Ok(convert_node_distance(&embeddings.vocab, nodes))
     }
 
@@ -4466,7 +4478,7 @@ fn convert_node_distance(
     dists.into_iter()
         .map(|n| {
             let (node_id, dist) = n.to_tup();
-            let (node_type, name) = vocab.get_name(node_id)
+            let (node_type, name) = vocab.get_name(*node_id)
                 .expect("Can't find node id in vocab!");
             (((*node_type).clone(), name.to_string()), dist)
         }).collect()

@@ -15,34 +15,49 @@ use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::{EmbeddingStore,Entity};
 
 /// Defines a distance metric which we can use with heaps.  Lower == better
-#[derive(Copy, Clone, Debug)]
-pub struct NodeDistance(pub f32, pub NodeID);
 
-impl NodeDistance {
-    pub fn to_tup(&self) -> (NodeID, f32) {
-        (self.1, self.0)
+#[derive(Copy, Clone, Debug)]
+pub struct DistanceFromEntity<A>(pub f32, pub A);
+
+impl <A> DistanceFromEntity<A> {
+    pub fn to_tup(&self) -> (&A, f32) {
+        (&self.1, self.0)
+    }
+
+    pub fn new(distance: f32, entity: A) -> DistanceFromEntity<A> {
+        DistanceFromEntity(distance, entity)
+    }
+}
+
+impl <A: Clone> DistanceFromEntity<A> {
+    pub fn to_tup_cloned(&self) -> (A, f32) {
+        (self.1.clone(), self.0)
     }
 }
 
 // Min Heap, so reverse order
-impl Ord for NodeDistance {
+impl <A: Ord> Ord for DistanceFromEntity<A> {
     fn cmp(&self, other: &Self) -> Ordering {
         FloatOrd(other.0).cmp(&FloatOrd(self.0))
             .then_with(|| other.1.cmp(&self.1))
     }
 }
 
-impl PartialOrd for NodeDistance {
+impl <A: Ord> PartialOrd for DistanceFromEntity<A> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl PartialEq for NodeDistance {
+impl <A: PartialEq> PartialEq for DistanceFromEntity<A> {
     fn eq(&self, other: &Self) -> bool {
         FloatOrd(self.0) == FloatOrd(other.0) && self.1 == other.1
     }
 }
+
+impl <A: Eq> Eq for DistanceFromEntity<A> {}
+
+pub type NodeDistance = DistanceFromEntity<NodeID>;
 
 /// Struct which tracks the top K nodes according to some distance.  Useful outside of ANN as well.
 pub struct TopK {
@@ -59,7 +74,7 @@ impl TopK {
     }
 
     pub fn push(&mut self, node_id: NodeID, score: f32) {
-        self.push_nd(Reverse(NodeDistance(score, node_id)));
+        self.push_nd(Reverse(NodeDistance::new(score, node_id)));
     }
 
     fn push_nd(&mut self, nd: Reverse<NodeDistance>) {
@@ -81,9 +96,11 @@ impl TopK {
             self.push_nd(nd);
         });
     }
-}
 
-impl Eq for NodeDistance {}
+    pub fn len(&self) -> usize {
+        self.heap.len()
+    }
+}
 
 /// This Ann hill climbs from random starting nodes within the graph.  if the graph isn't fully
 /// connected, good luck.  Depending on the smoothness of the embeddings amongst neighbors, has a
@@ -142,7 +159,7 @@ fn hill_climb<'a, G: CGraph, R: Rng>(
         let start_node = distribution.sample(rng);
         seen.insert(start_node.clone());
         let start_d = es.compute_distance(&needle, &Entity::Node(start_node.clone()));
-        let start = NodeDistance(start_d, start_node);
+        let start = NodeDistance::new(start_d, start_node);
         heap.push(start.clone());
 
         loop {
@@ -158,7 +175,7 @@ fn hill_climb<'a, G: CGraph, R: Rng>(
                 if !seen.contains(edge) {
                     seen.insert(*edge);
                     let dist = es.compute_distance(&needle, &Entity::Node(*edge));
-                    heap.push(NodeDistance(dist, *edge));
+                    heap.push(NodeDistance::new(dist, *edge));
                 }
             }
 
