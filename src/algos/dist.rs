@@ -10,7 +10,8 @@ use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 
 use crate::bitset::BitSet;
-use crate::embeddings::{EmbeddingStore,Distance};
+use crate::embeddings::EmbeddingStore;
+use crate::distance::Distance;
 use crate::graph::{Graph,NodeID};
 use crate::progress::CLProgressBar;
 

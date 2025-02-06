@@ -3,12 +3,18 @@ use std::collections::BinaryHeap;
 
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
+use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use float_ord::FloatOrd;
 
 use crate::graph::NodeID;
 use crate::embeddings::{EmbeddingStore,Entity};
 use crate::algos::graph_ann::{NodeDistance,TopK};
+
+#[inline(always)]
+fn dot(x: &[f32], y: &[f32]) -> f32 {
+    x.iter().zip(y.iter()).map(|(xi, yi)| xi * yi).sum()
+}
 
 struct Hyperplane {
     coef: Vec<f32>,
@@ -25,9 +31,7 @@ impl Hyperplane {
     }
 
     fn distance(&self, emb: &[f32]) -> f32 {
-        self.coef.iter().zip(emb.iter())
-            .map(|(ci, ei)| ci * ei)
-            .sum::<f32>() + self.bias
+        dot(&self.coef, emb) + self.bias
     }
 
 }
@@ -97,17 +101,33 @@ fn tree_predict(
     // Root node is last in the table.  Start exploring the root tree
     let tree_idx = tree_table.len() - 1;
     heap.push( HpDistance::new(tree_idx, 0.) );
+    let mut buff = vec![0f32; k];
 
     let mut visited = 0usize;
     while let Some(HpDistance(_, tree_idx)) = heap.pop() {
         match &tree_table[tree_idx] {
             Tree::Leaf { ref indices } => {
+                let n_nodes = indices.len();
+                // Ensure temp buff is sufficiently sized
+                while buff.len() < n_nodes {
+                    buff.push(0f32);
+                }
+
+                // Score the nodes
                 let qemb = Entity::Embedding(emb);
-                indices.iter().for_each(|&node_id| {
-                    let dist = es.compute_distance(&Entity::Node(node_id), &qemb);
-                    return_set.push(node_id, dist);
-                    visited += 1;
+                //indices.iter().zip(buff.iter_mut()).for_each(|(&node_id, b)| {
+                //    *b = es.compute_distance(&Entity::Node(node_id), &qemb);
+                //});
+                
+                indices.par_iter().zip(buff.par_iter_mut()).for_each(|(&node_id, b)| {
+                    *b = es.compute_distance(&Entity::Node(node_id), &qemb);
                 });
+
+                indices.iter().zip(buff.iter()).for_each(|(node_id, dist)| {
+                    return_set.push(*node_id, *dist);
+                });
+
+                visited += n_nodes;
             },
             Tree::Split { ref hp, ref above, ref below } => {
                 let dist = hp.distance(emb);
@@ -251,54 +271,30 @@ impl Ann {
             return tree_table.len() - 1
         }
 
-        // Pick two point to create the hyperplane
-        let mut best = (0usize, None);
-        // Try several different candidates and select the hyperplane that divides them the best
-        for _ in 0..config.test_hp_per_split {
-            
-            // Select two points to create the hyperplane
-            let idx_1 = indices.choose(rng).unwrap().0;
-            let mut idx_2 = idx_1;
-            while idx_1 == idx_2 {
-                idx_2 = indices.choose(rng).unwrap().0;
-            }
-
-            let pa = es.get_embedding(idx_1); 
-            let pb = es.get_embedding(idx_2); 
-
-            // Compute the hyperplane
-            let diff: Vec<_> = pa.iter().zip(pb.iter()).map(|(pai, pbi)| pai - pbi).collect();
-            
-            // Figure out the vector bias
-            let bias: f32 = diff.iter().zip(pa.iter().zip(pb.iter()))
-                .map(|(d, (pai, pbi))| d * (pai + pbi) / 2.)
-                .sum();
-
-            // Count the number of instances on each side of the hyperplane from random points
-            let hp = Hyperplane::new(diff, bias);
-            let mut s = 0usize;
-            for _ in 0..config.num_sampled_nodes_split_test {
-                let idx = indices.choose(rng).unwrap().0;
-                let emb = es.get_embedding(idx);
-                if hp.point_is_above(emb) { s += 1; } 
-            }
-             
-            let delta = config.num_sampled_nodes_split_test - s;
-            let score = s.max(delta) - s.min(delta);
-            if score < best.0 || best.1.is_none() {
-                best = (score, Some(hp));
-            }
-        }
-
+        let hp = if config.test_hp_per_split > 0 {
+            compute_simple_splits(
+                &(*indices), 
+                es, 
+                config.test_hp_per_split, 
+                config.num_sampled_nodes_split_test,
+                rng
+            )
+        } else {
+            compute_normal_rp(
+                &(*indices),
+                es,
+                config.num_sampled_nodes_split_test,
+                rng
+            )
+        };
         // Score the nodes and get the number below the hyperplane
-        let hp = best.1.unwrap();
         let split_idx: usize = indices.par_iter_mut().map(|v| {
             v.1 = hp.point_is_above(es.get_embedding(v.0));
             if v.1 { 0 } else { 1 }
         }).sum();
 
         // Fast sort - we do this to save memory allocations
-        indices.par_sort_by_key(|s| s.1);
+        sort_binary(indices);
 
         let (below, above) = indices.split_at_mut(split_idx);
 
@@ -323,6 +319,7 @@ impl Ann {
         k: usize,
         min_search_nodes: Option<usize>
     ) -> Vec<NodeDistance> {
+        
         // Get the scores
         let min_search = min_search_nodes.unwrap_or(self.trees.len() * k);
         let scores = self.trees.par_iter().map(|tree| {
@@ -381,4 +378,176 @@ impl Ann {
         self.trees.len()
     }
 
+}
+
+fn sort_binary(vec: &mut [(NodeID, bool)]) {
+    let mut low = 0;
+    for cur_ptr in 0..vec.len() {
+        if !vec[cur_ptr].1 {
+            (vec[cur_ptr], vec[low]) = (vec[low], vec[cur_ptr]);
+            //let cur_low = vec[low];
+            //vec[low] = vec[cur_ptr];
+            //vec[cur_ptr] = cur_low;
+            low += 1;
+        }
+    }
+}
+
+fn compute_w_vec_from_points<'a>(
+    indices: &[(NodeID, bool)], 
+    es: &'a EmbeddingStore,
+    rng: &mut impl Rng
+) -> (Vec<f32>, &'a [f32], &'a [f32]) {
+ 
+    // Select two points to create the hyperplane
+    let idx_1 = indices.choose(rng).unwrap().0;
+    let mut idx_2 = idx_1;
+    while idx_1 == idx_2 {
+        idx_2 = indices.choose(rng).unwrap().0;
+    }
+
+    let pa = es.get_embedding(idx_1); 
+    let pb = es.get_embedding(idx_2); 
+
+    // Compute the hyperplane
+    let delta = pa.iter().zip(pb.iter()).map(|(pai, pbi)| pai - pbi).collect();
+    (delta, pa, pb)
+}
+
+fn update_point(centroid: &mut [f32], new_point: &[f32], count: usize) {
+    centroid.iter_mut().zip(new_point.iter()).for_each(|(ci, npi)| {
+        let r = (count - 1) as f32 / count as f32;
+        *ci = r * *ci + (1f32 - r) * npi;
+    });
+}
+
+fn pseudo_kmeans_w_vec_from_points<'a>(
+    indices: &[(NodeID, bool)], 
+    es: &EmbeddingStore,
+    iterations: usize,
+    rng: &mut impl Rng
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+ 
+    // Select two initial points for seeding the centroid
+    let idx_1 = indices.choose(rng).unwrap().0;
+    let mut idx_2 = idx_1;
+    while idx_1 == idx_2 {
+        idx_2 = indices.choose(rng).unwrap().0;
+    }
+
+    let mut pa = es.get_embedding(idx_1).to_vec(); 
+    let mut pb = es.get_embedding(idx_2).to_vec(); 
+
+    let d = es.distance();
+    let (mut ac, mut bc) = (1usize, 1usize);
+    for _ in 0..iterations {
+        let idx = indices.choose(rng).unwrap().0;
+        let emb = es.get_embedding(idx);
+        let da = ac as f32 * d.compute(&pa, emb);
+        let db = bc as f32 * d.compute(&pb, emb);
+        if da > db {
+            bc += 1;
+            update_point(&mut pb, emb, bc);
+        } else {
+            ac += 1;
+            update_point(&mut pa, emb, ac);
+        }
+    }
+
+    // Compute the hyperplane
+    let delta = pa.iter().zip(pb.iter()).map(|(pai, pbi)| pai - pbi).collect();
+    (delta, pa, pb)
+}
+
+fn compute_simple_splits(
+    indices: &[(NodeID, bool)], 
+    es: &EmbeddingStore,
+    test_hp_per_split: usize,
+    num_sampled_nodes_split_test: usize,
+    rng: &mut impl Rng
+) -> Hyperplane {
+    let n = num_sampled_nodes_split_test.min(indices.len());
+
+    let mut best = (0usize, None);
+    // Try several different candidates and select the hyperplane that divides them the best
+    for _ in 0..test_hp_per_split {
+
+        //let (diff, pa, pb) = compute_w_vec_from_points(indices, es, rng);
+        let (diff, pa, pb) = pseudo_kmeans_w_vec_from_points(indices, es, num_sampled_nodes_split_test, rng);
+        
+        // Figure out the vector bias
+        let bias: f32 = diff.iter().zip(pa.iter().zip(pb.iter()))
+            .map(|(d, (pai, pbi))| d * (pai + pbi) / 2.)
+            .sum();
+
+        // Count the number of instances on each side of the hyperplane from random points
+        let hp = Hyperplane::new(diff, bias);
+        let mut s = 0usize;
+        for _ in 0..n {
+            let idx = indices.choose(rng).unwrap().0;
+            let emb = es.get_embedding(idx);
+            if hp.point_is_above(emb) { s += 1; } 
+        }
+         
+        let delta = n - s;
+        let score = s.max(delta) - s.min(delta);
+        if score < best.0 || best.1.is_none() {
+            best = (score, Some(hp));
+        }
+    }
+    best.1.unwrap()
+}
+
+fn create_normalized_vec(
+    dims: usize,
+    rng: &mut impl Rng
+) -> Vec<f32> {
+    let mut random_vec = vec![0f32; dims];
+    let mut norm = 0f32;
+    random_vec.iter_mut().for_each(|vi| {
+        *vi = rng.sample::<f32,StandardNormal>(StandardNormal);
+        norm += vi.powf(2f32);
+    });
+
+    norm = norm.sqrt();
+
+    if norm >= 0f32 && false {
+        random_vec.iter_mut().for_each(|vi| {
+            *vi /= norm;
+        });
+    }
+
+    random_vec
+}
+
+fn median(deltas: &[f32]) -> f32 {
+    assert!(deltas.len() > 0);
+    let is_odd = deltas.len() % 2 == 1;
+    let half = deltas.len() / 2;
+    if is_odd {
+        deltas[half]
+    } else {
+        (deltas[half - 1] + deltas[half]) / 2f32
+    }
+}
+
+fn compute_normal_rp(
+    indices: &[(NodeID, bool)], 
+    es: &EmbeddingStore,
+    num_sampled_nodes_split_test: usize,
+    rng: &mut impl Rng
+) -> Hyperplane {
+    let random_vec = compute_w_vec_from_points(indices, es, rng).0;
+    //let random_vec = create_normalized_vec(es.dims(), rng);
+    let n = num_sampled_nodes_split_test.min(indices.len());
+    let mut rps = vec![0f32; n];
+
+    rps.iter_mut().for_each(|rp_i| {
+        let idx = indices.choose(rng).unwrap().0;
+        let emb_i = es.get_embedding(idx);
+        *rp_i = dot(emb_i, random_vec.as_slice());
+    });
+    rps.sort_by_key(|v| FloatOrd(*v));
+    let bias = -median(rps.as_slice());
+    Hyperplane::new(random_vec, bias)
 }

@@ -15,7 +15,8 @@ use rayon::prelude::*;
 use ryu::Buffer;
 
 use crate::vocab::Vocab;
-use crate::embeddings::{EmbeddingStore,Distance};
+use crate::embeddings::EmbeddingStore;
+use crate::distance::Distance;
 use crate::graph::CumCSR;
 use crate::{CSR,EdgeType};
 

@@ -9,7 +9,8 @@ use rayon::prelude::*;
 
 use crate::progress::CLProgressBar;
 use crate::graph::Graph;
-use crate::embeddings::{EmbeddingStore,Distance};
+use crate::embeddings::EmbeddingStore;
+use crate::distance::Distance;
 use crate::algos::utils::get_best_count;
 
 /// Computes the LPA

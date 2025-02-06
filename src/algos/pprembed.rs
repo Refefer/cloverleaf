@@ -6,7 +6,8 @@ use hashbrown::HashMap;
 
 use crate::algos::rwr::{Steps,RWR};
 use crate::algos::utils::FeatureHasher;
-use crate::embeddings::{EmbeddingStore, Distance};
+use crate::embeddings::EmbeddingStore;
+use crate::distance::Distance;
 use crate::feature_store::FeatureStore;
 use crate::graph::{CDFGraph,Graph};
 use crate::progress::CLProgressBar;

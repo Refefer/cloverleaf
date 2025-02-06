@@ -21,6 +21,9 @@ mod embeddings;
 /// Simple bitset
 mod bitset;
 
+/// Stores optimized distances
+mod distance;
+
 /// This interface allows us to update embeddings (and other structures) in multiple threads
 /// without having to gain exclusive write access.  Do _not_ clone hogwild structures as they
 /// will still point to the underlying data
@@ -53,7 +56,8 @@ use rand_distr::Uniform;
 use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID,CDFtoP};
 use crate::vocab::Vocab;
 use crate::sampler::{Weighted,Unweighted};
-use crate::embeddings::{EmbeddingStore,Distance as EDist,Entity};
+use crate::distance::{Distance as EDist};
+use crate::embeddings::{EmbeddingStore,Entity};
 use crate::feature_store::FeatureStore;
 use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader,open_file_for_reading,open_file_for_writing};
 

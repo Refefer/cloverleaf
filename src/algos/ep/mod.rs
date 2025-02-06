@@ -17,7 +17,8 @@ use rand_xorshift::XorShiftRng;
 use simple_grad::*;
 
 use crate::graph::{Graph as CGraph,NodeID};
-use crate::embeddings::{EmbeddingStore,Distance};
+use crate::embeddings::EmbeddingStore;
+use crate::distance::Distance;
 use crate::progress::CLProgressBar;
 use crate::feature_store::FeatureStore;
 use crate::algos::grad_utils::scheduler::LRScheduler;

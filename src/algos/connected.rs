@@ -5,7 +5,8 @@ use crate::NodeID;
 use crate::bitset::BitSet;
 use crate::graph::{Graph,CDFtoP};
 
-use crate::embeddings::{EmbeddingStore, Distance};
+use crate::embeddings::EmbeddingStore;
+use crate::distance::Distance;
 
 /// Find the connected components of a graph
 pub fn find_connected_components(

@@ -1,7 +1,8 @@
 //! Defines the actual gradient optimizers for SGD.
 //! Nothing particularly special about these, just canonical versions of the ones used in practice.
 use rayon::prelude::*;
-use crate::embeddings::{EmbeddingStore,Distance};
+use crate::embeddings::EmbeddingStore;
+use crate::distance::Distance;
 use std::collections::{HashMap as CHashMap};
 
 /// Optimizer trait.  We provide it the feature set, the gradient maps, and a few other details

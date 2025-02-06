@@ -9,7 +9,8 @@ use crate::graph::{Graph,NodeID,CDFtoP};
 use crate::feature_store::FeatureStore;
 use crate::hogwild::Hogwild;
 use crate::algos::utils::FeatureHasher;
-use crate::embeddings::{Distance,EmbeddingStore};
+use crate::embeddings::EmbeddingStore;
+use crate::distance::Distance;
 
 type SparseEmbeddings = Vec<Vec<(usize, f32)>>;
 

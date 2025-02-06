@@ -4,7 +4,8 @@ use rayon::prelude::*;
 use crate::algos::utils::FeatureHasher;
 use crate::algos::rwr::{Steps,RWR,ppr_estimate};
 use crate::graph::{Graph as CGraph, CDFGraph};
-use crate::embeddings::{EmbeddingStore,Distance};
+use crate::embeddings::EmbeddingStore;
+use crate::distance::Distance;
 use crate::progress::CLProgressBar;
 
 #[derive(Clone,Copy, Debug)]
