@@ -1,6 +1,5 @@
 //! The main Embedding class.  This defines both distance metrics as well as access to the
 //! embeddings.
-use float_ord::FloatOrd;
 use rayon::prelude::*;
 use rand::prelude::*;
 

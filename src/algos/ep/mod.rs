@@ -127,7 +127,7 @@ impl EmbeddingPropagation {
         let pb = CLProgressBar::new((self.passes * steps_per_pass) as u64, self.indicator);
         
         // Enable/disable shared memory pool
-        use_shared_pool(true);
+        use_shared_pool(false);
 
         let total_updates = steps_per_pass * self.passes;
         let lr_scheduler = {
@@ -172,28 +172,29 @@ impl EmbeddingPropagation {
             // Shuffle for SGD
             node_idxs.shuffle(&mut rng);
             let err: Vec<_> = node_idxs.par_iter().chunks(self.batch_size).enumerate().map(|(i, nodes)| {
+            //let err: Vec<_> = node_idxs.chunks(self.batch_size).enumerate().map(|(i, nodes)| {
 
-                let mut grads = Vec::with_capacity(self.batch_size);
-                
                 let sampler = (&random_sampler).initialize_batch(
                     &nodes,
                     graph,
                     features);
                 
                 // Compute grads for batch
-                nodes.par_iter().map(|node_id| {
-                    let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + **node_id) as u64);
+                //let mut grads: Vec<_> = nodes.par_iter().map(|node_id| {
+                let mut grads: Vec<_> = nodes.par_iter().map(|node_id| {
+                    let n_id = **node_id;
+                    let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + n_id) as u64);
                     let (mut loss, hv_vars, thv_vars, hu_vars) = self.run_forward_pass(
-                        graph, **node_id, &features, &feature_embeddings, 
+                        graph, n_id, &features, &feature_embeddings, 
                         model, &sampler, &mut rng);
 
                     loss = match self.loss_weighting {
                         LossWeighting::DegreeLog => {
-                            let decrease = (1f32 + graph.degree(**node_id) as f32).ln();
+                            let decrease = (1f32 + graph.degree(n_id) as f32).ln();
                             loss / decrease
                         },
                         LossWeighting::DegreeExponential(weight) => {
-                            let decrease = (graph.degree(**node_id) as f32).powf(weight);
+                            let decrease = (graph.degree(n_id) as f32).powf(weight);
                             loss / decrease
                         },
                         LossWeighting::None => {
@@ -202,7 +203,7 @@ impl EmbeddingPropagation {
                     };
                     let grads = self.extract_gradients(&loss, hv_vars, thv_vars, hu_vars);
                     (loss.value()[0], grads)
-                }).collect_into_vec(&mut grads);
+                }).collect();
 
                 let mut error = 0f32;
                 let mut cnt = 0f32;

@@ -1,5 +1,6 @@
 //! Defines Samplers for selecting negatives from the graph.  This is a big over-engineered right
 //! now as the intent was to have richer samplers which ended up not being the limiting step.
+use std::borrow::Borrow;
 use rand::prelude::*;
 use rand_distr::{Distribution,Uniform};
 
@@ -10,9 +11,12 @@ use crate::graph::{Graph as CGraph,NodeID};
 pub trait BatchSamplerStrategy {
     type Sampler: NodeSampler;
 
-    fn initialize_batch<G: CGraph + Send + Sync>(
+    fn initialize_batch<
+        G: CGraph + Send + Sync,
+        T: Borrow<NodeID>>
+    (
         &self,
-        nodes: &[&NodeID],
+        nodes: &[T],
         graph: &G,
         features: &FeatureStore
     ) -> Self::Sampler;
@@ -49,9 +53,12 @@ impl RandomWalkHardStrategy {
 impl <'a> BatchSamplerStrategy for &'a RandomWalkHardStrategy {
     type Sampler = RandomWalkHardSampler<'a>;
 
-    fn initialize_batch<'b,G: CGraph + Send + Sync>(
+     fn initialize_batch<
+        G: CGraph + Send + Sync,
+        T: Borrow<NodeID>>
+    (
         &self,
-        _nodes: &[&NodeID],
+        _nodes: &[T],
         _graph: &G,
         _features: &FeatureStore
     ) -> Self::Sampler {

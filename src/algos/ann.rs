@@ -115,9 +115,6 @@ fn tree_predict(
 
                 // Score the nodes
                 let qemb = Entity::Embedding(emb);
-                //indices.iter().zip(buff.iter_mut()).for_each(|(&node_id, b)| {
-                //    *b = es.compute_distance(&Entity::Node(node_id), &qemb);
-                //});
                 
                 indices.par_iter().zip(buff.par_iter_mut()).for_each(|(&node_id, b)| {
                     *b = es.compute_distance(&Entity::Node(node_id), &qemb);
@@ -496,28 +493,6 @@ fn compute_simple_splits(
         }
     }
     best.1.unwrap()
-}
-
-fn create_normalized_vec(
-    dims: usize,
-    rng: &mut impl Rng
-) -> Vec<f32> {
-    let mut random_vec = vec![0f32; dims];
-    let mut norm = 0f32;
-    random_vec.iter_mut().for_each(|vi| {
-        *vi = rng.sample::<f32,StandardNormal>(StandardNormal);
-        norm += vi.powf(2f32);
-    });
-
-    norm = norm.sqrt();
-
-    if norm >= 0f32 && false {
-        random_vec.iter_mut().for_each(|vi| {
-            *vi /= norm;
-        });
-    }
-
-    random_vec
 }
 
 fn median(deltas: &[f32]) -> f32 {
