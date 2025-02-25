@@ -138,7 +138,13 @@ impl Loss {
                 ds.push(hv.dot(&thv));
                 let len = ds.len();
                 let dsc = ds.concat();
-                let sm = softmax(dsc);
+                let mut sm = softmax(dsc.clone(), false);
+                // Approximate softmax has some underflow issues in the taylor series
+                // so, we test if running the natural log causes a NaN, and if so,
+                // backtrack to the exact version at the expense of speed
+                if sm.value()[len-1] <= 0f32 {
+                    sm = softmax(dsc, true);
+                }
                 let p = sm.slice(len-1, 1);
                 let pi = p.value()[0];
                 if pi < *tau {
@@ -161,10 +167,6 @@ impl Loss {
         rng: &mut R
     ) -> (NodeCounts,ANode) {
         match self {
-            Loss::MarginLoss(_,_) | Loss::Contrastive(_,_,_) | Loss::RankLoss(_,_) | Loss::RankSpace (_,_) | Loss::StarSpace(_,_) => {
-                model.reconstruct_node_embedding(
-                    graph, node, feature_store, feature_embeddings, rng)
-            },
             Loss::PPR(_, num, restart_p) => {
                 let mut nodes = Vec::with_capacity(*num);
                 for _ in 0..(*num) {
@@ -177,6 +179,10 @@ impl Loss {
                 }
                 model.construct_from_multiple_nodes(nodes.into_iter(),
                         feature_store, feature_embeddings, rng)
+            },
+            _ => {
+                model.reconstruct_node_embedding(
+                    graph, node, feature_store, feature_embeddings, rng)
             }
         }
 

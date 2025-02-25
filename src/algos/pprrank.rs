@@ -387,7 +387,7 @@ impl PprRank {
     ) -> ANode {
 
         let scores = compute_distances(query_node, ranked_nodes, false);
-        let sm_scores = softmax(scores);
+        let sm_scores = softmax(scores, true);
 
         let ordered = node_weights.iter().enumerate()
             .filter(|(i, s)| {

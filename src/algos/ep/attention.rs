@@ -246,7 +246,7 @@ fn compute_attention_softmax(
             .collect();
 
         let nz_row = non_zero_row.concat() / &d_k;
-        let sm = softmax(nz_row);
+        let sm = softmax(nz_row, false);
 
         let mut idx = 0;
         row.iter_mut().for_each(|ri| {
@@ -260,14 +260,18 @@ fn compute_attention_softmax(
 }
 
 // Simple softmax.
-pub fn softmax(numers: ANode) -> ANode {
+pub fn softmax(numers: ANode, exact: bool) -> ANode {
     // Doesn't need to be part of the graph
     let max_value = numers.value().iter()
         .max_by_key(|v| FloatOrd(**v))
         .expect("Shouldn't be non-zero!");
 
     let mv = Constant::scalar(*max_value);
-    let n = (numers - &mv).exp();
+    let n = if exact {
+        (numers - &mv).exp()
+    } else {
+        (numers - &mv).exp_approx()
+    };
     &n / n.sum()
 }
 

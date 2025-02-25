@@ -172,7 +172,6 @@ impl EmbeddingPropagation {
             // Shuffle for SGD
             node_idxs.shuffle(&mut rng);
             let err: Vec<_> = node_idxs.par_iter().chunks(self.batch_size).enumerate().map(|(i, nodes)| {
-            //let err: Vec<_> = node_idxs.chunks(self.batch_size).enumerate().map(|(i, nodes)| {
 
                 let sampler = (&random_sampler).initialize_batch(
                     &nodes,
@@ -180,8 +179,7 @@ impl EmbeddingPropagation {
                     features);
                 
                 // Compute grads for batch
-                //let mut grads: Vec<_> = nodes.par_iter().map(|node_id| {
-                let mut grads: Vec<_> = nodes.par_iter().map(|node_id| {
+                let mut grads: Vec<_> = nodes.par_iter().filter_map(|node_id| {
                     let n_id = **node_id;
                     let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + n_id) as u64);
                     let (mut loss, hv_vars, thv_vars, hu_vars) = self.run_forward_pass(
@@ -201,8 +199,15 @@ impl EmbeddingPropagation {
                             loss
                         }
                     };
-                    let grads = self.extract_gradients(&loss, hv_vars, thv_vars, hu_vars);
-                    (loss.value()[0], grads)
+                    // Sometimes there are weird errors due to underflows in softmax
+                    // In this case, just print the graph and don't return
+                    if loss.value()[0].is_nan() {
+                        Graph::print_graph(&loss);
+                        None
+                    } else {
+                        let grads = self.extract_gradients(&loss, hv_vars, thv_vars, hu_vars);
+                        Some((loss.value()[0], grads))
+                    }
                 }).collect();
 
                 let mut error = 0f32;
