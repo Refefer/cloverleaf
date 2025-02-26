@@ -3016,7 +3016,10 @@ impl NeighborhoodAligner {
 #[pyclass]
 struct EmbeddingAligner {
     num_nodes: usize,
-    random_nodes: usize
+    random_nodes: usize,
+    alpha: f32,
+    error: f32,
+    max_iters: usize
 }
 
 #[pymethods]
@@ -3049,8 +3052,20 @@ impl EmbeddingAligner {
     ///        
     ///    
     #[new]
-    pub fn new(num_nodes: usize, random_nodes: Option<usize>) -> Self {
-        EmbeddingAligner { num_nodes, random_nodes: random_nodes.unwrap_or(0) }
+    pub fn new(
+        num_nodes: usize, 
+        random_nodes: Option<usize>,
+        alpha: Option<f32>,
+        error: Option<f32>,
+        max_iters: Option<usize>
+    ) -> Self {
+        EmbeddingAligner { 
+            num_nodes, 
+            random_nodes: random_nodes.unwrap_or(0),
+            alpha: alpha.unwrap_or(1e-1),
+            error: error.unwrap_or(1e-2),
+            max_iters: max_iters.unwrap_or(10)
+        }
     }
 
     /// Simple Python representation 
@@ -3092,47 +3107,36 @@ impl EmbeddingAligner {
         let query_embedding = lookup_embedding(emb, translated_embeddings)?;
         
         // Get the original neighbors and distances
-        let neighbors = orig_ann.ann.predict(&orig_embeddings.embeddings, query_embedding, self.num_nodes, None);
-        let rand_neighbors = if self.random_nodes > 0 {
+        let mut neighbors = orig_ann.ann.predict(&orig_embeddings.embeddings, query_embedding, self.num_nodes, None);
+        if self.random_nodes > 0 {
             let mut rng = XorShiftRng::seed_from_u64(seed.unwrap_or(SEED + 123123));
 
             let dist = Uniform::new(0, orig_embeddings.embeddings.len());
-            (0..self.random_nodes).map(|_| (dist.sample(&mut rng), 0.)).collect()
-        } else {
-            Vec::with_capacity(0)
-        };
+            (0..self.random_nodes).for_each(|_| {
+                let node_id = dist.sample(&mut rng);
+                let old_embedding = orig_embeddings.embeddings.get_embedding(node_id);
+                let euc_dist = EDist::Euclidean.compute(&query_embedding, old_embedding);
+                neighbors.push(NodeDistance::new(euc_dist, node_id));
+            });
+        } ;
 
         // Find the closest embeddings
         let n_embs: Vec<_> = neighbors.iter()
-            .filter(|nd| {
-                let (node_id, _dist) = nd.to_tup();
-                if let Some((node_type, node_name)) = orig_embeddings.vocab.get_name(*node_id) {
-                    get_node_id(translated_embeddings.vocab.deref(), 
-                           (*node_type).clone(), node_name.to_string()).is_ok()
-                } else {
-                    false
-                }
-            })
-            .take(self.num_nodes)
-            .map(|nd| nd.to_tup_cloned())
-            .chain(rand_neighbors.into_iter())
-            .map(|(node_id, _dist)| {
+            .filter_map(|nd| {
+                let (orig_node_id, dist) = nd.to_tup();
+                // Lookup the embedding in the na embeddings 
+                orig_embeddings.vocab.get_name(*orig_node_id)
+                    .and_then(|(node_type, node_name)| {
+                        get_node_id(translated_embeddings.vocab.deref(), 
+                               (*node_type).clone(), node_name.to_string())
+                            .map(|node_id| (translated_embeddings.embeddings.get_embedding(node_id), dist))
+                            .ok()
+                    })
+            }).collect();
 
-                let old_embedding = orig_embeddings.embeddings.get_embedding(node_id);
-                let euc_dist = EDist::Euclidean.compute(&query_embedding, old_embedding);
-                
-                // Translate the node id from one vocab to the other
-                let (node_type, node_name) = orig_embeddings.vocab.get_name(node_id)?;
-
-                let node_id = get_node_id(translated_embeddings.vocab.deref(), 
-                                          (*node_type).clone(), node_name.to_string()).ok()?;
-                let emb = translated_embeddings.embeddings.get_embedding(node_id);
-                Some((emb, euc_dist))
-            }).filter(|x| x.is_some())
-            .map(|x| x.unwrap())
-            .collect();
-
-        let new_emb = crate::algos::emb_aligner::align_embedding(&query_embedding, n_embs.as_slice(), 1e-1, 1e-2);
+        let new_emb = crate::algos::emb_aligner::align_embedding(
+            &query_embedding, n_embs.as_slice(), self.alpha, self.error, self.max_iters
+        );
 
         Ok(new_emb)
     }
