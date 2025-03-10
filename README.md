@@ -1,7 +1,7 @@
-Cloverleaf
+Graph Library
 ====
 
-Cloverleaf is a high performance graph library which provides a number of different optimizers for a variety of different usecases.  The library allows practioners to mine graphs for useful information through a variety of techniques, scalable to hundreds of millions of nodes and billions of edges (given sufficent hardware).  A key goal of the library is to avoid GPU computing while scaling to large scale graphs, enabling less well resourced teams to learn effective representations on industry scale graphs.  While it offers a suite of established tools, it also serves as a testing ground for new approaches in graph learning aligned with those needs.
+A high performance library which provides a number of different optimizers for a variety of different use cases when dealing with graphs.  The library allows practitioners to mine graphs for useful information through a variety of techniques, scalable to hundreds of millions of nodes and billions of edges (given sufficent hardware).  A key goal of the library is to avoid GPU computing while scaling to large scale graphs, enabling less well resourced teams to learn effective representations on industry scale graphs.  While it offers a suite of established tools, it also serves as a testing ground for new approaches in graph learning aligned with those needs.
 
 The library is broken up into a few different methods:
 
