@@ -171,15 +171,16 @@ impl EmbeddingPropagation {
 
             // Shuffle for SGD
             node_idxs.shuffle(&mut rng);
-            let err: Vec<_> = node_idxs.par_iter().chunks(self.batch_size).enumerate().map(|(i, nodes)| {
+            let err_cnt: (f32, usize) = node_idxs.par_iter().chunks(self.batch_size).enumerate().map(|(i, nodes)| {
 
                 let sampler = (&random_sampler).initialize_batch(
                     &nodes,
                     graph,
                     features);
                 
+                let n_nodes = nodes.len();
                 // Compute grads for batch
-                let mut grads: Vec<_> = nodes.par_iter().filter_map(|node_id| {
+                let grads: Vec<_> = nodes.par_iter().filter_map(|node_id| {
                     let n_id = **node_id;
                     let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + n_id) as u64);
                     let (mut loss, hv_vars, thv_vars, hu_vars) = self.run_forward_pass(
@@ -195,23 +196,25 @@ impl EmbeddingPropagation {
                             let decrease = (graph.degree(n_id) as f32).powf(weight);
                             loss / decrease
                         },
-                        LossWeighting::None => {
-                            loss
-                        }
+                        LossWeighting::None => { loss }
                     };
+
+                    let loss_value = loss.value()[0];
+
                     // Sometimes there are weird errors due to underflows in softmax
                     // In this case, just print the graph and don't return
-                    if loss.value()[0].is_nan() {
+                    if loss_value.is_nan() {
                         Graph::print_graph(&loss);
                         None
-                    } else {
+                    } else if loss_value > 0f32 {
                         let grads = self.extract_gradients(&loss, hv_vars, thv_vars, hu_vars);
-                        Some((loss.value()[0], grads))
+                        Some((loss_value, grads))
+                    } else {
+                        None
                     }
                 }).collect();
 
-                let mut error = 0f32;
-                let mut cnt = 0f32;
+                let cnt = grads.len();
                 
                 // We are using std Hashmap instead of hashbrown due to a weird bug
                 // where the optimizer, for whatever reason, has trouble draining it
@@ -221,19 +224,18 @@ impl EmbeddingPropagation {
 
                 // Since we're dealing with multiple reconstructions with likely shared features,
                 // we aggregate all the gradients
-                for (err, grad_set) in grads.drain(..nodes.len()) {
+                let error = grads.into_iter().map(|(err, grad_set)| {
                     for (feat, grad) in grad_set.into_iter() {
                         let e = all_grads.entry(feat).or_insert_with(|| vec![0.; grad.len()]);
                         e.iter_mut().zip(grad.iter()).for_each(|(ei, gi)| *ei += *gi);
                     }
-                    error += err;
-                    cnt += 1f32;
-                }
+                    err
+                }).sum::<f32>();
 
                 let cur_step = step.fetch_add(1, Ordering::Relaxed);
 
-                // Add gaussian noise to help regulate embeddings
-                if cnt > 0f32 {
+                if cnt > 0 {
+                    // Add gaussian noise to help regulate embeddings
                     if self.noise > 0.0 {
                         let noise = noise_scheduler.compute(cur_step);
                         all_grads.par_iter_mut().for_each(|(feat, emb)| {
@@ -251,17 +253,16 @@ impl EmbeddingPropagation {
 
                 // Update progress bar
                 pb.inc(1);
-                if cnt > 0f32 {
-                    error / cnt
+                if cnt > 0 {
+                    error / n_nodes as f32
                 } else {
                     0f32
                 }
-            }).collect();
+            })
+            .map(|x| { if x.is_infinite() { (0f32, 1usize) } else { (x, 1usize) } })
+            .reduce(|| (0f32, 0usize), |a, b| (a.0 + b.0, a.1 + b.1));
 
-            // Some losses go toward infinity.  This is a bug we should fix.
-            last_error = err.iter()
-                .filter(|x| !x.is_infinite() )
-                .sum::<f32>() / err.len() as f32;
+            last_error = err_cnt.0 / if err_cnt.1 > 0 { err_cnt.1 as f32} else { 1f32 };
             
             if valid_idxs.len() > 0 {
                 // Validate.  We use the same random seed for consistency across iterations.

@@ -122,11 +122,15 @@ fn convert_node_id_to_fqn(
 
 
 /// Convenience method for getting an internal node id from pretty name
-fn get_node_id(vocab: &Vocab, node_type: String, node: String) -> PyResult<NodeID> {
-    if let Some(node_id) = vocab.get_node_id(node_type.clone(), node.clone()) {
+fn get_node_id<A: AsRef<str>, B: AsRef<str>>(
+    vocab: &Vocab, 
+    node_type: A,
+    node_name:B 
+) -> PyResult<NodeID> {
+    if let Some(node_id) = vocab.get_node_id(node_type.as_ref(), node_name.as_ref()) {
         Ok(node_id)
     } else {
-        Err(PyKeyError::new_err(format!(" Node '{}:{}' does not exist!", node_type, node)))
+        Err(PyKeyError::new_err(format!(" Node '{}:{}' does not exist!", node_type.as_ref(), node_name.as_ref())))
     }
 }
 
@@ -1137,7 +1141,7 @@ impl EmbeddingPropagator {
     ///        If added, injects gaussian noise into the gradients to help with generalization.  
     ///
     ///        Default is None.
-    ///    
+    ///
     ///    Returns
     ///    -------
     ///    Self
@@ -1308,6 +1312,58 @@ impl EmbeddingPropagator {
 
 }
 
+/// Different ways of namespacing features.  
+#[derive(Clone)]
+pub enum FeatureNs {
+    Static(String),
+    NodeType,
+    Prefix(String)
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct FeatureNamespace(FeatureNs);
+
+impl FeatureNamespace {
+    fn parse<'a>(&'a self, node_type: &'a str, token: &'a str) -> Option<(&'a str, &'a str)> {
+        match self.0 {
+            FeatureNs::Static(ref s) => Some((s, token)),
+            FeatureNs::NodeType => Some((node_type, token)),
+            FeatureNs::Prefix(ref delim) => {
+                token.find(delim).map(|idx| {
+                    (&token[..idx], &token[(idx+1)..])
+                })
+            }
+        }
+    }
+}
+
+#[pymethods]
+impl FeatureNamespace {
+    #[staticmethod]
+    pub fn single(ns: String) -> Self {
+        FeatureNamespace(FeatureNs::Static(ns))
+    }
+
+    #[staticmethod]
+    pub fn node_type() -> Self {
+        FeatureNamespace(FeatureNs::NodeType)
+    }
+
+    #[staticmethod]
+    pub fn prefix(delim: String) -> Self {
+        FeatureNamespace(FeatureNs::Prefix(delim))
+    }
+
+}
+
+impl Default for FeatureNamespace {
+    fn default() -> FeatureNamespace {
+        FeatureNamespace::single("feat".into())
+    }
+}
+
+
 /// Defines the FeatureSet class, which allows setting discrete features for a node
 #[pyclass]
 pub struct FeatureSet {
@@ -1329,7 +1385,7 @@ impl FeatureSet {
             if pieces.len() != 3 {
                 return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ..."))
             }
-            vocab.get_or_insert(pieces[0].into(), pieces[1].into());
+            vocab.get_or_insert(pieces[0], pieces[1]);
         }
         Ok(vocab)
     }
@@ -1346,34 +1402,22 @@ impl FeatureSet {
     ///    graph : Graph
     ///        Graph to construct FeatureSet for
     ///    
-    ///    path : String - Optional
-    ///        If provided, reads features from a file.  If not, creates a FeatureSet which is
-    ///        empty.
-    ///    
-    ///    namespace : String - Optional
-    ///        If provided, overrides the default 'node type' for a feature.  Default is 'feat'.
-    ///    
     ///    Returns
     ///    -------
     ///    Self - Can throw exception
     ///        
     ///    
     #[staticmethod]
-    pub fn new_from_graph(graph: &Graph, path: Option<String>, namespace: Option<String>) -> PyResult<Self> {
+    pub fn new_from_graph(graph: &Graph) -> PyResult<Self> {
 
-        let ns = namespace.unwrap_or_else(|| "feat".to_string());
-        let mut fs = FeatureSet {
+        let fs = FeatureSet {
             vocab: graph.vocab.clone(),
-            features: FeatureStore::new(graph.graph.len(), ns)
+            features: FeatureStore::new(graph.graph.len())
         };
 
-        if let Some(path) = path {
-            fs.load_into(path)?;
-        }
         Ok(fs)
     }
 
-    // Loads features tied to a graph
     ///    Loads a feature set from file.  This is less memory efficient than using
     ///    `new_from_graph`.
     ///    
@@ -1391,18 +1435,20 @@ impl FeatureSet {
     ///        
     ///    
     #[staticmethod]
-    pub fn new_from_file(path: String, namespace: Option<String>) -> PyResult<Self> {
+    pub fn new_from_file(
+        path: String, 
+        namespace: Option<FeatureNamespace>
+    ) -> PyResult<Self> {
 
         // Build the vocab from the file first, get the length of the feature set
         let vocab = Arc::new(FeatureSet::read_vocab_from_file(&path)?);
-        let ns = namespace.unwrap_or_else(|| "feat".to_string());
-        let feats = FeatureStore::new(vocab.len(), ns);
+        let feats = FeatureStore::new(vocab.len());
         let mut fs = FeatureSet {
             vocab: vocab,
             features: feats
         };
 
-        fs.load_into(path)?;
+        fs.load_into(path, namespace)?;
         Ok(fs)
     }
 
@@ -1413,7 +1459,7 @@ impl FeatureSet {
     ///    node : FQNode
     ///        Fully qualified Node.
     ///    
-    ///    features : List[String]
+    ///    features : List[(String, String)]
     ///        Features to set for this node.
     ///    
     ///    Returns
@@ -1421,9 +1467,13 @@ impl FeatureSet {
     ///    () - Can throw exception
     ///        
     ///    
-    pub fn set_features(&mut self, node: FQNode, features: Vec<String>) -> PyResult<()> {
+    pub fn set_features(
+        &mut self, 
+        node: FQNode, 
+        features: Vec<(String, String)>
+    ) -> PyResult<()> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
-        self.features.set_features(node_id, features);
+        self.features.set_features(node_id, features.into_iter());
         Ok(())
     }
 
@@ -1436,10 +1486,13 @@ impl FeatureSet {
     ///    
     ///    Returns
     ///    -------
-    ///    List[String] - Can throw exception
+    ///    List[(String, String)] - Can throw exception
     ///        Set of features specified for node
     ///    
-    pub fn get_features(&self, node: FQNode) -> PyResult<Vec<String>> {
+    pub fn get_features(
+        &self, 
+        node: FQNode
+    ) -> PyResult<Vec<(String,String)>> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         Ok(self.features.get_pretty_features(node_id))
     }
@@ -1450,6 +1503,9 @@ impl FeatureSet {
     ///    ----------
     ///    path : String
     ///        Path point to features definitions.
+    ///
+    ///    f_ns : FeatureNamespace - optional
+    ///        How to construct a feature namespace from a given token.  Default is Static("feat")
     ///    
     ///    Returns
     ///    -------
@@ -1457,22 +1513,30 @@ impl FeatureSet {
     ///        
     ///    
     pub fn load_into(
-        &mut self, 
-        path: String
+        &mut self,
+        path: String,
+        f_ns: Option<FeatureNamespace>
     ) -> PyResult<()> {
         let reader = open_file_for_reading(&path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-        for line in reader.lines() {
+        let f_ns = f_ns.unwrap_or_default();
+        for (i, line) in reader.lines().enumerate() {
             let line = line.unwrap();
             let pieces: Vec<_> = line.split('\t').collect();
             if pieces.len() != 3 {
-                return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ..."))
+                let line_id = i + 1;
+                let err = format!("Line {line_id}:Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ...");
+                return Err(PyValueError::new_err(err))
             }
             let bow = pieces[2].split_whitespace()
-                .map(|s| s.to_string()).collect();
-            let _ = self.set_features((pieces[0].to_string(), pieces[1].to_string()), bow);
-                
+                .map(|s| {
+                    f_ns.parse(&pieces[0], s).unwrap_or_else(|| ("feat", s))
+                });
+
+            let _ = get_node_id(self.vocab.deref(), pieces[0], pieces[1]).map(|node_id| {
+                self.features.set_features(node_id, bow);
+            });
         }
         Ok(())
     }
@@ -1829,7 +1893,8 @@ impl FeatureAggregator {
                     }
                     let p_wi = pieces[2].parse::<f64>()
                         .map_err(|_e| PyValueError::new_err(format!("Tried to parse weight and failed:{:?}", line)))?;
-                    let node_id = vocab.get_or_insert(pieces[0].into(), pieces[1].into());
+
+                    let node_id = vocab.get_or_insert(pieces[0], pieces[1]);
                     if node_id < p_w.len() {
                         return Err(PyValueError::new_err(format!("Duplicate feature found:{} {}", pieces[0], pieces[1])))
                     }
@@ -3814,6 +3879,7 @@ impl VpcgEmbedder {
             alpha: self.alpha,
             err: self.err
         };
+
         let embs = vpcg.learn(graph.graph.as_ref(), &features.features, (&left, &right));
         let node_embeddings = NodeEmbeddings {
             vocab: graph.vocab.clone(),
@@ -4507,6 +4573,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<EPLoss>()?;
     m.add_class::<GraphAnn>()?;
     m.add_class::<EmbAnn>()?;
+    m.add_class::<FeatureNamespace>()?;
     m.add_class::<FeatureSet>()?;
     m.add_class::<FeaturePropagator>()?;
     m.add_class::<NodeEmbedder>()?;

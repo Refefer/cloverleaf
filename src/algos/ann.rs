@@ -3,7 +3,6 @@ use std::collections::BinaryHeap;
 
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
-use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use float_ord::FloatOrd;
 
