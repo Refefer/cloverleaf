@@ -3,6 +3,7 @@ use crate::graph::NodeID;
 use std::fs::File;
 use std::io::{Write,BufWriter,Result as IOResult,BufReader,BufRead};
 use std::convert::AsRef;
+use std::collections::HashSet;
 
 use fast_float::parse;
 use flate2::Compression;
@@ -137,11 +138,17 @@ impl EmbeddingReader {
     pub fn load(
         path: &str, 
         distance: Distance, 
-        filter_type: Option<String>, 
+        filter_type: &Option<&HashSet<String>>, 
         chunk_size: Option<usize>,
         skip_rows: Option<usize>
     ) -> PyResult<(Vocab, EmbeddingStore)> {
-        let num_embeddings = count_lines(path, &filter_type)
+
+        // Convert filter types to something more efficient
+        let ft_strs = filter_type
+            .map(|hs| hs.iter().map(|s| s.as_str()).collect());
+        let ft_refs = ft_strs.as_ref();
+
+        let num_embeddings = count_lines(path, ft_refs)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
         let reader = open_file_for_reading(path)
@@ -154,11 +161,11 @@ impl EmbeddingReader {
         let rr = RecordReader::new(chunk_size.unwrap_or(1_000), skip_rows.unwrap_or(0));
         let mut i = 0;
         
-        let filter_node = filter_type.as_ref();
+
         rr.read(reader.lines().map(|l| l.unwrap()),
             |_, line| {
-               if let Some(node_type) = filter_node {
-                   if !line.starts_with(node_type) {
+               if let Some(node_types) = ft_refs {
+                   if !is_node_type(&line, node_types) {
                        return None
                    }
                }
@@ -216,21 +223,27 @@ pub fn open_file_for_writing(path: &str, compression: Option<u32>) -> IOResult<B
     Ok(encoder)
 }
 
+fn is_node_type(line: &str, filter_types: &HashSet<&str>) -> bool {
+    match line.find('\t') {
+        Some(idx) => filter_types.contains(&line[..idx]),
+        None => false
+    }
+}
 
 /// Count the number of lines in an embeddings file so we only have to do one allocation.  If
 /// NodeEmbeddings internal memory structure changes, such as using slabs, this might be less
 /// relevant.
-fn count_lines(path: &str, node_type: &Option<String>) -> IOResult<usize> {
+fn count_lines(path: &str, node_type: Option<&HashSet<&str>>) -> IOResult<usize> {
     let reader = open_file_for_reading(path)?;
     let mut count = 0;
-    let filter_node = node_type.as_ref();
-    for line in reader.lines() {
-        let line = line?;
-        if let Some(p) = filter_node {
-            if line.starts_with(p) {
-                count += 1;
-            }
-        } else {
+    if let Some(fts) = node_type.as_ref() {
+        for line in reader.lines() {
+            let line = line?;
+            if is_node_type(&line, fts) { count += 1}
+        }
+    } else {
+        for line in reader.lines() {
+            line?;
             count += 1;
         }
     }

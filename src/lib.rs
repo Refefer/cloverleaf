@@ -43,11 +43,12 @@ use std::sync::Arc;
 use std::ops::Deref;
 use std::fs::File;
 use std::io::{Write,BufWriter,BufReader,BufRead};
+use std::collections::HashSet;
 
 use rayon::prelude::*;
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError};
+use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError,PyTypeError};
 use itertools::Itertools;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
@@ -96,7 +97,7 @@ fn convert_scores(
     vocab: &Vocab, 
     scores: impl Iterator<Item=(NodeID, f32)>, 
     k: Option<usize>,
-    filtered_node_type: Option<String>
+    filtered_node_type: Option<HashSet<String>>
 ) -> Vec<(FQNode, f32)> {
     let mut scores: Vec<_> = scores.collect();
     scores.sort_by_key(|(_k, v)| FloatOrd(-*v));
@@ -109,7 +110,9 @@ fn convert_scores(
             (((*node_type).clone(), name.to_string()), w)
         })
         .filter(|((node_type, _node_name), _w)| {
-            filtered_node_type.as_ref().map(|nt| nt == node_type).unwrap_or(true)
+            filtered_node_type.as_ref()
+                .map(|nts| nts.contains(node_type))
+                .unwrap_or(true)
         })
         .take(k)
         .collect()
@@ -513,7 +516,7 @@ impl RandomWalker {
     ///    k : Int - Optional
     ///        If provided, truncates the list to the top K.
     ///    
-    ///    filter_type : String - Optional
+    ///    filter_type : String or List[String] - Optional
     ///        If provided, only returns nodes that match the provided node type.
     ///    
     ///    weighted : Bool - Optional
@@ -530,7 +533,7 @@ impl RandomWalker {
         node: FQNode, 
         seed: Option<u64>, 
         k: Option<usize>, 
-        filter_type: Option<String>,
+        filter_type: Option<&PyAny>,
         single_threaded: Option<bool>,
         weighted: Option<bool>
     ) -> PyResult<Vec<(FQNode, f32)>> {
@@ -551,7 +554,9 @@ impl RandomWalker {
             rwr.sample(graph.graph.as_ref(), &Unweighted, node_id)
         };
 
-        Ok(convert_scores(&graph.vocab, results.into_iter(), k, filter_type))
+        let fts = convert_filter_type(filter_type)?;
+
+        Ok(convert_scores(&graph.vocab, results.into_iter(), k, fts))
     }
 
 }
@@ -639,7 +644,7 @@ impl BiasedRandomWalker {
     ///    rerank_context : Query - Optional
     ///        If provided, reranks the final result set by the rerank context.
     ///    
-    ///    filter_type : String - Optional
+    ///    filter_type : String or List[String] - Optional
     ///        If provided, only returns nodes that match the provided node type.
     ///    
     ///    
@@ -657,7 +662,7 @@ impl BiasedRandomWalker {
         k: Option<usize>, 
         seed: Option<u64>, 
         rerank_context: Option<&Query>,
-        filter_type: Option<String>
+        filter_type: Option<&PyAny>
     ) -> PyResult<Vec<(FQNode, f32)>> {
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
         let g_emb = lookup_embedding(context, embeddings)?;
@@ -691,7 +696,8 @@ impl BiasedRandomWalker {
                 .reweight(&mut results, node_embeddings, c_emb);
         }
 
-        Ok(convert_scores(&graph.vocab, results.into_iter(), k, filter_type))
+        let fts = convert_filter_type(filter_type)?;
+        Ok(convert_scores(&graph.vocab, results.into_iter(), k, fts))
     }
 
 
@@ -757,7 +763,7 @@ impl SparsePPR {
     ///    k : Int - Optional
     ///        If provided, returns only the top K nodes and scores; otherwise provides all.
     ///    
-    ///    filter_type : String - Optional
+    ///    filter_type : String or List[String] - Optional
     ///        If provided, filters out nodes that do not match the provided filter_type.
     ///    
     ///    Returns
@@ -770,13 +776,15 @@ impl SparsePPR {
         graph: &Graph,
         node: FQNode, 
         k: Option<usize>, 
-        filter_type: Option<String>
+        filter_type: Option<&PyAny>
     ) -> PyResult<Vec<(FQNode, f32)>> {
 
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
         let results = ppr_estimate(graph.graph.as_ref(), node_id, self.restarts, self.eps);
 
-        Ok(convert_scores(&graph.vocab, results.into_iter(), k, filter_type))
+        let fts = convert_filter_type(filter_type)?;
+
+        Ok(convert_scores(&graph.vocab, results.into_iter(), k, fts))
     }
 
 }
@@ -2594,7 +2602,7 @@ impl NodeEmbeddings {
     ///    k : Int
     ///        Top K items to return
     ///    
-    ///    filter_type : String - Optional
+    ///    filter_type : String or List[String] - Optional
     ///        If provided, filters out nodes that don't match the filter_type
     ///    
     ///    Returns
@@ -2606,20 +2614,20 @@ impl NodeEmbeddings {
         &self, 
         emb: Vec<f32>, 
         k: usize,
-        filter_type: Option<String>
-    ) -> Vec<(FQNode, f32)> {
+        filter_type: Option<&PyAny>
+    ) -> PyResult<Vec<(FQNode, f32)>> {
         let emb = Entity::Embedding(&emb);
-        let dists = if let Some(node_type) = filter_type {
-            let ant = Arc::new(node_type);
-            let filter_type = Some(&ant);
+        let fts = convert_filter_type(filter_type)?;
+        let dists = if let Some(fts) = fts {
             self.embeddings.nearest_neighbor(&emb, k, |node_id| {
-                let nt = self.vocab.get_node_type(node_id);
-                nt == filter_type
+                let nt = self.vocab.get_node_type(node_id)
+                    .expect("vocab and embeddings mismatch - this should never happen!");
+                fts.contains(nt.as_str())
             })
         } else {
             self.embeddings.nearest_neighbor(&emb, k, |_node_id| true)
         };
-        convert_node_distance(&self.vocab, dists)
+        Ok(convert_node_distance(&self.vocab, dists))
     }
 
     ///    Returns the number of dimensions for an embedding.
@@ -2759,7 +2767,7 @@ impl NodeEmbeddings {
     ///    distance : Distance
     ///        Distance method to use for computing embedding similarity.
     ///    
-    ///    filter_type : String - Optional
+    ///    filter_type : String or List[String] - Optional
     ///        If provided, only loads embeddings which match the provided node type.
     ///    
     ///        Default is None.
@@ -2780,15 +2788,17 @@ impl NodeEmbeddings {
         py: Python<'_>,
         path: &str, 
         distance: Option<Distance>, 
-        filter_type: Option<String>, 
+        filter_type: Option<&PyAny>, 
         chunk_size: Option<usize>,
         skip_rows: Option<usize>
     ) -> PyResult<Self> {
+        let fts = convert_filter_type(filter_type)?;
+        let fts_ref = fts.as_ref();
         py.allow_threads(move || {
             let (vocab, es) = EmbeddingReader::load(
                 path, 
                 distance.unwrap_or(Distance::Cosine).to_edist(), 
-                filter_type, 
+                &fts_ref, 
                 chunk_size, 
                 skip_rows
             )?;
@@ -3355,7 +3365,16 @@ impl EmbAnn {
     ///    max_nodes_per_leaf : Int
     ///        Determines whether a node should split.  Lower max nodes per leaf creates deeper,
     ///        more accurate trees, at the expense of more memory.
+    ///
+    ///    test_hp_per_split : Int - Optional
+    ///        Number of candidate hyperplanes to pick before selecting a splitting hyperplane.
+    ///        More usually results in cleaner splits at the expense of compute.
     ///    
+    ///    num_sampled_nodes_split_test : Int - Optional
+    ///        When determining the pseudo clusters for splitting during random projections, the
+    ///        number of nodes to use to "estimate" each cluster.  More means more accurate pseudo
+    ///        clusters at the cost of more compute.
+    ///
     ///    seed : Int - Optional
     ///        If provided, uses this seed for randomization.  Otherwise uses the global seed.
     ///    
@@ -3371,19 +3390,34 @@ impl EmbAnn {
         max_nodes_per_leaf: usize,
         test_hp_per_split: Option<usize>,
         num_sampled_nodes_split_test: Option<usize>,
+        filter_type: Option<&PyAny>,
         seed: Option<u64>
-    ) -> Self {
+    ) -> PyResult<Self> {
         let mut ann = Ann::new();
         let seed = seed.unwrap_or(SEED + 10);
+
+        // If filter_type is provided, only build an index to reference those nodes.
+        let node_ids = filter_type
+            .map(|pa| single_or_multistring(pa))
+            .transpose()?
+            .map(|hs| {
+                (0..embs.embeddings.len()).filter(|idx| {
+                    let nt = embs.vocab.get_node_type(*idx)
+                        .expect("Vocab doesn't match embeddings!  Should never happen");
+                    hs.contains(nt.as_ref())
+                }).collect()
+            });
+
         ann.fit(
             &embs.embeddings, 
             n_trees, 
             max_nodes_per_leaf, 
             test_hp_per_split,
             num_sampled_nodes_split_test,
+            node_ids,
             seed);
 
-        EmbAnn { ann: ann }
+        Ok(EmbAnn { ann: ann })
 
     }
 
@@ -3873,8 +3907,8 @@ impl VpcgEmbedder {
     ///    features : FeatureSet
     ///        Features to propagate between nodes
     ///    
-    ///    start_node_type : String
-    ///        Starting node type for propagation.
+    ///    start_node_type : String or List[String]
+    ///        Starting node type(s) for propagation.
     ///    
     ///    Returns
     ///    -------
@@ -3884,13 +3918,15 @@ impl VpcgEmbedder {
     pub fn learn(&self, 
         graph: &Graph, 
         features: &mut FeatureSet,
-        start_node_type: String
-    ) -> NodeEmbeddings  {
+        start_node_type: &PyAny
+    ) -> PyResult<NodeEmbeddings> {
+        let start_node_types = single_or_multistring(start_node_type)?;
+
         // Split the graph into left and right based on the start node type
         let (mut left, mut right) = (Vec::new(), Vec::new());
         for node_id in 0..graph.graph.len() {
             let nt = graph.vocab.get_node_type(node_id).unwrap();
-            if nt.as_ref() == &start_node_type {
+            if start_node_types.contains(nt.as_ref()) {
                 left.push(node_id);
             } else {
                 right.push(node_id)
@@ -3919,7 +3955,7 @@ impl VpcgEmbedder {
             embeddings:embs 
         };
 
-        node_embeddings 
+        Ok(node_embeddings)
     }
 
 }
@@ -4590,6 +4626,28 @@ fn convert_node_distance(
                 .expect("Can't find node id in vocab!");
             (((*node_type).clone(), name.to_string()), dist)
         }).collect()
+}
+
+fn single_or_multistring(xs: &PyAny) -> PyResult<HashSet<String>> {
+    // Try to extract a single string first.
+    let mut hs = HashSet::new();
+    if let Ok(s) = xs.extract::<String>() {
+        hs.insert(s);
+        Ok(hs)
+    } else if let Ok(v) = xs.extract::<Vec<String>>() {
+        v.into_iter().for_each(|s| { hs.insert(s); });
+        Ok(hs)
+    } else if let Ok(v) = xs.extract::<HashSet<String>>() {
+        Ok(v)
+    } else {
+        Err(PyTypeError::new_err("Expected a string or a list of strings"))
+    }
+}
+
+fn convert_filter_type(
+    filter_type: Option<&PyAny>
+) -> PyResult<Option<HashSet<String>>> {
+    filter_type.map(|pa| single_or_multistring(pa)).transpose()
 }
 
 #[pymodule]

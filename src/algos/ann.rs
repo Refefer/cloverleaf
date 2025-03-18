@@ -222,6 +222,7 @@ impl Ann {
         max_nodes_per_leaf: usize,
         test_hp_per_split: Option<usize>,
         num_sampled_nodes_split_test: Option<usize>,
+        node_ids: Option<Vec<NodeID>>,
         seed: u64
     ) {
         let config = AnnBuildConfig {
@@ -231,7 +232,6 @@ impl Ann {
         };
 
         // Setup the number of trees necessary to build
-        self.trees.clear();
         let mut trees = Vec::with_capacity(n_trees);
         for _ in 0..n_trees {
             trees.push(Vec::new());
@@ -239,7 +239,11 @@ impl Ann {
 
         // Learn each tree, using separate random seeds
         trees.par_iter_mut().enumerate().for_each(|(idx, tree) | {
-            let mut indices = (0..es.len()).map(|idx| (idx, false)).collect::<Vec<_>>();
+            let mut indices: Vec<_> = if let Some(nids) = node_ids.as_ref() {
+                nids.iter().map(|idx| (*idx, false)).collect()
+            } else {
+                (0..es.len()).map(|idx| (idx, false)).collect()
+            };
             let mut rng = XorShiftRng::seed_from_u64(seed + idx as u64);
             self.fit_group_(&config, tree, 1, es, indices.as_mut_slice(), &mut rng);
         });
