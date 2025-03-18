@@ -61,25 +61,27 @@ use crate::embeddings::{EmbeddingStore,Entity};
 use crate::feature_store::FeatureStore;
 use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader,open_file_for_reading,open_file_for_writing};
 
-use crate::algos::rwr::{RWR,ppr_estimate,rollout};
-use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
-use crate::algos::reweighter::{Reweighter};
+use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
+use crate::algos::alignment::{NeighborhoodAligner as NA};
+use crate::algos::ann::Ann;
+use crate::algos::connected::{find_connected_components,prune_graph_components};
+use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
 use crate::algos::ep::{EmbeddingPropagation,LossWeighting as EPLW};
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
-use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
-use crate::algos::graph_ann::NodeDistance;
-use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
-use crate::algos::alignment::{NeighborhoodAligner as NA};
-use crate::algos::smci::SupervisedMCIteration;
-use crate::algos::pprrank::{PprRank, Loss as PprLoss};
-use crate::algos::ann::Ann;
-use crate::algos::pprembed::PPREmbed;
+use crate::algos::graph_ann::NodeDistance;
+use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
 use crate::algos::lsr::{LSR as ALSR};
-use crate::algos::connected::{find_connected_components,prune_graph_components};
+use crate::algos::pprembed::PPREmbed;
+use crate::algos::pprrank::{PprRank, Loss as PprLoss};
+use crate::algos::reweighter::{Reweighter};
+use crate::algos::rwr::{RWR,ppr_estimate,rollout};
+use crate::algos::smci::SupervisedMCIteration;
 use crate::algos::utils::Sample;
+use crate::algos::vpcg::{VPCG, FeatureWeight as VFeatureWeight};
+
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
@@ -3776,6 +3778,17 @@ impl PprRankLearner {
 
 }
 
+/// Tells the VPCG algorithm how to weight the initial features
+#[pyclass]
+#[derive(Clone)]
+pub enum FeatureWeight {
+    /// All features are initialized uniformly: 1 / feat
+    Uniform,
+
+    /// All features are initialized as 1 / feat_count.ln()
+    IDF
+}
+
 /// Learns VPCG vectors on a graph.
 #[pyclass]
 struct VpcgEmbedder {
@@ -3783,7 +3796,8 @@ struct VpcgEmbedder {
     passes: usize,
     dims: usize,
     alpha: f32,
-    err: f32
+    err: f32,
+    feature_weight: FeatureWeight
 }
 
 #[pymethods]
@@ -3815,6 +3829,9 @@ impl VpcgEmbedder {
     ///    
     ///    err : Float - Optional
     ///        Suppresses terms with a weight of less than err.  Default is 1e-5
+    ///
+    ///    feature_weight : FeatureWeight - Optional
+    ///        Whether to weight each feature uniformly or based on the IDF
     ///    
     ///    Returns
     ///    -------
@@ -3827,14 +3844,16 @@ impl VpcgEmbedder {
         passes: usize, 
         dims: usize, 
         alpha: Option<f32>, 
-        err: Option<f32>
+        err: Option<f32>,
+        feature_weight: Option<FeatureWeight>
     ) -> Self {
         VpcgEmbedder { 
             max_terms, 
             passes, 
             dims,
             alpha: alpha.unwrap_or(1f32),
-            err: err.unwrap_or(1e-5f32)
+            err: err.unwrap_or(1e-5),
+            feature_weight: feature_weight.unwrap_or(FeatureWeight::Uniform) 
         }
     }
 
@@ -3867,6 +3886,7 @@ impl VpcgEmbedder {
         features: &mut FeatureSet,
         start_node_type: String
     ) -> NodeEmbeddings  {
+        // Split the graph into left and right based on the start node type
         let (mut left, mut right) = (Vec::new(), Vec::new());
         for node_id in 0..graph.graph.len() {
             let nt = graph.vocab.get_node_type(node_id).unwrap();
@@ -3877,13 +3897,20 @@ impl VpcgEmbedder {
             }
         }
 
+        let feature_weight = match self.feature_weight{
+            FeatureWeight::Uniform => VFeatureWeight::Uniform,
+            FeatureWeight::IDF => VFeatureWeight::IDF,
+        };
+
+        // Every node must have at least one feature
         features.features.fill_missing_nodes();
-        let vpcg = crate::algos::vpcg::VPCG {
+        let vpcg = VPCG {
             max_terms: self.max_terms, 
             iterations: self.passes,
             dims: self.dims,
             alpha: self.alpha,
-            err: self.err
+            err: self.err,
+            feature_weight: feature_weight 
         };
 
         let embs = vpcg.learn(graph.graph.as_ref(), &features.features, (&left, &right));
@@ -4595,6 +4622,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PageRank>()?;
     m.add_class::<Smci>()?;
     m.add_class::<VpcgEmbedder>()?;
+    m.add_class::<FeatureWeight>()?;
     m.add_class::<PPREmbedder>()?;
     m.add_class::<InstantEmbeddings>()?;
     m.add_class::<LSR>()?;

@@ -14,7 +14,13 @@ use crate::distance::Distance;
 
 type SparseEmbeddings = Vec<Vec<(usize, f32)>>;
 
+pub enum FeatureWeight {
+    Uniform,
+    IDF
+}
+
 pub struct VPCG {
+
     // Maximum number of terms to retain
     pub max_terms: usize,
 
@@ -28,7 +34,10 @@ pub struct VPCG {
     pub err: f32,
 
     // Number of passes to run
-    pub iterations: usize
+    pub iterations: usize,
+
+    // How to weight the initial features
+    pub feature_weight: FeatureWeight
 }
 
 impl VPCG {
@@ -40,12 +49,20 @@ impl VPCG {
         mask: (&[NodeID], &[NodeID]),
     ) -> EmbeddingStore {
         
+        let counts = features.count_features();
         let propagations: SparseEmbeddings = (0..graph.len())
             .map(|node_id| {
                 let mut fs = Vec::with_capacity(self.max_terms);
                 let feats = features.get_features(node_id);
-                let weight = 1. / (feats.len() as f32).sqrt();
-                feats.iter().for_each(|f| fs.push((*f, weight)));
+                let term_map: HashMap<_, _> = feats.iter().map(|fi| {
+                    if matches!(self.feature_weight, FeatureWeight::Uniform) {
+                        (*fi, 1. / (feats.len() as f32).sqrt())
+                    } else {
+                        (*fi, 1. / (1f32 + counts[*fi] as f32).ln())
+                    }
+                }).collect();
+                norm_filter_feat(&term_map, self.max_terms, self.err)
+                    .for_each(|f| fs.push(f));
                 fs
             })
             .collect();
@@ -73,37 +90,29 @@ impl VPCG {
                     // Sum up features
                     let mut term_map = HashMap::new();
 
+                    // If alpha, copy existing features into the term_map
                     if self.alpha < 1f32 {
                         let feats = &propagations.get()[*node_id];
                         feats.iter().for_each(|(feat, score)| {
-                            let e = term_map.entry(feat).or_insert(0f32);
+                            let e = term_map.entry(*feat).or_insert(0f32);
                             *e += (1f32 - self.alpha) * score;
                         });
                     }
 
+                    // Main propagation
                     let (edges, weights) = graph.get_edges(*node_id);
                     edges.iter().zip(CDFtoP::new(weights)).for_each(|(edge, p)| {
                         let feats = &propagations.get()[*edge];
                         feats.iter().for_each(|(feat, score)| {
-                            let e = term_map.entry(feat).or_insert(0f32);
+                            let e = term_map.entry(*feat).or_insert(0f32);
                             *e += self.alpha * p * score;
                         });
                     });
 
-                    // L2 norm
-                    let norm = term_map.par_values().map(|s| s.powf(2.)).sum::<f32>().sqrt();
-                    let mut results = term_map.into_par_iter().map(|(feature, score)| {
-                        (*feature, score / norm)
-                    }).collect::<Vec<_>>();
-                    
-                    // Sort and add to propagations
-                    results.par_sort_unstable_by_key(|(_, s)| FloatOrd(-*s));
+                    // L2 norm and filter
                     let node_feats = &mut propagations.get()[*node_id];
                     node_feats.clear();
-
-                    results.into_iter().take(self.max_terms)
-                        .filter(|(_t, s)| *s > self.err)
-                        .for_each(|ts| node_feats.push(ts));
+                    norm_filter_feat(&term_map, self.max_terms, self.err).for_each(|ts| node_feats.push(ts));
                 });
                 pb.inc(chunk.len() as u64);
             });
@@ -111,6 +120,7 @@ impl VPCG {
 
         // Convert it to an embedding store
         pb.finish();
+
         let props = propagations.into_inner().expect("Shouldn't have any other references!");
         let num_features = features.num_features();
         self.convert_to_es(num_features, props)
@@ -149,3 +159,24 @@ impl VPCG {
     }
 
 }
+
+fn l2norm(
+    term_map: &HashMap<usize, f32>
+) -> Vec<(usize, f32)> {
+    let norm = term_map.par_values().map(|s| s.powf(2.)).sum::<f32>().sqrt();
+    term_map.into_par_iter().map(|(feature, score)| {
+        (*feature, score / norm)
+    }).collect()
+}
+
+fn norm_filter_feat<'a>(
+    term_map: &HashMap<usize, f32>,
+    max_terms: usize,
+    err: f32
+) -> impl Iterator<Item=(usize, f32)> {
+    let mut results = l2norm(term_map);
+    results.par_sort_unstable_by_key(|(_, s)| FloatOrd(-*s));
+    results.into_iter().take(max_terms)
+        .filter(move |(_t, s)| *s > err)
+}
+
