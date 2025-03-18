@@ -10,7 +10,8 @@ use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use simple_grad::*;
 
-use crate::algos::rwr::{Steps,RWR};
+use crate::algos::rwr::RWR;
+use crate::algos::utils::Sample;
 use crate::sampler::Weighted;
 use crate::graph::{Graph as CGraph, CDFGraph, NodeID};
 use crate::embeddings::{EmbeddingStore,randomize_embedding_store};
@@ -57,7 +58,7 @@ pub struct PprRank {
 
     /// Whether we use hard negatives or not.  We might strip this out since I've had difficulty
     /// using it to improve test loss
-    pub steps: Steps,
+    pub steps: Sample,
 
     /// Beta to use for the RWR algorithm
     pub beta: f32,
@@ -66,7 +67,7 @@ pub struct PprRank {
     pub k: usize,
 
     /// Randomly selects K features
-    pub num_features: Option<usize>,
+    pub num_features: Sample,
 
     /// Compresses or flattens distribution
     pub compression: f32,

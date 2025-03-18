@@ -61,7 +61,7 @@ use crate::embeddings::{EmbeddingStore,Entity};
 use crate::feature_store::FeatureStore;
 use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader,open_file_for_reading,open_file_for_writing};
 
-use crate::algos::rwr::{Steps,RWR,ppr_estimate,rollout};
+use crate::algos::rwr::{RWR,ppr_estimate,rollout};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::reweighter::{Reweighter};
 use crate::algos::ep::{EmbeddingPropagation,LossWeighting as EPLW};
@@ -79,6 +79,7 @@ use crate::algos::pprembed::PPREmbed;
 use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
 use crate::algos::lsr::{LSR as ALSR};
 use crate::algos::connected::{find_connected_components,prune_graph_components};
+use crate::algos::utils::Sample;
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
@@ -451,7 +452,7 @@ impl Graph {
 #[pyclass]
 #[derive(Clone)]
 struct RandomWalker {
-    restarts: f32,
+    restarts: Sample,
     walks: usize,
     beta: Option<f32>
 }
@@ -482,13 +483,15 @@ impl RandomWalker {
     ///    Self
     ///        
     #[new]
-    fn new(restarts: f32, walks: usize, beta: Option<f32>) -> Self {
-        RandomWalker { restarts, walks, beta }
+    fn new(restarts: f32, walks: usize, beta: Option<f32>) -> PyResult<Self> {
+        Sample::new(restarts)
+            .map_err(|_err| PyValueError::new_err("restarts must be between (0, 1)"))
+            .map(|restarts| RandomWalker { restarts, walks, beta })
     }
 
     /// Simple representation of the RandomWalker
     pub fn __repr__(&self) -> String {
-        format!("RandomWalker<restarts={}, walks={}, beta={:?}>", self.restarts, self.walks, self.beta)
+        format!("RandomWalker<restarts={:?}, walks={}, beta={:?}>", self.restarts, self.walks, self.beta)
     }
 
     ///    Performs a random walk on a graph, returning a list of nodes and their approxmiate
@@ -532,16 +535,8 @@ impl RandomWalker {
 
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
         
-        let steps = if self.restarts >= 1. {
-            Steps::Fixed(self.restarts as usize)
-        } else if self.restarts > 0. {
-            Steps::Probability(self.restarts)
-        } else {
-            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
-        };
-
         let rwr = RWR {
-            steps: steps,
+            steps: self.restarts,
             walks: self.walks,
             beta: self.beta.unwrap_or(0.5),
             single_threaded: single_threaded.unwrap_or(false),
@@ -1101,9 +1096,10 @@ impl EmbeddingPropagator {
     ///        The larger the number, the better the estimate, but is more computationally
     ///        expensive.  These nodes are randomly selected each pass. Default is all.
     ///    
-    ///    max_features : Int - Optional
+    ///    max_features : Int/Float - Optional
     ///        Maximum number of features to use to construct a node embedding.  These features
-    ///        will be randomly selected every node construction.  Default is all.
+    ///        will be randomly selected every node construction.  If given a float between (0,1),
+    ///        will probabalistically drop out features.  Default is all.
     ///    
     ///    valid_pct : Float - Optional
     ///        Takes a percentage of the nodes in the graph and uses them to measure validation.
@@ -1177,7 +1173,7 @@ impl EmbeddingPropagator {
         weighted_neighbor_averaging: Option<bool>,
 
         // Max features to use for optimization
-        max_features: Option<usize>,
+        max_features: Option<f32>,
 
         // How to weight the loss in the graph
         loss_weighting: Option<LossWeighting>,
@@ -1203,7 +1199,7 @@ impl EmbeddingPropagator {
 
         // Use gradient noise where we sample from the normal distribution and blend with `noise`
         noise: Option<f32>
-    ) -> Self {
+    ) -> PyResult<Self> {
         let loss_weighting = loss_weighting.map(|lw| lw.loss).unwrap_or(EPLW::None);
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(0.9),
@@ -1221,25 +1217,30 @@ impl EmbeddingPropagator {
 
         let wns = weighted_neighbor_sampling.unwrap_or(false);
         let wna = weighted_neighbor_averaging.unwrap_or(false);
+        let max_features = max_features
+            .map(|mf| Sample::new(mf))
+            .unwrap_or(Ok(Sample::All))
+            .map_err(|_err| PyValueError::new_err("max_features must be either None, or (0, N)"))?;
 
         let model = if let Some(d_k) = attention {
             let num_heads = attention_heads.unwrap_or(1);
             let at = if let Some(size) = context_window {
                 AttentionType::Sliding{window_size: size}
-            } else if let Some(k) = max_features {
-                AttentionType::Random { num_features: k }
             } else {
-                AttentionType::Full
+                match max_features {
+                    Sample::All => AttentionType::Full,
+                    _ => AttentionType::Random { num_features: max_features }
+                }
             };
             let mha = MultiHeadedAttention::new(num_heads, d_k, at);
-            ModelType::Attention(AttentionFeatureModel::new(mha, None, max_nodes, wns))
+            ModelType::Attention(AttentionFeatureModel::new(mha, Sample::All, max_nodes, wns))
         } else {
             ModelType::Averaged(AveragedFeatureModel::new(
-                    max_features, max_nodes, wns, wna
+                max_features, max_nodes, wns, wna
             ))
         };
 
-        EmbeddingPropagator{ ep, model }
+        Ok(EmbeddingPropagator{ ep, model })
     }
 
     ///    Learns the features from a given graph
@@ -3524,10 +3525,10 @@ struct PprRankLearner {
     negatives: usize,
     loss: String,
     weight_decay: f32,
-    steps: Steps,
+    steps: Sample,
     walks: usize,
     k: usize,
-    num_features: Option<usize>,
+    num_features: Option<f32>,
     compression: f32,
     valid_pct: f32,
     beta: f32
@@ -3590,7 +3591,7 @@ impl PprRankLearner {
     ///
     ///        Default is 0.8
     ///    
-    ///    num_features : Int - Optional
+    ///    num_features : f32- Optional
     ///        How many features to use to construct nodes.  If provided, will randomly sample
     ///        features each construction.
     ///
@@ -3645,7 +3646,7 @@ impl PprRankLearner {
         // How much to benefit rarer/popular items
         beta: Option<f32>,
 
-        num_features: Option<usize>,
+        num_features: Option<f32>,
 
         weight_decay: Option<f32>, 
 
@@ -3655,11 +3656,11 @@ impl PprRankLearner {
     ) -> PyResult<Self> {
 
         let steps = if steps >= 1. {
-            Steps::Fixed(steps as usize)
+            Sample::Fixed(steps as usize)
         } else if steps > 0. {
-            Steps::Probability(steps)
+            Sample::Probability(steps)
         } else {
-            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
+            return Err(PyValueError::new_err("Steps must be between [0, inf)"))
         };
 
         Ok(PprRankLearner {
@@ -3723,13 +3724,18 @@ impl PprRankLearner {
         feature_embeddings: Option<&mut NodeEmbeddings>,
         indicator: Option<bool>,
         seed: Option<u64>
-    ) -> NodeEmbeddings {
+    ) -> PyResult<NodeEmbeddings> {
 
         let loss = if self.loss == "listnet" {
             PprLoss::ListNet { passive: true, weight_decay: self.weight_decay }
         } else {
             PprLoss::ListMLE { weight_decay: self.weight_decay }
         };
+
+        let num_features = self.num_features 
+            .map(|mf| Sample::new(mf))
+            .unwrap_or(Ok(Sample::All))
+            .map_err(|_err| PyValueError::new_err("num features must be either None, or (0, N)"))?;
 
         let ppr_rank = PprRank {
             alpha: self.alpha,
@@ -3742,7 +3748,7 @@ impl PprRankLearner {
             num_walks: self.walks,
             beta: self.beta,
             k: self.k,
-            num_features: self.num_features,
+            num_features: num_features,
             compression: self.compression,
             valid_pct: self.valid_pct,
             indicator: indicator.unwrap_or(true),
@@ -3765,7 +3771,7 @@ impl PprRankLearner {
             vocab: Arc::new(vocab),
             embeddings: feat_embeds};
 
-        feature_embeddings
+        Ok(feature_embeddings)
     }
 
 }
@@ -3952,7 +3958,7 @@ impl PPREmbedder {
 
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
-        format!("PPREmbedder<Dims={}, NumWalks={}, Steps={}, Beta={}, EPS={}>",
+        format!("PPREmbedder<Dims={}, NumWalks={}, Steps={:?}, Beta={}, EPS={}>",
                 self.dims, self.num_walks, self.steps, self.beta, self.eps)
     }
 
@@ -3981,11 +3987,11 @@ impl PPREmbedder {
         features.features.fill_missing_nodes();
 
         let steps = if self.steps >= 1. {
-            Steps::Fixed(self.steps as usize)
+            Sample::Fixed(self.steps as usize)
         } else if self.steps > 0. {
-            Steps::Probability(self.steps)
+            Sample::Probability(self.steps)
         } else {
-            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
+            return Err(PyValueError::new_err("Steps must be between [0, inf)"))
         };
 
         let embedder = PPREmbed {
@@ -4065,9 +4071,9 @@ impl InstantEmbeddings {
         seed: Option<u64>
     ) -> PyResult<Self> {
         let steps = if steps >= 1. {
-            Steps::Fixed(steps as usize)
+            Sample::Fixed(steps as usize)
         } else if steps > 0. {
-            Steps::Probability(steps)
+            Sample::Probability(steps)
         } else {
             return Err(PyValueError::new_err("Steps must be between [0, inf)"))
         };
@@ -4500,8 +4506,9 @@ impl RandomPath {
         restarts: f32, 
         weighted: bool,
     ) -> PyResult<Vec<Vec<FQNode>>> {
-        let steps = Steps::from_float(restarts)
-            .ok_or_else(|| PyValueError::new_err("restarts must be between [0, inf)"))?;
+        let steps = Sample::new(restarts)
+            .map_err(|_s| PyValueError::new_err("restarts must be between [0, inf)"))?;
+
         //let sampler: Box<dyn Sampler<_>> = if weighted { Box::new(Weighted) } else { Box::new(Unweighted) };
         let g = graph.graph.as_ref();
 

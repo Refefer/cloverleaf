@@ -5,7 +5,7 @@ use std::collections::BinaryHeap;
 
 use float_ord::FloatOrd;
 use rand::prelude::*;
-use rand_distr::Uniform;
+use rand_distr::{Uniform,Binomial};
 use ahash::AHasher;
 
 use crate::NodeID;
@@ -159,6 +159,63 @@ pub fn weighted_reservoir_sample<A>(
     }
     bh.into_iter().map(|of| of.0.1).collect()
 }
+
+pub struct IllegalSample;
+
+#[derive(Clone,Copy,Debug)]
+pub enum Sample {
+    All,
+    Fixed(usize),
+    Probability(f32)
+}
+
+impl Sample {
+    pub fn new(n: f32) -> Result<Sample,IllegalSample> {
+        if n < 0f32 {
+            Err(IllegalSample)
+        } else {
+            let s = if n > 0f32 && n < 1f32 {
+                Sample::Probability(n)
+            } else { 
+                Sample::Fixed(n as usize)
+            };
+            Ok(s)
+        }
+    }
+
+    pub fn all() -> Sample {
+        Sample::All
+    }
+
+    /// Samples from a Sample, returning both the number of entries
+    /// to sample as well as the scalar for drop out.  Probability is
+    /// interpretted as the expected number of success.
+    pub fn sample(
+        &self,
+        n: usize,
+        at_least_one: bool,
+        rng: &mut impl Rng
+    ) -> (usize, f32) {
+        match self {
+            Sample::Fixed(k) => { 
+                let r = (*k).min(n);
+                (r, n as f32 / r as f32) 
+            },
+            Sample::Probability(p) => { 
+                let dist = Binomial::new(n as u64, *p as f64).unwrap();
+                let k = dist.sample(rng);
+                if k == 0 && at_least_one {
+                    (1, (1f32 - p.powf(n as f32)) / p)
+                } else {
+                    (k as usize, 1f32 / p)
+                }
+            },
+            Sample::All => { (n, 1f32) }
+
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod utils_tests {

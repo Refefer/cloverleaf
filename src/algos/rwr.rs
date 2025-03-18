@@ -8,31 +8,10 @@ use rayon::prelude::*;
 
 use crate::graph::{Graph,NodeID,CDFtoP,CDFGraph};
 use crate::sampler::{Sampler, weighted_sample_cdf};
-
-// Fixed step or random restarts
-#[derive(Clone,Copy,Debug)]
-pub enum Steps {
-    /// Every walk is K steps long
-    Fixed(usize),
-    
-    /// A walk ends random with p probability
-    Probability(f32)
-}
-
-impl Steps {
-    pub fn from_float(f: f32) -> Option<Steps> {
-        if f >= 1. {
-            Some(Steps::Fixed(f as usize))
-        } else if f > 0. {
-            Some(Steps::Probability(f))
-        } else {
-            None
-        }
-    }
-}
+use crate::algos::utils::Sample;
 
 pub struct RWR {
-    pub steps: Steps,
+    pub steps: Sample,
     pub walks: usize,
     pub beta: f32,
     pub single_threaded: bool,
@@ -152,14 +131,14 @@ impl RWR {
             });
 
             match self.steps {
-                Steps::Fixed(max_pass) => {
+                Sample::Fixed(max_pass) => {
                     if max_pass == pass {
                         std::mem::swap(&mut ret, &mut next_counts);
                     } else {
                         std::mem::swap(&mut next_counts, &mut counts);
                     }
                 },
-                Steps::Probability(p) => {
+                Sample::Probability(p) => {
                     next_counts.drain().map(|(node_id, count)| {
                         let discount = (count as f32 * p).ceil() as usize;
                         let rem = count - discount;
@@ -168,7 +147,8 @@ impl RWR {
                     })
                     .filter(|(_, c)| *c > 0)
                     .for_each(|(n, c)| { counts.insert(n, c); });
-                }
+                },
+               Sample::All => { panic!("Sample::All is illegal!") }
             }
             pass += 1;
         }
@@ -191,7 +171,7 @@ impl RWR {
     ) -> NodeID {
        let mut cur_node = start_node;
        match self.steps {
-           Steps::Probability(alpha) => loop {
+           Sample::Probability(alpha) => loop {
 
                // Sample the next edge
                cur_node = sampler.sample(graph, cur_node, rng)
@@ -202,11 +182,12 @@ impl RWR {
                }
 
            },
-           Steps::Fixed(steps) => for _ in 0..steps {
+           Sample::Fixed(steps) => for _ in 0..steps {
                // Sample the next edge
                cur_node = sampler.sample(graph, cur_node, rng)
                    .unwrap_or(start_node);
-           }
+           },
+           Sample::All => { panic!("Sample::All is illegal!") }
        }
        cur_node
     }
@@ -217,7 +198,7 @@ impl RWR {
 /// in the output vector.  We can use this for a variety of other problems, such as SMCI.
 pub fn rollout<G: Graph + Send + Sync>(
     graph: &G, 
-    steps: Steps, 
+    steps: Sample, 
     sampler: &impl Sampler<G>,
     start_node: NodeID,
     rng: &mut impl Rng,
@@ -225,7 +206,7 @@ pub fn rollout<G: Graph + Send + Sync>(
 ) {
     let mut cur_node = start_node;
     match steps {
-       Steps::Probability(alpha) => loop {
+       Sample::Probability(alpha) => loop {
            // Sample the next edge
            cur_node = sampler.sample(graph, cur_node, rng)
                .unwrap_or(start_node);
@@ -235,12 +216,13 @@ pub fn rollout<G: Graph + Send + Sync>(
                break;
            }
        },
-       Steps::Fixed(steps) => for _ in 0..steps {
+       Sample::Fixed(steps) => for _ in 0..steps {
            // Sample the next edge
            cur_node = sampler.sample(graph, cur_node, rng)
                .unwrap_or(start_node);
            output.push(cur_node);
-       }
+       },
+       Sample::All => { panic!("Sample::All is illegal!") }
    };
 }
 
