@@ -1,11 +1,11 @@
 [package]
-name = "cloverleaf"
+name = "graph_library"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-name = "cloverleaf"
+name = "graph_library"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
