@@ -3,7 +3,7 @@ requires = ["maturin>=1.6.0"]
 build-backend = "maturin"
 
 [project]
-name = "cloverleaf"
+name = "graph_library"
 requires-python = ">=3.7"
 version = "1.0.0"
 classifiers = [
