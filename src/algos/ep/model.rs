@@ -8,7 +8,7 @@ use rand::prelude::*;
 use crate::FeatureStore;
 use crate::EmbeddingStore;
 use crate::graph::{Graph as CGraph,NodeID, CDFtoP};
-use crate::algos::utils::{weighted_reservoir_sample,reservoir_sample};
+use crate::algos::utils::{Sample,weighted_reservoir_sample,reservoir_sample};
 use super::attention::{attention_mean,MultiHeadedAttention};
 
 /// Main interface for model.  Needs to be threadsafe
@@ -57,7 +57,7 @@ pub trait Model: Send + Sync {
 /// Creates node embeddings by averaging features together
 pub struct AveragedFeatureModel {
     /// Randomly sample max_features if provided
-    max_features: Option<usize>,
+    max_features: Sample,
 
     /// In the case of the node reconstruction, we use max_neighbor_nodes instead of the entire
     /// neighborhood.  This is critical when we have nodes with large neighbors.
@@ -72,7 +72,7 @@ pub struct AveragedFeatureModel {
 
 impl AveragedFeatureModel {
     pub fn new(
-        max_features: Option<usize>,
+        max_features: Sample,
         max_neighbor_nodes: Option<usize>,
         weighted_neighbor_sampling: bool,
         weighted_neighbor_averaging: bool
@@ -160,7 +160,7 @@ pub struct AttentionFeatureModel {
     mha: MultiHeadedAttention,
 
     /// Max features to consider
-    max_features: Option<usize>,
+    max_features: Sample,
     
     /// Max neighbors to consider for reconstruction
     max_neighbor_nodes: Option<usize>,
@@ -173,7 +173,7 @@ pub struct AttentionFeatureModel {
 impl AttentionFeatureModel {
     pub fn new(
         mha: MultiHeadedAttention,
-        max_features: Option<usize>,
+        max_features: Sample,
         max_neighbor_nodes: Option<usize>,
         weighted_neighbor_sampling: bool
     ) -> Self {
@@ -256,15 +256,16 @@ pub type NodeCounts = HashMap<usize, (ANode, f32)>;
 /// Gets the feature embeddings for a node, adding or updating the counts
 pub fn collect_embeddings_from_node<R: Rng>(
     node: NodeID,
-    weight: f32,
+    mut weight: f32,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     feat_map: &mut NodeCounts,
-    max_features: Option<usize>,
+    max_features: Sample,
     rng: &mut R
 ) {
     let feats = feature_store.get_features(node);
-    let max_features = max_features.unwrap_or(feats.len());
+    let (max_features, scalar) = max_features.sample(feats.len(), true, rng);
+    weight += scalar;
     for feat in feats.choose_multiple(rng, max_features) {
         if let Some((_emb, count)) = feat_map.get_mut(feat) {
             *count += weight;
@@ -284,7 +285,7 @@ pub fn construct_node_embedding<R: Rng>(
     weight: f32,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
-    max_features: Option<usize>,
+    max_features: Sample,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
@@ -306,7 +307,7 @@ pub fn attention_construct_node_embedding<R: Rng>(
     node: NodeID,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
-    max_features: Option<usize>,
+    max_features: Sample,
     mha: MultiHeadedAttention,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
@@ -344,7 +345,7 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     max_nodes: Option<usize>,
-    max_features: Option<usize>,
+    max_features: Sample,
     mha: Option<MultiHeadedAttention>,
     weighted_neighbor_sampling: bool,
     weighted_neighbor_averaging: bool,
@@ -386,7 +387,7 @@ fn construct_from_multiple_nodes<I: Iterator<Item=(NodeID, f32)>, R: Rng>(
     nodes: I,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
-    max_features: Option<usize>,
+    max_features: Sample,
     mha: Option<MultiHeadedAttention>,
     rng: &mut R,
 ) -> (NodeCounts, ANode) {

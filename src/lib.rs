@@ -43,11 +43,12 @@ use std::sync::Arc;
 use std::ops::Deref;
 use std::fs::File;
 use std::io::{Write,BufWriter,BufReader,BufRead};
+use std::collections::HashSet;
 
 use rayon::prelude::*;
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError};
+use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError,PyTypeError};
 use itertools::Itertools;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
@@ -61,24 +62,27 @@ use crate::embeddings::{EmbeddingStore,Entity};
 use crate::feature_store::FeatureStore;
 use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader,open_file_for_reading,open_file_for_writing};
 
-use crate::algos::rwr::{Steps,RWR,ppr_estimate,rollout};
-use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
-use crate::algos::reweighter::{Reweighter};
+use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
+use crate::algos::alignment::{NeighborhoodAligner as NA};
+use crate::algos::ann::Ann;
+use crate::algos::connected::{find_connected_components,prune_graph_components};
+use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
 use crate::algos::ep::{EmbeddingPropagation,LossWeighting as EPLW};
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
-use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
-use crate::algos::graph_ann::NodeDistance;
-use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
 use crate::algos::feat_propagation::propagate_features;
-use crate::algos::alignment::{NeighborhoodAligner as NA};
-use crate::algos::smci::SupervisedMCIteration;
-use crate::algos::pprrank::{PprRank, Loss as PprLoss};
-use crate::algos::ann::Ann;
-use crate::algos::pprembed::PPREmbed;
+use crate::algos::graph_ann::NodeDistance;
+use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
 use crate::algos::lsr::{LSR as ALSR};
-use crate::algos::connected::{find_connected_components,prune_graph_components};
+use crate::algos::pprembed::PPREmbed;
+use crate::algos::pprrank::{PprRank, Loss as PprLoss};
+use crate::algos::reweighter::{Reweighter};
+use crate::algos::rwr::{RWR,ppr_estimate,rollout};
+use crate::algos::smci::SupervisedMCIteration;
+use crate::algos::utils::Sample;
+use crate::algos::vpcg::{VPCG, FeatureWeight as VFeatureWeight};
+
 
 /// Defines a constant seed for use when a seed is not provided.  This is specifically hardcoded to
 /// allow for deterministic performance across all algorithms using any stochasticity.
@@ -93,7 +97,7 @@ fn convert_scores(
     vocab: &Vocab, 
     scores: impl Iterator<Item=(NodeID, f32)>, 
     k: Option<usize>,
-    filtered_node_type: Option<String>
+    filtered_node_type: Option<HashSet<String>>
 ) -> Vec<(FQNode, f32)> {
     let mut scores: Vec<_> = scores.collect();
     scores.sort_by_key(|(_k, v)| FloatOrd(-*v));
@@ -106,7 +110,9 @@ fn convert_scores(
             (((*node_type).clone(), name.to_string()), w)
         })
         .filter(|((node_type, _node_name), _w)| {
-            filtered_node_type.as_ref().map(|nt| nt == node_type).unwrap_or(true)
+            filtered_node_type.as_ref()
+                .map(|nts| nts.contains(node_type))
+                .unwrap_or(true)
         })
         .take(k)
         .collect()
@@ -122,11 +128,15 @@ fn convert_node_id_to_fqn(
 
 
 /// Convenience method for getting an internal node id from pretty name
-fn get_node_id(vocab: &Vocab, node_type: String, node: String) -> PyResult<NodeID> {
-    if let Some(node_id) = vocab.get_node_id(node_type.clone(), node.clone()) {
+fn get_node_id<A: AsRef<str>, B: AsRef<str>>(
+    vocab: &Vocab, 
+    node_type: A,
+    node_name:B 
+) -> PyResult<NodeID> {
+    if let Some(node_id) = vocab.get_node_id(node_type.as_ref(), node_name.as_ref()) {
         Ok(node_id)
     } else {
-        Err(PyKeyError::new_err(format!(" Node '{}:{}' does not exist!", node_type, node)))
+        Err(PyKeyError::new_err(format!(" Node '{}:{}' does not exist!", node_type.as_ref(), node_name.as_ref())))
     }
 }
 
@@ -447,7 +457,7 @@ impl Graph {
 #[pyclass]
 #[derive(Clone)]
 struct RandomWalker {
-    restarts: f32,
+    restarts: Sample,
     walks: usize,
     beta: Option<f32>
 }
@@ -478,13 +488,15 @@ impl RandomWalker {
     ///    Self
     ///        
     #[new]
-    fn new(restarts: f32, walks: usize, beta: Option<f32>) -> Self {
-        RandomWalker { restarts, walks, beta }
+    fn new(restarts: f32, walks: usize, beta: Option<f32>) -> PyResult<Self> {
+        Sample::new(restarts)
+            .map_err(|_err| PyValueError::new_err("restarts must be between (0, 1)"))
+            .map(|restarts| RandomWalker { restarts, walks, beta })
     }
 
     /// Simple representation of the RandomWalker
     pub fn __repr__(&self) -> String {
-        format!("RandomWalker<restarts={}, walks={}, beta={:?}>", self.restarts, self.walks, self.beta)
+        format!("RandomWalker<restarts={:?}, walks={}, beta={:?}>", self.restarts, self.walks, self.beta)
     }
 
     ///    Performs a random walk on a graph, returning a list of nodes and their approxmiate
@@ -504,7 +516,7 @@ impl RandomWalker {
     ///    k : Int - Optional
     ///        If provided, truncates the list to the top K.
     ///    
-    ///    filter_type : String - Optional
+    ///    filter_type : String or List[String] - Optional
     ///        If provided, only returns nodes that match the provided node type.
     ///    
     ///    weighted : Bool - Optional
@@ -521,23 +533,15 @@ impl RandomWalker {
         node: FQNode, 
         seed: Option<u64>, 
         k: Option<usize>, 
-        filter_type: Option<String>,
+        filter_type: Option<&PyAny>,
         single_threaded: Option<bool>,
         weighted: Option<bool>
     ) -> PyResult<Vec<(FQNode, f32)>> {
 
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
         
-        let steps = if self.restarts >= 1. {
-            Steps::Fixed(self.restarts as usize)
-        } else if self.restarts > 0. {
-            Steps::Probability(self.restarts)
-        } else {
-            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
-        };
-
         let rwr = RWR {
-            steps: steps,
+            steps: self.restarts,
             walks: self.walks,
             beta: self.beta.unwrap_or(0.5),
             single_threaded: single_threaded.unwrap_or(false),
@@ -550,7 +554,9 @@ impl RandomWalker {
             rwr.sample(graph.graph.as_ref(), &Unweighted, node_id)
         };
 
-        Ok(convert_scores(&graph.vocab, results.into_iter(), k, filter_type))
+        let fts = convert_filter_type(filter_type)?;
+
+        Ok(convert_scores(&graph.vocab, results.into_iter(), k, fts))
     }
 
 }
@@ -638,7 +644,7 @@ impl BiasedRandomWalker {
     ///    rerank_context : Query - Optional
     ///        If provided, reranks the final result set by the rerank context.
     ///    
-    ///    filter_type : String - Optional
+    ///    filter_type : String or List[String] - Optional
     ///        If provided, only returns nodes that match the provided node type.
     ///    
     ///    
@@ -656,7 +662,7 @@ impl BiasedRandomWalker {
         k: Option<usize>, 
         seed: Option<u64>, 
         rerank_context: Option<&Query>,
-        filter_type: Option<String>
+        filter_type: Option<&PyAny>
     ) -> PyResult<Vec<(FQNode, f32)>> {
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
         let g_emb = lookup_embedding(context, embeddings)?;
@@ -690,7 +696,8 @@ impl BiasedRandomWalker {
                 .reweight(&mut results, node_embeddings, c_emb);
         }
 
-        Ok(convert_scores(&graph.vocab, results.into_iter(), k, filter_type))
+        let fts = convert_filter_type(filter_type)?;
+        Ok(convert_scores(&graph.vocab, results.into_iter(), k, fts))
     }
 
 
@@ -756,7 +763,7 @@ impl SparsePPR {
     ///    k : Int - Optional
     ///        If provided, returns only the top K nodes and scores; otherwise provides all.
     ///    
-    ///    filter_type : String - Optional
+    ///    filter_type : String or List[String] - Optional
     ///        If provided, filters out nodes that do not match the provided filter_type.
     ///    
     ///    Returns
@@ -769,13 +776,15 @@ impl SparsePPR {
         graph: &Graph,
         node: FQNode, 
         k: Option<usize>, 
-        filter_type: Option<String>
+        filter_type: Option<&PyAny>
     ) -> PyResult<Vec<(FQNode, f32)>> {
 
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
         let results = ppr_estimate(graph.graph.as_ref(), node_id, self.restarts, self.eps);
 
-        Ok(convert_scores(&graph.vocab, results.into_iter(), k, filter_type))
+        let fts = convert_filter_type(filter_type)?;
+
+        Ok(convert_scores(&graph.vocab, results.into_iter(), k, fts))
     }
 
 }
@@ -1097,9 +1106,10 @@ impl EmbeddingPropagator {
     ///        The larger the number, the better the estimate, but is more computationally
     ///        expensive.  These nodes are randomly selected each pass. Default is all.
     ///    
-    ///    max_features : Int - Optional
+    ///    max_features : Int/Float - Optional
     ///        Maximum number of features to use to construct a node embedding.  These features
-    ///        will be randomly selected every node construction.  Default is all.
+    ///        will be randomly selected every node construction.  If given a float between (0,1),
+    ///        will probabalistically drop out features.  Default is all.
     ///    
     ///    valid_pct : Float - Optional
     ///        Takes a percentage of the nodes in the graph and uses them to measure validation.
@@ -1137,7 +1147,7 @@ impl EmbeddingPropagator {
     ///        If added, injects gaussian noise into the gradients to help with generalization.  
     ///
     ///        Default is None.
-    ///    
+    ///
     ///    Returns
     ///    -------
     ///    Self
@@ -1173,7 +1183,7 @@ impl EmbeddingPropagator {
         weighted_neighbor_averaging: Option<bool>,
 
         // Max features to use for optimization
-        max_features: Option<usize>,
+        max_features: Option<f32>,
 
         // How to weight the loss in the graph
         loss_weighting: Option<LossWeighting>,
@@ -1199,7 +1209,7 @@ impl EmbeddingPropagator {
 
         // Use gradient noise where we sample from the normal distribution and blend with `noise`
         noise: Option<f32>
-    ) -> Self {
+    ) -> PyResult<Self> {
         let loss_weighting = loss_weighting.map(|lw| lw.loss).unwrap_or(EPLW::None);
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(0.9),
@@ -1217,25 +1227,30 @@ impl EmbeddingPropagator {
 
         let wns = weighted_neighbor_sampling.unwrap_or(false);
         let wna = weighted_neighbor_averaging.unwrap_or(false);
+        let max_features = max_features
+            .map(|mf| Sample::new(mf))
+            .unwrap_or(Ok(Sample::All))
+            .map_err(|_err| PyValueError::new_err("max_features must be either None, or (0, N)"))?;
 
         let model = if let Some(d_k) = attention {
             let num_heads = attention_heads.unwrap_or(1);
             let at = if let Some(size) = context_window {
                 AttentionType::Sliding{window_size: size}
-            } else if let Some(k) = max_features {
-                AttentionType::Random { num_features: k }
             } else {
-                AttentionType::Full
+                match max_features {
+                    Sample::All => AttentionType::Full,
+                    _ => AttentionType::Random { num_features: max_features }
+                }
             };
             let mha = MultiHeadedAttention::new(num_heads, d_k, at);
-            ModelType::Attention(AttentionFeatureModel::new(mha, None, max_nodes, wns))
+            ModelType::Attention(AttentionFeatureModel::new(mha, Sample::All, max_nodes, wns))
         } else {
             ModelType::Averaged(AveragedFeatureModel::new(
-                    max_features, max_nodes, wns, wna
+                max_features, max_nodes, wns, wna
             ))
         };
 
-        EmbeddingPropagator{ ep, model }
+        Ok(EmbeddingPropagator{ ep, model })
     }
 
     ///    Learns the features from a given graph
@@ -1308,6 +1323,58 @@ impl EmbeddingPropagator {
 
 }
 
+/// Different ways of namespacing features.  
+#[derive(Clone)]
+pub enum FeatureNs {
+    Static(String),
+    NodeType,
+    Prefix(String)
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct FeatureNamespace(FeatureNs);
+
+impl FeatureNamespace {
+    fn parse<'a>(&'a self, node_type: &'a str, token: &'a str) -> Option<(&'a str, &'a str)> {
+        match self.0 {
+            FeatureNs::Static(ref s) => Some((s, token)),
+            FeatureNs::NodeType => Some((node_type, token)),
+            FeatureNs::Prefix(ref delim) => {
+                token.find(delim).map(|idx| {
+                    (&token[..idx], &token[(idx+1)..])
+                })
+            }
+        }
+    }
+}
+
+#[pymethods]
+impl FeatureNamespace {
+    #[staticmethod]
+    pub fn single(ns: String) -> Self {
+        FeatureNamespace(FeatureNs::Static(ns))
+    }
+
+    #[staticmethod]
+    pub fn node_type() -> Self {
+        FeatureNamespace(FeatureNs::NodeType)
+    }
+
+    #[staticmethod]
+    pub fn prefix(delim: String) -> Self {
+        FeatureNamespace(FeatureNs::Prefix(delim))
+    }
+
+}
+
+impl Default for FeatureNamespace {
+    fn default() -> FeatureNamespace {
+        FeatureNamespace::single("feat".into())
+    }
+}
+
+
 /// Defines the FeatureSet class, which allows setting discrete features for a node
 #[pyclass]
 pub struct FeatureSet {
@@ -1329,7 +1396,7 @@ impl FeatureSet {
             if pieces.len() != 3 {
                 return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ..."))
             }
-            vocab.get_or_insert(pieces[0].into(), pieces[1].into());
+            vocab.get_or_insert(pieces[0], pieces[1]);
         }
         Ok(vocab)
     }
@@ -1346,34 +1413,22 @@ impl FeatureSet {
     ///    graph : Graph
     ///        Graph to construct FeatureSet for
     ///    
-    ///    path : String - Optional
-    ///        If provided, reads features from a file.  If not, creates a FeatureSet which is
-    ///        empty.
-    ///    
-    ///    namespace : String - Optional
-    ///        If provided, overrides the default 'node type' for a feature.  Default is 'feat'.
-    ///    
     ///    Returns
     ///    -------
     ///    Self - Can throw exception
     ///        
     ///    
     #[staticmethod]
-    pub fn new_from_graph(graph: &Graph, path: Option<String>, namespace: Option<String>) -> PyResult<Self> {
+    pub fn new_from_graph(graph: &Graph) -> PyResult<Self> {
 
-        let ns = namespace.unwrap_or_else(|| "feat".to_string());
-        let mut fs = FeatureSet {
+        let fs = FeatureSet {
             vocab: graph.vocab.clone(),
-            features: FeatureStore::new(graph.graph.len(), ns)
+            features: FeatureStore::new(graph.graph.len())
         };
 
-        if let Some(path) = path {
-            fs.load_into(path)?;
-        }
         Ok(fs)
     }
 
-    // Loads features tied to a graph
     ///    Loads a feature set from file.  This is less memory efficient than using
     ///    `new_from_graph`.
     ///    
@@ -1391,18 +1446,20 @@ impl FeatureSet {
     ///        
     ///    
     #[staticmethod]
-    pub fn new_from_file(path: String, namespace: Option<String>) -> PyResult<Self> {
+    pub fn new_from_file(
+        path: String, 
+        namespace: Option<FeatureNamespace>
+    ) -> PyResult<Self> {
 
         // Build the vocab from the file first, get the length of the feature set
         let vocab = Arc::new(FeatureSet::read_vocab_from_file(&path)?);
-        let ns = namespace.unwrap_or_else(|| "feat".to_string());
-        let feats = FeatureStore::new(vocab.len(), ns);
+        let feats = FeatureStore::new(vocab.len());
         let mut fs = FeatureSet {
             vocab: vocab,
             features: feats
         };
 
-        fs.load_into(path)?;
+        fs.load_into(path, namespace)?;
         Ok(fs)
     }
 
@@ -1413,7 +1470,7 @@ impl FeatureSet {
     ///    node : FQNode
     ///        Fully qualified Node.
     ///    
-    ///    features : List[String]
+    ///    features : List[(String, String)]
     ///        Features to set for this node.
     ///    
     ///    Returns
@@ -1421,9 +1478,13 @@ impl FeatureSet {
     ///    () - Can throw exception
     ///        
     ///    
-    pub fn set_features(&mut self, node: FQNode, features: Vec<String>) -> PyResult<()> {
+    pub fn set_features(
+        &mut self, 
+        node: FQNode, 
+        features: Vec<(String, String)>
+    ) -> PyResult<()> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
-        self.features.set_features(node_id, features);
+        self.features.set_features(node_id, features.into_iter());
         Ok(())
     }
 
@@ -1436,10 +1497,13 @@ impl FeatureSet {
     ///    
     ///    Returns
     ///    -------
-    ///    List[String] - Can throw exception
+    ///    List[(String, String)] - Can throw exception
     ///        Set of features specified for node
     ///    
-    pub fn get_features(&self, node: FQNode) -> PyResult<Vec<String>> {
+    pub fn get_features(
+        &self, 
+        node: FQNode
+    ) -> PyResult<Vec<(String,String)>> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         Ok(self.features.get_pretty_features(node_id))
     }
@@ -1450,6 +1514,9 @@ impl FeatureSet {
     ///    ----------
     ///    path : String
     ///        Path point to features definitions.
+    ///
+    ///    f_ns : FeatureNamespace - optional
+    ///        How to construct a feature namespace from a given token.  Default is Static("feat")
     ///    
     ///    Returns
     ///    -------
@@ -1457,22 +1524,30 @@ impl FeatureSet {
     ///        
     ///    
     pub fn load_into(
-        &mut self, 
-        path: String
+        &mut self,
+        path: String,
+        f_ns: Option<FeatureNamespace>
     ) -> PyResult<()> {
         let reader = open_file_for_reading(&path)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
-        for line in reader.lines() {
+        let f_ns = f_ns.unwrap_or_default();
+        for (i, line) in reader.lines().enumerate() {
             let line = line.unwrap();
             let pieces: Vec<_> = line.split('\t').collect();
             if pieces.len() != 3 {
-                return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ..."))
+                let line_id = i + 1;
+                let err = format!("Line {line_id}:Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ...");
+                return Err(PyValueError::new_err(err))
             }
             let bow = pieces[2].split_whitespace()
-                .map(|s| s.to_string()).collect();
-            let _ = self.set_features((pieces[0].to_string(), pieces[1].to_string()), bow);
-                
+                .map(|s| {
+                    f_ns.parse(&pieces[0], s).unwrap_or_else(|| ("feat", s))
+                });
+
+            let _ = get_node_id(self.vocab.deref(), pieces[0], pieces[1]).map(|node_id| {
+                self.features.set_features(node_id, bow);
+            });
         }
         Ok(())
     }
@@ -1829,7 +1904,8 @@ impl FeatureAggregator {
                     }
                     let p_wi = pieces[2].parse::<f64>()
                         .map_err(|_e| PyValueError::new_err(format!("Tried to parse weight and failed:{:?}", line)))?;
-                    let node_id = vocab.get_or_insert(pieces[0].into(), pieces[1].into());
+
+                    let node_id = vocab.get_or_insert(pieces[0], pieces[1]);
                     if node_id < p_w.len() {
                         return Err(PyValueError::new_err(format!("Duplicate feature found:{} {}", pieces[0], pieces[1])))
                     }
@@ -2526,7 +2602,7 @@ impl NodeEmbeddings {
     ///    k : Int
     ///        Top K items to return
     ///    
-    ///    filter_type : String - Optional
+    ///    filter_type : String or List[String] - Optional
     ///        If provided, filters out nodes that don't match the filter_type
     ///    
     ///    Returns
@@ -2538,20 +2614,20 @@ impl NodeEmbeddings {
         &self, 
         emb: Vec<f32>, 
         k: usize,
-        filter_type: Option<String>
-    ) -> Vec<(FQNode, f32)> {
+        filter_type: Option<&PyAny>
+    ) -> PyResult<Vec<(FQNode, f32)>> {
         let emb = Entity::Embedding(&emb);
-        let dists = if let Some(node_type) = filter_type {
-            let ant = Arc::new(node_type);
-            let filter_type = Some(&ant);
+        let fts = convert_filter_type(filter_type)?;
+        let dists = if let Some(fts) = fts {
             self.embeddings.nearest_neighbor(&emb, k, |node_id| {
-                let nt = self.vocab.get_node_type(node_id);
-                nt == filter_type
+                let nt = self.vocab.get_node_type(node_id)
+                    .expect("vocab and embeddings mismatch - this should never happen!");
+                fts.contains(nt.as_str())
             })
         } else {
             self.embeddings.nearest_neighbor(&emb, k, |_node_id| true)
         };
-        convert_node_distance(&self.vocab, dists)
+        Ok(convert_node_distance(&self.vocab, dists))
     }
 
     ///    Returns the number of dimensions for an embedding.
@@ -2691,7 +2767,7 @@ impl NodeEmbeddings {
     ///    distance : Distance
     ///        Distance method to use for computing embedding similarity.
     ///    
-    ///    filter_type : String - Optional
+    ///    filter_type : String or List[String] - Optional
     ///        If provided, only loads embeddings which match the provided node type.
     ///    
     ///        Default is None.
@@ -2712,15 +2788,17 @@ impl NodeEmbeddings {
         py: Python<'_>,
         path: &str, 
         distance: Option<Distance>, 
-        filter_type: Option<String>, 
+        filter_type: Option<&PyAny>, 
         chunk_size: Option<usize>,
         skip_rows: Option<usize>
     ) -> PyResult<Self> {
+        let fts = convert_filter_type(filter_type)?;
+        let fts_ref = fts.as_ref();
         py.allow_threads(move || {
             let (vocab, es) = EmbeddingReader::load(
                 path, 
                 distance.unwrap_or(Distance::Cosine).to_edist(), 
-                filter_type, 
+                &fts_ref, 
                 chunk_size, 
                 skip_rows
             )?;
@@ -3287,7 +3365,16 @@ impl EmbAnn {
     ///    max_nodes_per_leaf : Int
     ///        Determines whether a node should split.  Lower max nodes per leaf creates deeper,
     ///        more accurate trees, at the expense of more memory.
+    ///
+    ///    test_hp_per_split : Int - Optional
+    ///        Number of candidate hyperplanes to pick before selecting a splitting hyperplane.
+    ///        More usually results in cleaner splits at the expense of compute.
     ///    
+    ///    num_sampled_nodes_split_test : Int - Optional
+    ///        When determining the pseudo clusters for splitting during random projections, the
+    ///        number of nodes to use to "estimate" each cluster.  More means more accurate pseudo
+    ///        clusters at the cost of more compute.
+    ///
     ///    seed : Int - Optional
     ///        If provided, uses this seed for randomization.  Otherwise uses the global seed.
     ///    
@@ -3303,19 +3390,34 @@ impl EmbAnn {
         max_nodes_per_leaf: usize,
         test_hp_per_split: Option<usize>,
         num_sampled_nodes_split_test: Option<usize>,
+        filter_type: Option<&PyAny>,
         seed: Option<u64>
-    ) -> Self {
+    ) -> PyResult<Self> {
         let mut ann = Ann::new();
         let seed = seed.unwrap_or(SEED + 10);
+
+        // If filter_type is provided, only build an index to reference those nodes.
+        let node_ids = filter_type
+            .map(|pa| single_or_multistring(pa))
+            .transpose()?
+            .map(|hs| {
+                (0..embs.embeddings.len()).filter(|idx| {
+                    let nt = embs.vocab.get_node_type(*idx)
+                        .expect("Vocab doesn't match embeddings!  Should never happen");
+                    hs.contains(nt.as_ref())
+                }).collect()
+            });
+
         ann.fit(
             &embs.embeddings, 
             n_trees, 
             max_nodes_per_leaf, 
             test_hp_per_split,
             num_sampled_nodes_split_test,
+            node_ids,
             seed);
 
-        EmbAnn { ann: ann }
+        Ok(EmbAnn { ann: ann })
 
     }
 
@@ -3459,10 +3561,10 @@ struct PprRankLearner {
     negatives: usize,
     loss: String,
     weight_decay: f32,
-    steps: Steps,
+    steps: Sample,
     walks: usize,
     k: usize,
-    num_features: Option<usize>,
+    num_features: Option<f32>,
     compression: f32,
     valid_pct: f32,
     beta: f32
@@ -3525,7 +3627,7 @@ impl PprRankLearner {
     ///
     ///        Default is 0.8
     ///    
-    ///    num_features : Int - Optional
+    ///    num_features : f32- Optional
     ///        How many features to use to construct nodes.  If provided, will randomly sample
     ///        features each construction.
     ///
@@ -3580,7 +3682,7 @@ impl PprRankLearner {
         // How much to benefit rarer/popular items
         beta: Option<f32>,
 
-        num_features: Option<usize>,
+        num_features: Option<f32>,
 
         weight_decay: Option<f32>, 
 
@@ -3590,11 +3692,11 @@ impl PprRankLearner {
     ) -> PyResult<Self> {
 
         let steps = if steps >= 1. {
-            Steps::Fixed(steps as usize)
+            Sample::Fixed(steps as usize)
         } else if steps > 0. {
-            Steps::Probability(steps)
+            Sample::Probability(steps)
         } else {
-            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
+            return Err(PyValueError::new_err("Steps must be between [0, inf)"))
         };
 
         Ok(PprRankLearner {
@@ -3658,13 +3760,18 @@ impl PprRankLearner {
         feature_embeddings: Option<&mut NodeEmbeddings>,
         indicator: Option<bool>,
         seed: Option<u64>
-    ) -> NodeEmbeddings {
+    ) -> PyResult<NodeEmbeddings> {
 
         let loss = if self.loss == "listnet" {
             PprLoss::ListNet { passive: true, weight_decay: self.weight_decay }
         } else {
             PprLoss::ListMLE { weight_decay: self.weight_decay }
         };
+
+        let num_features = self.num_features 
+            .map(|mf| Sample::new(mf))
+            .unwrap_or(Ok(Sample::All))
+            .map_err(|_err| PyValueError::new_err("num features must be either None, or (0, N)"))?;
 
         let ppr_rank = PprRank {
             alpha: self.alpha,
@@ -3677,7 +3784,7 @@ impl PprRankLearner {
             num_walks: self.walks,
             beta: self.beta,
             k: self.k,
-            num_features: self.num_features,
+            num_features: num_features,
             compression: self.compression,
             valid_pct: self.valid_pct,
             indicator: indicator.unwrap_or(true),
@@ -3700,9 +3807,20 @@ impl PprRankLearner {
             vocab: Arc::new(vocab),
             embeddings: feat_embeds};
 
-        feature_embeddings
+        Ok(feature_embeddings)
     }
 
+}
+
+/// Tells the VPCG algorithm how to weight the initial features
+#[pyclass]
+#[derive(Clone)]
+pub enum FeatureWeight {
+    /// All features are initialized uniformly: 1 / feat
+    Uniform,
+
+    /// All features are initialized as 1 / feat_count.ln()
+    IDF
 }
 
 /// Learns VPCG vectors on a graph.
@@ -3712,7 +3830,8 @@ struct VpcgEmbedder {
     passes: usize,
     dims: usize,
     alpha: f32,
-    err: f32
+    err: f32,
+    feature_weight: FeatureWeight
 }
 
 #[pymethods]
@@ -3744,6 +3863,9 @@ impl VpcgEmbedder {
     ///    
     ///    err : Float - Optional
     ///        Suppresses terms with a weight of less than err.  Default is 1e-5
+    ///
+    ///    feature_weight : FeatureWeight - Optional
+    ///        Whether to weight each feature uniformly or based on the IDF
     ///    
     ///    Returns
     ///    -------
@@ -3756,14 +3878,16 @@ impl VpcgEmbedder {
         passes: usize, 
         dims: usize, 
         alpha: Option<f32>, 
-        err: Option<f32>
+        err: Option<f32>,
+        feature_weight: Option<FeatureWeight>
     ) -> Self {
         VpcgEmbedder { 
             max_terms, 
             passes, 
             dims,
             alpha: alpha.unwrap_or(1f32),
-            err: err.unwrap_or(1e-5f32)
+            err: err.unwrap_or(1e-5),
+            feature_weight: feature_weight.unwrap_or(FeatureWeight::Uniform) 
         }
     }
 
@@ -3783,8 +3907,8 @@ impl VpcgEmbedder {
     ///    features : FeatureSet
     ///        Features to propagate between nodes
     ///    
-    ///    start_node_type : String
-    ///        Starting node type for propagation.
+    ///    start_node_type : String or List[String]
+    ///        Starting node type(s) for propagation.
     ///    
     ///    Returns
     ///    -------
@@ -3794,33 +3918,44 @@ impl VpcgEmbedder {
     pub fn learn(&self, 
         graph: &Graph, 
         features: &mut FeatureSet,
-        start_node_type: String
-    ) -> NodeEmbeddings  {
+        start_node_type: &PyAny
+    ) -> PyResult<NodeEmbeddings> {
+        let start_node_types = single_or_multistring(start_node_type)?;
+
+        // Split the graph into left and right based on the start node type
         let (mut left, mut right) = (Vec::new(), Vec::new());
         for node_id in 0..graph.graph.len() {
             let nt = graph.vocab.get_node_type(node_id).unwrap();
-            if nt.as_ref() == &start_node_type {
+            if start_node_types.contains(nt.as_ref()) {
                 left.push(node_id);
             } else {
                 right.push(node_id)
             }
         }
 
+        let feature_weight = match self.feature_weight{
+            FeatureWeight::Uniform => VFeatureWeight::Uniform,
+            FeatureWeight::IDF => VFeatureWeight::IDF,
+        };
+
+        // Every node must have at least one feature
         features.features.fill_missing_nodes();
-        let vpcg = crate::algos::vpcg::VPCG {
+        let vpcg = VPCG {
             max_terms: self.max_terms, 
             iterations: self.passes,
             dims: self.dims,
             alpha: self.alpha,
-            err: self.err
+            err: self.err,
+            feature_weight: feature_weight 
         };
+
         let embs = vpcg.learn(graph.graph.as_ref(), &features.features, (&left, &right));
         let node_embeddings = NodeEmbeddings {
             vocab: graph.vocab.clone(),
             embeddings:embs 
         };
 
-        node_embeddings 
+        Ok(node_embeddings)
     }
 
 }
@@ -3886,7 +4021,7 @@ impl PPREmbedder {
 
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
-        format!("PPREmbedder<Dims={}, NumWalks={}, Steps={}, Beta={}, EPS={}>",
+        format!("PPREmbedder<Dims={}, NumWalks={}, Steps={:?}, Beta={}, EPS={}>",
                 self.dims, self.num_walks, self.steps, self.beta, self.eps)
     }
 
@@ -3915,11 +4050,11 @@ impl PPREmbedder {
         features.features.fill_missing_nodes();
 
         let steps = if self.steps >= 1. {
-            Steps::Fixed(self.steps as usize)
+            Sample::Fixed(self.steps as usize)
         } else if self.steps > 0. {
-            Steps::Probability(self.steps)
+            Sample::Probability(self.steps)
         } else {
-            return Err(PyValueError::new_err("Alpha must be between [0, inf)"))
+            return Err(PyValueError::new_err("Steps must be between [0, inf)"))
         };
 
         let embedder = PPREmbed {
@@ -3999,9 +4134,9 @@ impl InstantEmbeddings {
         seed: Option<u64>
     ) -> PyResult<Self> {
         let steps = if steps >= 1. {
-            Steps::Fixed(steps as usize)
+            Sample::Fixed(steps as usize)
         } else if steps > 0. {
-            Steps::Probability(steps)
+            Sample::Probability(steps)
         } else {
             return Err(PyValueError::new_err("Steps must be between [0, inf)"))
         };
@@ -4434,8 +4569,9 @@ impl RandomPath {
         restarts: f32, 
         weighted: bool,
     ) -> PyResult<Vec<Vec<FQNode>>> {
-        let steps = Steps::from_float(restarts)
-            .ok_or_else(|| PyValueError::new_err("restarts must be between [0, inf)"))?;
+        let steps = Sample::new(restarts)
+            .map_err(|_s| PyValueError::new_err("restarts must be between [0, inf)"))?;
+
         //let sampler: Box<dyn Sampler<_>> = if weighted { Box::new(Weighted) } else { Box::new(Unweighted) };
         let g = graph.graph.as_ref();
 
@@ -4492,6 +4628,28 @@ fn convert_node_distance(
         }).collect()
 }
 
+fn single_or_multistring(xs: &PyAny) -> PyResult<HashSet<String>> {
+    // Try to extract a single string first.
+    let mut hs = HashSet::new();
+    if let Ok(s) = xs.extract::<String>() {
+        hs.insert(s);
+        Ok(hs)
+    } else if let Ok(v) = xs.extract::<Vec<String>>() {
+        v.into_iter().for_each(|s| { hs.insert(s); });
+        Ok(hs)
+    } else if let Ok(v) = xs.extract::<HashSet<String>>() {
+        Ok(v)
+    } else {
+        Err(PyTypeError::new_err("Expected a string or a list of strings"))
+    }
+}
+
+fn convert_filter_type(
+    filter_type: Option<&PyAny>
+) -> PyResult<Option<HashSet<String>>> {
+    filter_type.map(|pa| single_or_multistring(pa)).transpose()
+}
+
 #[pymodule]
 fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Graph>()?;
@@ -4507,6 +4665,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<EPLoss>()?;
     m.add_class::<GraphAnn>()?;
     m.add_class::<EmbAnn>()?;
+    m.add_class::<FeatureNamespace>()?;
     m.add_class::<FeatureSet>()?;
     m.add_class::<FeaturePropagator>()?;
     m.add_class::<NodeEmbedder>()?;
@@ -4521,6 +4680,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PageRank>()?;
     m.add_class::<Smci>()?;
     m.add_class::<VpcgEmbedder>()?;
+    m.add_class::<FeatureWeight>()?;
     m.add_class::<PPREmbedder>()?;
     m.add_class::<InstantEmbeddings>()?;
     m.add_class::<LSR>()?;

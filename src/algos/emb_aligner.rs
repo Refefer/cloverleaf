@@ -23,8 +23,8 @@ pub fn align_embedding(
         // Compute the distances between the current embedding and the neighbor embeddings
         // we weight it based on position of the anchors
         let buff: Vec<_> = embs.iter().zip(t_embeddings.iter()).enumerate().map(|(pos, (e, (_, d)))| {
-            let euc_dist = (e.clone() - &ne).pow(2.).sum().sqrt();
-            (&euc_dist - *d).pow(2.) / ((pos + 1) as f32).sqrt()
+            let euc_dist = (e.clone() - &ne).pow(2f32).sum().sqrt();
+            (euc_dist - *d).pow(2.) / ((pos + 1) as f32).sqrt()
         }).collect();
 
         let loss = buff.sum_all();

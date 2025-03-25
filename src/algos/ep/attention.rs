@@ -6,6 +6,8 @@ use simple_grad::*;
 use float_ord::FloatOrd;
 use rand::prelude::*;
 
+use crate::algos::utils::Sample;
+
 /// The number of heads to use, and parmeters, for attention.
 #[derive(Copy,Clone)]
 pub struct MultiHeadedAttention {
@@ -30,7 +32,7 @@ pub enum AttentionType {
 
     /// Randomly selects num_features and computes full attention on it.  Can learn longer distance
     /// relationships due to random selection at the expense of longer train times.
-    Random { num_features: usize }
+    Random { num_features: Sample }
 }
 
 // Multi-headed attention is encoded as
@@ -78,6 +80,18 @@ impl Attention {
         let key = mha.get_key_vec(&node, head);
         let value = mha.get_value_vec(&node, head);
         Attention {query, key, value}
+    }
+
+    fn scale(&self, scalar: f32) -> Attention {
+        if scalar != 1f32 {
+            Attention {
+                query: scalar * &self.query,
+                key: scalar * &self.key,
+                value: scalar * &self.value
+            }
+        } else {
+            self.clone()
+        }
     }
 }
 
@@ -206,13 +220,19 @@ fn compute_sliding_attention_matrix(
 // toward.
 fn compute_random_attention_matrix(
     items: &[(Attention, f32)],
-    k: usize,
+    sample: Sample,
     rng: &mut impl Rng
 ) -> AttentionMatrix {
     
-     // Get the attention for each feature
+    // Sample K features and scale
+    let (k, scale) = sample.sample(items.len(), true, rng);
+    let items = items.iter()
+        .map(|(at, w)| (at.scale(scale), w))
+        .collect::<Vec<_>>();
+
+    // Get the attention for each feature
     let mut scaled = vec![vec![None; items.len()]; items.len()];
-    let mut buff = vec![0; k.min(items.len())];
+    let mut buff = vec![0; k];
     for i in 0..items.len() {
         let at_i = &items[i].0;
         let row = &mut scaled[i];

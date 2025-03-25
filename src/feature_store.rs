@@ -3,6 +3,15 @@ use std::sync::Arc;
 use crate::NodeID;
 use crate::vocab::Vocab;
 
+/// Makes it compatible for with feature setting
+struct ArcWrap(Arc<String>);
+
+impl AsRef<str> for ArcWrap {
+    fn as_ref(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
 /// Main FeatureStore struct.  We use a vector of vectors to allow for dynamic numbers of features.
 /// This can and should be updated to a more memory friendly approach since vectors have surprising
 /// overhead and the number of discrete features tends to be relatively small.
@@ -11,49 +20,38 @@ pub struct FeatureStore {
     /// Raw storage for features, indexed by node id
     features: Vec<Vec<usize>>,
 
-    /// Since we often convert features to embeddings, which need namespaces, we have a feature
-    /// namespace.
-    namespace: String,
-
     /// Maps a raw feature to a feature_id
     feature_vocab: Vocab,
 }
 
 impl FeatureStore {
 
-    pub fn new(size: usize, namespace: String) -> Self {
+    pub fn new(size: usize) -> Self {
         FeatureStore {
             features: vec![Vec::with_capacity(0); size],
-            namespace: namespace,
             feature_vocab: Vocab::new(),
         }
     }
 
-    pub fn get_ns(&self) -> &String {
-        &self.namespace
-    }
-
-    fn set_nt_features(&mut self, node: NodeID, namespace: String, node_features: Vec<String>) {
-        let ns = Arc::new(namespace);
-        let fs = node_features.iter().map(|f| f.as_str());
-        self.set_nt_features_shared(node, ns, fs);
-    }
-
-    fn set_nt_features_shared<'a>(&mut self, 
+    pub fn set_features<A,B>(
+        &mut self, 
         node: NodeID, 
-        namespace: Arc<String>, 
-        node_features: impl Iterator<Item=&'a str>
-    ) {
+        node_features: impl Iterator<Item=(A, B)>
+    )
+        where
+            A: AsRef<str>,
+            B: AsRef<str>
+    {
         self.features[node] = node_features
-            .map(|f| self.feature_vocab.get_or_insert_shared(namespace.clone(), f))
+            .map(|(ft, fname)| self.feature_vocab.get_or_insert(ft.as_ref(), fname.as_ref()))
             .collect()
     }
 
-    pub fn set_features(&mut self, node: NodeID, node_features: Vec<String>) {
-        self.set_nt_features(node, self.namespace.clone(), node_features);
-    }
-
-    pub fn set_features_raw(&mut self, node: NodeID, node_features: impl Iterator<Item=usize>) {
+    pub fn set_features_raw(
+        &mut self, 
+        node: NodeID, 
+        node_features: impl Iterator<Item=usize>
+    ) {
         self.features[node].extend(node_features);
     }
 
@@ -61,12 +59,12 @@ impl FeatureStore {
         &self.features[node]
     }
 
-    fn get_pretty_feature(&self, feat_id: usize) -> String {
-        let (_nt, name) = self.feature_vocab.get_name(feat_id).unwrap();
-        name.to_string()
+    fn get_pretty_feature(&self, feat_id: usize) -> (String, String) {
+        let (nt, name) = self.feature_vocab.get_name(feat_id).unwrap();
+        (nt.to_string(), name.to_string())
     }
 
-    pub fn get_pretty_features(&self, node: NodeID) -> Vec<String> {
+    pub fn get_pretty_features(&self, node: NodeID) -> Vec<(String, String)> {
         self.features[node].iter().map(|v_id| {
             self.get_pretty_feature(*v_id)
         }).collect()
@@ -85,7 +83,7 @@ impl FeatureStore {
     pub fn fill_missing_nodes(&mut self) {
         for i in 0..self.features.len() {
             if self.features[i].len() == 0 {
-                self.set_nt_features(i, "node".into(), vec![format!("{}", i)]);
+                self.set_features(i, [("node", i.to_string())].into_iter());
             }
         }
     }
@@ -120,20 +118,19 @@ impl FeatureStore {
     pub fn prune_min_count(&self, count: usize) -> FeatureStore {
         let counts = self.count_features();
 
-        let mut new_fs = FeatureStore::new(self.features.len(), self.namespace.clone());
+        let mut new_fs = FeatureStore::new(self.features.len());
         
         // Filter out features that don't meet the min_count
-        let ns = Arc::new(self.namespace.clone());
         self.features.iter().enumerate().for_each(|(node_id, feats)| {
             let new_feats = feats.iter()
                 .filter(|f_i| counts[**f_i] >= count)
                 .map(|f_i| {
-                    let (_nt, nn) = self.feature_vocab.get_name(*f_i)
+                    let (nt, nn) = self.feature_vocab.get_name(*f_i)
                         .expect("Should never be unavailable!");
-                    nn
+                    (ArcWrap(nt), nn)
                 });
 
-            new_fs.set_nt_features_shared(node_id, ns.clone(), new_feats);
+            new_fs.set_features(node_id, new_feats);
         });
         new_fs
     }

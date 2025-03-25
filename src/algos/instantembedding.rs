@@ -1,8 +1,8 @@
 //! 
 use rayon::prelude::*;
 
-use crate::algos::utils::FeatureHasher;
-use crate::algos::rwr::{Steps,RWR,ppr_estimate};
+use crate::algos::rwr::{RWR,ppr_estimate};
+use crate::algos::utils::{Sample,FeatureHasher};
 use crate::graph::{Graph as CGraph, CDFGraph};
 use crate::embeddings::EmbeddingStore;
 use crate::distance::Distance;
@@ -11,7 +11,7 @@ use crate::progress::CLProgressBar;
 #[derive(Clone,Copy, Debug)]
 pub enum Estimator {
     RandomWalk {
-        steps: Steps,
+        steps: Sample,
         walks: usize,
         beta: f32,
         seed: u64

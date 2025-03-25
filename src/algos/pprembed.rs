@@ -4,8 +4,8 @@ use std::fmt::Write;
 use rayon::prelude::*;
 use hashbrown::HashMap;
 
-use crate::algos::rwr::{Steps,RWR};
-use crate::algos::utils::FeatureHasher;
+use crate::algos::rwr::RWR;
+use crate::algos::utils::{Sample,FeatureHasher};
 use crate::embeddings::EmbeddingStore;
 use crate::distance::Distance;
 use crate::feature_store::FeatureStore;
@@ -18,7 +18,7 @@ pub struct PPREmbed {
     pub num_walks: usize,
 
     /// Restart criteria
-    pub steps: Steps,
+    pub steps: Sample,
 
     /// Beta Parameter 
     pub beta: f32,

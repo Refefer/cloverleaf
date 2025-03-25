@@ -10,11 +10,12 @@ use float_ord::FloatOrd;
 
 use std::ops::Deref;
 
-use crate::graph::*;
+use crate::algos::rwr::rollout;
+use crate::algos::utils::Sample;
 use crate::embeddings::{EmbeddingStore,Entity};
+use crate::graph::*;
 use crate::hogwild::{Hogwild};
 use crate::sampler::{GreedySampler};
-use crate::algos::rwr::{rollout,Steps};
 use crate::vocab::TranslationTable;
 
 pub struct SupervisedMCIteration {
@@ -77,7 +78,7 @@ impl SupervisedMCIteration {
                     trajectory.clear();
                     
                     // Compute rollout
-                    rollout(&t_graph, Steps::Probability(self.restart_prob), 
+                    rollout(&t_graph, Sample::Probability(self.restart_prob), 
                             &sampler, *start_node, &mut rng, &mut trajectory);
 
                     // Scoring is a function of distance from the terminal node to the reward node.

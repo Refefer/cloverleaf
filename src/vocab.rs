@@ -35,8 +35,8 @@ impl Vocab {
         self.vocab_id == other.vocab_id
     }
 
-    pub fn get_node_id(&self, node_type: String, name: String) -> Option<NodeID> {
-        self.get_node_id_int(&Arc::new(node_type), &name)
+    pub fn get_node_id<A: Into<String>, B: AsRef<str>>(&self, node_type: A, name: B) -> Option<NodeID> {
+        self.get_node_id_int(&Arc::new(node_type.into()), name.as_ref())
     }
 
     fn get_node_id_int(&self, node_type: &Arc<String>, name: &str) -> Option<NodeID> {
@@ -64,11 +64,11 @@ impl Vocab {
         }
     }
 
-    pub fn get_or_insert(&mut self, node_type: String, name: String) -> NodeID {
-        self.get_or_insert_shared(Arc::new(node_type), &name)
+    pub fn get_or_insert<A: Into<String>, B: AsRef<str>>(&mut self, node_type: A, name: B) -> NodeID {
+        self.get_or_insert_shared(Arc::new(node_type.into()), name.as_ref())
     }
 
-    pub fn get_or_insert_shared(&mut self, node_type: Arc<String>, name: &str) -> NodeID {
+    fn get_or_insert_shared(&mut self, node_type: Arc<String>, name: &str) -> NodeID {
         let nt_id = self.get_or_insert_node_type(node_type);
         let name_key = self.interner.get_or_intern(name);
         let t = (nt_id, name_key);
