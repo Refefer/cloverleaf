@@ -54,7 +54,7 @@ use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use rand_distr::Uniform;
 
-use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID,CDFtoP};
+use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID,CDFtoP,Transpose};
 use crate::vocab::Vocab;
 use crate::sampler::{Weighted,Unweighted};
 use crate::distance::{Distance as EDist};
@@ -394,6 +394,21 @@ impl Graph {
         }
         Ok(())
     }
+    
+    /**
+     * Transposes a graph, swapping directions of the edges and associated weights, returning a new
+     * graph.
+     *
+     *   Returns
+     *    -------
+     *    Graph
+     *      A new graph constructed from the transpose of an existing graph
+     **/
+    pub fn transpose(&self) -> Graph {
+        let graph = Arc::new(self.graph.transpose());
+        let vocab = self.vocab.clone();
+        Graph { graph, vocab }
+    }
 
     /// Returns the number of nodes in the graph
     pub fn __len__(&self) -> PyResult<usize> {
@@ -449,7 +464,6 @@ impl Graph {
         })
 
     }
-
 
 }
 
@@ -2510,6 +2524,7 @@ impl NodeEmbeddings {
         embs.into_iter().for_each(|(node_id, emb)| {
             es.set_embedding(node_id, &emb);
         });
+
         NodeEmbeddings {
             vocab: Arc::new(vocab),
             embeddings: es

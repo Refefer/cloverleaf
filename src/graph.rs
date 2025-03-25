@@ -32,6 +32,14 @@ pub trait ModifiableGraph {
     fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]);
 }
 
+/// Trait which transposes a graph's adjacency list
+pub trait Transpose {
+    type Output: Graph;
+
+    /// Transpose function to a new Graph
+    fn transpose(&self) -> Self::Output;
+}
+
 /// Used for trait bounds.  Confirms the underlying weights for each node
 /// sum to 1, as in a transition matrix.
 pub trait NormalizedGraph: Graph {}
@@ -50,7 +58,10 @@ pub struct CSR {
 }
 
 impl CSR {
-    pub fn construct_from_edges(mut edges: Vec<(NodeID, NodeID, f32)>, deduplicate: bool) -> Self {
+    pub fn construct_from_edges(
+        mut edges: Vec<(NodeID, NodeID, f32)>, 
+        deduplicate: bool
+    ) -> Self {
 
         if deduplicate {
             CSR::deduplicate_edges(&mut edges);
@@ -217,6 +228,7 @@ impl NormalizedGraph for NormalizedCSR {}
 pub struct CumCSR(CSR);
 
 impl CumCSR {
+    /// Converts a Compressed Sparse Row Format into a CDF version of weights
     pub fn convert(mut csr: CSR) -> Self {
         for start_stop in csr.rows.windows(2) {
             let (start, stop) = (start_stop[0], start_stop[1]);
@@ -227,6 +239,7 @@ impl CumCSR {
         CumCSR(csr)
     }
 
+    /// Swaps out the underlying edge weghts with new edge weights and confirm invariants
     pub fn clone_with_edges(&self, weights: Vec<f32>) -> Result<CumCSR,&'static str> {
         if weights.len() != self.0.weights.len() {
             Err("weights lengths not equal!")?
@@ -242,23 +255,64 @@ impl CumCSR {
         for node_id in 0..graph.len() {
             let weights = self.get_edges(node_id).1;
             for pair in weights.windows(2) {
-                match pair {
-                    &[p, n] => { 
-                        if p > 1.0 {
-                            Err("Edge weight exceeds 1.0, illegal in CDF")?
-                        } else if n < p {
-                            Err("Edge weight for node in decreasing order")?
-                        }
-                    },
-                    _ => panic!("Something busted with built in")
+                let &[p, n] = pair else { panic!("Should never hit!") };
+                if p > 1.0 {
+                    Err("Edge weight exceeds 1.0, illegal in CDF")?
+                } else if n < p {
+                    Err("Edge weight for node in decreasing order")?
                 }
             }
+
             if weights[weights.len() - 1] > 1.0 {
                 Err("Edge weight exceeds 1.0, illegal in CDF")?
             }
         }
 
         Ok(CumCSR(graph))
+    }
+}
+
+impl Transpose for CumCSR {
+    type Output = CumCSR;
+
+    fn transpose(&self) -> CumCSR {
+
+        // Count the inbound edges in the graph
+        let mut inbound_counts = vec![0usize; self.len()];
+        for node_id in 0..self.len() {
+            let edges = self.get_edges(node_id).0;
+            for inbound_node in edges {
+                inbound_counts[*inbound_node] += 1;
+            }
+        }
+
+        // Convert the counts into weight offsets
+        let mut rows = vec![0usize; self.len() + 1];
+        let mut state = 0;
+        rows.iter_mut().zip(inbound_counts.iter()).for_each(|(row, count)| {
+            *row = state;
+            state += count;
+        });
+
+        let n = rows.len() - 1;
+        rows[n] = state;
+
+        // Reverse the edge weights into the weights and columns matrix
+        let mut weights = self.0.weights.clone();
+        let mut columns = self.0.columns.clone();
+        for node_id in 0..self.len() {
+            let (edges, edge_weights) = self.get_edges(node_id);
+            for (edge, weight) in edges.iter().zip(edge_weights.iter()) {
+                let offset = rows[*edge];
+                let idx = offset + inbound_counts[*edge] - 1;
+                weights[idx] = *weight;
+                columns[idx] = node_id;
+                inbound_counts[*edge] -= 1;
+            }
+        }
+
+        CumCSR::convert(CSR { rows, columns, weights})
+
     }
 }
 
@@ -403,13 +457,9 @@ impl <'a> Iterator for CDFtoP<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.idx < self.cdf.len() {
-            let p = if self.idx == 0 {
-                Some(self.cdf[self.idx])
-            } else {
-                Some(self.cdf[self.idx] - self.cdf[self.idx-1])
-            };
+            let p = self.prob(0);
             self.idx += 1;
-            p
+            Some(p)
         } else {
             None
         }
@@ -432,30 +482,9 @@ pub fn convert_edges_to_cdf(weights: &mut [f32]) {
         acc += *w;
         *w = acc / denom;
     });
+
+    // Accumulation error can result in it not equaling 1
     weights[weights.len() - 1] = 1.;
-}
-
-/// Converts an iterator of weights to CDF
-pub fn collect_weights_into(
-    weights: impl Iterator<Item=f32>,
-    cdf_weights: &mut Vec<f32>
-) {
-    cdf_weights.clear();
-    if let (_, Some(ul)) = weights.size_hint() {
-        cdf_weights.reserve(ul);
-    }
-
-    let mut acc = 0f32;
-    cdf_weights.push(0f32);
-    for wi in weights {
-        acc += wi;
-        cdf_weights.push(acc);
-    }
-    for wi in cdf_weights.iter_mut() {
-        *wi /= acc;
-    }
-    let l = cdf_weights.len();
-    cdf_weights[l - 1] = 1.;
 }
 
 #[cfg(test)]
@@ -542,5 +571,18 @@ mod csr_tests {
             assert!((p - exp_p).abs() < 1e-7);
         });
     }
+
+    #[test]
+    fn transpose_matrix() {
+        let edges = build_edges();
+
+        let csr = CSR::construct_from_edges(edges);
+        let ccsr = CumCSR::convert(csr);
+
+        let t_ccsr = ccsr.transpose();
+
+    }
+
+
 
 }
