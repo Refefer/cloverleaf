@@ -4651,7 +4651,7 @@ fn convert_filter_type(
 }
 
 #[pymodule]
-fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn graph_library(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Graph>()?;
     m.add_class::<Distance>()?;
     m.add_class::<GraphBuilder>()?;
@@ -4692,4 +4692,3 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<RandomPath>()?;
     Ok(())
 }
-
