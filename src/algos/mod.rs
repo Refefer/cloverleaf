@@ -20,4 +20,5 @@ pub mod pprembed;
 pub mod instantembedding;
 pub mod lsr;
 pub mod connected;
+pub mod embedding_diffusion;
 mod grad_utils;

@@ -51,6 +51,7 @@ impl VPCG {
         
         let counts = features.count_features();
         let propagations: SparseEmbeddings = (0..graph.len())
+            .into_par_iter()
             .map(|node_id| {
                 let mut fs = Vec::with_capacity(self.max_terms);
                 let feats = features.get_features(node_id);
@@ -149,6 +150,9 @@ impl VPCG {
         let embs = EmbeddingStore::new(embeddings.len(), self.dims, Distance::Cosine);
         embeddings.into_par_iter().enumerate().for_each(|(node_id, sparse_emb)| {
             let emb = embs.get_embedding_mut_hogwild(node_id);
+            if sparse_emb.len() == 0 {
+                panic!("node missing features!");
+            }
             for (feat, weight) in sparse_emb {
                 for (sign, dim) in hash_table[feat] {
                     emb[dim] += sign as f32 * weight;

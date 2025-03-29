@@ -120,9 +120,13 @@ impl Distance {
         let normb = b_val + tail_b;
 
         // cosine similarity = dot / (||a|| * ||b||)
-        -(dot / (norma.sqrt() * normb.sqrt())) + 1f32
+        let dist = -(dot / (norma.sqrt() * normb.sqrt())) + 1f32;
+        if dist.is_nan() {
+            std::f32::INFINITY
+        } else {
+            dist
+        }
     }
-
 
     pub fn compute(&self, e1: &[f32], e2: &[f32]) -> f32 {
         match &self {

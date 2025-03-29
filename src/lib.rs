@@ -131,7 +131,7 @@ fn convert_node_id_to_fqn(
 fn get_node_id<A: AsRef<str>, B: AsRef<str>>(
     vocab: &Vocab, 
     node_type: A,
-    node_name:B 
+    node_name: B 
 ) -> PyResult<NodeID> {
     if let Some(node_id) = vocab.get_node_id(node_type.as_ref(), node_name.as_ref()) {
         Ok(node_id)
@@ -143,8 +143,9 @@ fn get_node_id<A: AsRef<str>, B: AsRef<str>>(
 
 #[derive(Clone)]
 enum QueryType {
-    Node(String,String),
-    Embedding(Vec<f32>)
+    Node(String, String),
+    Embedding(Vec<f32>),
+    NodeID(NodeID)
 }
 
 /// Type of Query to issue: a direct node lookup or an embedding
@@ -195,6 +196,23 @@ impl Query {
         Query { qt: QueryType::Embedding(emb) }
     }
 
+    ///    Creates a Query using a referenced NodeID
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    node_id :  Integer
+    ///        NodeID
+    ///
+    ///    Returns
+    ///    -------
+    ///    Query
+    #[staticmethod]
+    pub fn node_id(
+        node_id: NodeID
+    ) -> Self {
+        Query { qt: QueryType::NodeID(node_id) }
+    }
+ 
 }
 
 
@@ -3967,7 +3985,7 @@ impl VpcgEmbedder {
         let embs = vpcg.learn(graph.graph.as_ref(), &features.features, (&left, &right));
         let node_embeddings = NodeEmbeddings {
             vocab: graph.vocab.clone(),
-            embeddings:embs 
+            embeddings: embs 
         };
 
         Ok(node_embeddings)
@@ -4626,7 +4644,12 @@ fn lookup_embedding<'a>(
             let node_id = get_node_id(embeddings.vocab.deref(), nt.clone(), nn.clone())?;
             Ok(embeddings.embeddings.get_embedding(node_id))
         },
-        QueryType::Embedding(ref emb) => Ok(emb)
+        QueryType::Embedding(ref emb) => Ok(emb),
+        QueryType::NodeID(node_id) => if *node_id >= embeddings.embeddings.len() {
+            Err(PyIndexError::new_err("NodeID is larger than number of embeddings"))
+        } else {
+            Ok(embeddings.embeddings.get_embedding(*node_id))
+        }
     }
 }
 

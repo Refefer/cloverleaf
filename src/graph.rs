@@ -302,16 +302,16 @@ impl Transpose for CumCSR {
         let mut columns = self.0.columns.clone();
         for node_id in 0..self.len() {
             let (edges, edge_weights) = self.get_edges(node_id);
-            for (edge, weight) in edges.iter().zip(edge_weights.iter()) {
+            for (edge, weight) in edges.iter().zip(CDFtoP::new(edge_weights)) {
                 let offset = rows[*edge];
                 let idx = offset + inbound_counts[*edge] - 1;
-                weights[idx] = *weight;
+                weights[idx] = weight;
                 columns[idx] = node_id;
                 inbound_counts[*edge] -= 1;
             }
         }
 
-        CumCSR::convert(CSR { rows, columns, weights})
+        CumCSR::convert(CSR { rows, columns, weights })
 
     }
 }
