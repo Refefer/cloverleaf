@@ -61,7 +61,7 @@ pub struct AveragedFeatureModel {
 
     /// In the case of the node reconstruction, we use max_neighbor_nodes instead of the entire
     /// neighborhood.  This is critical when we have nodes with large neighbors.
-    max_neighbor_nodes: Option<usize>,
+    max_neighbor_nodes: Sample,
 
     /// If true, samples neighborhoods proportionally to their edge weights
     weighted_neighbor_sampling: bool,
@@ -73,7 +73,7 @@ pub struct AveragedFeatureModel {
 impl AveragedFeatureModel {
     pub fn new(
         max_features: Sample,
-        max_neighbor_nodes: Option<usize>,
+        max_neighbor_nodes: Sample,
         weighted_neighbor_sampling: bool,
         weighted_neighbor_averaging: bool
     ) -> Self {
@@ -163,7 +163,7 @@ pub struct AttentionFeatureModel {
     max_features: Sample,
     
     /// Max neighbors to consider for reconstruction
-    max_neighbor_nodes: Option<usize>,
+    max_neighbor_nodes: Sample,
     
     /// If true, samples neighborhoods proportionally to their edge weights
     weighted_neighbor_sampling: bool
@@ -174,7 +174,7 @@ impl AttentionFeatureModel {
     pub fn new(
         mha: MultiHeadedAttention,
         max_features: Sample,
-        max_neighbor_nodes: Option<usize>,
+        max_neighbor_nodes: Sample,
         weighted_neighbor_sampling: bool
     ) -> Self {
         AttentionFeatureModel { mha, max_features, max_neighbor_nodes, weighted_neighbor_sampling }
@@ -344,7 +344,7 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     node: NodeID,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
-    max_nodes: Option<usize>,
+    max_nodes: Sample,
     max_features: Sample,
     mha: Option<MultiHeadedAttention>,
     weighted_neighbor_sampling: bool,
@@ -353,14 +353,16 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
 ) -> (NodeCounts, ANode) {
     let (edges, weights) = &graph.get_edges(node);
     
-    let mn = max_nodes.unwrap_or(edges.len());
+    let (nodes_to_sample, scale_weight) = max_nodes.sample(edges.len(), true, rng);
     let weights: Box<dyn Iterator<Item=f32>> = if weighted_neighbor_averaging {
-        Box::new(CDFtoP::new(weights).map(|p| p * edges.len() as f32))
+        Box::new(CDFtoP::new(weights).map(|p| scale_weight * p * edges.len() as f32))
     } else {
-        Box::new(std::iter::repeat(1f32))
+        Box::new(std::iter::repeat(scale_weight))
     };
+
     let it = edges.iter().cloned().zip(weights);
-    if edges.len() <= mn {
+
+    if edges.len() == nodes_to_sample {
         construct_from_multiple_nodes(it,
             feature_store,
             feature_embeddings,
@@ -369,9 +371,9 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
             rng)
     } else {
         let it:Box<dyn Iterator<Item=(NodeID, f32)>> = if weighted_neighbor_sampling {
-            Box::new(weighted_reservoir_sample(it, mn, rng).into_iter())
+            Box::new(weighted_reservoir_sample(it, nodes_to_sample, rng).into_iter())
         } else {
-            Box::new(reservoir_sample(it, mn, rng).into_iter())
+            Box::new(reservoir_sample(it, nodes_to_sample, rng).into_iter())
         };
 
         construct_from_multiple_nodes(it,

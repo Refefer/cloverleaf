@@ -1206,7 +1206,7 @@ impl EmbeddingPropagator {
         seed: Option<u64>,
 
         // Max neighbors to use for reconstructions
-        max_nodes: Option<usize>,
+        max_nodes: Option<f32>,
 
         // How we sample neighbors
         weighted_neighbor_sampling: Option<bool>,
@@ -1263,6 +1263,11 @@ impl EmbeddingPropagator {
             .map(|mf| Sample::new(mf))
             .unwrap_or(Ok(Sample::All))
             .map_err(|_err| PyValueError::new_err("max_features must be either None, or (0, N)"))?;
+
+        let max_nodes = max_nodes 
+            .map(|mn| Sample::new(mn))
+            .unwrap_or(Ok(Sample::All))
+            .map_err(|_err| PyValueError::new_err("max_nodes must be either None, or (0, N)"))?;
 
         let model = if let Some(d_k) = attention {
             let num_heads = attention_heads.unwrap_or(1);
@@ -2412,8 +2417,8 @@ impl SLPAEmbedder {
 #[pyclass]
 struct PageRank {
     iterations: usize,
-    damping: f32, 
-    eps: f32
+    damping: f64, 
+    eps: f64
 }
 
 #[pymethods]
@@ -2441,7 +2446,7 @@ impl PageRank {
     ///        
     ///    
     #[new]
-    pub fn new(iterations: usize, damping: Option<f32>, eps: Option<f32>) -> Self {
+    pub fn new(iterations: usize, damping: Option<f64>, eps: Option<f64>) -> Self {
         PageRank {iterations, damping: damping.unwrap_or(0.85), eps: eps.unwrap_or(1e-5) }
     }
 
@@ -2471,7 +2476,7 @@ impl PageRank {
         let es = EmbeddingStore::new(graph.graph.len(), 1, EDist::Euclidean);
         scores.par_iter().enumerate().for_each(|(node_id, score)| {
             let e1 = es.get_embedding_mut_hogwild(node_id);
-            e1[0] = *score;
+            e1[0] = *score as f32;
         });
         NodeEmbeddings {
             vocab: graph.vocab.clone(),
@@ -4481,7 +4486,7 @@ impl LSR {
         let embs = EmbeddingStore::new(g.len(), 1, EDist::Euclidean);
         scores.par_iter().enumerate().for_each(|(node_id, score)| {
             let e1 = embs.get_embedding_mut_hogwild(node_id);
-            e1[0] = *score;
+            e1[0] = *score as f32;
         });
 
         let node_embeddings = NodeEmbeddings {
