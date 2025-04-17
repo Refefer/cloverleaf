@@ -5,7 +5,11 @@ build-backend = "maturin"
 [project]
 name = "graph_library"
 requires-python = ">=3.7"
-version = "1.0.0"
+
+# Bumped version after replacing simple_grad package source
+# Relevant PR: https://github.com/fiverr/graph_library/pull/5
+version = "1.0.1"
+
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
