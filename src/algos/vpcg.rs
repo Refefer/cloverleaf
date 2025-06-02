@@ -24,9 +24,6 @@ pub struct VPCG {
     // Maximum number of terms to retain
     pub max_terms: usize,
 
-    // Dimensions of the hashed space
-    pub dims: usize,
-
     // Blend coefficient
     pub alpha: f32,
 
@@ -47,7 +44,7 @@ impl VPCG {
         graph: &G,
         features: &FeatureStore,
         mask: (&[NodeID], &[NodeID]),
-    ) -> EmbeddingStore {
+    ) -> SparseEmbeddings {
         
         let counts = features.count_features();
         let propagations: SparseEmbeddings = (0..graph.len())
@@ -123,16 +120,15 @@ impl VPCG {
         pb.finish();
 
         let props = propagations.into_inner().expect("Shouldn't have any other references!");
-        let num_features = features.num_features();
-        self.convert_to_es(num_features, props)
+        props
     }
 
     fn build_hash_table(
-        &self,
         num_features: usize,
+        dims: usize
     ) -> Vec<[(i8, usize); 3]> {
         let mut hash_lookups = vec![[(1i8, 0usize); 3]; num_features];
-        let hasher = FeatureHasher::new(self.dims);
+        let hasher = FeatureHasher::new(dims);
         hash_lookups.par_iter_mut().enumerate().for_each(|(feat_idx, hashes)| {
             hashes.par_iter_mut().enumerate().for_each(|(hash_num, out)| {
                 *out = hasher.hash(feat_idx, hash_num);
@@ -141,13 +137,13 @@ impl VPCG {
         hash_lookups
     }
 
-    fn convert_to_es(
-        &self, 
+    pub fn convert_to_es(
         num_features: usize, 
+        dims: usize,
         embeddings: SparseEmbeddings
     ) -> EmbeddingStore {
-        let hash_table = self.build_hash_table(num_features);
-        let embs = EmbeddingStore::new(embeddings.len(), self.dims, Distance::Cosine);
+        let hash_table = VPCG::build_hash_table(num_features, dims);
+        let embs = EmbeddingStore::new(embeddings.len(), dims, Distance::Cosine);
         embeddings.into_par_iter().enumerate().for_each(|(node_id, sparse_emb)| {
             let emb = embs.get_embedding_mut_hogwild(node_id);
             if sparse_emb.len() == 0 {

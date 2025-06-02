@@ -59,7 +59,7 @@ impl FeatureStore {
         &self.features[node]
     }
 
-    fn get_pretty_feature(&self, feat_id: usize) -> (String, String) {
+    pub fn get_pretty_feature(&self, feat_id: usize) -> (String, String) {
         let (nt, name) = self.feature_vocab.get_name(feat_id).unwrap();
         (nt.to_string(), name.to_string())
     }

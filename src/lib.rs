@@ -1639,6 +1639,33 @@ impl FeatureSet {
             vocab: self.vocab.clone()
         }
     }
+
+    ///    Returns the FQN for the feature at feature_id.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    idx : isize
+    ///        Internal index.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    (FQNode) - Can throw exception
+    ///        
+    ///    
+    pub fn __getitem__(&self, mut idx: isize) -> PyResult<FQNode> {
+        let len = self.features.num_features() as isize;
+        // Negative indexing
+        if idx < 0 {
+            idx += len;
+        }
+        if idx >= len {
+            return Err(PyIndexError::new_err(format!("Feature Index larger than FeatureSet!")));
+        }
+
+        let fqn = self.features.get_pretty_feature(idx as usize);
+        Ok(fqn)
+    }
+
     
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
@@ -3850,6 +3877,49 @@ impl PprRankLearner {
 
 }
 
+#[pyclass]
+/// Method holding sparse embeddings
+struct VpcgSparseEmbeddings {
+    /// Vocab used for NodeID
+    vocab: Arc<Vocab>,
+
+    /// Mapping from NodeID to a list of (feature_idx, weight)
+    embeddings: Vec<Vec<(usize, f32)>>
+}
+
+#[pymethods]
+impl VpcgSparseEmbeddings {
+    ///    Retrieves the sparse embedding set for a node.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    node : FQNode
+    ///        Node to retrieve sparse embeddings from.
+    ///    
+    ///    features : FeatureSet
+    ///        FeatureSet mapping nodes -> features
+    pub fn get_sparse_embedding(
+        &self, 
+        node: FQNode
+    ) -> PyResult<Vec<(usize, f32)>> {
+        let node_id = get_node_id(&self.vocab, node.0, node.1)?;
+        Ok(self.embeddings[node_id].clone())
+    }
+
+    /// Retrieves sparse embeddings for a given node id.
+    pub fn __getitem__(
+        &self, 
+        node_id: NodeID 
+    ) -> PyResult<Vec<(usize, f32)>> {
+        if node_id > self.vocab.len() {
+            Err(PyIndexError::new_err("Node index larger than embedding size!"))
+        } else {
+            Ok(self.embeddings[node_id].clone())
+        }
+    }
+
+}
+
 /// Tells the VPCG algorithm how to weight the initial features
 #[pyclass]
 #[derive(Clone)]
@@ -3870,6 +3940,25 @@ struct VpcgEmbedder {
     alpha: f32,
     err: f32,
     feature_weight: FeatureWeight
+}
+
+impl VpcgEmbedder {
+    fn split_graph(
+        graph: &Graph, 
+        start_node_types: HashSet<String>
+    ) -> (Vec<NodeID>, Vec<NodeID>) {
+        // Split the graph into left and right based on the start node type
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for node_id in 0..graph.graph.len() {
+            let nt = graph.vocab.get_node_type(node_id).unwrap();
+            if start_node_types.contains(nt.as_ref()) {
+                left.push(node_id);
+            } else {
+                right.push(node_id)
+            }
+        }
+        (left, right)
+    }
 }
 
 #[pymethods]
@@ -3958,18 +4047,43 @@ impl VpcgEmbedder {
         features: &mut FeatureSet,
         start_node_type: &PyAny
     ) -> PyResult<NodeEmbeddings> {
+        let sparse_embeddings = self.learn_sparse_features(graph, features, start_node_type)?;
+        let embs = VPCG::convert_to_es(features.num_features(), self.dims, sparse_embeddings.embeddings);
+        let node_embeddings = NodeEmbeddings {
+            vocab: graph.vocab.clone(),
+            embeddings: embs 
+        };
+
+        Ok(node_embeddings)
+    }
+
+    ///    Learns VPCG sparse feature maps on the graph.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to use for bipartite structure
+    ///    
+    ///    features : FeatureSet
+    ///        Features to propagate between nodes
+    ///    
+    ///    start_node_type : String or List[String]
+    ///        Starting node type(s) for propagation.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    List[List(FeatureID, float)]
+    ///        New NodeEmbeddings capturing the VPCG Embeddings.
+    ///    
+    pub fn learn_sparse_features(&self, 
+        graph: &Graph, 
+        features: &mut FeatureSet,
+        start_node_type: &PyAny
+    ) -> PyResult<VpcgSparseEmbeddings> {
         let start_node_types = single_or_multistring(start_node_type)?;
 
-        // Split the graph into left and right based on the start node type
-        let (mut left, mut right) = (Vec::new(), Vec::new());
-        for node_id in 0..graph.graph.len() {
-            let nt = graph.vocab.get_node_type(node_id).unwrap();
-            if start_node_types.contains(nt.as_ref()) {
-                left.push(node_id);
-            } else {
-                right.push(node_id)
-            }
-        }
+        // Bisect the graph
+        let (left, right) = VpcgEmbedder::split_graph(graph, start_node_types);
 
         let feature_weight = match self.feature_weight{
             FeatureWeight::Uniform => VFeatureWeight::Uniform,
@@ -3981,19 +4095,24 @@ impl VpcgEmbedder {
         let vpcg = VPCG {
             max_terms: self.max_terms, 
             iterations: self.passes,
-            dims: self.dims,
             alpha: self.alpha,
             err: self.err,
             feature_weight: feature_weight 
         };
 
-        let embs = vpcg.learn(graph.graph.as_ref(), &features.features, (&left, &right));
-        let node_embeddings = NodeEmbeddings {
+        let sparse_embeddings = vpcg.learn(
+            graph.graph.as_ref(), 
+            &features.features, 
+            (&left, &right)
+        );
+
+        let vse = VpcgSparseEmbeddings {
             vocab: graph.vocab.clone(),
-            embeddings: embs 
+            embeddings: sparse_embeddings
         };
 
-        Ok(node_embeddings)
+        Ok(vse)
+
     }
 
 }
@@ -4723,6 +4842,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PageRank>()?;
     m.add_class::<Smci>()?;
     m.add_class::<VpcgEmbedder>()?;
+    m.add_class::<VpcgSparseEmbeddings>()?;
     m.add_class::<FeatureWeight>()?;
     m.add_class::<PPREmbedder>()?;
     m.add_class::<InstantEmbeddings>()?;
