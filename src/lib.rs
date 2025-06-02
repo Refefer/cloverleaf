@@ -3896,7 +3896,7 @@ impl VpcgFeatureMappings {
     ///    node : FQNode
     ///        Node to retrieve sparse embeddings from.
     ///    
-    pub fn get_sparse_embedding(
+    pub fn get_feature_map(
         &self, 
         node: FQNode
     ) -> PyResult<Vec<(usize, f32)>> {
