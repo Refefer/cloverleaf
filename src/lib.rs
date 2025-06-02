@@ -3879,34 +3879,32 @@ impl PprRankLearner {
 
 #[pyclass]
 /// Method holding sparse embeddings
-struct VpcgSparseEmbeddings {
+struct VpcgFeatureMappings {
     /// Vocab used for NodeID
     vocab: Arc<Vocab>,
 
     /// Mapping from NodeID to a list of (feature_idx, weight)
-    embeddings: Vec<Vec<(usize, f32)>>
+    feature_mappings: Vec<Vec<(usize, f32)>>
 }
 
 #[pymethods]
-impl VpcgSparseEmbeddings {
-    ///    Retrieves the sparse embedding set for a node.
+impl VpcgFeatureMappings {
+    ///    Retrieves the feature mappings and weights for a given node.
     ///    
     ///    Parameters
     ///    ----------
     ///    node : FQNode
     ///        Node to retrieve sparse embeddings from.
     ///    
-    ///    features : FeatureSet
-    ///        FeatureSet mapping nodes -> features
     pub fn get_sparse_embedding(
         &self, 
         node: FQNode
     ) -> PyResult<Vec<(usize, f32)>> {
         let node_id = get_node_id(&self.vocab, node.0, node.1)?;
-        Ok(self.embeddings[node_id].clone())
+        Ok(self.feature_mappings[node_id].clone())
     }
 
-    /// Retrieves sparse embeddings for a given node id.
+    ///    Retrieves the feature mappings and weights for a given NodeID.
     pub fn __getitem__(
         &self, 
         node_id: NodeID 
@@ -3914,7 +3912,7 @@ impl VpcgSparseEmbeddings {
         if node_id > self.vocab.len() {
             Err(PyIndexError::new_err("Node index larger than embedding size!"))
         } else {
-            Ok(self.embeddings[node_id].clone())
+            Ok(self.feature_mappings[node_id].clone())
         }
     }
 
@@ -4048,7 +4046,7 @@ impl VpcgEmbedder {
         start_node_type: &PyAny
     ) -> PyResult<NodeEmbeddings> {
         let sparse_embeddings = self.learn_sparse_features(graph, features, start_node_type)?;
-        let embs = VPCG::convert_to_es(features.num_features(), self.dims, sparse_embeddings.embeddings);
+        let embs = VPCG::convert_to_es(features.num_features(), self.dims, sparse_embeddings.feature_mappings);
         let node_embeddings = NodeEmbeddings {
             vocab: graph.vocab.clone(),
             embeddings: embs 
@@ -4079,7 +4077,7 @@ impl VpcgEmbedder {
         graph: &Graph, 
         features: &mut FeatureSet,
         start_node_type: &PyAny
-    ) -> PyResult<VpcgSparseEmbeddings> {
+    ) -> PyResult<VpcgFeatureMappings> {
         let start_node_types = single_or_multistring(start_node_type)?;
 
         // Bisect the graph
@@ -4106,12 +4104,12 @@ impl VpcgEmbedder {
             (&left, &right)
         );
 
-        let vse = VpcgSparseEmbeddings {
+        let vfm = VpcgFeatureMappings {
             vocab: graph.vocab.clone(),
-            embeddings: sparse_embeddings
+            feature_mappings: sparse_embeddings
         };
 
-        Ok(vse)
+        Ok(vfm)
 
     }
 
@@ -4842,7 +4840,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PageRank>()?;
     m.add_class::<Smci>()?;
     m.add_class::<VpcgEmbedder>()?;
-    m.add_class::<VpcgSparseEmbeddings>()?;
+    m.add_class::<VpcgFeatureMappings>()?;
     m.add_class::<FeatureWeight>()?;
     m.add_class::<PPREmbedder>()?;
     m.add_class::<InstantEmbeddings>()?;
