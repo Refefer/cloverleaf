@@ -4045,8 +4045,8 @@ impl VpcgEmbedder {
         features: &mut FeatureSet,
         start_node_type: &PyAny
     ) -> PyResult<NodeEmbeddings> {
-        let sparse_embeddings = self.learn_sparse_features(graph, features, start_node_type)?;
-        let embs = VPCG::convert_to_es(features.num_features(), self.dims, sparse_embeddings.feature_mappings);
+        let feature_maps = self.learn_feature_mapping(graph, features, start_node_type)?;
+        let embs = VPCG::convert_to_es(features.num_features(), self.dims, feature_maps.feature_mappings);
         let node_embeddings = NodeEmbeddings {
             vocab: graph.vocab.clone(),
             embeddings: embs 
@@ -4055,7 +4055,7 @@ impl VpcgEmbedder {
         Ok(node_embeddings)
     }
 
-    ///    Learns VPCG sparse feature maps on the graph.
+    ///    Learns VPCG feature maps on the graph.
     ///    
     ///    Parameters
     ///    ----------
@@ -4070,10 +4070,10 @@ impl VpcgEmbedder {
     ///    
     ///    Returns
     ///    -------
-    ///    List[List(FeatureID, float)]
-    ///        New NodeEmbeddings capturing the VPCG Embeddings.
+    ///    VpcgFeatureMappings
+    ///        New FeatureMaps.
     ///    
-    pub fn learn_sparse_features(&self, 
+    pub fn learn_feature_mapping(&self, 
         graph: &Graph, 
         features: &mut FeatureSet,
         start_node_type: &PyAny
