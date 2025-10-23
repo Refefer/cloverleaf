@@ -180,7 +180,7 @@ impl EmbeddingReader {
                     es = EmbeddingStore::new(num_embeddings, emb.len(), distance);
                 }
 
-                let node_id = vocab.get_or_insert(node_type, node_name);
+                let node_id = vocab.get_or_insert(&node_type, &node_name);
                 if node_id < i {
                     return Err(PyKeyError::new_err(format!("found duplicate node at index {}! node_id: {}, node_type: '{}', node_name: '{}'", i, node_id, node_type, node_name)));
                 }
