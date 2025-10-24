@@ -373,4 +373,119 @@ A simple random projection based ANN method which can be consumed directly or in
 7. Eksombatchai, Chantat, et al. "Pixie: A system for recommending 3+ billion items to 200+ million users in real-time." Proceedings of the 2018 world wide web conference. 2018.
 8. Recht, Benjamin, et al. "Hogwild!: A lock-free approach to parallelizing stochastic gradient descent." Advances in neural information processing systems 24 (2011).
 9. Postăvaru, Ştefan, et al. "InstantEmbedding: Efficient local node representations." arXiv preprint arXiv:2010.06992 (2020).
-10. Maystre, Lucas, and Matthias Grossglauser. "Fast and accurate inference of Plackett–Luce models." Advances in neural information processing systems 28 (2015).
+10. Maystre, Lucas, and Matthias Grossglauser. "Fast and accurate inference of Plackett\u2013Luce models." Advances in neural information processing systems 28 (2015).
+
+## Python API Reference
+
+### Core Graph Types
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `Graph` | `Graph.load(path: str, edge_type: EdgeType, chunk_size: int = 1, skip_rows: int = 0, weighted: bool = True, deduplicate: bool = False) -> Graph` | • `contains_node(name: tuple[str,str]) -> bool`<br>• `nodes() -> int`<br>• `edges() -> int`<br>• `get_edges(node: tuple[str,str], normalized: bool \| None = None) -> tuple[list[tuple[str,str]], list[float]]`<br>• `vocab() -> VocabIterator`<br>• `save(path: str, comp_level: int \| None = None)`<br>• `transpose() -> Graph` |
+| `EdgeType` | enum values `EdgeType.Directed`, `EdgeType.Undirected` | *(used in GraphBuilder)* |
+| `Distance` | enum values `Distance.Cosine`, `Distance.Euclidean`, `Distance.Dot`, `Distance.ALT`, `Distance.Jaccard`, `Distance.Hamming` | `compute(e1: list[float], e2: list[float]) -> float` |
+
+### Query Objects
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `Query` | • `Query.node(node_type: str, node_name: str)`<br>• `Query.embedding(emb: list[float])`<br>• `Query.node_id(node_id: int)` | *(no additional public methods)* |
+
+### Graph Construction
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `GraphBuilder` | `GraphBuilder()` | • `add_edge(from_node: tuple[str,str], to_node: tuple[str,str], weight: float, node_type: EdgeType)`<br>• `build_graph(deduplicate: bool = True) -> Graph \| None` |
+
+### Random Walks
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `RandomWalker` | `RandomWalker(restarts: float, walks: int, beta: float \| None = None)` | `walk(graph: Graph, node: tuple[str,str], seed: int \| None = None, k: int \| None = None, filter_type: str \| list[str] \| None = None, single_threaded: bool \| None = None, weighted: bool \| None = True) -> list[tuple[tuple[str,str], float]]` |
+| `BiasedRandomWalker` | `BiasedRandomWalker(restarts: float, walks: int, beta: float \| None = None, blend: float \| None = None)` | `walk(graph: Graph, embeddings: NodeEmbeddings, node: tuple[str,str], context: Query, k: int \| None = None, seed: int \| None = None, rerank_context: Query \| None = None, filter_type: str \| list[str] \| None = None) -> list[tuple[tuple[str,str], float]]` |
+
+### Sparse Personalized PageRank
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `SparsePPR` | `SparsePPR(restarts: float, eps: float \| None = None)` | `compute(graph: Graph, node: tuple[str,str], k: int \| None = None, filter_type: str \| list[str] \| None = None) -> list[tuple[tuple[str,str], float]]` |
+
+### Neighborhood Alignment
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `NeighborhoodAligner` | `NeighborhoodAligner(alpha: float \| None = None, max_neighbors: int \| None = None)` | `align(embeddings: NodeEmbeddings, graph: Graph) -> NodeEmbeddings` |
+| `EmbeddingAligner` | `EmbeddingAligner(num_nodes: int, random_nodes: int, alpha: float, error: float, max_iters: int)` | `align(orig_embeddings: NodeEmbeddings, orig_ann: EmbAnn, translated_embeddings: NodeEmbeddings, query: Query, seed: int \| None = None) -> list[float]`<br>`bulk_align(... ) -> list[list[float]]` |
+
+### Ranking & PageRank
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `PprRankLearner` | See full signature below* | `learn_features(graph: Graph, features: FeatureSet, feature_embeddings: NodeEmbeddings \| None = None, indicator: bool = True, seed: int \| None = None) -> NodeEmbeddings` |
+| `PageRank` | `PageRank(iterations: int, damping: float = 0.85, eps: float = 1e-5)` | `learn(graph: Graph, indicator: bool = True) -> NodeEmbeddings` |
+
+*Full signature for `PprRankLearner.__new__`*  
+```python
+PprRankLearner(
+    alpha: float,
+    batch_size: int,
+    dims: int,
+    passes: int,
+    steps: float,
+    walks: int,
+    k: int,
+    negatives: int,
+    loss: str | None = None,
+    compression: float | None = None,
+    beta: float | None = None,
+    num_features: float | None = None,
+    weight_decay: float | None = None,
+    valid_pct: float | None = None
+)
+```
+
+### Feature handling
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `FeatureNamespace` | `FeatureNamespace.single(ns: str)`<br>`FeatureNamespace.node_type()`<br>`FeatureNamespace.prefix(delim: str)` | *(used when loading features)* |
+| `FeatureSet` | • `FeatureSet.new_from_graph(graph: Graph)`<br>• `FeatureSet.new_from_file(path: str, namespace: FeatureNamespace \| None = None)` | `set_features(node: tuple[str,str], features: list[tuple[str,str]])`<br>`get_features(node: tuple[str,str]) -> list[tuple[str,str]]`<br>`load_into(path: str, f_ns: FeatureNamespace \| None = None)`<br>`nodes() -> int`<br>`num_features() -> int` |
+| `FeaturePropagator` | `FeaturePropagator(k: int, threshold: float = 0.0, max_iters: int = 20)` | `propagate(graph: Graph, features: FeatureSet) -> None` |
+| `FeatureWeight` | enum values `FeatureWeight.Uniform`, `FeatureWeight.IDF` | *(used in VPCG)* |
+| `FeatureAggregator` | • `FeatureAggregator.Averaged()`<br>• `FeatureAggregator.Attention(num_heads: int, d_k: int, window: int \| None = None)`<br>• `FeatureAggregator.Weighted(alpha: float, fs: FeatureSet)` | `save(path: str) -> None`<br>`load(path: str) -> FeatureAggregator` |
+
+### Embedding Core
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `NodeEmbeddings` | • `NodeEmbeddings.new(graph: Graph, dims: int, distance: Distance)`<br>• `NodeEmbeddings.new_from_list(list: list[tuple[tuple[str,str], list[float]]], distance: Distance)` | `contains(node: tuple[str,str]) -> bool`<br>`get_embedding(node: tuple[str,str]) -> list[float]`<br>`set_embedding(node: tuple[str,str], embedding: list[float])`<br>`nearest_neighbor(emb: list[float], k: int, filter_type: str \| list[str] \| None = None) -> list[tuple[tuple[str,str], float]]`<br>`compute_distance(e1: Query, e2: Query) -> float`<br>`l2norm()`<br>`save(path: str, comp_level: int \| None = None)`<br>`load(path: str, distance: Distance \| None = None, filter_type: ... ) -> NodeEmbeddings` |
+| `EmbeddingPropagator` | See full signature below* (many optional arguments) | `learn_features(graph: Graph, features: FeatureSet, feature_embeddings: NodeEmbeddings \| None = None) -> NodeEmbeddings` |
+| `NodeEmbedder` | `NodeEmbedder(feat_agg: FeatureAggregator)` | `embed_feature_set(feat_set: FeatureSet, feature_embeddings: NodeEmbeddings) -> NodeEmbeddings`<br>`embed_adhoc(features: list[tuple[str,str]], feature_embeddings: NodeEmbeddings, strict: bool = True) -> list[float]` |
+| `EmbeddingAligner` | `EmbeddingAligner(num_nodes: int, random_nodes: int, alpha: float, error: float, max_iters: int)` | (see methods above) |
+
+*Full signature for `EmbeddingPropagator.__new__` includes optional arguments such as `alpha`, `loss`, `batch_size`, `dims`, `passes`, `seed`, `max_nodes`, `weighted_neighbor_sampling`, `weighted_neighbor_averaging`, `max_features`, `loss_weighting`, `valid_pct`, `hard_negatives`, `indicator`, `attention`, `attention_heads`, `context_window`, `noise` (all default to sensible values).*
+
+### ANN utilities
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `GraphAnn` | `GraphAnn(graph: Graph, max_steps: int = 1000)` | `find(query: Query, embeddings: NodeEmbeddings, k: int, seed: int \| None = None) -> list[tuple[tuple[str,str], float]]` |
+| `EmbAnn` | `EmbAnn(embs: NodeEmbeddings, n_trees: int, max_nodes_per_leaf: int, test_hp_per_split: int \| None = None, num_sampled_nodes_split_test: int \| None = None, filter_type: str \| list[str] \| None = None, seed: int \| None = None)` | `find(embeddings: NodeEmbeddings, query: Query, k: int, min_search_size: int \| None = None) -> list[tuple[tuple[str,str], float]]`<br>`find_leaf_indices(query: list[float]) -> list[int]`<br>`find_leaf_paths(query: list[float]) -> list[list[int]]`<br>`depth() -> list[int]` |
+
+### Advanced Embeddings
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `DistanceEmbedder` | `DistanceEmbedder(n_landmarks: int, seed: int \| None = None)` | `learn(graph: Graph) -> NodeEmbeddings` |
+| `ClusterLPAEmbedder` | `ClusterLPAEmbedder(k: int, passes: int, seed: int \| None = None)` | `learn(graph: Graph) -> NodeEmbeddings` |
+| `SLPAEmbedder` | `SLPAEmbedder(t: int, threshold: int, memory_size: int \| None = None, rule: ListenerRule \| None = None, seed: int \| None = None)` | `learn(graph: Graph) -> NodeEmbeddings` |
+| `VpcgEmbedder` | `VpcgEmbedder(max_terms: int, passes: int, dims: int, alpha: float = 1.0, err: float = 1e-5, feature_weight: FeatureWeight = FeatureWeight.Uniform)` | `learn(graph: Graph, features: FeatureSet, start_node_type: str \| list[str]) -> NodeEmbeddings`<br>`learn_feature_mapping(... ) -> VpcgFeatureMappings` |
+| `VpcgFeatureMappings` | *(returned by `VpcgEmbedder.learn_feature_mapping`)* | `get_feature_map(node: tuple[str,str]) -> list[tuple[int,float]]`<br>`__getitem__(node_id: int) -> list[tuple[int,float]]` |
+| `PPREmbedder` | *static constructors*:<br>`PPREmbedder.random_walk(dims: int, hashes: int, num_walks: int, steps: float, beta: float = 0.8, seed: int \| None = None)`<br>`PPREmbedder.sparse_ppr(dims: int, hashes: int, steps: float, eps: float = 1e-5)` | `learn(graph: Graph) -> NodeEmbeddings` |
+| `InstantEmbeddings` | *static constructors*:<br>`InstantEmbeddings.random_walk(...)`<br>`InstantEmbeddings.sparse_ppr(...)` | `learn(graph: Graph) -> NodeEmbeddings` |
+
+### Ranking & Tournament
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `TournamentBuilder` | `TournamentBuilder()` | `add_outcome(winner: tuple[str,str], loser: tuple[str,str], weight: float)`<br>`add_ranked_outcomes(order: list[tuple[str,str]], weight: float)`<br>`build() -> Tournament \| None` |
+| `Tournament` | *(created by builder)* | *(used as input to LSR)* |
+| `LSR` | `LSR(passes: int)` | `learn(tournament: Tournament, indicator: bool = True) -> NodeEmbeddings` |
+
+### Miscellaneous utilities
+| Class | Constructor (Python) | Key Methods |
+|-------|----------------------|-------------|
+| `ConnectedComponents` | *(no init)* | `learn(graph: Graph) -> NodeEmbeddings`<br>`prune_largest_components(graph: Graph, k: int) -> Graph \| None` |
+| `ListenerRule` | enum values `ListenerRule.Best`, `ListenerRule.Probabilistic` | *(used by SLPAEmbedder)* |
+| `LossWeighting` | `LossWeighting.Log()`<br>`LossWeighting.Exponential(weight: float)` | *(used in EmbeddingPropagator)* |
+| `RandomPath` | `RandomPath(seed: int \| None = None)` | `rollout(graph: Graph, node: tuple[str,str], count: int, restarts: float, weighted: bool) -> list[list[tuple[str,str]]]` |
+
+---
