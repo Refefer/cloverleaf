@@ -4851,6 +4851,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<ListenerRule>()?;
     m.add_class::<LossWeighting>()?;
     m.add_class::<RandomPath>()?;
+    m.add_class::<NodeEmbedder>()?;
     Ok(())
 }
 
