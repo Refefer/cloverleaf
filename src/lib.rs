@@ -2887,7 +2887,7 @@ struct NodeEmbeddingsBuilder {
 
 #[pymethods]
 impl NodeEmbeddingsBuilder {
-    ///    Creates a NodeEmbeddingBuilder.  Allows progressive addition of nodes and embeddings.
+    ///    Creates a NodeEmbeddingsBuilder.  Allows progressive addition of nodes and embeddings.
     ///    
     ///    Parameters
     ///    ----------
@@ -4828,7 +4828,6 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<FeatureNamespace>()?;
     m.add_class::<FeatureSet>()?;
     m.add_class::<FeaturePropagator>()?;
-    m.add_class::<NodeEmbedder>()?;
     m.add_class::<FeatureAggregator>()?;
     m.add_class::<Query>()?;
     m.add_class::<RandomWalker>()?;
@@ -4851,6 +4850,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<ListenerRule>()?;
     m.add_class::<LossWeighting>()?;
     m.add_class::<RandomPath>()?;
+    m.add_class::<NodeEmbeddingsBuilder>()?;
     m.add_class::<NodeEmbedder>()?;
     Ok(())
 }
