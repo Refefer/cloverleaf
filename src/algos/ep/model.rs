@@ -1,7 +1,7 @@
 //! The Embedding Propagation framework parameterizes over the feature aggregator - that is, given
 //! a node with a set of features, how do we combine them to product a node embedding?
 //! This module defines them
-use simple_grad::*;
+use candle_core::{Device, Tensor};
 use hashbrown::HashMap;
 use rand::prelude::*;
 
@@ -22,7 +22,7 @@ pub trait Model: Send + Sync {
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
-    ) -> (NodeCounts, ANode);
+    ) -> (NodeCounts, Tensor);
 
     /// Given a node, reconstruct a node from its neighborhood
     fn reconstruct_node_embedding<G: CGraph, R: Rng>(
@@ -32,7 +32,7 @@ pub trait Model: Send + Sync {
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
-    ) -> (NodeCounts, ANode);
+    ) -> (NodeCounts, Tensor);
 
     /// Construct multiple node embeddings - we use this for negatives, typically.
     fn construct_from_multiple_nodes<I: Iterator<Item=(NodeID, f32)>, R: Rng>(
@@ -41,7 +41,7 @@ pub trait Model: Send + Sync {
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
-    ) -> (NodeCounts, ANode); 
+    ) -> (NodeCounts, Tensor); 
 
     /// Indicates whether it uses attention
     fn uses_attention(&self) -> bool;
@@ -51,7 +51,7 @@ pub trait Model: Send + Sync {
 
     /// Currently unused and should be axed (YAGNI).  If models have parmeters they can learn, we
     /// can expose them here.  Not wired up currently
-    fn parameters(&self) -> Vec<ANode>;
+    fn parameters(&self) -> Vec<Tensor>;
 }
 
 /// Creates node embeddings by averaging features together
@@ -94,7 +94,7 @@ impl Model for AveragedFeatureModel {
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
-    ) -> (NodeCounts, ANode) {
+    ) -> (NodeCounts, Tensor) {
         construct_node_embedding(
             node,
             weight,
@@ -111,7 +111,7 @@ impl Model for AveragedFeatureModel {
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
-    ) -> (NodeCounts, ANode){
+    ) -> (NodeCounts, Tensor){
         reconstruct_node_embedding(
             graph,
             node,
@@ -131,7 +131,7 @@ impl Model for AveragedFeatureModel {
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
-    ) -> (NodeCounts, ANode) { 
+    ) -> (NodeCounts, Tensor) { 
         construct_from_multiple_nodes(
             nodes, feature_store, 
             feature_embeddings, 
@@ -147,7 +147,7 @@ impl Model for AveragedFeatureModel {
         false
     }
 
-    fn parameters(&self) -> Vec<ANode> {
+    fn parameters(&self) -> Vec<Tensor> {
         Vec::with_capacity(0)
     }
  
@@ -189,7 +189,7 @@ impl Model for AttentionFeatureModel {
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
-    ) -> (NodeCounts, ANode) {
+    ) -> (NodeCounts, Tensor) {
         attention_construct_node_embedding(
             node,
             feature_store,
@@ -206,7 +206,7 @@ impl Model for AttentionFeatureModel {
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
-    ) -> (NodeCounts, ANode){
+    ) -> (NodeCounts, Tensor){
         reconstruct_node_embedding(
             graph,
             node,
@@ -226,7 +226,7 @@ impl Model for AttentionFeatureModel {
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
-    ) -> (NodeCounts, ANode) { 
+    ) -> (NodeCounts, Tensor) { 
         construct_from_multiple_nodes(
             nodes, feature_store, 
             feature_embeddings, 
@@ -242,7 +242,7 @@ impl Model for AttentionFeatureModel {
         self.mha.num_heads * (self.mha.d_k * 2 + d_model)
     }
 
-    fn parameters(&self) -> Vec<ANode> {
+    fn parameters(&self) -> Vec<Tensor> {
         Vec::with_capacity(0)
     }
  
@@ -251,7 +251,7 @@ impl Model for AttentionFeatureModel {
 /// We track the number of times a features has been seen to help reduce the gradient graph we need
 /// to compute.  It's a bit of a headache for the book keeping but the speed up is worth it.  Could
 /// probably be abstracted better.
-pub type NodeCounts = HashMap<usize, (ANode, f32)>;
+pub type NodeCounts = HashMap<usize, (Tensor, f32)>;
 
 /// Gets the feature embeddings for a node, adding or updating the counts
 pub fn collect_embeddings_from_node<R: Rng>(
@@ -263,6 +263,7 @@ pub fn collect_embeddings_from_node<R: Rng>(
     max_features: Sample,
     rng: &mut R
 ) {
+    let device = Device::Cpu;
     let feats = feature_store.get_features(node);
     let (max_features, scalar) = max_features.sample(feats.len(), true, rng);
     weight += scalar;
@@ -271,7 +272,7 @@ pub fn collect_embeddings_from_node<R: Rng>(
             *count += weight;
         } else {
             let emb = feature_embeddings.get_embedding(*feat);
-            let v = Variable::pooled(emb);
+            let v = Tensor::from_slice(emb, emb.len(), &device).unwrap();
             feat_map.insert(*feat, (v, weight));
         }
     }
@@ -287,7 +288,7 @@ pub fn construct_node_embedding<R: Rng>(
     feature_embeddings: &EmbeddingStore,
     max_features: Sample,
     rng: &mut R
-) -> (NodeCounts, ANode) {
+) -> (NodeCounts, Tensor) {
     let mut feature_map = HashMap::new();
     collect_embeddings_from_node(node, weight, 
                                  feature_store, 
@@ -310,7 +311,7 @@ pub fn attention_construct_node_embedding<R: Rng>(
     max_features: Sample,
     mha: MultiHeadedAttention,
     rng: &mut R
-) -> (NodeCounts, ANode) {
+) -> (NodeCounts, Tensor) {
     let mut feature_map = HashMap::new();
     collect_embeddings_from_node(node, 1f32, 
                                  feature_store, 
@@ -350,7 +351,7 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     weighted_neighbor_sampling: bool,
     weighted_neighbor_averaging: bool,
     rng: &mut R
-) -> (NodeCounts, ANode) {
+) -> (NodeCounts, Tensor) {
     let (edges, weights) = &graph.get_edges(node);
     
     let (nodes_to_sample, scale_weight) = max_nodes.sample(edges.len(), true, rng);
@@ -392,7 +393,7 @@ fn construct_from_multiple_nodes<I: Iterator<Item=(NodeID, f32)>, R: Rng>(
     max_features: Sample,
     mha: Option<MultiHeadedAttention>,
     rng: &mut R,
-) -> (NodeCounts, ANode) {
+) -> (NodeCounts, Tensor) {
     let mut feature_map = HashMap::new();
     let mut new_nodes = Vec::with_capacity(0);
     for (node, weight) in nodes {
@@ -422,7 +423,7 @@ fn attention_multiple(
     feature_map: &NodeCounts,
     mha: MultiHeadedAttention,
     rng: &mut impl Rng
-) -> ANode {
+) -> Tensor {
     let mut feats_per_node = HashMap::new();
     let mut output = Vec::new();
     for node in new_nodes {
@@ -446,8 +447,9 @@ fn attention_multiple(
 }
 
 pub fn mean_embeddings<'a>(
-    items: impl Iterator<Item=&'a (ANode, f32)>
-) -> ANode {
+    items: impl Iterator<Item=&'a (Tensor, f32)>
+) -> Tensor {
+    let device = Device::Cpu;
     let mut vs = Vec::new();
     let mut n = 0f32;
     items.for_each(|(emb, count)| {
@@ -455,10 +457,13 @@ pub fn mean_embeddings<'a>(
         if (*count - 1f32).abs() < 1e-6 {
             vs.push(emb.clone());
         } else {
-            vs.push(emb * *count);
+            let count_t = Tensor::from_slice(&[*count], 1usize, &device).unwrap();
+            vs.push(emb.mul(&count_t).unwrap());
         }
         n += *count;
     });
-    vs.sum_all() / n as f32
+    let sum = vs.iter().cloned().reduce(|a, b| a.add(&b).unwrap()).unwrap();
+    let n_t = Tensor::from_slice(&[n], 1usize, &device).unwrap();
+    sum.div(&n_t).unwrap()
 }
 

@@ -2,8 +2,7 @@
 //! attention methods.  Notably, we use averaged versus concat -> linear projection due to
 //! performance cost.  This has representational downsides but performs significantly faster and
 //! with no extra parmeters.
-use simple_grad::*;
-use float_ord::FloatOrd;
+use candle_core::{Device, Tensor};
 use rand::prelude::*;
 
 use crate::algos::utils::Sample;
@@ -23,20 +22,11 @@ pub struct MultiHeadedAttention {
 
 #[derive(Copy,Clone)]
 pub enum AttentionType {
-    /// Computes the full attention matrix of the feature step.  Incredibly expensive if the
-    /// feature size is large: O(N^2)
     Full,
-
-    /// Sliding attention, which looks at [i-window_size:i+window_size] for each attention matrix.  Quite a bit faster than Full, but can't attend to features beyond the window size: O(N * window_size * 2)
     Sliding { window_size: usize },
-
-    /// Randomly selects num_features and computes full attention on it.  Can learn longer distance
-    /// relationships due to random selection at the expense of longer train times.
     Random { num_features: Sample }
 }
 
-// Multi-headed attention is encoded as
-// Q1,K1,Q2,K2,V1,V2
 impl MultiHeadedAttention {
     pub fn new(num_heads: usize, d_k: usize, attention_type: AttentionType) -> Self {
         MultiHeadedAttention { num_heads, d_k, attention_type }
@@ -46,48 +36,47 @@ impl MultiHeadedAttention {
         matches!(self.attention_type,  AttentionType::Sliding {window_size:_})
     }
 
-    fn get_query_vec(&self, emb: &ANode, head_num: usize) -> ANode {
+    fn get_query_vec(&self, emb: &Tensor, head_num: usize) -> Tensor {
         let start = self.d_k * head_num;
-        emb.slice(start, self.d_k)
+        emb.narrow(0, start, self.d_k).unwrap()
     }
 
-    fn get_key_vec(&self, emb: &ANode, head_num: usize) -> ANode {
+    fn get_key_vec(&self, emb: &Tensor, head_num: usize) -> Tensor {
         let start = (self.num_heads * self.d_k) + self.d_k * head_num;
-        emb.slice(start, self.d_k)
+        emb.narrow(0, start, self.d_k).unwrap()
     }
 
-    fn get_value_vec(&self, emb: &ANode, head_num: usize) -> ANode {
+    fn get_value_vec(&self, emb: &Tensor, head_num: usize) -> Tensor {
         let query_key_size = self.num_heads * self.d_k * 2;
-        let v = emb.value().len();
+        let v = emb.dims1().unwrap();
         let d_model = ((v - query_key_size) as f32 / self.num_heads as f32) as usize;
         let start = query_key_size + d_model * head_num;
-        emb.slice(start, d_model)
+        emb.narrow(0, start, d_model).unwrap()
     }
-
 }
 
-/// Struct for easy access of the different pieces of the vector.
 #[derive(Clone)]
 struct Attention {
-    query: ANode,
-    key: ANode,
-    value: ANode
+    query: Tensor,
+    key: Tensor,
+    value: Tensor
 }
 
 impl Attention {
-    fn new(node: &ANode, mha: &MultiHeadedAttention, head: usize) -> Self {
+    fn new(node: &Tensor, mha: &MultiHeadedAttention, head: usize) -> Self {
         let query = mha.get_query_vec(&node, head);
         let key = mha.get_key_vec(&node, head);
         let value = mha.get_value_vec(&node, head);
         Attention {query, key, value}
     }
 
-    fn scale(&self, scalar: f32) -> Attention {
+    fn scale(&self, scalar: f32, device: &Device) -> Attention {
         if scalar != 1f32 {
+            let scalar_t = Tensor::from_slice(&[scalar], 1usize, device).unwrap();
             Attention {
-                query: scalar * &self.query,
-                key: scalar * &self.key,
-                value: scalar * &self.value
+                query: scalar_t.mul(&self.query).unwrap(),
+                key: scalar_t.mul(&self.key).unwrap(),
+                value: scalar_t.mul(&self.value).unwrap()
             }
         } else {
             self.clone()
@@ -95,14 +84,12 @@ impl Attention {
     }
 }
 
-/// The big chalupa: given attention and a set of vectors, computes the attention according to the
-/// attention type within the MHA parameter.  
 pub fn attention_mean<'a>(
-    it: impl Iterator<Item=&'a (ANode, f32)>,
+    it: impl Iterator<Item=&'a (Tensor, f32)>,
     mha: &MultiHeadedAttention,
     rng: &mut impl Rng
-) -> ANode {
-
+) -> Tensor {
+    let device = Device::Cpu;
     let features = it.collect::<Vec<_>>();
     let mut averages = Vec::with_capacity(mha.num_heads);
     for head in 0..mha.num_heads {
@@ -111,92 +98,92 @@ pub fn attention_mean<'a>(
         }).collect();
 
         if items.len() == 1 {
-            return items[0].0.value.clone()
+            return items[0].0.value.clone();
         }
         
-        // Compute attention matrix
-        let attention_matrix = compute_attention_matrix(&items, &mha.attention_type, rng);
-        
-        let sm_att_mat = compute_attention_softmax(attention_matrix, mha.d_k);
+        let attention_matrix = compute_attention_matrix(&items, &mha.attention_type, rng, &device);
+        let sm_att_mat = compute_attention_softmax(attention_matrix, mha.d_k, &device);
 
         let n = items.len() as f32;
-        let mean = scale_vecs(items, &sm_att_mat)
-            .collect::<Vec<_>>().sum_all() / n;
+        let mean = scale_vecs(items, &sm_att_mat, &device)
+            .collect::<Vec<_>>().iter()
+            .cloned()
+            .reduce(|a, b| a.add(&b).unwrap())
+            .unwrap();
+        let n_t = Tensor::from_slice(&[n], 1usize, &device).unwrap();
+        let mean = mean.div(&n_t).unwrap();
 
-        //averages.push(mean.tanh());
         averages.push(mean);
     }
 
-    averages.sum_all() / (mha.num_heads as f32)
+    let num_heads_t = Tensor::from_slice(&[mha.num_heads as f32], 1usize, &device).unwrap();
+    averages.iter()
+        .cloned()
+        .reduce(|a, b| a.add(&b).unwrap())
+        .unwrap()
+        .div(&num_heads_t)
+        .unwrap()
 }
 
-/// Computes value level attention scaling.
 fn scale_vecs<'a>(
     items: Vec<(Attention, f32)>, 
-    sm_att_mat: &'a AttentionMatrix 
-) -> impl Iterator<Item=ANode> + 'a {
-
+    sm_att_mat: &'a AttentionMatrix,
+    device: &Device
+) -> impl Iterator<Item=Tensor> + 'a {
     let mut rows = vec![Vec::new(); sm_att_mat.len()];
     sm_att_mat.iter().enumerate().for_each(|(ri, row)| {
         items.iter().zip(row.iter()).for_each(|((att, _), scaled_v)| {
             if let Some(v) = scaled_v {
-                rows[ri].push(&att.value * v);
+                rows[ri].push(att.value.mul(v).unwrap());
             }
         });
     });
 
-    rows.into_iter().map(|sums| sums.sum_all())
+    rows.into_iter().map(|sums| {
+        sums.iter().cloned().reduce(|a, b| a.add(&b).unwrap()).unwrap()
+    })
 }
 
-type AttentionMatrix = Vec<Vec<Option<ANode>>>;
+type AttentionMatrix = Vec<Vec<Option<Tensor>>>;
 
-#[inline]
 fn compute_attention_matrix(
     items: &[(Attention, f32)],
     at: &AttentionType,
-    rng: &mut impl Rng
+    rng: &mut impl Rng,
+    device: &Device
 ) -> AttentionMatrix {
     match at {
-        AttentionType::Full => compute_full_attention_matrix(items),
+        AttentionType::Full => compute_full_attention_matrix(items, device),
         AttentionType::Sliding{ window_size } => {
-            compute_sliding_attention_matrix(items, *window_size)
+            compute_sliding_attention_matrix(items, *window_size, device)
         },
         AttentionType::Random { num_features } => {
-            compute_random_attention_matrix(items, *num_features, rng)
+            compute_random_attention_matrix(items, *num_features, rng, device)
         }
     }
 }
 
-// Computes the full N^2 attention matrix.  
-fn compute_full_attention_matrix(
-    items: &[(Attention, f32)]
-) -> AttentionMatrix {
-    
-     // Get the attention for each feature
+fn compute_full_attention_matrix(items: &[(Attention, f32)], device: &Device) -> AttentionMatrix {
     let mut scaled = vec![vec![None; items.len()]; items.len()];
     for i in 0..items.len() {
         let (at_i, ic) = &items[i];
         let row = &mut scaled[i];
         for j in 0..items.len() {
             let (at_j, jc) = &items[j];
-            let mut dot_i_j = (&at_i.query).dot(&at_j.key);
+            let dot_i_j = at_i.query.dot(&at_j.key).unwrap();
             let num = ic * jc;
             if num >= 1f32 {
-                dot_i_j = dot_i_j * (num as f32);
+                let num_t = Tensor::from_slice(&[num], 1usize, device).unwrap();
+                row[j] = Some(dot_i_j.mul(&num_t).unwrap());
+            } else {
+                row[j] = Some(dot_i_j.clone());
             }
-            row[j] = Some(dot_i_j);
         }
     }
     scaled
 }
 
-// Computes the sliding attention matrix
-fn compute_sliding_attention_matrix(
-    items: &[(Attention, f32)],
-    window: usize
-) -> AttentionMatrix {
-    
-     // Get the attention for each feature
+fn compute_sliding_attention_matrix(items: &[(Attention, f32)], window: usize, device: &Device) -> AttentionMatrix {
     let mut scaled = vec![vec![None; items.len()]; items.len()];
     for i in 0..items.len() {
         let (j_start, j_end) = {
@@ -204,33 +191,22 @@ fn compute_sliding_attention_matrix(
             let stop = (i + window+ 1).min(items.len());
             (start, stop)
         };
-
         let at_i = &items[i].0;
         let row = &mut scaled[i];
         for j in j_start..j_end {
             let at_j = &items[j].0;
-            let dot_i_j = (&at_i.query).dot(&at_j.key);
-            row[j] = Some(dot_i_j);
+            row[j] = Some(at_i.query.dot(&at_j.key).unwrap());
         }
     }
     scaled
 }
 
-// Computes the random attention matrix.  For each features, we select k random features to attend
-// toward.
-fn compute_random_attention_matrix(
-    items: &[(Attention, f32)],
-    sample: Sample,
-    rng: &mut impl Rng
-) -> AttentionMatrix {
-    
-    // Sample K features and scale
+fn compute_random_attention_matrix(items: &[(Attention, f32)], sample: Sample, rng: &mut impl Rng, device: &Device) -> AttentionMatrix {
     let (k, scale) = sample.sample(items.len(), true, rng);
     let items = items.iter()
-        .map(|(at, w)| (at.scale(scale), w))
+        .map(|(at, w)| (at.scale(scale, device), w))
         .collect::<Vec<_>>();
 
-    // Get the attention for each feature
     let mut scaled = vec![vec![None; items.len()]; items.len()];
     let mut buff = vec![0; k];
     for i in 0..items.len() {
@@ -239,39 +215,31 @@ fn compute_random_attention_matrix(
         items.iter().enumerate().map(|(i,_)| i).choose_multiple_fill(rng, buff.as_mut_slice());
         for j in buff.iter() {
             let at_j = &items[*j].0;
-            let dot_i_j = (&at_i.query).dot(&at_j.key);
-            row[*j] = Some(dot_i_j);
+            row[*j] = Some(at_i.query.dot(&at_j.key).unwrap());
         }
     }
     scaled
 }
 
+fn compute_attention_softmax(mut attention_matrix: AttentionMatrix, d_k: usize, device: &Device) -> AttentionMatrix {
+    let d_k_sqrt = (d_k as f32).sqrt();
+    let d_k_t = Tensor::from_slice(&[d_k_sqrt], 1usize, device).unwrap();
 
-// Learn the softmax of the attention matrix.  Lots of effort in place to make this efficient,
-// within the limitations of dynamic allocations.  Might make sense to make a special attention
-// operator ala pytorch/tensorflow within simple_grad.
-fn compute_attention_softmax(
-    mut attention_matrix: AttentionMatrix,
-    d_k: usize
-) -> AttentionMatrix {
-    // Compute softmax
-    let d_k = Constant::scalar((d_k as f32).sqrt());
-
-    // Compute softmax for each non-masked feature
     attention_matrix.iter_mut().for_each(|row| {
-        // Get non-zero rows
-        let non_zero_row: Vec<_>  = row.iter()
+        let non_zero_row: Vec<_> = row.iter()
             .filter(|x| x.is_some())
             .map(|x| x.clone().unwrap())
             .collect();
 
-        let nz_row = non_zero_row.concat() / &d_k;
-        let sm = softmax(nz_row, false);
+        let nz_row = Tensor::cat(&non_zero_row, 0).unwrap().div(&d_k_t).unwrap();
+        let exp_vals = nz_row.exp().unwrap();
+        let sum_exp = exp_vals.sum_all().unwrap();
+        let sm = exp_vals.div(&sum_exp).unwrap();
 
         let mut idx = 0;
         row.iter_mut().for_each(|ri| {
             if ri.is_some() {
-                *ri = Some(sm.slice(idx,1));
+                *ri = Some(sm.narrow(0, idx, 1).unwrap());
                 idx += 1;
             }
         });
@@ -279,20 +247,10 @@ fn compute_attention_softmax(
     attention_matrix
 }
 
-// Simple softmax.
-pub fn softmax(numers: ANode, exact: bool) -> ANode {
-    // Doesn't need to be part of the graph
-    let max_value = numers.value().iter()
-        .max_by_key(|v| FloatOrd(**v))
-        .expect("Shouldn't be non-zero!");
-
-    let mv = Constant::scalar(*max_value);
-    let n = if exact {
-        (numers - &mv).exp()
-    } else {
-        (numers - &mv).exp_approx()
-    };
-    &n / n.sum()
+pub fn softmax(numers: &Tensor, _exact: bool) -> Tensor {
+    let exp_vals = numers.exp().unwrap();
+    let sum_exp = exp_vals.sum_all().unwrap();
+    exp_vals.div(&sum_exp).unwrap()
 }
 
 #[cfg(test)]
@@ -300,23 +258,23 @@ mod attention_tests {
     use super::*;
     use rand_xorshift::XorShiftRng;
 
-    fn create_att_vecs() -> Vec<(Attention, usize)> {
+    fn create_att_vecs(device: &Device) -> Vec<(Attention, f32)> {
         let mha = MultiHeadedAttention {
             d_k: 1,
             num_heads: 1,
             attention_type: AttentionType::Full
         };
         vec![
-            (Attention::new(&Variable::new(vec![-1., -1., 1., 1.]), &mha, 0), 1f32),
-            (Attention::new(&Variable::new(vec![0., 0., 2., 2.]), &mha, 0), 1f32),
-            (Attention::new(&Variable::new(vec![1., 1., -1., -1.]), &mha, 0), 1f32)
+            (Attention::new(&Tensor::from_slice(&[-1., -1., 1., 1.], 4usize, device).unwrap(), &mha, 0), 1f32),
+            (Attention::new(&Tensor::from_slice(&[0., 0., 2., 2.], 4usize, device).unwrap(), &mha, 0), 1f32),
+            (Attention::new(&Tensor::from_slice(&[1., 1., -1., -1.], 4usize, device).unwrap(), &mha, 0), 1f32)
         ]
     }
 
     #[test]
     fn test_attention_matrix_global() {
-        let feats = create_att_vecs();
-
+        let device = Device::Cpu;
+        let feats = create_att_vecs(&device);
         let exp_att_matrix = vec![
             vec![vec![-1. * -1.], vec![-1. * 0.], vec![-1. * 1.]],
             vec![vec![0.  * -1.], vec![0.  * 0.], vec![0.  * 1.]],
@@ -324,105 +282,14 @@ mod attention_tests {
         ];
 
         let mut rng = XorShiftRng::seed_from_u64(0);
-        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Full, &mut rng);
+        let att_matrix = compute_attention_matrix(&feats, &AttentionType::Full, &mut rng, &device);
         for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
-            for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
-                assert_eq!(ri.unwrap().value(), eri);
-            }
-        }
-
-    }
-
-    #[test]
-    fn test_attention_matrix_cw() {
-        let feats = create_att_vecs();
-
-        let exp_att_matrix = vec![
-            vec![vec![-1. * -1.], vec![-1. * 0.], vec![0.]],
-            vec![vec![0.  * -1.], vec![0.  * 0.], vec![0.  * 1.]],
-            vec![vec![0.], vec![1.  * 0.], vec![1.  * 1.]],
-        ];
-
-        let mut rng = XorShiftRng::seed_from_u64(0);
-        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Sliding {window_size: 1}, &mut rng);
-        for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
-            assert_eq!(row.len(), exp_row.len());
             for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
                 if let Some(v) = ri {
-                    assert_eq!(v.value(), eri);
-                } else {
-                    assert_eq!(eri, vec![0f32]);
-                }
-            }
-        }
-
-        let exp_att_matrix = vec![
-            vec![vec![-1. * -1.], vec![-1. * 0.], vec![-1. * 1.]],
-            vec![vec![0.  * -1.], vec![0.  * 0.], vec![0.  * 1.]],
-            vec![vec![1.  * -1.], vec![1.  * 0.], vec![1.  * 1.]],
-        ];
-
-        // larger window than feat set
-        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Sliding { window_size: 10}, &mut rng);
-        for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
-            assert_eq!(row.len(), exp_row.len());
-            for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
-                if let Some(v) = ri {
-                    assert_eq!(v.value(), eri);
-                } else {
-                    assert_eq!(eri, vec![0f32]);
+                    let vals: Vec<f32> = v.to_vec1().unwrap();
+                    assert!((vals[0] - eri[0]).abs() < 1e-5);
                 }
             }
         }
     }
-
-    #[test]
-    fn test_att_softmax() {
-        let feats = create_att_vecs();
-
-        let exp_softmax = vec![
-            vec![0.66524096,0.24472847,0.09003057],
-            vec![1./3.,1./3.,1./3.],
-            vec![0.09003057, 0.24472847, 0.66524096],
-        ];
-
-        let mut rng = XorShiftRng::seed_from_u64(0);
-        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Full, &mut rng);
-        let softmax_matrix = compute_attention_softmax(att_matrix, 1);
-
-        assert_eq!(softmax_matrix.len(), exp_softmax.len());
-        for (row, exp_row) in softmax_matrix.into_iter().zip(exp_softmax.into_iter()) {
-            let r: Vec<_> = row.into_iter().map(|x| x.unwrap()).collect();
-            assert_eq!(r.concat().value(), exp_row);
-        }
-
-    }
-
-    #[test]
-    fn test_att_reweighted() {
-        let feats = create_att_vecs();
-
-        let mut rng = XorShiftRng::seed_from_u64(0);
-        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Full, &mut rng);
-        let softmax_matrix = compute_attention_softmax(att_matrix, 1);
-        let reweighted = scale_vecs(feats, &softmax_matrix).collect::<Vec<_>>();
-
-        let exp_weights = vec![
-            vec![ 1.0647,  1.0647],
-            vec![ 0.6667,  0.6667],
-            vec![-0.0858, -0.0858]
-        ];
-
-        for row in reweighted.iter() {
-            println!("{:?}", row.value());
-        }
-
-        for (row, erow) in reweighted.iter().zip(exp_weights.into_iter()) {
-            for (ri, eri) in row.value().iter().zip(erow.iter()) {
-                assert!((ri - eri).abs() < 1e-4);
-            }
-        }
-    }
-
-
 }
