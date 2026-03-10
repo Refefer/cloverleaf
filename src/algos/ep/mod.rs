@@ -14,7 +14,7 @@ use std::collections::{HashMap as CHashMap};
 use rand::prelude::*;
 use rand_distr::StandardNormal;
 use rand_xorshift::XorShiftRng;
-use simple_grad::*;
+use candle_core::{Device, Tensor, Var};
 
 use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::EmbeddingStore;
@@ -98,6 +98,7 @@ impl EmbeddingPropagation {
     ) -> EmbeddingStore {
 
         let mut rng = XorShiftRng::seed_from_u64(self.seed);
+        let device = Device::Cpu;
 
         let dims = model.feature_dims(self.d_model);
         let feature_embeddings = if let Some(embs) = feature_embeddings {
@@ -127,7 +128,6 @@ impl EmbeddingPropagation {
         let pb = CLProgressBar::new((self.passes * steps_per_pass) as u64, self.indicator);
         
         // Enable/disable shared memory pool
-        use_shared_pool(false);
 
         let total_updates = steps_per_pass * self.passes;
         let lr_scheduler = {
@@ -183,28 +183,28 @@ impl EmbeddingPropagation {
                 let grads: Vec<_> = nodes.par_iter().filter_map(|node_id| {
                     let n_id = **node_id;
                     let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + n_id) as u64);
-                    let (mut loss, hv_vars, thv_vars, hu_vars) = self.run_forward_pass(
+                    let (loss, hv_vars, thv_vars, hu_vars) = self.run_forward_pass(
                         graph, n_id, &features, &feature_embeddings, 
                         model, &sampler, &mut rng);
 
-                    loss = match self.loss_weighting {
+                    let loss = match self.loss_weighting {
                         LossWeighting::DegreeLog => {
-                            let decrease = (1f32 + graph.degree(n_id) as f32).ln();
-                            loss / decrease
+                            let decrease = Tensor::from_slice(&[(1f32 + graph.degree(n_id) as f32).ln()], 1usize, &device).unwrap();
+                            loss.div(&decrease).unwrap()
                         },
                         LossWeighting::DegreeExponential(weight) => {
-                            let decrease = (graph.degree(n_id) as f32).powf(weight);
-                            loss / decrease
+                            let decrease = Tensor::from_slice(&[(graph.degree(n_id) as f32).powf(weight)], 1usize, &device).unwrap();
+                            loss.div(&decrease).unwrap()
                         },
                         LossWeighting::None => { loss }
                     };
 
-                    let loss_value = loss.value()[0];
+                    let loss_value = loss.to_scalar::<f32>().unwrap();
 
                     // Sometimes there are weird errors due to underflows in softmax
                     // In this case, just print the graph and don't return
                     if loss_value.is_nan() {
-                        Graph::print_graph(&loss);
+                        println!("Loss: {:?}", loss);
                         None
                     } else if loss_value > 0f32 {
                         let grads = self.extract_gradients(&loss, hv_vars, thv_vars, hu_vars);
@@ -275,7 +275,7 @@ impl EmbeddingPropagation {
                             graph, **node_id, &features, &feature_embeddings, 
                             model, &sampler, &mut rng).0;
 
-                        loss.value()[0]
+                        loss.to_scalar::<f32>().unwrap()
                     }).sum::<f32>()
                 }).sum::<f32>();
                 
@@ -295,7 +295,7 @@ impl EmbeddingPropagation {
         model: &M,
         sampler: &S,
         rng: &mut R
-    ) -> (ANode, NodeCounts, NodeCounts, Vec<NodeCounts>) {
+    ) -> (Tensor, NodeCounts, NodeCounts, Vec<NodeCounts>) {
         // h(v)
         let (hv_vars, hv) = model.construct_node_embedding(
             node, 1f32, features, &feature_embeddings, rng);
@@ -320,35 +320,33 @@ impl EmbeddingPropagation {
         });
 
         // Compute error
-        let loss = self.loss.compute(thv, hv.clone(), &hus);
+        let device = Device::Cpu;
+        let loss = self.loss.compute(&thv, &hv, &hus, &device);
 
         (loss, hv_vars, thv_vars, hu_vars)
 
     }
 
     fn extract_gradients(
-        &self, 
-        loss: &ANode,
+        &self,
+        loss: &Tensor,
         hv_vars: NodeCounts,
         thv_vars: NodeCounts,
         hu_vars: Vec<NodeCounts>
     ) -> HashMap<usize, Vec<f32>> {
+        let device = Device::Cpu;
 
         // Compute gradients
-        let mut agraph = Graph::new();
-
-        // This call is about 90% of the entire cost of the algorithm.  The compute graph is
-        // incredibly deep when using attention and requires the computation of several gigabytes
-        // of gradients.
-        // Non-attention methods are substantially simpler to compute the gradients for and are two
-        // orders of a magnitude lower.
-        agraph.backward(&loss);
+        // Compute gradients - this is about 90% of the entire cost of the algorithm.
+        // The compute graph is incredibly deep when using attention and requires
+        // the computation of several gigabytes of gradients.
+        let grad_store = loss.backward().unwrap();
 
         let mut grads = HashMap::new();
-        extract_grads(&agraph, &mut grads, hv_vars.into_iter());
-        extract_grads(&agraph, &mut grads, thv_vars.into_iter());
+        extract_grads(&grad_store, &mut grads, &device, hv_vars.into_iter());
+        extract_grads(&grad_store, &mut grads, &device, thv_vars.into_iter());
         hu_vars.into_iter().for_each(|hu_var| {
-            extract_grads(&agraph, &mut grads, hu_var.into_iter());
+            extract_grads(&grad_store, &mut grads, &device, hu_var.into_iter());
         });
 
         grads
@@ -359,19 +357,19 @@ impl EmbeddingPropagation {
 
 /// We extract the gradients for each unique feature
 pub fn extract_grads(
-    graph: &Graph, 
+    grad_store: &candle_core::backprop::GradStore,
     grads: &mut HashMap<usize, Vec<f32>>, 
-    vars: impl Iterator<Item=(usize, (ANode, f32))>
+    device: &Device,
+    vars: impl Iterator<Item=(usize, (Tensor, f32))>
 ) {
-    for (feat_id, (var, _)) in vars {
+        for (feat_id, (var, weight)) in vars {
         if grads.contains_key(&feat_id) { continue }
 
-        if let Some(grad) = graph.get_grad(&var) {
-            if grad.iter().all(|gi| !(gi.is_nan() || gi.is_infinite())) {
-                // Can get some nans in weird cases, such as the distance between
-                // a node and it's reconstruction when it shares all features.
-                // Since that's not all that helpful anyways, we simply ignore it and move on
-                grads.insert(feat_id, grad.to_vec());
+        if let Some(grad) = grad_store.get(&var) {
+            if let Ok(grad_vec) = grad.to_vec1::<f32>() {
+                if grad_vec.iter().all(|gi| !gi.is_nan() && !gi.is_infinite()) {
+                    grads.insert(feat_id, grad_vec);
+                }
             }
         }
     }

@@ -1,7 +1,7 @@
 //! Defines the different losses for use within the Embedding Propagation framework.
 //! Admitedly, the EP framework isn't parameterized on loss, so technically choosing a loss other
 //! than Margin Loss is a different optimizer. 
-use simple_grad::*;
+use candle_core::{Device, Tensor};
 use rand::prelude::*;
 use rand_distr::{Distribution,Uniform};
 
@@ -13,27 +13,11 @@ use super::attention::softmax;
 
 #[derive(Copy,Clone,Debug)]
 pub enum Loss {
-    /// This is the max margin loss with threshold that's common in embedding work.  FaceNet was
-    /// one of the first to define it and a good starting point
     MarginLoss(f32, usize),
-
-    /// Contrastive Loss is another embedding approach; two margins are provided: a positive and a
-    /// negative margin, moderating how much each matters
     Contrastive(f32, f32, usize),
-
-    /// This is loss used in the StarSpace paper.  It's basically max margin loss but using cosine
-    /// rather than euclidean distances
     StarSpace(f32, usize),
-
-    /// This use negative log likelihood to maximize a 1-of-N ranked list.
     RankLoss(f32, usize),
-    
-    /// This combines StarSpace and RankLoss, which for search purposes significantly outperforms
-    /// the other losses
     RankSpace(f32, usize),
-
-    /// This uses PPR to generate a set of candidates for optimize toward.  Should be broken out as
-    /// it's fairly unique.
     PPR(f32, usize, f32)
 }
 
@@ -49,111 +33,109 @@ impl Loss {
         }
     }
 
-    // hv is the embedding constructed from its features
-    // thv is the reconstruction of v from its neighbor nodes or 
-    // a random positive, depending on the loss
-    // hu is a random negative node constructed via its neighbors
-    pub fn compute(&self, thv: ANode, hv: ANode, hus: &[ANode]) -> ANode {
+    pub fn compute(&self, thv: &Tensor, hv: &Tensor, hus: &[Tensor], device: &Device) -> Tensor {
         match self {
-
             Loss::MarginLoss(gamma, _) | Loss::PPR(gamma, _, _) => {
-                let d1 = gamma + euclidean_distance(&thv, &hv);
-                let pos_losses = hus.iter()
-                    .map(|hu| &d1 - euclidean_distance(&thv, hu))
-                    .filter(|loss| loss.value()[0] > 0f32)
-                    .collect::<Vec<_>>();
+                let d1 = crate::candle_utils::euclidean_distance(thv, hv).unwrap().add(&Tensor::from_slice(&[*gamma], 1usize, device).unwrap()).unwrap();
+                let pos_losses: Vec<_> = hus.iter()
+                    .map(|hu| {
+                        let dist = crate::candle_utils::euclidean_distance(thv, hu).unwrap();
+                        d1.sub(&dist).unwrap()
+                    })
+                    .filter(|loss| loss.to_vec1::<f32>().unwrap()[0] > 0f32)
+                    .collect();
 
-                // Only return positive ones
-                if pos_losses.len() > 0 {
+                if !pos_losses.is_empty() {
                     let n_losses = pos_losses.len() as f32;
-                    pos_losses.sum_all() / n_losses
+                    let sum = pos_losses.iter().cloned().reduce(|a, b| a.add(&b).unwrap()).unwrap();
+                    sum.div(&Tensor::from_slice(&[n_losses], 1usize, device).unwrap()).unwrap()
                 } else {
-                    Constant::scalar(0f32)
+                    Tensor::from_slice(&[0f32], 1usize, device).unwrap()
                 }
             },
 
             Loss::RankSpace(gamma, n) => {
-                let ss_loss = Loss::StarSpace(*gamma, *n).compute(thv.clone(), hv.clone(), hus);
-                let rank_loss = Loss::RankLoss(*gamma, *n).compute(thv, hv, hus);
-                ss_loss + rank_loss
+                let ss_loss = Loss::StarSpace(*gamma, *n).compute(thv, hv, hus, device);
+                let rank_loss = Loss::RankLoss(*gamma, *n).compute(thv, hv, hus, device);
+                ss_loss.add(&rank_loss).unwrap()
             }
 
             Loss::StarSpace(gamma, _)  => {
-                let thv_norm = il2norm(&thv);
-                let hv_norm  = il2norm(&hv);
-
-                // margin between a positive node and its reconstruction
-                // The more correlated
-                let reconstruction_dist = cosine(thv_norm.clone(), hv_norm.clone());
-                let losses = hus.iter()
+                let thv_norm = crate::candle_utils::il2norm(thv).unwrap();
+                let hv_norm  = crate::candle_utils::il2norm(hv).unwrap();
+                let reconstruction_dist = crate::candle_utils::cosine(&thv_norm, &hv_norm).unwrap();
+                let gamma_t = Tensor::from_slice(&[*gamma], 1usize, device).unwrap();
+                
+                let losses: Vec<_> = hus.iter()
                     .map(|hu| {
-                        let hu_norm = il2norm(hu);
-                        // Margin loss
-                        (gamma - (&reconstruction_dist - cosine(hv_norm.clone(), hu_norm))).maximum(0f32)
+                        let hu_norm = crate::candle_utils::il2norm(hu).unwrap();
+                        let cos = crate::candle_utils::cosine(&hv_norm, &hu_norm).unwrap();
+                        let diff = gamma_t.sub(&reconstruction_dist).unwrap().add(&cos).unwrap();
+                        // Maximum with 0
+                        let max_val = diff.maximum(&Tensor::from_slice(&[0f32], 1usize, device).unwrap()).unwrap();
+                        max_val
                     })
-                    // Only collect losses which are not zero
-                    .filter(|l| l.value()[0] > 0f32)
-                    .collect::<Vec<_>>();
+                    .filter(|l| l.to_vec1::<f32>().unwrap()[0] > 0f32)
+                    .collect();
 
-                // Only return positive ones
-                if losses.len() > 0 {
+                if !losses.is_empty() {
                     let n_losses = losses.len() as f32;
-                    losses.sum_all() / n_losses
+                    let sum = losses.iter().cloned().reduce(|a, b| a.add(&b).unwrap()).unwrap();
+                    sum.div(&Tensor::from_slice(&[n_losses], 1usize, device).unwrap()).unwrap()
                 } else {
-                    Constant::scalar(0f32)
+                    Tensor::from_slice(&[0f32], 1usize, device).unwrap()
                 }
             },
 
             Loss::Contrastive(pos_margin, neg_margin, _)  => {
-                let thv_norm = il2norm(&thv);
-                let hv_norm  = il2norm(&hv);
+                let thv_norm = crate::candle_utils::il2norm(thv).unwrap();
+                let hv_norm  = crate::candle_utils::il2norm(hv).unwrap();
+                let pos_margin_t = Tensor::from_slice(&[*pos_margin], 1usize, device).unwrap();
+                let neg_margin_t = Tensor::from_slice(&[*neg_margin], 1usize, device).unwrap();
 
-                let pos_reconstruction = (pos_margin - cosine(thv_norm, hv_norm.clone())).maximum(0f32);
+                let pos_cos = crate::candle_utils::cosine(&thv_norm, &hv_norm).unwrap();
+                let pos_reconstruction = pos_margin_t.sub(&pos_cos).unwrap().maximum(&Tensor::from_slice(&[0f32], 1usize, device).unwrap()).unwrap();
+                
                 let mut margins: Vec<_> = hus.iter().map(|hu| {
-                        let hu_norm = il2norm(hu);
-                        let cs = cosine(hv_norm.clone(), hu_norm);
-                        (cs - *neg_margin).maximum(0f32)
-                    })
-                    .filter(|v| v.value()[0] > 0f32)
-                    .collect();
+                    let hu_norm = crate::candle_utils::il2norm(hu).unwrap();
+                    let cs = crate::candle_utils::cosine(&hv_norm, &hu_norm).unwrap();
+                    cs.sub(&neg_margin_t).unwrap().maximum(&Tensor::from_slice(&[0f32], 1usize, device).unwrap()).unwrap()
+                })
+                .filter(|v| v.to_vec1::<f32>().unwrap()[0] > 0f32)
+                .collect();
 
-                if pos_reconstruction.value()[0] > 0f32 {
+                if pos_reconstruction.to_vec1::<f32>().unwrap()[0] > 0f32 {
                     margins.push(pos_reconstruction);
                 }
                 let n = margins.len();
                 if n > 0 {
-                    margins.sum_all() / n as f32
+                    let sum = margins.iter().cloned().reduce(|a, b| a.add(&b).unwrap()).unwrap();
+                    sum.div(&Tensor::from_slice(&[n as f32], 1usize, device).unwrap()).unwrap()
                 } else {
-                    Constant::scalar(0f32)
+                    Tensor::from_slice(&[0f32], 1usize, device).unwrap()
                 }
             }
 
             Loss::RankLoss(tau, _)  => {
-                // Get the dot products
                 let mut ds: Vec<_> = hus.iter().map(|hu| {
-                    hu.dot(&hv)
+                    crate::candle_utils::dot(hv, hu).unwrap()
                 }).collect();
                 
-                // Add the positive example
-                ds.push(hv.dot(&thv));
+                ds.push(crate::candle_utils::dot(hv, thv).unwrap());
                 let len = ds.len();
-                let dsc = ds.concat();
-                let mut sm = softmax(dsc.clone(), false);
-                // Approximate softmax has some underflow issues in the taylor series
-                // so, we test if running the natural log causes a NaN, and if so,
-                // backtrack to the exact version at the expense of speed
-                if sm.value()[len-1] <= 0f32 {
-                    sm = softmax(dsc, true);
+                let dsc = Tensor::cat(&ds, 0).unwrap();
+                let mut sm = softmax(&dsc, false);
+                if sm.to_vec1::<f32>().unwrap()[len-1] <= 0f32 {
+                    sm = softmax(&dsc, true);
                 }
-                let p = sm.slice(len-1, 1);
-                let pi = p.value()[0];
+                let p = sm.narrow(0, len-1, 1).unwrap();
+                let pi = p.to_vec1::<f32>().unwrap()[0];
                 if pi < *tau {
-                    -p.ln()
+                    p.log().unwrap().mul(&Tensor::from_slice(&[-1f32], 1usize, device).unwrap()).unwrap()
                 } else {
-                    Constant::scalar(0f32)
+                    Tensor::from_slice(&[0f32], 1usize, device).unwrap()
                 }
             }
-
         }
     }
 
@@ -165,7 +147,7 @@ impl Loss {
         feature_embeddings: &EmbeddingStore,
         model: &M,
         rng: &mut R
-    ) -> (NodeCounts,ANode) {
+    ) -> (NodeCounts,Tensor) {
         match self {
             Loss::PPR(_, num, restart_p) => {
                 let mut nodes = Vec::with_capacity(*num);
@@ -185,9 +167,7 @@ impl Loss {
                     graph, node, feature_store, feature_embeddings, rng)
             }
         }
-
     }
-
 }
 
 fn random_walk<R: Rng, G: CGraph>(
@@ -201,7 +181,6 @@ fn random_walk<R: Rng, G: CGraph>(
     let mut node = anchor;
     let mut i = 0;
     
-    // Random walk
     loop {
         i += 1;
         let edges = graph.get_edges(node).0;
@@ -210,36 +189,36 @@ fn random_walk<R: Rng, G: CGraph>(
         }
         let dist = Uniform::new(0, edges.len());
         node = edges[dist.sample(rng)];
-        // We want at least one step in our walk
-        // before exiting since zero-steps guarantees an anchor
-        // edge
         if i > 1 && rng.gen::<f32>() < restart_p && node != anchor { break }
     }
 
     if node != anchor {
-        Some(node)
-    } else if anchor_edges.len() > 0 {
+        if !anchor_edges.is_empty() {
+            Some(anchor_edges[Uniform::new(0, anchor_edges.len()).sample(rng)])
+        } else {
+            None
+        }
+    } else if !anchor_edges.is_empty() {
         Some(anchor_edges[Uniform::new(0, anchor_edges.len()).sample(rng)])
     } else {
         None
     }
 }
 
-
-fn l2norm(v: ANode) -> ANode {
-    v.pow(2f32).sum().pow(0.5)
+fn l2norm(v: &Tensor, device: &Device) -> Tensor {
+    v.powf(2.0).unwrap().sum_all().unwrap().sqrt().unwrap()
 }
 
-fn il2norm(v: &ANode) -> ANode {
-    v / l2norm(v.clone())
+fn il2norm(v: &Tensor, device: &Device) -> Tensor {
+    v.div(&l2norm(v, device)).unwrap()
 }
 
-fn cosine(x1: ANode, x2: ANode) -> ANode {
-    x1.dot(&x2)
+fn cosine(x1: &Tensor, x2: &Tensor, device: &Device) -> Tensor {
+    crate::candle_utils::dot(x1, x2).unwrap()
 }
 
-fn euclidean_distance(e1: &ANode, e2: &ANode) -> ANode {
-    (e1 - e2).pow(2f32).sum().pow(0.5)
+fn euclidean_distance(e1: &Tensor, e2: &Tensor, device: &Device) -> Tensor {
+    crate::candle_utils::euclidean_distance(e1, e2).unwrap()
 }
 
 #[cfg(test)]
@@ -248,18 +227,21 @@ mod ep_loss_tests {
 
     #[test]
     fn test_euclidean_dist() {
-        let x = Variable::new(vec![1f32, 3f32]);
-        let y = Variable::new(vec![3f32, 5f32]);
-        let dist = euclidean_distance(&x, &y);
-        assert_eq!(dist.value(), &[(8f32).powf(0.5)]);
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[1f32, 3f32], 2usize, &device).unwrap();
+        let y = Tensor::from_slice(&[3f32, 5f32], 2usize, &device).unwrap();
+        let dist = euclidean_distance(&x, &y, &device);
+        assert!((dist.to_vec1::<f32>().unwrap()[0] - (8f32).powf(0.5)).abs() < 1e-5);
     }
 
     #[test]
     fn test_l2norm() {
-        let x = Variable::new(vec![1f32, 3f32]);
-        let norm = il2norm(&x);
+        let device = Device::Cpu;
+        let x = Tensor::from_slice(&[1f32, 3f32], 2usize, &device).unwrap();
+        let norm = il2norm(&x, &device);
         let denom = 10f32.powf(0.5);
-        assert_eq!(norm.value(), &[1f32 / denom, 3f32 / denom]);
+        let vals = norm.to_vec1::<f32>().unwrap();
+        assert!((vals[0] - 1f32 / denom).abs() < 1e-5);
+        assert!((vals[1] - 3f32 / denom).abs() < 1e-5);
     }
-
 }
