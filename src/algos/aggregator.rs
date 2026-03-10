@@ -1,7 +1,7 @@
 //! Aggregators take models, feature embeddings, and a feature set and convert them into
 //! embeddings.  They are constructed adhoc so can be used in parallel as well as within the python
 //! interface
-use simple_grad::*;
+use candle_core::{Device, Tensor};
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 
@@ -141,13 +141,14 @@ impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {
         out.fill(0f32);
         let it = features.iter().map(|feat_id| {
             let e = self.embs.get_embedding(*feat_id); 
-            (Constant::new(e.to_vec()), 1f32)
+            (Tensor::from_slice(e, e.len(), &Device::Cpu).unwrap(), 1f32)
         }).collect::<Vec<_>>();
 
         // No-op RNG
         let mut rng = XorShiftRng::seed_from_u64(0);
-        let v = attention_mean(it.iter(), &self.mha, &mut rng);
-        v.value().iter().zip(out.iter_mut()).for_each(|(vi, outi)| {
+        let result = attention_mean(it.iter(), &self.mha, &mut rng);
+        let v = result.to_vec1::<f32>().unwrap();
+        v.iter().zip(out.iter_mut()).for_each(|(vi, outi)| {
             *outi = *vi;
         });
     }

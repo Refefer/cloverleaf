@@ -329,6 +329,7 @@ impl PprRank {
         sampler: &S,
         rng: &mut R
     ) -> (Tensor, Vec<NodeCounts>) {
+        let device = Device::Cpu;
         let mut ranked_ids = Vec::with_capacity(self.k + self.negatives);
         let mut ranked_scores = Vec::with_capacity(self.k + self.negatives);
         let mut neg_ids = Vec::with_capacity(self.negatives);
@@ -360,7 +361,7 @@ impl PprRank {
         // Compute error
         let loss = match self.loss {
             Loss::ListNet { passive, weight_decay } => {
-                let mut list_loss = self.listnet_loss(&query_node, &ranked_embeddings, &ranked_scores, node, passive);
+                let mut list_loss = self.listnet_loss(&device, &query_node, &ranked_embeddings, &ranked_scores, node, passive);
                 if weight_decay > 0f32 {
                     let wd_tensor = Tensor::from_slice(&[weight_decay], 1usize, &device).unwrap();
                     let decay_loss = comp_weight_decay(&query_node, &ranked_embeddings, 0.1f32);
@@ -370,7 +371,7 @@ impl PprRank {
                 list_loss
             },
             Loss::ListMLE { weight_decay } => {
-                let mut list_loss = self.list_mle_loss(&query_node, &ranked_embeddings, &ranked_scores, node);
+                let mut list_loss = self.list_mle_loss(&device, &query_node, &ranked_embeddings, &ranked_scores, node);
                 if weight_decay > 0f32 {
                     let wd_tensor = Tensor::from_slice(&[weight_decay], 1usize, &device).unwrap();
                     let decay_loss = comp_weight_decay(&query_node, &ranked_embeddings, 0.1f32);
@@ -384,8 +385,7 @@ impl PprRank {
         (loss, feat_maps)
     }
 
-    fn listnet_loss(
-        &self,
+    fn listnet_loss(&self, device: &Device,
         query_node: &Tensor,
         ranked_nodes: &[Tensor],
         node_weights: &[f32],
@@ -412,7 +412,7 @@ impl PprRank {
             //println!("Node:{}, {:?} -> {:?}", node_id, node_weights, sm_scores.to_vec1::<f32>().unwrap());
             Tensor::from_slice(&[0f32], 1usize, &device).unwrap()
         } else {
-            let loss = -ordered.sum_all();
+            let loss = Tensor::cat(&ordered, 0).unwrap().sum_all().unwrap().neg().unwrap();
             if node_id == 0 {
                 println!("loss:{}, {:?} -> {:?}", loss.to_vec1::<f32>().unwrap()[0], node_weights, sm_scores.to_vec1::<f32>().unwrap());
             }
@@ -420,8 +420,7 @@ impl PprRank {
         }
     }
 
-    fn list_mle_loss(
-        &self,
+    fn list_mle_loss(&self, device: &Device,
         query_node: &Tensor,
         ranked_nodes: &[Tensor],
         node_weights: &[f32],
@@ -451,7 +450,7 @@ impl PprRank {
         }).collect();
 
         let pl_loss = pl.iter().cloned().reduce(|a, b| a.mul(&b).unwrap()).unwrap();
-        let loss = pl_loss.log().unwrap().neg();
+        let loss = pl_loss.log().unwrap().neg().unwrap();
         
         let loss_val = loss.to_vec1::<f32>().unwrap()[0];
         if loss_val.is_nan() || loss_val.is_infinite() {
@@ -488,20 +487,21 @@ impl PprRank {
 }
 
 fn compute_distances(query_node: &Tensor, ranked_nodes: &[Tensor], cosine: bool) -> Tensor {
+    let device = Device::Cpu;
     if cosine {
-        // Compute the dot products to construct our yis
         let qn = il2norm(query_node, &device);
-        (ranked_nodes.iter().map(|n| {
-            qn.dot(&il2norm(n, &device))
-        }).collect::<Vec<_>>().concat() * 5f32).exp()
+        let dots: Vec<_> = ranked_nodes.iter().map(|n| {
+            crate::candle_utils::dot(&qn, &il2norm(n, &device)).unwrap()
+        }).collect();
+        let cat = Tensor::cat(&dots, 0).unwrap();
+        let scaled = cat.add(&Tensor::from_slice(&[5f32], 1usize, &device).unwrap()).unwrap();
+        scaled.exp().unwrap()
     } else {
-        ranked_nodes.iter().map(|n| {
-            query_node.dot(n)
-        }).collect::<Vec<_>>().concat().exp()
-        //ranked_nodes.iter().map(|n| {
-        //    1f32 / (1f32 + l2norm(&(query_node - n)))
-        //}).collect::<Vec<_>>().concat()
-        
+        let dots: Vec<_> = ranked_nodes.iter().map(|n| {
+            crate::candle_utils::dot(query_node, n).unwrap()
+        }).collect();
+        let cat = Tensor::cat(&dots, 0).unwrap();
+        cat.exp().unwrap()
     }
 }
 
