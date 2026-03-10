@@ -8,7 +8,7 @@ use hashbrown::HashMap;
 use std::collections::{HashMap as CHashMap};
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
-use simple_grad::*;
+use candle_core::{Device, Tensor};
 
 use crate::algos::rwr::RWR;
 use crate::algos::utils::Sample;
@@ -106,6 +106,7 @@ impl PprRank {
         // Initialization
         //
         let mut rng = XorShiftRng::seed_from_u64(self.seed);
+        let device = Device::Cpu;
 
         let feature_embeddings = if let Some(embs) = feature_embeddings {
             embs
@@ -132,7 +133,6 @@ impl PprRank {
         let steps_per_pass = (node_idxs.len() as f32 / self.batch_size as f32) as usize;
 
         // Enable/disable shared memory pool
-        use_shared_pool(true);
 
         let total_updates = steps_per_pass * self.passes;
         let lr_scheduler = {
@@ -192,7 +192,7 @@ impl PprRank {
                         graph, **node_id, &walk_lib, &features, &feature_embeddings, &sampler, &mut rng);
 
                     let grads = self.extract_gradients(&loss, feat_maps);
-                    (loss.value()[0], grads)
+                    (loss.to_vec1::<f32>().unwrap()[0], grads)
                 }).collect_into_vec(&mut grads);
 
                 let mut error = 0f32;
@@ -242,7 +242,7 @@ impl PprRank {
                             graph, **node_id, &walk_lib, &features, &feature_embeddings, 
                             &sampler, &mut rng).0;
 
-                        loss.value()[0]
+                        loss.to_vec1::<f32>().unwrap()[0]
                     })
                     .filter(|l| !l.is_infinite())
                     .sum::<f32>()
@@ -261,7 +261,7 @@ impl PprRank {
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut impl Rng
-    ) -> (NodeCounts, ANode) {
+    ) -> (NodeCounts, Tensor) {
         construct_node_embedding(
             node_id, 
             1f32,
@@ -328,7 +328,7 @@ impl PprRank {
         feature_embeddings: &EmbeddingStore,
         sampler: &S,
         rng: &mut R
-    ) -> (ANode, Vec<NodeCounts>) {
+    ) -> (Tensor, Vec<NodeCounts>) {
         let mut ranked_ids = Vec::with_capacity(self.k + self.negatives);
         let mut ranked_scores = Vec::with_capacity(self.k + self.negatives);
         let mut neg_ids = Vec::with_capacity(self.negatives);
@@ -362,14 +362,20 @@ impl PprRank {
             Loss::ListNet { passive, weight_decay } => {
                 let mut list_loss = self.listnet_loss(&query_node, &ranked_embeddings, &ranked_scores, node, passive);
                 if weight_decay > 0f32 {
-                    list_loss = list_loss + weight_decay * comp_weight_decay(&query_node, &ranked_embeddings, 0.1f32)
+                    let wd_tensor = Tensor::from_slice(&[weight_decay], 1usize, &device).unwrap();
+                    let decay_loss = comp_weight_decay(&query_node, &ranked_embeddings, 0.1f32);
+                    let weighted_decay = wd_tensor.mul(&decay_loss).unwrap();
+                    list_loss = list_loss.add(&weighted_decay).unwrap()
                 }
                 list_loss
             },
             Loss::ListMLE { weight_decay } => {
                 let mut list_loss = self.list_mle_loss(&query_node, &ranked_embeddings, &ranked_scores, node);
                 if weight_decay > 0f32 {
-                    list_loss = list_loss + weight_decay * comp_weight_decay(&query_node, &ranked_embeddings, 0.1f32)
+                    let wd_tensor = Tensor::from_slice(&[weight_decay], 1usize, &device).unwrap();
+                    let decay_loss = comp_weight_decay(&query_node, &ranked_embeddings, 0.1f32);
+                    let weighted_decay = wd_tensor.mul(&decay_loss).unwrap();
+                    list_loss = list_loss.add(&weighted_decay).unwrap()
                 }
                 list_loss
             }
@@ -380,35 +386,35 @@ impl PprRank {
 
     fn listnet_loss(
         &self,
-        query_node: &ANode,
-        ranked_nodes: &[ANode],
+        query_node: &Tensor,
+        ranked_nodes: &[Tensor],
         node_weights: &[f32],
         node_id: NodeID,
         passive: bool
-    ) -> ANode {
+    ) -> Tensor {
 
         let scores = compute_distances(query_node, ranked_nodes, false);
-        let sm_scores = softmax(scores, true);
+        let sm_scores = softmax(&scores, true);
 
         let ordered = node_weights.iter().enumerate()
             .filter(|(i, s)| {
                 let nonzero = **s > 0f32;
                 if passive {
-                    nonzero && sm_scores.value()[*i] <= **s
+                    nonzero && sm_scores.to_vec1::<f32>().unwrap()[*i] <= **s
                 } else { nonzero }
             })
             .map(|(idx, s)| {
-                let k = sm_scores.slice(idx, 1);
-                k.ln() * *s
-            }).collect::<Vec<ANode>>();
+                let k = sm_scores.narrow(0, idx, 1).unwrap();
+                k.log().unwrap().mul(&Tensor::from_slice(&[*s], 1usize, &device).unwrap()).unwrap()
+            }).collect::<Vec<Tensor>>();
 
         if ordered.len() == 0 {
-            //println!("Node:{}, {:?} -> {:?}", node_id, node_weights, sm_scores.value());
-            Constant::scalar(0f32)
+            //println!("Node:{}, {:?} -> {:?}", node_id, node_weights, sm_scores.to_vec1::<f32>().unwrap());
+            Tensor::from_slice(&[0f32], 1usize, &device).unwrap()
         } else {
             let loss = -ordered.sum_all();
             if node_id == 0 {
-                println!("loss:{}, {:?} -> {:?}", loss.value()[0], node_weights, sm_scores.value());
+                println!("loss:{}, {:?} -> {:?}", loss.to_vec1::<f32>().unwrap()[0], node_weights, sm_scores.to_vec1::<f32>().unwrap());
             }
             loss
         }
@@ -416,30 +422,46 @@ impl PprRank {
 
     fn list_mle_loss(
         &self,
-        query_node: &ANode,
-        ranked_nodes: &[ANode],
+        query_node: &Tensor,
+        ranked_nodes: &[Tensor],
         node_weights: &[f32],
         node_id: NodeID
-    ) -> ANode {
+    ) -> Tensor {
 
+        let device = Device::Cpu;
         let yi = compute_distances(query_node, ranked_nodes, false);
 
         // Compute the plackett luce model for each score
         let n = ranked_nodes.len();
+        let ones = Tensor::from_slice(&[1f32], 1usize, &device).unwrap();
         let pl: Vec<_> = (0..n).map(|i| {
-            yi.slice(i,1) / yi.slice(i, n - i).sum()
+            let yi_i = yi.narrow(0, i, 1).unwrap();
+            // For denominator, take elements from i to end and sum
+            let mut denom_elems = Vec::new();
+            for j in i..n {
+                let elem = yi.get(j).unwrap();
+                denom_elems.push(elem);
+            }
+            if denom_elems.is_empty() {
+                ones.clone()
+            } else {
+                let sum_tensor = denom_elems.iter().cloned().reduce(|a, b| a.add(&b).unwrap()).unwrap();
+                yi_i.div(&sum_tensor).unwrap()
+            }
         }).collect();
 
-        let pl_loss = pl.iter().fold(Constant::scalar(1f32), |acc, x| acc * x);
-
-        let loss = -pl_loss.ln();
-        if loss.value()[0].is_nan() || loss.value()[0].is_infinite() {
-            println!("yi: {:?}",yi.value());
-            println!("pl: {:?}", pl.concat().value());
-            Constant::scalar(0f32)
+        let pl_loss = pl.iter().cloned().reduce(|a, b| a.mul(&b).unwrap()).unwrap();
+        let loss = pl_loss.log().unwrap().neg();
+        
+        let loss_val = loss.to_vec1::<f32>().unwrap()[0];
+        if loss_val.is_nan() || loss_val.is_infinite() {
+            println!("yi: {:?}", yi.to_vec1::<f32>().unwrap());
+            let cat_pl = Tensor::cat(&pl, 0).unwrap();
+            println!("pl: {:?}", cat_pl.to_vec1::<f32>().unwrap());
+            Tensor::from_slice(&[0f32], 1usize, &device).unwrap()
         } else {
             if node_id == 0 {
-                println!("loss:{}, {:?} -> {:?}", loss.value()[0], node_weights, yi.value());
+                println!("loss:{}, {:?} -> {:?}", loss.to_vec1::<f32>().unwrap()[0], node_weights, yi.to_vec1::<f32>().unwrap());
             }
             loss
         }
@@ -448,18 +470,15 @@ impl PprRank {
 
     fn extract_gradients(
         &self, 
-        loss: &ANode,
+        loss: &Tensor,
         feat_maps: Vec<NodeCounts>
     ) -> HashMap<usize, Vec<f32>> {
-
-        // Compute gradients
-        let mut agraph = Graph::new();
-
-        agraph.backward(&loss);
+        let device = Device::Cpu;
+        let grad_store = loss.backward().unwrap();
 
         let mut grads = HashMap::new();
         feat_maps.into_iter().for_each(|fm| {
-            extract_grads(&agraph, &mut grads, fm.into_iter());
+            extract_grads(&grad_store, &mut grads, &device, fm.into_iter());
         });
 
         grads
@@ -468,12 +487,12 @@ impl PprRank {
 
 }
 
-fn compute_distances(query_node: &ANode, ranked_nodes: &[ANode], cosine: bool) -> ANode {
+fn compute_distances(query_node: &Tensor, ranked_nodes: &[Tensor], cosine: bool) -> Tensor {
     if cosine {
         // Compute the dot products to construct our yis
-        let qn = il2norm(query_node);
+        let qn = il2norm(query_node, &device);
         (ranked_nodes.iter().map(|n| {
-            qn.dot(&il2norm(n))
+            qn.dot(&il2norm(n, &device))
         }).collect::<Vec<_>>().concat() * 5f32).exp()
     } else {
         ranked_nodes.iter().map(|n| {
@@ -486,31 +505,31 @@ fn compute_distances(query_node: &ANode, ranked_nodes: &[ANode], cosine: bool) -
     }
 }
 
-fn il2norm(v: &ANode) -> ANode {
-    v / l2norm(v)
+fn il2norm(v: &Tensor, device: &Device) -> Tensor {
+    v.div(&l2norm(v, device)).unwrap()
 }
 
-fn l2norm(v: &ANode) -> ANode {
-    v.pow(2f32).sum().pow(0.5)
+fn l2norm(v: &Tensor, device: &Device) -> Tensor {
+    v.powf(2.0).unwrap().sum_all().unwrap().sqrt().unwrap()
 }
 
-fn comp_weight_decay(query_node: &ANode, ranked_nodes: &[ANode], threshold: f32) -> ANode {
-    let t = Constant::scalar(threshold);
-    let mut mag = Vec::with_capacity(ranked_nodes.len() + 1);
+fn comp_weight_decay(query_node: &Tensor, ranked_nodes: &[Tensor], threshold: f32) -> Tensor {
+    let device = Device::Cpu;
+    let t = Tensor::from_slice(&[threshold], 1usize, &device).unwrap();
+    let mut mag = Vec::new();
 
-
-    let qn = query_node.pow(2f32).sum() - &t;
-    if qn.value()[0] > 0f32 {
+    let qn = query_node.powf(2.0).unwrap().sum_all().unwrap().sub(&t).unwrap();
+    if qn.to_vec1::<f32>().unwrap()[0] > 0f32 {
         mag.push(qn);
     }
 
     ranked_nodes.iter().for_each(|n| {
-        let nn = n.pow(2f32).sum() - &t;
-        if nn.value()[0] > 0f32 {
+        let nn = n.powf(2.0).unwrap().sum_all().unwrap().sub(&t).unwrap();
+        if nn.to_vec1::<f32>().unwrap()[0] > 0f32 {
             mag.push(nn)
         }
     });
-    mag.concat().sum()
+    Tensor::cat(&mag, 0).unwrap().sum_all().unwrap()
 }
 
 struct WalkLibrary {
