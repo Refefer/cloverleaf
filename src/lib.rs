@@ -2,6 +2,8 @@
 //! It has tight coupling to python, specifically as the lingua franca of the machine learning
 //! world.  Consequently, this coupling has a couple of nuances that limit cloverleaf's ability
 //! as a standalone module but that's ok :)
+/// Candle utility functions for tensor operations
+mod candle_utils;
 
 /// Main interface for defining graphs
 pub mod graph;
