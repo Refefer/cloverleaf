@@ -3615,6 +3615,163 @@ impl Smci {
     }
 }
 
+/// Implements Bellman expectation equation for graph-based policy evaluation.
+/// Treats the graph as an MDP where nodes are states and outgoing edges are actions.
+/// Computes the optimal value function V(s) given a per-node reward signal, then reweights
+/// edges via softmax to bias trajectories toward higher-value states.
+#[pyclass]
+struct PolicyEvaluation {
+    graph: Arc<CumCSR>,
+    vocab: Arc<Vocab>,
+    gamma: f32,
+    iterations: usize,
+    eps: f32,
+    temperature: f32,
+    rewards: Vec<f32>,
+    indicator: Option<bool>,
+}
+
+#[pymethods]
+impl PolicyEvaluation {
+    ///    Creates a PolicyEvaluation instance for a given graph.
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to run policy evaluation on.
+    ///
+    ///    gamma : Float - Optional
+    ///        Discount factor ~ [0, 1).  Higher values make the agent plan further
+    ///        ahead.  Default is 0.99.
+    ///
+    ///    iterations : Int - Optional
+    ///        Maximum number of Bellman update sweeps.  Default is 100.
+    ///
+    ///    eps : Float - Optional
+    ///        Convergence threshold.  Stops early when L2 change in V is below eps.
+    ///        Default is 1e-6.
+    ///
+    ///    temperature : Float - Optional
+    ///        Controls the sharpness of the softmax policy extraction.  Lower values
+    ///        produce a near-deterministic policy; higher values keep edges uniform.
+    ///        Default is 1.0.
+    ///
+    ///    Returns
+    ///    -------
+    ///    Self
+    #[new]
+    pub fn new(
+        graph: &Graph,
+        gamma: Option<f32>,
+        iterations: Option<usize>,
+        eps: Option<f32>,
+        temperature: Option<f32>,
+        indicator: Option<bool>,
+    ) -> Self {
+        let n = graph.graph.len();
+        PolicyEvaluation {
+            graph: graph.graph.clone(),
+            vocab: graph.vocab.clone(),
+            gamma: gamma.unwrap_or(0.99),
+            iterations: iterations.unwrap_or(100),
+            eps: eps.unwrap_or(1e-6),
+            temperature: temperature.unwrap_or(1.0),
+            rewards: vec![0f32; n],
+            indicator: indicator,
+        }
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!(
+            "PolicyEvaluation<gamma={}, iterations={}, eps={}, temperature={}>",
+            self.gamma, self.iterations, self.eps, self.temperature
+        )
+    }
+
+    ///    Sets the reward for a specific node.
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    node : FQNode
+    ///        Fully qualified node: (NodeType, NodeName)
+    ///
+    ///    reward : Float
+    ///        Reward value for the node.
+    ///
+    ///    Returns
+    ///    -------
+    ///    () - Can throw exception
+    pub fn set_reward(&mut self, node: FQNode, reward: f32) -> PyResult<()> {
+        let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
+        self.rewards[node_id] = reward;
+        Ok(())
+    }
+
+    ///    Loads rewards from a tab-separated file.  Format per line:
+    ///    node_type<TAB>node_name<TAB>reward
+    ///
+    ///    Nodes not present in the file retain their current reward (default 0).
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    path : String
+    ///        Path to the rewards file.
+    ///
+    ///    Returns
+    ///    -------
+    ///    () - Can throw exception
+    pub fn load_rewards(&mut self, path: &str) -> PyResult<()> {
+        let reader =
+            open_file_for_reading(path).map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
+        for (i, line) in reader.lines().enumerate() {
+            let line = line.map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+            let pieces: Vec<_> = line.split('\t').collect();
+            if pieces.len() != 3 {
+                let line_id = i + 1;
+                return Err(PyValueError::new_err(format!(
+                    "Line {}: Malformed reward line! Need node_type<TAB>name<TAB>reward",
+                    line_id
+                )));
+            }
+            let reward: f32 = pieces[2].trim().parse().map_err(|_| {
+                PyValueError::new_err(format!("Invalid reward value: {}", pieces[2]))
+            })?;
+            let node_id = get_node_id(self.vocab.deref(), pieces[0], pieces[1].trim())?;
+            self.rewards[node_id] = reward;
+        }
+        Ok(())
+    }
+
+    ///    Runs policy evaluation and returns a new Graph with reweighted edges.
+    ///
+    ///    Returns
+    ///    -------
+    ///    Graph
+    ///        New graph whose edge weights reflect the optimal policy.
+    pub fn optimize(&self) -> PyResult<Graph> {
+        let vi = crate::algos::policy_evaluation::PolicyEvaluation::new(
+            self.gamma,
+            self.iterations,
+            self.eps,
+            self.temperature,
+            self.indicator.unwrap_or(true),
+        );
+        let values = vi.compute(self.graph.as_ref(), &self.rewards);
+        let weights = vi.to_policy_weights(self.graph.as_ref(), &values);
+        let new_graph = self
+            .graph
+            .clone_with_edges(weights)
+            .map_err(|e| PyValueError::new_err(e))?;
+
+        Ok(Graph {
+            graph: Arc::new(new_graph),
+            vocab: self.vocab.clone(),
+        })
+    }
+}
+
+
 /// 
 #[pyclass]
 #[derive(Clone,Debug)]
@@ -4852,6 +5009,7 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<RandomPath>()?;
     m.add_class::<NodeEmbeddingsBuilder>()?;
     m.add_class::<NodeEmbedder>()?;
+    m.add_class::<PolicyEvaluation>()?;
     Ok(())
 }
 
