@@ -457,7 +457,7 @@ impl <'a> Iterator for CDFtoP<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.idx < self.cdf.len() {
-            let p = self.prob(0);
+            let p = self.prob(self.idx);
             self.idx += 1;
             Some(p)
         } else {
