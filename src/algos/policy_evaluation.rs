@@ -16,6 +16,39 @@ use std::fmt::Write;
 use crate::graph::{Graph, ModifiableGraph}; 
 use crate::progress::CLProgressBar;
 
+/// Utility to ensure the graph's edge weights are a normalized CDF.
+/// Run this ONCE on your graph before passing it to PolicyEvaluation::compute()
+/// if your initial edge weights are raw frequencies, distances, or a PDF.
+pub fn normalize_graph_to_cdf<G>(graph: &mut G)
+where
+    G: ModifiableGraph + Graph,
+{
+    eprintln!("normalizing graph to CDF...");
+    for node_id in 0..graph.len() {
+        let (edges, weights) = graph.modify_edges(node_id as _);
+        
+        if edges.is_empty() {
+            continue;
+        }
+
+        // 1. Sum up all raw weights (treating current weights as a PDF/raw values)
+        let total: f32 = weights.iter().sum();
+
+        // 2. Convert to normalized CDF
+        if total > 0.0 {
+            let mut accum = 0.0;
+            for w in weights.iter_mut() {
+                accum += *w / total;
+                *w = accum;
+            }
+            // Force the last element to exactly 1.0 to avoid floating point drift
+            if let Some(last) = weights.last_mut() {
+                *last = 1.0;
+            }
+        }
+    }
+}
+
 pub struct PolicyEvaluation {
     pub gamma: f32,
     pub iterations: usize,
@@ -44,6 +77,11 @@ impl PolicyEvaluation {
         let mut v = rewards.to_vec();
         let mut next_v = vec![0f32; n];
 
+        let max_reward = rewards.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let min_reward = rewards.iter().cloned().fold(f32::INFINITY, f32::min);
+        let num_nonzero_rewards = rewards.iter().filter(|r| **r != 0.0).count();
+        eprintln!("[PE] n={} gamma={} iters={} eps={} max_reward={:.4} min_reward={:.4} nonzero_rewards={}/{}", n, self.gamma, self.iterations, self.eps, max_reward, min_reward, num_nonzero_rewards, n);
+
         let pb = CLProgressBar::new(self.iterations as u64, self.indicator);
         let mut err = 0f32;
 
@@ -63,6 +101,15 @@ impl PolicyEvaluation {
                     // Base case for single-edge nodes
                     v[edges[0]] * weights[0]
                 } else {
+                    // Safety check to ensure we are actually working with a normalized CDF.
+                    // This compiles away in release mode but saves hours of debugging in debug mode.
+                    debug_assert!(
+                        (weights.last().unwrap() - 1.0).abs() < 1e-4,
+                        "Node {}'s weights are not a normalized CDF! Last weight: {}",
+                        node_id,
+                        weights.last().unwrap()
+                    );
+
                     // Summation by parts: completely stateless and fully parallel over the edges
                     let sum: f32 = edges
                         .par_windows(2)
@@ -105,75 +152,86 @@ impl PolicyEvaluation {
     /// Extracts a stochastic policy from the value function and updates the graph weights IN-PLACE.
     /// Blends the original transition probabilities with a softmax over neighbor values.
     pub fn update_policy_weights_in_place<G>(&self, graph: &mut G, values: &[f32])
-        where G: ModifiableGraph + Graph
-    {
-        // We iterate sequentially over the nodes, but parallelize over the edges.
-        // This keeps the borrow checker happy and solves the 120M edge hub bottleneck.
-        for node_id in 0..graph.len() {
-            // Adjust to your specific NodeID type if necessary
-            let (edges, weights) = graph.modify_edges(node_id as _); 
-            
-            if edges.is_empty() {
-                continue;
-            }
+        where G: ModifiableGraph + Graph {
 
-            // 1. In-place CDF to Probabilities (Sequential Backwards)
-            // Memory efficient, incredibly cache-friendly
-            for i in (1..weights.len()).rev() {
-                weights[i] -= weights[i - 1];
-            }
+    eprintln!("updating graph weights in place...");
+    
+    // Threshold for when parallelization becomes worth the overhead.
+    // You might need to tune this (e.g., 1024, 10_000, etc.)
+    const PARALLEL_THRESHOLD: usize = 10_000; 
 
-            // 2. Find Max Value (Parallel)
+    for node_id in 0..graph.len() {
+        let (edges, weights) = graph.modify_edges(node_id as _);
+        
+        // 1. In-place CDF to Probabilities (Sequential Backwards)
+        // Kept sequential because dependencies make it hard to parallelize trivially
+        for i in (1..weights.len()).rev() {
+            weights[i] -= weights[i - 1];
+        }
+
+        if edges.len() >= PARALLEL_THRESHOLD {
+            // === HEAVY NODE: USE RAYON ===
             let max_v = edges
                 .par_iter()
                 .map(|&e| values[e as usize])
                 .reduce(|| f32::NEG_INFINITY, f32::max);
 
-            if self.temperature <= f32::EPSILON {
-                // Greedy selection
-                let sum_orig_max: f32 = edges
-                    .par_iter()
-                    .zip(weights.par_iter_mut())
-                    .map(|(&edge, w)| {
-                        if (values[edge as usize] - max_v).abs() <= f32::EPSILON {
-                            *w // Keep original probability
-                        } else {
-                            *w = 0.0;
-                            0.0
-                        }
-                    })
-                    .sum();
+            let sum = if self.temperature <= f32::EPSILON {
+                edges.par_iter().zip(weights.par_iter_mut()).map(|(&edge, w)| {
+                    if (values[edge as usize] - max_v).abs() <= f32::EPSILON { *w } else { *w = 0.0; 0.0 }
+                }).sum()
+            } else {
+                edges.par_iter().zip(weights.par_iter_mut()).map(|(&edge, w)| {
+                    let exp_v = ((values[edge as usize] - max_v) / self.temperature).exp();
+                    *w *= exp_v;
+                    *w
+                }).sum()
+            };
 
-                // 3. Normalize and convert back to CDF in-place (Sequential Prefix Sum)
-                if sum_orig_max > 0.0 {
-                    let mut accum = 0.0;
-                    for w in weights.iter_mut() {
-                        accum += *w / sum_orig_max;
-                        *w = accum;
+            normalize_to_cdf(weights, sum);
+
+        } else {
+            // === TYPICAL NODE: FAST SEQUENTIAL (Auto-vectorized by LLVM) ===
+            let mut max_v = f32::NEG_INFINITY;
+            for &e in edges.iter() {
+                max_v = f32::max(max_v, values[e as usize]);
+            }
+
+            let mut sum = 0.0;
+            if self.temperature <= f32::EPSILON {
+                for (&edge, w) in edges.iter().zip(weights.iter_mut()) {
+                    if (values[edge as usize] - max_v).abs() <= f32::EPSILON {
+                        sum += *w;
+                    } else {
+                        *w = 0.0;
                     }
                 }
             } else {
-                // Softmax selection
-                // Compute biased probabilities in-place and get sum (Parallel)
-                let sum_exp: f32 = edges
-                    .par_iter()
-                    .zip(weights.par_iter_mut())
-                    .map(|(&edge, w)| {
-                        let exp_v = ((values[edge as usize] - max_v) / self.temperature).exp();
-                        *w *= exp_v; // Biased probability
-                        *w
-                    })
-                    .sum();
-
-                // 3. Normalize and convert back to CDF in-place (Sequential Prefix Sum)
-                if sum_exp > 0.0 {
-                    let mut accum = 0.0;
-                    for w in weights.iter_mut() {
-                        accum += *w / sum_exp;
-                        *w = accum;
-                    }
+                for (&edge, w) in edges.iter().zip(weights.iter_mut()) {
+                    let exp_v = ((values[edge as usize] - max_v) / self.temperature).exp();
+                    *w *= exp_v;
+                    sum += *w;
                 }
             }
+
+            normalize_to_cdf(weights, sum);
         }
     }
+}
+}
+
+// Helper function to keep the code DRY
+#[inline]
+fn normalize_to_cdf(weights: &mut [f32], sum: f32) {
+    if sum > 0.0 {
+        let mut accum = 0.0;
+        for w in weights.iter_mut() {
+            accum += *w / sum;
+            *w = accum;
+        }
+        if let Some(last) = weights.last_mut() {
+            *last = 1.0; 
+        }
+    }
+
 }

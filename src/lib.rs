@@ -54,6 +54,7 @@ use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use rand_distr::Uniform;
 
+use crate::algos::policy_evaluation::normalize_graph_to_cdf;
 use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID,CDFtoP,Transpose};
 use crate::vocab::Vocab;
 use crate::sampler::{Weighted,Unweighted};
@@ -3743,13 +3744,13 @@ impl PolicyEvaluation {
         Ok(())
     }
 
-    ///    Runs policy evaluation and returns a new Graph with reweighted edges.
+    ///    Runs policy evaluation and mutates the graph weights in place.
     ///
     ///    Returns
     ///    -------
     ///    Graph
-    ///        New graph whose edge weights reflect the optimal policy.
-    pub fn optimize(&self) -> PyResult<Graph> {
+    ///        Graph whose edge weights now reflect the optimal policy.
+    pub fn optimize(&mut self) -> PyResult<Graph> {
         let vi = crate::algos::policy_evaluation::PolicyEvaluation::new(
             self.gamma,
             self.iterations,
@@ -3758,14 +3759,12 @@ impl PolicyEvaluation {
             self.indicator.unwrap_or(true),
         );
         let values = vi.compute(self.graph.as_ref(), &self.rewards);
-        let weights = vi.to_policy_weights(self.graph.as_ref(), &values);
-        let new_graph = self
-            .graph
-            .clone_with_edges(weights)
-            .map_err(|e| PyValueError::new_err(e))?;
+        let graph = Arc::make_mut(&mut self.graph);
+        normalize_graph_to_cdf(graph);
+        vi.update_policy_weights_in_place(graph, &values);
 
         Ok(Graph {
-            graph: Arc::new(new_graph),
+            graph: self.graph.clone(),
             vocab: self.vocab.clone(),
         })
     }
