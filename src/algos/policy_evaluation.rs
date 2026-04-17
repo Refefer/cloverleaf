@@ -58,16 +58,12 @@ impl PolicyEvaluation {
             next_v.par_iter_mut().enumerate().for_each(|(node_id, nv)| {
                 let (edges, weights) = graph.get_edges(node_id);
 
-                let expected_future_value = if edges.is_empty() {
-                    0f32
-                } else {
-                    // SUM instead of MAX: we evaluate the existing stochastic policy
+                let expected_future_value = 
                     edges
                         .iter()
                         .zip(CDFtoP::new(weights))
                         .map(|(&edge, prob)| prob * v[edge])
-                        .sum::<f32>()
-                };
+                        .sum::<f32>();
 
                 *nv = rewards[node_id] + self.gamma * expected_future_value;
             });
@@ -95,58 +91,59 @@ impl PolicyEvaluation {
     /// Blends the original transition probabilities with a softmax over neighbor values:
     ///   w(s, s') = P_orig(s'|s) * exp(V(s') / tau) / Z
     pub fn to_policy_weights(&self, graph: &(impl Graph + Sync), values: &[f32]) -> Vec<f32> {
-        // PARALLEL: Compute weights for each node's edges, convert to CDF, and flatten back into a single Vec
+        // Compute weights for each node's edges, convert to CDF, and flatten back into a single Vec
         (0..graph.len())
             .into_par_iter()
             .flat_map_iter(|node_id| {
+                // NOTE: edges is never empty
                 let (edges, orig_cdf_weights) = graph.get_edges(node_id);
-
-                if edges.is_empty() {
-                    return vec![];
-                }
 
                 // Convert original CDF weights back to probabilities to use as our base/prior
                 let orig_probs: Vec<f32> = CDFtoP::new(orig_cdf_weights).collect();
                 let mut node_weights = vec![0f32; edges.len()];
 
                 let max_v = edges
-                    .iter()
+                    .par_iter()
                     .map(|&e| values[e])
-                    .fold(f32::NEG_INFINITY, f32::max);
+                    .reduce(|| f32::NEG_INFINITY, f32::max);
 
                 if self.temperature <= f32::EPSILON {
-                    // Greedy selection: distribute probability among max-value neighbors
-                    // proportionally to their original probabilities.
-                    let mut sum_orig_max = 0f32;
-                    for (i, &edge) in edges.iter().enumerate() {
-                        if (values[edge] - max_v).abs() <= f32::EPSILON {
-                            node_weights[i] = orig_probs[i];
-                            sum_orig_max += orig_probs[i];
-                        }
-                    }
+                    // Greedy selection
+                    let sum_orig_max: f32 = edges
+                        .par_iter()
+                        .zip(orig_probs.par_iter())
+                        .zip(node_weights.par_iter_mut())
+                        .map(|((&edge, &orig_prob), w)| {
+                            if (values[edge] - max_v).abs() <= f32::EPSILON {
+                                *w = orig_prob;
+                                orig_prob
+                            } else {
+                                0.0
+                            }
+                        })
+                        .sum();
 
-                    // Normalize among the greedy choices
+                    // normalize
                     if sum_orig_max > 0.0 {
-                        for w in &mut node_weights {
-                            *w /= sum_orig_max;
-                        }
+                        node_weights.par_iter_mut().for_each(|w| *w /= sum_orig_max);
                     }
                 } else {
-                    // Softmax selection: Multiply original probability by the exponential bias
-                    let mut sum_exp = 0f32;
-                    for (i, &edge) in edges.iter().enumerate() {
-                        let exp_v = ((values[edge] - max_v) / self.temperature).exp();
-                        let biased_prob = orig_probs[i] * exp_v;
+                    // Softmax selection
+                    let sum_exp: f32 = edges
+                        .par_iter()
+                        .zip(orig_probs.par_iter())
+                        .zip(node_weights.par_iter_mut())
+                        .map(|((&edge, &orig_prob), w)| {
+                            let exp_v = ((values[edge] - max_v) / self.temperature).exp();
+                            let biased_prob = orig_prob * exp_v;
+                            *w = biased_prob;
+                            biased_prob
+                        })
+                        .sum();
 
-                        node_weights[i] = biased_prob;
-                        sum_exp += biased_prob;
-                    }
-
-                    // Normalize the newly biased probabilities
+                    // normalize
                     if sum_exp > 0f32 {
-                        for w in &mut node_weights {
-                            *w /= sum_exp;
-                        }
+                        node_weights.par_iter_mut().for_each(|w| *w /= sum_exp);
                     }
                 }
 
@@ -158,6 +155,7 @@ impl PolicyEvaluation {
             .collect()
     }
 }
+
 
 #[cfg(test)]
 mod policy_evaluation_tests {
