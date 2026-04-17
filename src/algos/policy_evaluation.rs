@@ -16,39 +16,6 @@ use std::fmt::Write;
 use crate::graph::{Graph, ModifiableGraph}; 
 use crate::progress::CLProgressBar;
 
-/// Utility to ensure the graph's edge weights are a normalized CDF.
-/// Run this ONCE on your graph before passing it to PolicyEvaluation::compute()
-/// if your initial edge weights are raw frequencies, distances, or a PDF.
-pub fn normalize_graph_to_cdf<G>(graph: &mut G)
-where
-    G: ModifiableGraph + Graph,
-{
-    eprintln!("normalizing graph to CDF...");
-    for node_id in 0..graph.len() {
-        let (edges, weights) = graph.modify_edges(node_id as _);
-        
-        if edges.is_empty() {
-            continue;
-        }
-
-        // 1. Sum up all raw weights (treating current weights as a PDF/raw values)
-        let total: f32 = weights.iter().sum();
-
-        // 2. Convert to normalized CDF
-        if total > 0.0 {
-            let mut accum = 0.0;
-            for w in weights.iter_mut() {
-                accum += *w / total;
-                *w = accum;
-            }
-            // Force the last element to exactly 1.0 to avoid floating point drift
-            if let Some(last) = weights.last_mut() {
-                *last = 1.0;
-            }
-        }
-    }
-}
-
 pub struct PolicyEvaluation {
     pub gamma: f32,
     pub iterations: usize,
@@ -76,11 +43,6 @@ impl PolicyEvaluation {
 
         let mut v = rewards.to_vec();
         let mut next_v = vec![0f32; n];
-
-        let max_reward = rewards.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let min_reward = rewards.iter().cloned().fold(f32::INFINITY, f32::min);
-        let num_nonzero_rewards = rewards.iter().filter(|r| **r != 0.0).count();
-        eprintln!("[PE] n={} gamma={} iters={} eps={} max_reward={:.4} min_reward={:.4} nonzero_rewards={}/{}", n, self.gamma, self.iterations, self.eps, max_reward, min_reward, num_nonzero_rewards, n);
 
         let pb = CLProgressBar::new(self.iterations as u64, self.indicator);
         let mut err = 0f32;
@@ -153,8 +115,6 @@ impl PolicyEvaluation {
     /// Blends the original transition probabilities with a softmax over neighbor values.
     pub fn update_policy_weights_in_place<G>(&self, graph: &mut G, values: &[f32])
         where G: ModifiableGraph + Graph {
-
-    eprintln!("updating graph weights in place...");
     
     // Threshold for when parallelization becomes worth the overhead.
     // You might need to tune this (e.g., 1024, 10_000, etc.)

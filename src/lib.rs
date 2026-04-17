@@ -54,7 +54,6 @@ use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 use rand_distr::Uniform;
 
-use crate::algos::policy_evaluation::normalize_graph_to_cdf;
 use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID,CDFtoP,Transpose};
 use crate::vocab::Vocab;
 use crate::sampler::{Weighted,Unweighted};
@@ -3760,7 +3759,6 @@ impl PolicyEvaluation {
         );
         let values = vi.compute(self.graph.as_ref(), &self.rewards);
         let graph = Arc::make_mut(&mut self.graph);
-        //normalize_graph_to_cdf(graph);
         vi.update_policy_weights_in_place(graph, &values);
 
         Ok(Graph {
