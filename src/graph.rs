@@ -5,6 +5,8 @@
 //! copy.
 
 use rayon::prelude::ParallelSliceMut;
+use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use rayon::iter::plumbing::{bridge, Consumer, Producer, ProducerCallback, UnindexedConsumer};
 
 pub type NodeID = usize;
 
@@ -30,6 +32,13 @@ pub trait Graph {
 pub trait ModifiableGraph {
     /// Get edges and corresponding weights
     fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]);
+}
+
+/// trait which allows graphs to be updated in parallel.  Implementors must expose per-node
+/// edge and weight slices that live in disjoint regions of flat backing buffers.
+pub trait ParallelModifiableGraph: ModifiableGraph {
+    /// Parallel iterator yielding `(&mut edges, &mut weights)` per node, in node order.
+    fn par_iter_mut(&mut self) -> CSRParIterMut<'_>;
 }
 
 /// Trait which transposes a graph's adjacency list
@@ -99,6 +108,15 @@ impl CSR {
         CSR { rows, columns, weights: data }
     }
 
+    /// Parallel mutable access to each node's edge and weight slices.
+    pub fn par_iter_mut(&mut self) -> CSRParIterMut<'_> {
+        CSRParIterMut {
+            rows: &self.rows,
+            columns: &mut self.columns,
+            weights: &mut self.weights,
+        }
+    }
+
     fn deduplicate_edges(
         edges: &mut Vec<(NodeID, NodeID, f32)>
     ) -> () {
@@ -164,6 +182,147 @@ impl ModifiableGraph for CSR {
 
 }
 
+impl ParallelModifiableGraph for CSR {
+    fn par_iter_mut(&mut self) -> CSRParIterMut<'_> {
+        CSR::par_iter_mut(self)
+    }
+}
+
+/// Zero-allocation parallel iterator over each node's mutable edge and weight slices.
+/// Splits via rayon are O(1) — we carve the flat CSR buffers with split_at_mut.
+pub struct CSRParIterMut<'a> {
+    rows: &'a [NodeID],
+    columns: &'a mut [NodeID],
+    weights: &'a mut [f32],
+}
+
+impl<'a> ParallelIterator for CSRParIterMut<'a> {
+    type Item = (&'a mut [NodeID], &'a mut [f32]);
+
+    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+    where
+        C: UnindexedConsumer<Self::Item>,
+    {
+        bridge(self, consumer)
+    }
+
+    fn opt_len(&self) -> Option<usize> {
+        Some(IndexedParallelIterator::len(self))
+    }
+}
+
+impl<'a> IndexedParallelIterator for CSRParIterMut<'a> {
+    fn len(&self) -> usize {
+        self.rows.len().saturating_sub(1)
+    }
+
+    fn drive<C: Consumer<Self::Item>>(self, consumer: C) -> C::Result {
+        bridge(self, consumer)
+    }
+
+    fn with_producer<CB: ProducerCallback<Self::Item>>(self, callback: CB) -> CB::Output {
+        callback.callback(CSRProducer {
+            rows: self.rows,
+            columns: self.columns,
+            weights: self.weights,
+        })
+    }
+}
+
+/// Producer used by rayon to drive parallel splits of a CSRParIterMut.
+struct CSRProducer<'a> {
+    rows: &'a [NodeID],
+    columns: &'a mut [NodeID],
+    weights: &'a mut [f32],
+}
+
+impl<'a> Producer for CSRProducer<'a> {
+    type Item = (&'a mut [NodeID], &'a mut [f32]);
+    type IntoIter = CSRSeqIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        CSRSeqIter {
+            rows: self.rows,
+            cols: self.columns,
+            wgts: self.weights,
+        }
+    }
+
+    fn split_at(self, mid: usize) -> (Self, Self) {
+        // Invariant: columns.len() == weights.len() == rows.last() - rows.first().
+        // After splits rows[0] may be non-zero, so subtract base to get the local boundary.
+        let base = self.rows[0];
+        let boundary = self.rows[mid] - base;
+        let (cols_l, cols_r) = self.columns.split_at_mut(boundary);
+        let (wgts_l, wgts_r) = self.weights.split_at_mut(boundary);
+        let rows_l = &self.rows[..=mid];
+        let rows_r = &self.rows[mid..];
+        (
+            CSRProducer { rows: rows_l, columns: cols_l, weights: wgts_l },
+            CSRProducer { rows: rows_r, columns: cols_r, weights: wgts_r },
+        )
+    }
+}
+
+/// Sequential leaf iterator; peels one node off the front of its buffers per call.
+struct CSRSeqIter<'a> {
+    rows: &'a [NodeID],
+    cols: &'a mut [NodeID],
+    wgts: &'a mut [f32],
+}
+
+impl<'a> Iterator for CSRSeqIter<'a> {
+    type Item = (&'a mut [NodeID], &'a mut [f32]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rows.len() < 2 {
+            return None;
+        }
+        // Move the full-length slice out of self so we can split it; the tail
+        // goes back in.  mem::take works here since &mut [T] has a Default impl.
+        let len = self.rows[1] - self.rows[0];
+        let cols = std::mem::take(&mut self.cols);
+        let wgts = std::mem::take(&mut self.wgts);
+        let (ch, ct) = cols.split_at_mut(len);
+        let (wh, wt) = wgts.split_at_mut(len);
+        self.cols = ct;
+        self.wgts = wt;
+        self.rows = &self.rows[1..];
+        Some((ch, wh))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.rows.len().saturating_sub(1);
+        (n, Some(n))
+    }
+}
+
+impl<'a> DoubleEndedIterator for CSRSeqIter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.rows.len() < 2 {
+            return None;
+        }
+        // Peel the tail node by splitting off the last `last_len` elements.
+        let n = self.rows.len() - 1;
+        let last_len = self.rows[n] - self.rows[n - 1];
+        let keep = self.cols.len() - last_len;
+        let cols = std::mem::take(&mut self.cols);
+        let wgts = std::mem::take(&mut self.wgts);
+        let (ch, ct) = cols.split_at_mut(keep);
+        let (wh, wt) = wgts.split_at_mut(keep);
+        self.cols = ch;
+        self.wgts = wh;
+        self.rows = &self.rows[..n];
+        Some((ct, wt))
+    }
+}
+
+impl<'a> ExactSizeIterator for CSRSeqIter<'a> {
+    fn len(&self) -> usize {
+        self.rows.len().saturating_sub(1)
+    }
+}
+
 /// Normalizes sum of weights for a node to 1
 pub struct NormalizedCSR(CSR);
 
@@ -181,6 +340,11 @@ impl NormalizedCSR {
             }
         }
         NormalizedCSR(csr)
+    }
+
+    /// Parallel mutable access to each node's edge and weight slices.
+    pub fn par_iter_mut(&mut self) -> CSRParIterMut<'_> {
+        self.0.par_iter_mut()
     }
 }
 
@@ -217,6 +381,12 @@ impl ModifiableGraph for NormalizedCSR {
     /// Get edges and corresponding weights
     fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]) {
         self.0.modify_edges(idx)
+    }
+}
+
+impl ParallelModifiableGraph for NormalizedCSR {
+    fn par_iter_mut(&mut self) -> CSRParIterMut<'_> {
+        self.0.par_iter_mut()
     }
 }
 
@@ -269,6 +439,12 @@ impl CumCSR {
         }
 
         Ok(CumCSR(graph))
+    }
+
+    /// Parallel mutable access to each node's edge and weight slices.  Note that arbitrary
+    /// mutation can break the CDF invariant - callers are responsible for restoring it.
+    pub fn par_iter_mut(&mut self) -> CSRParIterMut<'_> {
+        self.0.par_iter_mut()
     }
 }
 
@@ -345,7 +521,7 @@ impl Graph for CumCSR {
 }
 
 impl ModifiableGraph for CumCSR {
-    
+
     /// Get edges and corresponding weights
     fn modify_edges(&mut self, idx: NodeID) -> (&mut [NodeID], &mut [f32]) {
         self.0.modify_edges(idx)
@@ -353,16 +529,22 @@ impl ModifiableGraph for CumCSR {
 
 }
 
+impl ParallelModifiableGraph for CumCSR {
+    fn par_iter_mut(&mut self) -> CSRParIterMut<'_> {
+        self.0.par_iter_mut()
+    }
+}
+
 impl CDFGraph for CumCSR {}
 
 /// This is a graph which allows us to swap in a new set of edge weights without having to copy the
 /// entire graph.  We use it in cases where policies update edge transition probabilities.
-pub struct OptCDFGraph<'a,G> {
+pub struct OptCDFGraph<'a, G> {
     graph: &'a G,
     weights: Vec<f32>
 }
 
-impl <'a,G:Graph> OptCDFGraph<'a,G> {
+impl <'a, G:Graph> OptCDFGraph<'a,G> {
     pub fn new(graph: &'a G, weights: Vec<f32>) -> Self {
         let mut s = OptCDFGraph { graph, weights };
         s.convert_edges();
@@ -384,7 +566,7 @@ impl <'a,G:Graph> OptCDFGraph<'a,G> {
 
 }
 
-impl <'a,G:CDFGraph> OptCDFGraph<'a,G> {
+impl <'a, G:CDFGraph> OptCDFGraph<'a, G> {
     pub fn clone_from_cdf(graph: &'a G) -> Self {
         let mut weights = vec![0f32; graph.edges()];
         for node_id in 0..graph.len() {
@@ -398,7 +580,7 @@ impl <'a,G:CDFGraph> OptCDFGraph<'a,G> {
 
 }
 
-impl <'a,G:Graph> Graph for OptCDFGraph<'a,G> {
+impl <'a, G:Graph> Graph for OptCDFGraph<'a,G> {
     /// Get number of nodes in graph
     fn len(&self) -> usize {
         self.graph.len()
@@ -505,7 +687,7 @@ mod csr_tests {
     fn construct_csr() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, true);
         assert_eq!(csr.rows, vec![0, 1, 4, 5]);
         assert_eq!(csr.columns, vec![1, 1, 2, 0, 0]);
         assert_eq!(csr.weights, vec![1., 3., 2., 10., 2.5]);
@@ -515,7 +697,7 @@ mod csr_tests {
     fn test_graph() {
         let edges = build_edges();
 
-        let mut csr = CSR::construct_from_edges(edges);
+        let mut csr = CSR::construct_from_edges(edges, true);
         assert_eq!(csr.len(), 3);
         assert_eq!(csr.degree(0), 1);
         assert_eq!(csr.degree(1), 3);
@@ -535,7 +717,7 @@ mod csr_tests {
     fn construct_mk() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, true);
         let mk = NormalizedCSR::convert(csr);
 
         assert_eq!(mk.get_edges(0), (vec![1].as_slice(), vec![1.].as_slice()));
@@ -548,7 +730,7 @@ mod csr_tests {
     fn construct_cdf() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, true);
         let ccsr = CumCSR::convert(csr);
 
         assert_eq!(ccsr.0.rows, vec![0, 1, 4, 5]);
@@ -561,7 +743,7 @@ mod csr_tests {
     fn construct_cdf_to_p() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, true);
         let ccsr = CumCSR::convert(csr);
 
         let weights = ccsr.get_edges(1).1;
@@ -576,13 +758,141 @@ mod csr_tests {
     fn transpose_matrix() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, true);
         let ccsr = CumCSR::convert(csr);
 
-        let t_ccsr = ccsr.transpose();
+        let _t_ccsr = ccsr.transpose();
 
     }
 
+    /// Sanity check that a plain `.for_each` reaches every weight.  After dedup the
+    /// edges are sorted by (from, to), so node 1's weights are [10, 3, 2] -> doubled
+    /// to [20, 6, 4].
+    #[test]
+    fn test_par_iter_mut_for_each_doubles_weights() {
+        let edges = build_edges();
+        let mut csr = CSR::construct_from_edges(edges, true);
+        csr.par_iter_mut().for_each(|(_e, w)| {
+            w.iter_mut().for_each(|x| *x *= 2.0);
+        });
+        assert_eq!(csr.get_edges(0), ([1usize].as_slice(), [2.0f32].as_slice()));
+        assert_eq!(csr.get_edges(1).1, [20.0, 6.0, 4.0].as_slice());
+        assert_eq!(csr.get_edges(2), ([0usize].as_slice(), [5.0f32].as_slice()));
+    }
 
+    /// Verify `.enumerate()` hands each worker the right node index.
+    #[test]
+    fn test_par_iter_mut_enumerate_writes_node_id() {
+        let edges = build_edges();
+        let mut csr = CSR::construct_from_edges(edges, true);
+        csr.par_iter_mut().enumerate().for_each(|(i, (_e, w))| {
+            w.iter_mut().for_each(|x| *x = i as f32);
+        });
+        for i in 0..csr.len() {
+            for &x in csr.get_edges(i).1 {
+                assert_eq!(x, i as f32);
+            }
+        }
+    }
 
+    /// A zero-degree node should yield an empty slice pair without tripping the split logic.
+    #[test]
+    fn test_par_iter_mut_zero_degree_node() {
+        // node 1 has degree 0
+        let edges = vec![(0usize, 2usize, 1.0f32), (2, 0, 2.0)];
+        let mut csr = CSR::construct_from_edges(edges, true);
+        assert_eq!(csr.degree(1), 0);
+
+        csr.par_iter_mut().for_each(|(_e, w)| {
+            if !w.is_empty() {
+                w.iter_mut().for_each(|x| *x += 100.0);
+            }
+        });
+
+        assert_eq!(csr.get_edges(0).1, &[101.0]);
+        assert_eq!(csr.get_edges(2).1, &[102.0]);
+        assert_eq!(csr.degree(1), 0);
+    }
+
+    /// Guard against double-visits or skipped nodes in the split tree.  Atomic counters
+    /// let the workers tally hits in parallel without racing the assertion.
+    #[test]
+    fn test_par_iter_mut_visits_each_node_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let edges = build_edges();
+        let mut csr = CSR::construct_from_edges(edges, true);
+        let n = csr.len();
+        let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+
+        csr.par_iter_mut().enumerate().for_each(|(i, (_e, w))| {
+            counts[i].fetch_add(1, Ordering::Relaxed);
+            w.iter_mut().for_each(|x| *x = i as f32);
+        });
+
+        for (i, c) in counts.iter().enumerate() {
+            assert_eq!(c.load(Ordering::Relaxed), 1, "node {i} hit count");
+        }
+        for i in 0..n {
+            for &x in csr.get_edges(i).1 {
+                assert_eq!(x, i as f32);
+            }
+        }
+    }
+
+    /// NormalizedCSR delegates to the inner CSR; confirm mutation is visible through the wrapper.
+    #[test]
+    fn test_normalized_csr_par_iter_mut_delegates() {
+        let edges = build_edges();
+        let mut norm = NormalizedCSR::convert(CSR::construct_from_edges(edges, true));
+
+        norm.par_iter_mut().for_each(|(_e, w)| {
+            w.iter_mut().for_each(|x| *x = 0.0);
+        });
+
+        for i in 0..norm.len() {
+            for &x in norm.get_edges(i).1 {
+                assert_eq!(x, 0.0);
+            }
+        }
+    }
+
+    /// CumCSR delegates the same way; we ignore the CDF invariant here since we're testing plumbing.
+    #[test]
+    fn test_cum_csr_par_iter_mut_delegates() {
+        let edges = build_edges();
+        let mut cum = CumCSR::convert(CSR::construct_from_edges(edges, true));
+
+        cum.par_iter_mut().enumerate().for_each(|(i, (_e, w))| {
+            w.iter_mut().for_each(|x| *x = i as f32);
+        });
+
+        for i in 0..cum.len() {
+            for &x in cum.get_edges(i).1 {
+                assert_eq!(x, i as f32);
+            }
+        }
+    }
+
+    /// Exercise the Producer::split_at path under real rayon work-stealing with enough nodes
+    /// that the split tree has real depth.  3 edges/node keeps the CSR small but non-trivial.
+    #[test]
+    fn test_par_iter_mut_scale_1000_nodes() {
+        let mut edges: Vec<(usize, usize, f32)> = Vec::with_capacity(3_000);
+        for i in 0..1000usize {
+            edges.push((i, (i + 1) % 1000, 1.0));
+            edges.push((i, (i + 7) % 1000, 1.0));
+            edges.push((i, (i + 31) % 1000, 1.0));
+        }
+
+        let mut csr = CSR::construct_from_edges(edges, true);
+        csr.par_iter_mut().enumerate().for_each(|(i, (_e, w))| {
+            w.iter_mut().for_each(|x| *x = i as f32);
+        });
+
+        for i in 0..csr.len() {
+            for &x in csr.get_edges(i).1 {
+                assert_eq!(x, i as f32);
+            }
+        }
+    }
 }
