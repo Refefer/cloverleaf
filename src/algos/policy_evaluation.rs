@@ -123,7 +123,8 @@ impl PolicyEvaluation {
         
         // 1. In-place CDF to Probabilities (Sequential Backwards)
         for i in (1..weights.len()).rev() {
-            weights[i] -= weights[i - 1];
+            // Add .max(0.0) to eradicate any floating-point drift
+            weights[i] = (weights[i] - weights[i - 1]).max(0.0);
         }
 
         if edges.len() >= PARALLEL_THRESHOLD {
@@ -183,11 +184,19 @@ fn normalize_to_cdf(weights: &mut [f32], sum: f32) {
         let mut accum = 0.0;
         for w in weights.iter_mut() {
             accum += *w / sum;
-            *w = accum;
+            // .min(1.0) prevents intermediate values from overshooting
+            // the final 1.0 clamp, preserving monotonicity.
+            *w = accum.min(1.0);
         }
         if let Some(last) = weights.last_mut() {
-            *last = 1.0; 
+            *last = 1.0;
+        }
+    } else if !weights.is_empty() {
+        // Fallback: If all probabilities vanished, revert to a uniform
+        // CDF to prevent the node from becoming a broken sink.
+        let n = weights.len() as f32;
+        for (i, w) in weights.iter_mut().enumerate() {
+            *w = ((i + 1) as f32) / n;
         }
     }
-
 }
