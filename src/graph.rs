@@ -263,7 +263,7 @@ impl CumCSR {
                 }
             }
 
-            if weights[weights.len() - 1] > 1.0 {
+            if !weights.is_empty() && weights[weights.len() - 1] > 1.0 {
                 Err("Edge weight exceeds 1.0, illegal in CDF")?
             }
         }
