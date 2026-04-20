@@ -12,7 +12,6 @@
 use rayon::prelude::*;
 use std::fmt::Write;
 
-// Assumes your Graph and ModifiableGraph traits are available in crate::graph
 use crate::graph::{Graph, ModifiableGraph}; 
 use crate::progress::CLProgressBar;
 
@@ -117,14 +116,12 @@ impl PolicyEvaluation {
         where G: ModifiableGraph + Graph {
     
     // Threshold for when parallelization becomes worth the overhead.
-    // You might need to tune this (e.g., 1024, 10_000, etc.)
     const PARALLEL_THRESHOLD: usize = 10_000; 
 
     for node_id in 0..graph.len() {
         let (edges, weights) = graph.modify_edges(node_id as _);
         
         // 1. In-place CDF to Probabilities (Sequential Backwards)
-        // Kept sequential because dependencies make it hard to parallelize trivially
         for i in (1..weights.len()).rev() {
             weights[i] -= weights[i - 1];
         }
@@ -151,7 +148,7 @@ impl PolicyEvaluation {
             normalize_to_cdf(weights, sum);
 
         } else {
-            // === TYPICAL NODE: FAST SEQUENTIAL (Auto-vectorized by LLVM) ===
+            // === TYPICAL NODE: FAST SEQUENTIAL
             let mut max_v = f32::NEG_INFINITY;
             for &e in edges.iter() {
                 max_v = f32::max(max_v, values[e as usize]);
@@ -180,7 +177,6 @@ impl PolicyEvaluation {
 }
 }
 
-// Helper function to keep the code DRY
 #[inline]
 fn normalize_to_cdf(weights: &mut [f32], sum: f32) {
     if sum > 0.0 {
