@@ -12,7 +12,7 @@
 use rayon::prelude::*;
 use std::fmt::Write;
 
-use crate::graph::{Graph, ModifiableGraph}; 
+use crate::graph::{Graph, ParallelModifiableGraph, convert_edges_to_cdf}; 
 use crate::progress::CLProgressBar;
 
 pub struct PolicyEvaluation {
@@ -91,7 +91,7 @@ impl PolicyEvaluation {
                 *nv = rewards[node_id] + self.gamma * expected_future_value;
             });
 
-            // Map-Reduce to find the maximum absolute error (L-infinity norm)
+            // Find the maximum absolute error (L-infinity norm)
             err = next_v
                 .par_iter()
                 .zip(v.par_iter())
@@ -113,90 +113,67 @@ impl PolicyEvaluation {
     /// Extracts a stochastic policy from the value function and updates the graph weights IN-PLACE.
     /// Blends the original transition probabilities with a softmax over neighbor values.
     pub fn update_policy_weights_in_place<G>(&self, graph: &mut G, values: &[f32])
-        where G: ModifiableGraph + Graph {
+        where G: ParallelModifiableGraph + Graph {
     
-    // Threshold for when parallelization becomes worth the overhead.
-    const PARALLEL_THRESHOLD: usize = 10_000; 
+        // Threshold for when parallelization becomes worth the overhead.
+        const PARALLEL_THRESHOLD: usize = 10_000; 
 
-    for node_id in 0..graph.len() {
-        let (edges, weights) = graph.modify_edges(node_id as _);
-        
-        // 1. In-place CDF to Probabilities (Sequential Backwards)
-        for i in (1..weights.len()).rev() {
-            // Add .max(0.0) to eradicate any floating-point drift
-            weights[i] = (weights[i] - weights[i - 1]).max(0.0);
-        }
+        graph.par_iter_mut().for_each(|(edges, weights)| {
 
-        if edges.len() >= PARALLEL_THRESHOLD {
-            // === HEAVY NODE: USE RAYON ===
-            let max_v = edges
-                .par_iter()
-                .map(|&e| values[e as usize])
-                .reduce(|| f32::NEG_INFINITY, f32::max);
-
-            let sum = if self.temperature <= f32::EPSILON {
-                edges.par_iter().zip(weights.par_iter_mut()).map(|(&edge, w)| {
-                    if (values[edge as usize] - max_v).abs() <= f32::EPSILON { *w } else { *w = 0.0; 0.0 }
-                }).sum()
-            } else {
-                edges.par_iter().zip(weights.par_iter_mut()).map(|(&edge, w)| {
-                    let exp_v = ((values[edge as usize] - max_v) / self.temperature).exp();
-                    *w *= exp_v;
-                    *w
-                }).sum()
-            };
-
-            normalize_to_cdf(weights, sum);
-
-        } else {
-            // === TYPICAL NODE: FAST SEQUENTIAL
-            let mut max_v = f32::NEG_INFINITY;
-            for &e in edges.iter() {
-                max_v = f32::max(max_v, values[e as usize]);
+            // 1. In-place CDF to Probabilities (Sequential Backwards)
+            for i in (1..weights.len()).rev() {
+                // Add .max(0.0) to eradicate any floating-point drift
+                weights[i] = (weights[i] - weights[i - 1]).max(0.0);
             }
 
-            let mut sum = 0.0;
-            if self.temperature <= f32::EPSILON {
-                for (&edge, w) in edges.iter().zip(weights.iter_mut()) {
-                    if (values[edge as usize] - max_v).abs() <= f32::EPSILON {
+            let sum = if edges.len() >= PARALLEL_THRESHOLD {
+                // === HEAVY NODE: USE RAYON ===
+                let max_v = edges
+                    .par_iter()
+                    .map(|&e| values[e as usize])
+                    .reduce(|| f32::NEG_INFINITY, f32::max);
+
+                if self.temperature <= f32::EPSILON {
+                    edges.par_iter().zip(weights.par_iter_mut()).map(|(&edge, w)| {
+                        if (values[edge as usize] - max_v).abs() <= f32::EPSILON { *w } else { *w = 0.0; 0.0 }
+                    }).sum()
+                } else {
+                    edges.par_iter().zip(weights.par_iter_mut()).map(|(&edge, w)| {
+                        let exp_v = ((values[edge as usize] - max_v) / self.temperature).exp();
+                        *w *= exp_v;
+                        *w
+                    }).sum()
+                }
+
+            } else {
+                // === TYPICAL NODE: FAST SEQUENTIAL
+                let mut max_v = f32::NEG_INFINITY;
+                for &e in edges.iter() {
+                    max_v = f32::max(max_v, values[e as usize]);
+                }
+
+                let mut sum = 0.0;
+                if self.temperature <= f32::EPSILON {
+                    for (&edge, w) in edges.iter().zip(weights.iter_mut()) {
+                        if (values[edge as usize] - max_v).abs() <= f32::EPSILON {
+                            sum += *w;
+                        } else {
+                            *w = 0.0;
+                        }
+                    }
+                } else {
+                    for (&edge, w) in edges.iter().zip(weights.iter_mut()) {
+                        let exp_v = ((values[edge as usize] - max_v) / self.temperature).exp();
+                        *w *= exp_v;
                         sum += *w;
-                    } else {
-                        *w = 0.0;
                     }
                 }
-            } else {
-                for (&edge, w) in edges.iter().zip(weights.iter_mut()) {
-                    let exp_v = ((values[edge as usize] - max_v) / self.temperature).exp();
-                    *w *= exp_v;
-                    sum += *w;
-                }
-            }
+                sum
+            };
+            // Convert back to CDF
+            convert_edges_to_cdf(weights, Some(sum));
 
-            normalize_to_cdf(weights, sum);
-        }
+        });
     }
 }
-}
 
-#[inline]
-fn normalize_to_cdf(weights: &mut [f32], sum: f32) {
-    if sum > 0.0 {
-        let mut accum = 0.0;
-        for w in weights.iter_mut() {
-            accum += *w / sum;
-            // .min(1.0) prevents intermediate values from overshooting
-            // the final 1.0 clamp, preserving monotonicity.
-            *w = accum.min(1.0);
-        }
-        if let Some(last) = weights.last_mut() {
-            *last = 1.0;
-        }
-    } else if !weights.is_empty() {
-        // Fallback: If all probabilities vanished, revert to a uniform
-        // CDF to prevent the node from becoming a broken sink.
-        let n = weights.len() as f32;
-        for (i, w) in weights.iter_mut().enumerate() {
-            *w = ((i + 1) as f32) / n;
-        }
-    }
-}

@@ -18,7 +18,6 @@ pe = cloverleaf.PolicyEvaluation(
     iterations=100,
     eps=1e-6,
     temperature=0.5,
-    indicator=True,
 )
 
 # Products get positive reward -- we want trajectories biased toward them
@@ -26,19 +25,25 @@ pe.set_reward(("prod", "widget"), 10.0)
 pe.set_reward(("prod", "gadget"), 5.0)
 pe.set_reward(("prod", "doohickey"), 2.0)
 
-new_graph = pe.optimize()
+# Snapshot edges BEFORE optimize, since optimize mutates `graph` in place.
+before = {}
+for node_type, node_name in graph.vocab():
+    nodes, weights = graph.get_edges((node_type, node_name), normalized=True)
+    if nodes:
+        before[(node_type, node_name)] = (nodes, weights)
+
+# Mutates `graph` in place.  no_copy defaults to True; we hold no other
+# references to the graph, so this runs without any copy.
+pe.optimize(graph, indicator=True)
 
 print("Edge weight changes under optimal policy:\n")
-for node_type, node_name in graph.vocab():
-    nodes_old, weights_old = graph.get_edges((node_type, node_name), normalized=True)
-    nodes_new, weights_new = new_graph.get_edges((node_type, node_name), normalized=True)
-    if not nodes_old:
-        continue
+for (node_type, node_name), (nodes_old, weights_old) in before.items():
+    nodes_new, weights_new = graph.get_edges((node_type, node_name), normalized=True)
     print(f"  {node_type}:{node_name}")
     for (_, wo), (nn, wn) in zip(zip(nodes_old, weights_old), zip(nodes_new, weights_new)):
         changed = " <--" if abs(wo - wn) > 0.001 else ""
         print(f"    -> {nn[0]}:{nn[1]:10s}  {wo:.4f} -> {wn:.4f}{changed}")
     print()
 
-new_graph.save("/tmp/pe_graph")
+graph.save("/tmp/pe_graph")
 print("Saved reweighted graph to /tmp/pe_graph")
