@@ -663,6 +663,12 @@ impl <'a> Iterator for CDFtoP<'a> {
 /// Converts a set of weights to CDF
 pub fn convert_edges_to_cdf(weights: &mut [f32], sum: Option<f32>) {
 
+    // Dead-end node: nothing to normalize and the terminal clamp below would
+    // underflow `len - 1`.
+    if weights.is_empty() {
+        return;
+    }
+
     // Figure out denominator.
     let mut denom = sum.unwrap_or_else(|| weights.iter().sum::<f32>());
 
@@ -767,6 +773,17 @@ mod csr_tests {
         ps.zip(exp.iter()).for_each(|(p, exp_p)| {
             assert!((p - exp_p).abs() < 1e-7);
         });
+    }
+
+    /// Dead-end nodes (no outbound edges) reach `convert_edges_to_cdf` with an
+    /// empty slice.  The function must no-op rather than underflow on
+    /// `len - 1`.
+    #[test]
+    fn convert_edges_to_cdf_handles_empty() {
+        let mut empty: [f32; 0] = [];
+        convert_edges_to_cdf(&mut empty, None);
+        convert_edges_to_cdf(&mut empty, Some(0.0));
+        convert_edges_to_cdf(&mut empty, Some(1.0));
     }
 
     #[test]
