@@ -82,7 +82,7 @@ impl CSR {
         }).max().unwrap_or(0);
 
         // Figure out how many out edges per node
-        let mut rows = vec![0; max_node+2];
+        let mut rows = vec![0; max_node + 2];
         edges.iter().for_each(|(from_node, _to_node, _w)| {
             rows[*from_node + 1] += 1;
         });
@@ -120,12 +120,14 @@ impl CSR {
     fn deduplicate_edges(
         edges: &mut Vec<(NodeID, NodeID, f32)>
     ) -> () {
+
         edges.par_sort_by_key(|(f_n, t_n, _)| (*f_n, *t_n));
+
         let mut cur_record = 0;
-        let mut idx = 1;
-        while idx < edges.len() {
+        for idx in 1..edges.len() {
             let (f_n, t_n, w) = edges[idx];
             let c_r = edges[cur_record];
+            
             // Same edge, add the weights.
             if f_n == c_r.0 && t_n == c_r.1 {
                 (&mut edges[cur_record]).2 += w;
@@ -134,7 +136,6 @@ impl CSR {
                 cur_record += 1;
                 edges[cur_record] = edges[idx];
             }
-            idx += 1;
         }
         edges.truncate(cur_record + 1);
 
@@ -398,12 +399,23 @@ impl NormalizedGraph for NormalizedCSR {}
 pub struct CumCSR(CSR);
 
 impl CumCSR {
+    /// Cheap placeholder: a zero-node, zero-edge CumCSR.  Intended as a temporary
+    /// value for `std::mem::replace`-based swaps so callers can take unique
+    /// ownership of the real inner CSR without cloning its rows/columns/weights.
+    pub fn empty() -> Self {
+        CumCSR(CSR {
+            rows: vec![0],
+            columns: Vec::new(),
+            weights: Vec::new(),
+        })
+    }
+
     /// Converts a Compressed Sparse Row Format into a CDF version of weights
     pub fn convert(mut csr: CSR) -> Self {
         for start_stop in csr.rows.windows(2) {
             let (start, stop) = (start_stop[0], start_stop[1]);
             if start < stop {
-                convert_edges_to_cdf(&mut csr.weights[start..stop]);
+                convert_edges_to_cdf(&mut csr.weights[start..stop], None);
             }
         }
         CumCSR(csr)
@@ -559,7 +571,7 @@ impl <'a, G:Graph> OptCDFGraph<'a,G> {
         for idx in 0..self.len() {
             let (start, stop) = self.get_edge_range(idx);
             if start < stop {
-                convert_edges_to_cdf(&mut self.weights[start..stop]);
+                convert_edges_to_cdf(&mut self.weights[start..stop], None);
             }
         }
     }
@@ -649,8 +661,11 @@ impl <'a> Iterator for CDFtoP<'a> {
 }
 
 /// Converts a set of weights to CDF
-pub fn convert_edges_to_cdf(weights: &mut [f32]) {
-    let mut denom = weights.iter().sum::<f32>();
+pub fn convert_edges_to_cdf(weights: &mut [f32], sum: Option<f32>) {
+
+    // Figure out denominator.
+    let mut denom = sum.unwrap_or_else(|| weights.iter().sum::<f32>());
+
     if denom == 0f32 {
         // If we have no weights, set all weights to uniform.
         weights.iter_mut().for_each(|w| {
@@ -662,7 +677,7 @@ pub fn convert_edges_to_cdf(weights: &mut [f32]) {
     let mut acc = 0.;
     weights.iter_mut().for_each(|w| {
         acc += *w;
-        *w = acc / denom;
+        *w = (acc / denom).min(1.0);
     });
 
     // Accumulation error can result in it not equaling 1

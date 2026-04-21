@@ -175,7 +175,7 @@ fn interpolate_edges(alpha: f32, g: &impl CDFGraph, weights: &mut [f32]) {
             t.push(w);
         });
         nw.clone_from_slice(&t);
-        convert_edges_to_cdf(&mut nw);
+        convert_edges_to_cdf(&mut nw, None);
     }
 }
 

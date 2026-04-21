@@ -48,7 +48,7 @@ use std::collections::HashSet;
 use rayon::prelude::*;
 use float_ord::FloatOrd;
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError,PyTypeError};
+use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError,PyTypeError,PyRuntimeError};
 use itertools::Itertools;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
@@ -77,6 +77,7 @@ use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
 use crate::algos::lsr::{LSR as ALSR};
 use crate::algos::pprembed::PPREmbed;
 use crate::algos::pprrank::{PprRank, Loss as PprLoss};
+use crate::algos::policy_evaluation::{PolicyEvaluation as PEA};
 use crate::algos::reweighter::{Reweighter};
 use crate::algos::rwr::{RWR,ppr_estimate,rollout};
 use crate::algos::smci::SupervisedMCIteration;
@@ -292,6 +293,21 @@ impl Distance {
 pub struct Graph {
     graph: Arc<CumCSR>,
     vocab: Arc<Vocab>
+}
+
+impl Graph {
+    /// Swap the inner `Arc<CumCSR>` out, replacing it with an empty placeholder.
+    /// The caller owns the returned Arc; the Graph is left in a valid-but-empty
+    /// state that must be repaired via `put_inner` before returning control.
+    /// Pairs with `put_inner` to support in-place optimizers that need unique
+    /// ownership of the CSR without bumping the refcount.
+    pub(crate) fn take_inner(&mut self) -> Arc<CumCSR> {
+        std::mem::replace(&mut self.graph, Arc::new(CumCSR::empty()))
+    }
+
+    pub(crate) fn put_inner(&mut self, inner: Arc<CumCSR>) {
+        self.graph = inner;
+    }
 }
 
 #[pymethods]
@@ -3621,24 +3637,28 @@ impl Smci {
 /// edges via softmax to bias trajectories toward higher-value states.
 #[pyclass]
 struct PolicyEvaluation {
-    graph: Arc<CumCSR>,
     vocab: Arc<Vocab>,
     gamma: f32,
     iterations: usize,
     eps: f32,
     temperature: f32,
     rewards: Vec<f32>,
-    indicator: Option<bool>,
 }
 
 #[pymethods]
 impl PolicyEvaluation {
-    ///    Creates a PolicyEvaluation instance for a given graph.
+    ///    Creates a PolicyEvaluation instance seeded from a graph's vocabulary.
+    ///
+    ///    The graph itself is NOT stored on the returned object.  Pass it back
+    ///    to `optimize(graph)` when you're ready to run.  This avoids holding
+    ///    an extra reference to the graph, which would force a full copy of
+    ///    its edges inside `optimize`.
     ///
     ///    Parameters
     ///    ----------
     ///    graph : Graph
-    ///        Graph to run policy evaluation on.
+    ///        Graph whose vocabulary and size seed this PolicyEvaluation.  The
+    ///        same graph should be passed to `optimize` later.
     ///
     ///    gamma : Float - Optional
     ///        Discount factor ~ [0, 1).  Higher values make the agent plan further
@@ -3666,18 +3686,15 @@ impl PolicyEvaluation {
         iterations: Option<usize>,
         eps: Option<f32>,
         temperature: Option<f32>,
-        indicator: Option<bool>,
     ) -> Self {
         let n = graph.graph.len();
         PolicyEvaluation {
-            graph: graph.graph.clone(),
             vocab: graph.vocab.clone(),
             gamma: gamma.unwrap_or(0.99),
             iterations: iterations.unwrap_or(100),
             eps: eps.unwrap_or(1e-6),
             temperature: temperature.unwrap_or(1.0),
             rewards: vec![0f32; n],
-            indicator: indicator,
         }
     }
 
@@ -3743,28 +3760,82 @@ impl PolicyEvaluation {
         Ok(())
     }
 
-    ///    Runs policy evaluation and mutates the graph weights in place.
+    ///    Runs policy evaluation and rewrites the passed graph's edge weights
+    ///    in place.
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to optimize.  Must have been built from the same vocabulary
+    ///        as this PolicyEvaluation.  Edge weights are mutated in place;
+    ///        no new Graph is returned.
+    ///
+    ///    no_copy : Bool - Optional
+    ///        When True (default), raises an exception instead of silently
+    ///        copying the graph if it has other live references.  This is the
+    ///        whole point of the refactor — accidental allocations should be
+    ///        loud.  Pass False to opt into a full copy when that's what you
+    ///        want.
+    ///
+    ///    indicator : Bool - Optional
+    ///        Show a progress bar while iterating.  Defaults to True.
     ///
     ///    Returns
     ///    -------
-    ///    Graph
-    ///        Graph whose edge weights now reflect the optimal policy.
-    pub fn optimize(&mut self) -> PyResult<Graph> {
-        let vi = crate::algos::policy_evaluation::PolicyEvaluation::new(
+    ///    () - Can throw exception
+    pub fn optimize(
+        &self,
+        graph: &mut Graph,
+        no_copy: Option<bool>,
+        indicator: Option<bool>,
+    ) -> PyResult<()> {
+        // Identity check: PE's vocab must be the vocab the graph was built with,
+        // otherwise `rewards[node_id]` is meaningless against this graph.
+        if !Arc::ptr_eq(&self.vocab, &graph.vocab) {
+            return Err(PyValueError::new_err(
+                "PolicyEvaluation was built from a different graph's vocabulary; \
+                 construct a new PolicyEvaluation from this graph before optimizing."
+            ));
+        }
+
+        let no_copy = no_copy.unwrap_or(true);
+
+        // Swap out the inner Arc<CumCSR>; the Graph is temporarily backed by an
+        // empty CSR.  Taking exclusive ownership this way lets us mutate the
+        // CSR without forcing a clone.
+        let taken = graph.take_inner();
+
+        let mut owned: CumCSR = match Arc::try_unwrap(taken) {
+            Ok(csr) => csr,
+            Err(shared) => {
+                if no_copy {
+                    graph.put_inner(shared);
+                    return Err(PyRuntimeError::new_err(
+                        "Cannot optimize in place: this graph has other live \
+                         references, so running the optimizer would require \
+                         making a full copy of it.  Release the other references \
+                         (for example, drop any other Python variables pointing \
+                         at the same graph) or pass no_copy=False to allow the \
+                         copy."
+                    ));
+                }
+                (*shared).clone()
+            }
+        };
+
+        let vi = PEA::new(
             self.gamma,
             self.iterations,
             self.eps,
             self.temperature,
-            self.indicator.unwrap_or(true),
+            indicator.unwrap_or(true),
         );
-        let values = vi.compute(self.graph.as_ref(), &self.rewards);
-        let graph = Arc::make_mut(&mut self.graph);
-        vi.update_policy_weights_in_place(graph, &values);
 
-        Ok(Graph {
-            graph: self.graph.clone(),
-            vocab: self.vocab.clone(),
-        })
+        let values = vi.compute(&owned, &self.rewards);
+        vi.update_policy_weights_in_place(&mut owned, &values);
+
+        graph.put_inner(Arc::new(owned));
+        Ok(())
     }
 }
 
