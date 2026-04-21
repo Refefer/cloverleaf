@@ -40,6 +40,10 @@ criterion = "0.3"
 name = "bench_algos"
 harness = false
 
+[[bench]]
+name = "bench_policy_evaluation"
+harness = false
+
 [profile.bench]
 debug = true
 
