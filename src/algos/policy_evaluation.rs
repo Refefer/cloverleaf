@@ -12,7 +12,7 @@
 use rayon::prelude::*;
 use std::fmt::Write;
 
-use crate::graph::{Graph, ParallelModifiableGraph, convert_edges_to_cdf}; 
+use crate::graph::{Graph, NodeID, ParallelModifiableGraph, convert_edges_to_cdf};
 use crate::progress::CLProgressBar;
 
 pub struct PolicyEvaluation {
@@ -84,7 +84,7 @@ impl PolicyEvaluation {
 
                     let last_val = v[*edges.last().unwrap() as usize];
                     let last_cdf = *weights.last().unwrap();
-                    
+
                     sum + (last_val * last_cdf)
                 };
 
@@ -114,66 +114,62 @@ impl PolicyEvaluation {
     /// Blends the original transition probabilities with a softmax over neighbor values.
     pub fn update_policy_weights_in_place<G>(&self, graph: &mut G, values: &[f32])
         where G: ParallelModifiableGraph + Graph {
-    
-        // Threshold for when parallelization becomes worth the overhead.
-        const PARALLEL_THRESHOLD: usize = 10_000; 
+
+        let temperature = self.temperature;
 
         graph.par_iter_mut().for_each(|(edges, weights)| {
-
-            // 1. In-place CDF to Probabilities (Sequential Backwards)
-            for i in (1..weights.len()).rev() {
-                // Add .max(0.0) to eradicate any floating-point drift
-                weights[i] = (weights[i] - weights[i - 1]).max(0.0);
-            }
-
-            let sum = if edges.len() >= PARALLEL_THRESHOLD {
-                // === HEAVY NODE: USE RAYON ===
-                let max_v = edges
-                    .par_iter()
-                    .map(|&e| values[e as usize])
-                    .reduce(|| f32::NEG_INFINITY, f32::max);
-
-                if self.temperature <= f32::EPSILON {
-                    edges.par_iter().zip(weights.par_iter_mut()).map(|(&edge, w)| {
-                        if (values[edge as usize] - max_v).abs() <= f32::EPSILON { *w } else { *w = 0.0; 0.0 }
-                    }).sum()
-                } else {
-                    edges.par_iter().zip(weights.par_iter_mut()).map(|(&edge, w)| {
-                        let exp_v = ((values[edge as usize] - max_v) / self.temperature).exp();
-                        *w *= exp_v;
-                        *w
-                    }).sum()
-                }
-
-            } else {
-                // === TYPICAL NODE: FAST SEQUENTIAL
-                let mut max_v = f32::NEG_INFINITY;
-                for &e in edges.iter() {
-                    max_v = f32::max(max_v, values[e as usize]);
-                }
-
-                let mut sum = 0.0;
-                if self.temperature <= f32::EPSILON {
-                    for (&edge, w) in edges.iter().zip(weights.iter_mut()) {
-                        if (values[edge as usize] - max_v).abs() <= f32::EPSILON {
-                            sum += *w;
-                        } else {
-                            *w = 0.0;
-                        }
-                    }
-                } else {
-                    for (&edge, w) in edges.iter().zip(weights.iter_mut()) {
-                        let exp_v = ((values[edge as usize] - max_v) / self.temperature).exp();
-                        *w *= exp_v;
-                        sum += *w;
-                    }
-                }
-                sum
-            };
-            // Convert back to CDF
-            convert_edges_to_cdf(weights, Some(sum));
-
+            update_one_node(edges, weights, values, temperature);
         });
     }
 }
 
+/// Per-node softmax weight update for [`PolicyEvaluation::update_policy_weights_in_place`].
+///
+/// Exposed at crate visibility so benchmarks can drive this without reconstructing
+/// a full graph. Production code reaches this via `update_policy_weights_in_place`,
+/// which calls it inside `graph.par_iter_mut()` — so nodes are already processed
+/// in parallel, and the per-node body stays sequential to avoid nested-Rayon
+/// contention.
+///
+/// Preconditions:
+///   - `weights` is a normalized CDF on entry (last element ~= 1.0).
+///   - `edges.len() == weights.len()`.
+///   - All edge ids index into `values`.
+///
+/// On exit, `weights` is a normalized CDF over the softmax-reweighted probabilities.
+pub fn update_one_node(
+    edges: &mut [NodeID],
+    weights: &mut [f32],
+    values: &[f32],
+    temperature: f32,
+) {
+    // 1. In-place CDF -> probabilities (sequential backwards pass).
+    for i in (1..weights.len()).rev() {
+        weights[i] = (weights[i] - weights[i - 1]).max(0.0);
+    }
+
+    let mut max_v = f32::NEG_INFINITY;
+    for &e in edges.iter() {
+        max_v = f32::max(max_v, values[e as usize]);
+    }
+
+    let mut sum = 0.0;
+    if temperature <= f32::EPSILON {
+        for (&edge, w) in edges.iter().zip(weights.iter_mut()) {
+            if (values[edge as usize] - max_v).abs() <= f32::EPSILON {
+                sum += *w;
+            } else {
+                *w = 0.0;
+            }
+        }
+    } else {
+        for (&edge, w) in edges.iter().zip(weights.iter_mut()) {
+            let exp_v = ((values[edge as usize] - max_v) / temperature).exp();
+            *w *= exp_v;
+            sum += *w;
+        }
+    }
+
+    // Back to CDF.
+    convert_edges_to_cdf(weights, Some(sum));
+}
