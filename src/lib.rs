@@ -3738,11 +3738,12 @@ impl PolicyEvaluation {
     ///    -------
     ///    () - Can throw exception
     pub fn load_rewards(&mut self, path: &str) -> PyResult<()> {
-        let reader =
-            open_file_for_reading(path).map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+        let reader = open_file_for_reading(path)
+            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
 
         for (i, line) in reader.lines().enumerate() {
             let line = line.map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+
             let pieces: Vec<_> = line.split('\t').collect();
             if pieces.len() != 3 {
                 let line_id = i + 1;
@@ -3751,9 +3752,11 @@ impl PolicyEvaluation {
                     line_id
                 )));
             }
+
             let reward: f32 = pieces[2].trim().parse().map_err(|_| {
                 PyValueError::new_err(format!("Invalid reward value: {}", pieces[2]))
             })?;
+
             let node_id = get_node_id(self.vocab.deref(), pieces[0], pieces[1].trim())?;
             self.rewards[node_id] = reward;
         }
@@ -3806,21 +3809,25 @@ impl PolicyEvaluation {
         let taken = graph.take_inner();
 
         let mut owned: CumCSR = match Arc::try_unwrap(taken) {
+
+            // No copy needed
             Ok(csr) => csr,
-            Err(shared) => {
-                if no_copy {
-                    graph.put_inner(shared);
-                    return Err(PyRuntimeError::new_err(
-                        "Cannot optimize in place: this graph has other live \
-                         references, so running the optimizer would require \
-                         making a full copy of it.  Release the other references \
-                         (for example, drop any other Python variables pointing \
-                         at the same graph) or pass no_copy=False to allow the \
-                         copy."
-                    ));
-                }
-                (*shared).clone()
+
+            // Shared state and we the user doesn't want to copy it.
+            Err(shared) if no_copy => {
+                graph.put_inner(shared);
+                return Err(PyRuntimeError::new_err(
+                    "Cannot optimize in place: this graph has other live \
+                     references, so running the optimizer would require \
+                     making a full copy of it.  Release the other references \
+                     (for example, drop any other Python variables pointing \
+                     at the same graph) or pass no_copy=False to allow the \
+                     copy."
+                ));
             }
+            
+            // Deep copy is allowed
+            Err(shared) => (*shared).clone()
         };
 
         let vi = PEA::new(
