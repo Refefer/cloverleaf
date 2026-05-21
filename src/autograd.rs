@@ -199,6 +199,40 @@ fn scalar_op(
     ANode::from_tensor(unwrap_tensor(op(lhs.as_tensor(), rhs as f64), context))
 }
 
+
+impl Div<ANode> for f32 {
+    type Output = ANode;
+
+    fn div(self, rhs: ANode) -> Self::Output {
+        Constant::scalar(self) / rhs
+    }
+}
+
+impl Div<&ANode> for f32 {
+    type Output = ANode;
+
+    fn div(self, rhs: &ANode) -> Self::Output {
+        Constant::scalar(self) / rhs
+    }
+}
+
+impl Neg for ANode {
+    type Output = ANode;
+
+    fn neg(self) -> Self::Output {
+        scalar_op(&self, 0.0, |lhs, _| lhs.affine(-1.0, 0.0), "neg")
+    }
+}
+
+impl Neg for &ANode {
+    type Output = ANode;
+
+    fn neg(self) -> Self::Output {
+        scalar_op(self, 0.0, |lhs, _| lhs.affine(-1.0, 0.0), "neg")
+    }
+}
+
+
 macro_rules! impl_binary_op {
     ($trait:ident, $method:ident, $tensor_op:path, $context:literal) => {
         impl $trait for ANode {
@@ -295,46 +329,6 @@ macro_rules! impl_scalar_lhs_op {
     };
 }
 
-macro_rules! impl_scalar_lhs_via_constant_op {
-    ($trait:ident, $method:ident, $op:tt) => {
-        impl $trait<ANode> for f32 {
-            type Output = ANode;
-
-            fn $method(self, rhs: ANode) -> Self::Output {
-                Constant::scalar(self) $op rhs
-            }
-        }
-
-        impl $trait<&ANode> for f32 {
-            type Output = ANode;
-
-            fn $method(self, rhs: &ANode) -> Self::Output {
-                Constant::scalar(self) $op rhs
-            }
-        }
-    };
-}
-
-macro_rules! impl_unary_op {
-    ($trait:ident, $method:ident, $op:expr, $context:literal) => {
-        impl $trait for ANode {
-            type Output = ANode;
-
-            fn $method(self) -> Self::Output {
-                scalar_op(&self, 0.0, $op, $context)
-            }
-        }
-
-        impl $trait for &ANode {
-            type Output = ANode;
-
-            fn $method(self) -> Self::Output {
-                scalar_op(self, 0.0, $op, $context)
-            }
-        }
-    };
-}
-
 impl_binary_op!(Add, add, Tensor::broadcast_add, "add");
 impl_scalar_rhs_op!(Add, add, |lhs, s| lhs.affine(1.0, s), "add scalar");
 impl_commutative_scalar_lhs_op!(Add, add, +);
@@ -349,6 +343,3 @@ impl_commutative_scalar_lhs_op!(Mul, mul, *);
 
 impl_binary_op!(Div, div, Tensor::broadcast_div, "div");
 impl_scalar_rhs_op!(Div, div, |lhs, s| lhs.affine(1.0 / s, 0.0), "div scalar");
-impl_scalar_lhs_via_constant_op!(Div, div, /);
-
-impl_unary_op!(Neg, neg, |lhs, _| lhs.affine(-1.0, 0.0), "neg");
