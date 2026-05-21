@@ -10,17 +10,23 @@ fn unwrap_tensor(result: candle_core::Result<Tensor>, context: &str) -> Tensor {
 fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
-        #[cfg(feature = "metal")]
+        #[cfg(feature = "cuda")]
+        {
+            return Device::new_cuda(0).expect("Candle CUDA device");
+        }
+
+        #[cfg(all(not(feature = "cuda"), feature = "metal"))]
         {
             return Device::new_metal(0).expect("Candle Metal device");
         }
 
-        #[cfg(not(feature = "metal"))]
+        #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
         {
             Device::Cpu
         }
     })
 }
+
 
 #[derive(Clone)]
 pub struct ANode {

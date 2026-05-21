@@ -7,6 +7,7 @@ edition = "2021"
 default = []
 accelerate = ["candle-core/accelerate"]
 metal = ["candle-core/metal"]
+cuda = ["candle-core/cuda"]
 
 [lib]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
