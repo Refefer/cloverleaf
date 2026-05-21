@@ -181,282 +181,174 @@ impl ANodeVecOps for Vec<ANode> {
     }
 }
 
-fn binary_op(lhs: &ANode, rhs: &ANode, op: fn(&Tensor, &Tensor) -> candle_core::Result<Tensor>, context: &str) -> ANode {
+fn binary_op(
+    lhs: &ANode,
+    rhs: &ANode,
+    op: fn(&Tensor, &Tensor) -> candle_core::Result<Tensor>,
+    context: &str,
+) -> ANode {
     ANode::from_tensor(unwrap_tensor(op(lhs.as_tensor(), rhs.as_tensor()), context))
 }
 
-fn scalar_op(lhs: &ANode, rhs: f32, op: fn(&Tensor, f64) -> candle_core::Result<Tensor>, context: &str) -> ANode {
+fn scalar_op(
+    lhs: &ANode,
+    rhs: f32,
+    op: fn(&Tensor, f64) -> candle_core::Result<Tensor>,
+    context: &str,
+) -> ANode {
     ANode::from_tensor(unwrap_tensor(op(lhs.as_tensor(), rhs as f64), context))
 }
 
-impl Add for ANode {
-    type Output = ANode;
+macro_rules! impl_binary_op {
+    ($trait:ident, $method:ident, $tensor_op:path, $context:literal) => {
+        impl $trait for ANode {
+            type Output = ANode;
 
-    fn add(self, rhs: Self) -> Self::Output {
-        binary_op(&self, &rhs, Tensor::broadcast_add, "add")
-    }
+            fn $method(self, rhs: Self) -> Self::Output {
+                binary_op(&self, &rhs, $tensor_op, $context)
+            }
+        }
+
+        impl $trait<&ANode> for ANode {
+            type Output = ANode;
+
+            fn $method(self, rhs: &ANode) -> Self::Output {
+                binary_op(&self, rhs, $tensor_op, $context)
+            }
+        }
+
+        impl $trait<ANode> for &ANode {
+            type Output = ANode;
+
+            fn $method(self, rhs: ANode) -> Self::Output {
+                binary_op(self, &rhs, $tensor_op, $context)
+            }
+        }
+
+        impl $trait<&ANode> for &ANode {
+            type Output = ANode;
+
+            fn $method(self, rhs: &ANode) -> Self::Output {
+                binary_op(self, rhs, $tensor_op, $context)
+            }
+        }
+    };
 }
 
-impl Add<&ANode> for ANode {
-    type Output = ANode;
+macro_rules! impl_scalar_rhs_op {
+    ($trait:ident, $method:ident, $op:expr, $context:literal) => {
+        impl $trait<f32> for ANode {
+            type Output = ANode;
 
-    fn add(self, rhs: &ANode) -> Self::Output {
-        binary_op(&self, rhs, Tensor::broadcast_add, "add")
-    }
+            fn $method(self, rhs: f32) -> Self::Output {
+                scalar_op(&self, rhs, $op, $context)
+            }
+        }
+
+        impl $trait<f32> for &ANode {
+            type Output = ANode;
+
+            fn $method(self, rhs: f32) -> Self::Output {
+                scalar_op(self, rhs, $op, $context)
+            }
+        }
+    };
 }
 
-impl Add<ANode> for &ANode {
-    type Output = ANode;
+macro_rules! impl_commutative_scalar_lhs_op {
+    ($trait:ident, $method:ident, $op:tt) => {
+        impl $trait<ANode> for f32 {
+            type Output = ANode;
 
-    fn add(self, rhs: ANode) -> Self::Output {
-        binary_op(self, &rhs, Tensor::broadcast_add, "add")
-    }
+            fn $method(self, rhs: ANode) -> Self::Output {
+                rhs $op self
+            }
+        }
+
+        impl $trait<&ANode> for f32 {
+            type Output = ANode;
+
+            fn $method(self, rhs: &ANode) -> Self::Output {
+                rhs $op self
+            }
+        }
+    };
 }
 
-impl Add<&ANode> for &ANode {
-    type Output = ANode;
+macro_rules! impl_scalar_lhs_op {
+    ($trait:ident, $method:ident, $op:expr, $context:literal) => {
+        impl $trait<ANode> for f32 {
+            type Output = ANode;
 
-    fn add(self, rhs: &ANode) -> Self::Output {
-        binary_op(self, rhs, Tensor::broadcast_add, "add")
-    }
+            fn $method(self, rhs: ANode) -> Self::Output {
+                scalar_op(&rhs, self, $op, $context)
+            }
+        }
+
+        impl $trait<&ANode> for f32 {
+            type Output = ANode;
+
+            fn $method(self, rhs: &ANode) -> Self::Output {
+                scalar_op(rhs, self, $op, $context)
+            }
+        }
+    };
 }
 
-impl Add<f32> for ANode {
-    type Output = ANode;
+macro_rules! impl_scalar_lhs_via_constant_op {
+    ($trait:ident, $method:ident, $op:tt) => {
+        impl $trait<ANode> for f32 {
+            type Output = ANode;
 
-    fn add(self, rhs: f32) -> Self::Output {
-        scalar_op(&self, rhs, |lhs, s| lhs.affine(1.0, s), "add scalar")
-    }
+            fn $method(self, rhs: ANode) -> Self::Output {
+                Constant::scalar(self) $op rhs
+            }
+        }
+
+        impl $trait<&ANode> for f32 {
+            type Output = ANode;
+
+            fn $method(self, rhs: &ANode) -> Self::Output {
+                Constant::scalar(self) $op rhs
+            }
+        }
+    };
 }
 
-impl Add<f32> for &ANode {
-    type Output = ANode;
+macro_rules! impl_unary_op {
+    ($trait:ident, $method:ident, $op:expr, $context:literal) => {
+        impl $trait for ANode {
+            type Output = ANode;
 
-    fn add(self, rhs: f32) -> Self::Output {
-        scalar_op(self, rhs, |lhs, s| lhs.affine(1.0, s), "add scalar")
-    }
+            fn $method(self) -> Self::Output {
+                scalar_op(&self, 0.0, $op, $context)
+            }
+        }
+
+        impl $trait for &ANode {
+            type Output = ANode;
+
+            fn $method(self) -> Self::Output {
+                scalar_op(self, 0.0, $op, $context)
+            }
+        }
+    };
 }
 
-impl Add<ANode> for f32 {
-    type Output = ANode;
+impl_binary_op!(Add, add, Tensor::broadcast_add, "add");
+impl_scalar_rhs_op!(Add, add, |lhs, s| lhs.affine(1.0, s), "add scalar");
+impl_commutative_scalar_lhs_op!(Add, add, +);
 
-    fn add(self, rhs: ANode) -> Self::Output {
-        rhs + self
-    }
-}
+impl_binary_op!(Sub, sub, Tensor::broadcast_sub, "sub");
+impl_scalar_rhs_op!(Sub, sub, |lhs, s| lhs.affine(1.0, -s), "sub scalar");
+impl_scalar_lhs_op!(Sub, sub, |lhs, s| lhs.affine(-1.0, s), "scalar sub");
 
-impl Add<&ANode> for f32 {
-    type Output = ANode;
+impl_binary_op!(Mul, mul, Tensor::broadcast_mul, "mul");
+impl_scalar_rhs_op!(Mul, mul, |lhs, s| lhs.affine(s, 0.0), "mul scalar");
+impl_commutative_scalar_lhs_op!(Mul, mul, *);
 
-    fn add(self, rhs: &ANode) -> Self::Output {
-        rhs + self
-    }
-}
+impl_binary_op!(Div, div, Tensor::broadcast_div, "div");
+impl_scalar_rhs_op!(Div, div, |lhs, s| lhs.affine(1.0 / s, 0.0), "div scalar");
+impl_scalar_lhs_via_constant_op!(Div, div, /);
 
-impl Sub for ANode {
-    type Output = ANode;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        binary_op(&self, &rhs, Tensor::broadcast_sub, "sub")
-    }
-}
-
-impl Sub<&ANode> for ANode {
-    type Output = ANode;
-
-    fn sub(self, rhs: &ANode) -> Self::Output {
-        binary_op(&self, rhs, Tensor::broadcast_sub, "sub")
-    }
-}
-
-impl Sub<ANode> for &ANode {
-    type Output = ANode;
-
-    fn sub(self, rhs: ANode) -> Self::Output {
-        binary_op(self, &rhs, Tensor::broadcast_sub, "sub")
-    }
-}
-
-impl Sub<&ANode> for &ANode {
-    type Output = ANode;
-
-    fn sub(self, rhs: &ANode) -> Self::Output {
-        binary_op(self, rhs, Tensor::broadcast_sub, "sub")
-    }
-}
-
-impl Sub<f32> for ANode {
-    type Output = ANode;
-
-    fn sub(self, rhs: f32) -> Self::Output {
-        scalar_op(&self, rhs, |lhs, s| lhs.affine(1.0, -s), "sub scalar")
-    }
-}
-
-impl Sub<f32> for &ANode {
-    type Output = ANode;
-
-    fn sub(self, rhs: f32) -> Self::Output {
-        scalar_op(self, rhs, |lhs, s| lhs.affine(1.0, -s), "sub scalar")
-    }
-}
-
-impl Sub<ANode> for f32 {
-    type Output = ANode;
-
-    fn sub(self, rhs: ANode) -> Self::Output {
-        scalar_op(&rhs, self, |lhs, s| lhs.affine(-1.0, s), "scalar sub")
-    }
-}
-
-impl Sub<&ANode> for f32 {
-    type Output = ANode;
-
-    fn sub(self, rhs: &ANode) -> Self::Output {
-        scalar_op(rhs, self, |lhs, s| lhs.affine(-1.0, s), "scalar sub")
-    }
-}
-
-impl Mul for ANode {
-    type Output = ANode;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        binary_op(&self, &rhs, Tensor::broadcast_mul, "mul")
-    }
-}
-
-impl Mul<&ANode> for ANode {
-    type Output = ANode;
-
-    fn mul(self, rhs: &ANode) -> Self::Output {
-        binary_op(&self, rhs, Tensor::broadcast_mul, "mul")
-    }
-}
-
-impl Mul<ANode> for &ANode {
-    type Output = ANode;
-
-    fn mul(self, rhs: ANode) -> Self::Output {
-        binary_op(self, &rhs, Tensor::broadcast_mul, "mul")
-    }
-}
-
-impl Mul<&ANode> for &ANode {
-    type Output = ANode;
-
-    fn mul(self, rhs: &ANode) -> Self::Output {
-        binary_op(self, rhs, Tensor::broadcast_mul, "mul")
-    }
-}
-
-impl Mul<f32> for ANode {
-    type Output = ANode;
-
-    fn mul(self, rhs: f32) -> Self::Output {
-        scalar_op(&self, rhs, |lhs, s| lhs.affine(s, 0.0), "mul scalar")
-    }
-}
-
-impl Mul<f32> for &ANode {
-    type Output = ANode;
-
-    fn mul(self, rhs: f32) -> Self::Output {
-        scalar_op(self, rhs, |lhs, s| lhs.affine(s, 0.0), "mul scalar")
-    }
-}
-
-impl Mul<ANode> for f32 {
-    type Output = ANode;
-
-    fn mul(self, rhs: ANode) -> Self::Output {
-        rhs * self
-    }
-}
-
-impl Mul<&ANode> for f32 {
-    type Output = ANode;
-
-    fn mul(self, rhs: &ANode) -> Self::Output {
-        rhs * self
-    }
-}
-
-impl Div for ANode {
-    type Output = ANode;
-
-    fn div(self, rhs: Self) -> Self::Output {
-        binary_op(&self, &rhs, Tensor::broadcast_div, "div")
-    }
-}
-
-impl Div<&ANode> for ANode {
-    type Output = ANode;
-
-    fn div(self, rhs: &ANode) -> Self::Output {
-        binary_op(&self, rhs, Tensor::broadcast_div, "div")
-    }
-}
-
-impl Div<ANode> for &ANode {
-    type Output = ANode;
-
-    fn div(self, rhs: ANode) -> Self::Output {
-        binary_op(self, &rhs, Tensor::broadcast_div, "div")
-    }
-}
-
-impl Div<&ANode> for &ANode {
-    type Output = ANode;
-
-    fn div(self, rhs: &ANode) -> Self::Output {
-        binary_op(self, rhs, Tensor::broadcast_div, "div")
-    }
-}
-
-impl Div<f32> for ANode {
-    type Output = ANode;
-
-    fn div(self, rhs: f32) -> Self::Output {
-        scalar_op(&self, rhs, |lhs, s| lhs.affine(1.0 / s, 0.0), "div scalar")
-    }
-}
-
-impl Div<f32> for &ANode {
-    type Output = ANode;
-
-    fn div(self, rhs: f32) -> Self::Output {
-        scalar_op(self, rhs, |lhs, s| lhs.affine(1.0 / s, 0.0), "div scalar")
-    }
-}
-
-impl Div<ANode> for f32 {
-    type Output = ANode;
-
-    fn div(self, rhs: ANode) -> Self::Output {
-        Constant::scalar(self) / rhs
-    }
-}
-
-impl Div<&ANode> for f32 {
-    type Output = ANode;
-
-    fn div(self, rhs: &ANode) -> Self::Output {
-        Constant::scalar(self) / rhs
-    }
-}
-
-impl Neg for ANode {
-    type Output = ANode;
-
-    fn neg(self) -> Self::Output {
-        scalar_op(&self, 0.0, |lhs, _| lhs.affine(-1.0, 0.0), "neg")
-    }
-}
-
-impl Neg for &ANode {
-    type Output = ANode;
-
-    fn neg(self) -> Self::Output {
-        scalar_op(self, 0.0, |lhs, _| lhs.affine(-1.0, 0.0), "neg")
-    }
-}
+impl_unary_op!(Neg, neg, |lhs, _| lhs.affine(-1.0, 0.0), "neg");
