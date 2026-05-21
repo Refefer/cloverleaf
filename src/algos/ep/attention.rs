@@ -2,7 +2,7 @@
 //! attention methods.  Notably, we use averaged versus concat -> linear projection due to
 //! performance cost.  This has representational downsides but performs significantly faster and
 //! with no extra parmeters.
-use simple_grad::*;
+use crate::autograd::*;
 use float_ord::FloatOrd;
 use rand::prelude::*;
 
@@ -249,7 +249,7 @@ fn compute_random_attention_matrix(
 
 // Learn the softmax of the attention matrix.  Lots of effort in place to make this efficient,
 // within the limitations of dynamic allocations.  Might make sense to make a special attention
-// operator ala pytorch/tensorflow within simple_grad.
+// operator ala pytorch/tensorflow within the autograd backend.
 fn compute_attention_softmax(
     mut attention_matrix: AttentionMatrix,
     d_k: usize
@@ -282,7 +282,8 @@ fn compute_attention_softmax(
 // Simple softmax.
 pub fn softmax(numers: ANode, exact: bool) -> ANode {
     // Doesn't need to be part of the graph
-    let max_value = numers.value().iter()
+    let numer_values = numers.value();
+    let max_value = numer_values.iter()
         .max_by_key(|v| FloatOrd(**v))
         .expect("Shouldn't be non-zero!");
 

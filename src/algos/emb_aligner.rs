@@ -1,4 +1,4 @@
-use simple_grad::*;
+use crate::autograd::*;
 
 pub fn align_embedding(
     embedding: &[f32],
