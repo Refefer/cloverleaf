@@ -1,9 +1,25 @@
 use std::ops::{Add, Div, Mul, Neg, Sub};
+use std::sync::OnceLock;
 
 use candle_core::{backprop::GradStore, Device, Tensor, Var};
 
 fn unwrap_tensor(result: candle_core::Result<Tensor>, context: &str) -> Tensor {
     result.unwrap_or_else(|err| panic!("Candle autograd error in {context}: {err}"))
+}
+
+fn device() -> &'static Device {
+    static DEVICE: OnceLock<Device> = OnceLock::new();
+    DEVICE.get_or_init(|| {
+        #[cfg(feature = "metal")]
+        {
+            return Device::new_metal(0).expect("Candle Metal device");
+        }
+
+        #[cfg(not(feature = "metal"))]
+        {
+            Device::Cpu
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -81,7 +97,7 @@ impl Variable {
     }
 
     pub fn pooled(data: &[f32]) -> ANode {
-        let var = Var::from_slice(data, data.len(), &Device::Cpu).expect("Candle variable");
+        let var = Var::from_slice(data, data.len(), device()).expect("Candle variable");
         ANode::from_tensor(var.into_inner())
     }
 }
@@ -91,13 +107,13 @@ pub struct Constant;
 impl Constant {
     pub fn new(data: Vec<f32>) -> ANode {
         ANode::from_tensor(
-            Tensor::from_slice(data.as_slice(), data.len(), &Device::Cpu).expect("Candle constant"),
+            Tensor::from_slice(data.as_slice(), data.len(), device()).expect("Candle constant"),
         )
     }
 
     pub fn scalar(value: f32) -> ANode {
         ANode::from_tensor(
-            Tensor::from_slice(&[value], 1, &Device::Cpu).expect("Candle scalar constant"),
+            Tensor::from_slice(&[value], 1, device()).expect("Candle scalar constant"),
         )
     }
 }
