@@ -7,6 +7,8 @@ edition = "2021"
 default = []
 accelerate = ["candle-core/accelerate"]
 metal = ["candle-core/metal"]
+# Experimental: the CUDA backend works end-to-end but is currently slower than
+# the CPU backend on typical Cloverleaf workloads. See README for build notes.
 cuda = ["candle-core/cuda"]
 
 [lib]

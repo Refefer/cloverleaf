@@ -28,8 +28,30 @@ The library is broken up into a few different methods:
 1. Create a new python virtualenv
 2. `pip install maturin numpy`
 3. Ensure you have the latest Rust compiler
-4. `RUSTFLAGS="-C target-cpu=native" maturin develop --release`
+4. Build the extension. The autograd backend is the [Candle](https://github.com/huggingface/candle) tensor library; by default it runs on CPU:
+
+    ```
+    RUSTFLAGS="-C target-cpu=native" maturin develop --release
+    ```
+
 5. Profit!
+
+### Experimental CUDA support
+
+Cloverleaf can also be built with Candle's CUDA backend. This is **experimental** — the CPU path is the supported path and is faster than the CUDA path on most workloads at typical Cloverleaf sizes. The CUDA build is useful as a starting point if you want to experiment with GPU acceleration, but it is not yet production-ready.
+
+To build with CUDA, you need:
+
+- A working CUDA toolkit (`nvcc`, headers, runtime libs) on `PATH` / `LD_LIBRARY_PATH`.
+- The `CUDA_COMPUTE_CAP` env var set to your GPU's compute capability (e.g. `120` for SM 12.0 / Blackwell-class, `89` for SM 8.9 / Ada). This is read by the underlying `cudarc` build script.
+- Pass `--features cuda` to maturin so the `cuda` feature gets propagated to `candle-core`:
+
+    ```
+    CUDA_COMPUTE_CAP=120 RUSTFLAGS="-C target-cpu=native" \
+        maturin develop --release --features cuda
+    ```
+
+The resulting binary places all autograd tensors on the GPU. If you find the CUDA path slower than CPU for your workload, fall back to the plain (no-`--features`) build above — the CPU build does not link any CUDA libraries.
 
 ## Data Format
 
