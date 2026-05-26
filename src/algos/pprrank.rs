@@ -8,7 +8,7 @@ use hashbrown::HashMap;
 use std::collections::{HashMap as CHashMap};
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
-use simple_grad::*;
+use crate::autograd::*;
 
 use crate::algos::rwr::RWR;
 use crate::algos::utils::Sample;

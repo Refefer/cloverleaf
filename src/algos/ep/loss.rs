@@ -1,7 +1,7 @@
 //! Defines the different losses for use within the Embedding Propagation framework.
 //! Admitedly, the EP framework isn't parameterized on loss, so technically choosing a loss other
 //! than Margin Loss is a different optimizer. 
-use simple_grad::*;
+use crate::autograd::*;
 use rand::prelude::*;
 use rand_distr::{Distribution,Uniform};
 
@@ -57,7 +57,7 @@ impl Loss {
         match self {
 
             Loss::MarginLoss(gamma, _) | Loss::PPR(gamma, _, _) => {
-                let d1 = gamma + euclidean_distance(&thv, &hv);
+                let d1 = *gamma + euclidean_distance(&thv, &hv);
                 let pos_losses = hus.iter()
                     .map(|hu| &d1 - euclidean_distance(&thv, hu))
                     .filter(|loss| loss.value()[0] > 0f32)
@@ -89,7 +89,7 @@ impl Loss {
                     .map(|hu| {
                         let hu_norm = il2norm(hu);
                         // Margin loss
-                        (gamma - (&reconstruction_dist - cosine(hv_norm.clone(), hu_norm))).maximum(0f32)
+                        (*gamma - (&reconstruction_dist - cosine(hv_norm.clone(), hu_norm))).maximum(0f32)
                     })
                     // Only collect losses which are not zero
                     .filter(|l| l.value()[0] > 0f32)
@@ -108,7 +108,7 @@ impl Loss {
                 let thv_norm = il2norm(&thv);
                 let hv_norm  = il2norm(&hv);
 
-                let pos_reconstruction = (pos_margin - cosine(thv_norm, hv_norm.clone())).maximum(0f32);
+                let pos_reconstruction = (*pos_margin - cosine(thv_norm, hv_norm.clone())).maximum(0f32);
                 let mut margins: Vec<_> = hus.iter().map(|hu| {
                         let hu_norm = il2norm(hu);
                         let cs = cosine(hv_norm.clone(), hu_norm);

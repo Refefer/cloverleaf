@@ -1,7 +1,7 @@
 //! Aggregators take models, feature embeddings, and a feature set and convert them into
 //! embeddings.  They are constructed adhoc so can be used in parallel as well as within the python
 //! interface
-use simple_grad::*;
+use crate::autograd::*;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 
@@ -152,4 +152,3 @@ impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {
         });
     }
 }
-

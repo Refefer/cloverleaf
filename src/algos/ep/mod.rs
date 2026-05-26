@@ -14,7 +14,7 @@ use std::collections::{HashMap as CHashMap};
 use rand::prelude::*;
 use rand_distr::StandardNormal;
 use rand_xorshift::XorShiftRng;
-use simple_grad::*;
+use crate::autograd::*;
 
 use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::EmbeddingStore;

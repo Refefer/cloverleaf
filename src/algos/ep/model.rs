@@ -1,7 +1,7 @@
 //! The Embedding Propagation framework parameterizes over the feature aggregator - that is, given
 //! a node with a set of features, how do we combine them to product a node embedding?
 //! This module defines them
-use simple_grad::*;
+use crate::autograd::*;
 use hashbrown::HashMap;
 use rand::prelude::*;
 
@@ -461,4 +461,3 @@ pub fn mean_embeddings<'a>(
     });
     vs.sum_all() / n as f32
 }
-

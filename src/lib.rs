@@ -9,6 +9,8 @@ pub mod graph;
 /// We define all the algorithms within this module
 pub mod algos;
 
+mod autograd;
+
 /// How can we efficiently sample from the graph?
 mod sampler;
 
@@ -5087,4 +5089,3 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PolicyEvaluation>()?;
     Ok(())
 }
-
