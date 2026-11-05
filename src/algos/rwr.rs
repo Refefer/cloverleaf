@@ -123,6 +123,12 @@ impl RWR {
         let mut counts = HashMap::new();
         let mut next_counts = HashMap::new();
         counts.insert(start_node, self.walks);
+
+        // Zero-length walks terminate at the start node, matching `walk`.
+        if matches!(self.steps, Sample::Fixed(0)) {
+            std::mem::swap(&mut ret, &mut counts);
+        }
+
         let mut pass = 1;
         loop {
             if counts.len() == 0 { break }
@@ -286,12 +292,13 @@ mod rwr_tests {
     fn test_rwr() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, false);
         let ccsr = CumCSR::convert(csr);
         let rwr = RWR {
-            steps: Steps::Probability(0.1),
+            steps: Sample::Probability(0.1),
             walks: 10_000,
             beta: 0.5,
+            single_threaded: false,
             seed: 20222022
         };
 
@@ -305,4 +312,33 @@ mod rwr_tests {
         assert_eq!(v[2].0, 1);
     }
 
+    /// A zero-length walk ends where it starts.  The BFS sampler must terminate (it used to spin
+    /// forever) and agree with the per-walk sampler.
+    #[test]
+    fn test_sample_bfs_zero_steps_terminates() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let ccsr = CumCSR::convert(CSR::construct_from_edges(build_edges(), false));
+            let rwr = RWR {
+                steps: Sample::Fixed(0),
+                walks: 100,
+                beta: 0.0,
+                single_threaded: true,
+                seed: 20222022
+            };
+            let bfs = rwr.sample_bfs(&ccsr, 0);
+            let st = rwr.sample(&ccsr, &Unweighted, 0);
+            tx.send((bfs, st)).unwrap();
+        });
+
+        let (bfs, st) = rx.recv_timeout(Duration::from_secs(10))
+            .expect("sample_bfs did not terminate with Sample::Fixed(0)");
+        assert_eq!(bfs.keys().collect::<Vec<_>>(), vec![&0]);
+        assert_eq!(bfs, st);
+    }
+
 }
+

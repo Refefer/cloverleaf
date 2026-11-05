@@ -135,7 +135,8 @@ pub fn reservoir_sample(
         if i < size {
             sample.push(n);
         } else {
-            let idx = Uniform::new(0, i).sample(rng);
+            // Algorithm R: replace with probability size / (i + 1).
+            let idx = Uniform::new_inclusive(0, i).sample(rng);
             if idx < size {
                 sample[idx] = n;
             }
@@ -171,7 +172,8 @@ pub enum Sample {
 
 impl Sample {
     pub fn new(n: f32) -> Result<Sample,IllegalSample> {
-        if n < 0f32 {
+        // Negated so NaN is rejected as well.
+        if !(n >= 0f32) {
             Err(IllegalSample)
         } else {
             let s = if n > 0f32 && n < 1f32 {
@@ -221,6 +223,35 @@ impl Sample {
 mod utils_tests {
     use super::*;
     use rand_xorshift::XorShiftRng;
+
+    #[test]
+    fn test_sample_new_rejects_nan() {
+        assert!(Sample::new(f32::NAN).is_err());
+        assert!(Sample::new(-1.).is_err());
+        assert!(matches!(Sample::new(0.5), Ok(Sample::Probability(_))));
+        assert!(matches!(Sample::new(3.), Ok(Sample::Fixed(3))));
+    }
+
+    /// Algorithm R: every item should be equally likely to end up in the reservoir.
+    #[test]
+    fn test_reservoir_sample_is_uniform() {
+        let mut rng = XorShiftRng::seed_from_u64(1234);
+        let n_items = 4;
+        let trials = 20_000;
+        let mut picks = vec![0usize; n_items];
+        for _ in 0..trials {
+            let items = (0..n_items).map(|i| (i, 1f32));
+            for (node, _) in reservoir_sample(items, 1, &mut rng) {
+                picks[node] += 1;
+            }
+        }
+        let expected = trials as f32 / n_items as f32;
+        for (node, count) in picks.iter().enumerate() {
+            let ratio = *count as f32 / expected;
+            assert!((0.9..1.1).contains(&ratio),
+                "item {} picked {} times, expected ~{}: {:?}", node, count, expected, picks);
+        }
+    }
 
     #[test]
     fn test_choose_best() {

@@ -122,7 +122,7 @@ mod dist_tests {
     fn construct_distances() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, false);
         let distances = unweighted_walk_distance(&csr, 0);
         assert_eq!(distances, vec![0, 1, 2, 3]);
 
@@ -137,7 +137,7 @@ mod dist_tests {
     fn test_top_k() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, false);
         let top = top_k_nodes(&csr, 2);
         assert_eq!(top, vec![1, 2]);
 
@@ -147,7 +147,7 @@ mod dist_tests {
     fn test_distance_embeddings() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, false);
         let es = construct_walk_distances(&csr, 2, LandmarkSelection::Degree);
         assert_eq!(es.get_embedding(0), vec![2f32, 1f32]);
         assert_eq!(es.get_embedding(1), vec![0f32, 2f32]);

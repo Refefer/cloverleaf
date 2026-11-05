@@ -65,16 +65,16 @@ pub fn prune_graph_components(
 ) -> Vec<(NodeID,NodeID,f32)> {
     let es = find_connected_components(graph);
     
-    // A graph, at worse, has a max of N / 2 components
+    // Component ids are 1-based and every node can be its own component (eg. self loops or
+    // nodes without out edges), so there are at most N components.
     let n = graph.len();
-    let mut counts = vec![0usize; n / 2 + 1];
+    let mut counts = vec![0usize; n + 1];
 
-    for node_id in 0..counts.len() {
+    for node_id in 0..n {
         let component_id = get_component(&es, node_id);
         counts[component_id] += 1;
     }
-    let mut idxs = vec![0; n / 2 + 1];
-    idxs.iter_mut().enumerate().for_each(|(i, v)| *v = i);
+    let mut idxs: Vec<usize> = (0..counts.len()).collect();
     idxs.sort_by_key(|v| counts[*v]);
     // Grab the top K clusters
     let clusters = idxs.iter().rev().take(k).collect::<HashSet<_>>();
@@ -98,7 +98,7 @@ pub fn prune_graph_components(
 #[cfg(test)]
 mod connected_tests {
     use super::*;
-    use crate::graph::CSR;
+    use crate::graph::{CSR, CumCSR};
 
     fn build_edges() -> Vec<(usize, usize, f32)> {
         vec![
@@ -128,7 +128,7 @@ mod connected_tests {
 
     #[test]
     fn run_test() {
-        let graph = CSR::construct_from_edges(build_edges());
+        let graph = CSR::construct_from_edges(build_edges(), false);
         let es = find_connected_components(&graph);
         assert_eq!(es.get_embedding(0), &[1.0]);
         assert_eq!(es.get_embedding(1), &[1.0]);
@@ -140,5 +140,40 @@ mod connected_tests {
         assert_eq!(es.get_embedding(6), &[2.0]);
 
         assert_eq!(es.get_embedding(7), &[3.0]);
+    }
+
+    fn undirected_clique(nodes: std::ops::Range<usize>) -> Vec<(usize, usize, f32)> {
+        let mut edges = Vec::new();
+        for a in nodes.clone() {
+            for b in nodes.clone() {
+                if a != b { edges.push((a, b, 1.)); }
+            }
+        }
+        edges
+    }
+
+    /// Component sizes must be computed over every node, not just the first n/2 + 1.
+    #[test]
+    fn test_prune_keeps_largest_component() {
+        // 4-node component on 0..4, 8-node component on 4..12.
+        let mut edges = undirected_clique(0..4);
+        edges.extend(undirected_clique(4..12));
+        let graph = CumCSR::convert(CSR::construct_from_edges(edges, false));
+
+        let pruned = prune_graph_components(&graph, 1);
+        assert!(!pruned.is_empty());
+        for (f, t, _) in pruned {
+            assert!(f >= 4 && t >= 4, "kept edge ({}, {}) from the smaller component", f, t);
+        }
+    }
+
+    /// Singleton components (self loops) mean there can be more than n/2 components.
+    #[test]
+    fn test_prune_more_than_half_n_components() {
+        let edges = vec![(0, 0, 1.), (1, 1, 1.), (2, 2, 1.), (3, 3, 1.)];
+        let graph = CumCSR::convert(CSR::construct_from_edges(edges, false));
+
+        let pruned = prune_graph_components(&graph, 2);
+        assert_eq!(pruned.len(), 2);
     }
 }

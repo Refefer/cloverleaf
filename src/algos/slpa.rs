@@ -145,8 +145,8 @@ mod slpa_tests {
 
     #[test]
     fn run_test() {
-        let graph = CSR::construct_from_edges(build_edges());
-        let es = construct_slpa_embedding(&graph, 10, 0.3, 12345123);
+        let graph = CSR::construct_from_edges(build_edges(), false);
+        let es = construct_slpa_embedding(&graph, ListenerRule::Best, 10, 3, 10, 12345123);
         for node_id in 0..graph.len() {
             println!("{}: {:?}", node_id, es.get_embedding(node_id));
         }

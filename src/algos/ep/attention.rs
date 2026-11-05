@@ -301,7 +301,7 @@ mod attention_tests {
     use super::*;
     use rand_xorshift::XorShiftRng;
 
-    fn create_att_vecs() -> Vec<(Attention, usize)> {
+    fn create_att_vecs() -> Vec<(Attention, f32)> {
         let mha = MultiHeadedAttention {
             d_k: 1,
             num_heads: 1,

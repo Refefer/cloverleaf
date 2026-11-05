@@ -539,8 +539,12 @@ impl RandomWalker {
     ///        
     #[new]
     fn new(restarts: f32, walks: usize, beta: Option<f32>) -> PyResult<Self> {
+        // Reject 0 and NaN explicitly: neither is a meaningful restart probability or walk length.
+        if !(restarts > 0f32) {
+            return Err(PyValueError::new_err("restarts must be in (0, 1) or [1, inf)"))
+        }
         Sample::new(restarts)
-            .map_err(|_err| PyValueError::new_err("restarts must be between (0, 1)"))
+            .map_err(|_err| PyValueError::new_err("restarts must be in (0, 1) or [1, inf)"))
             .map(|restarts| RandomWalker { restarts, walks, beta })
     }
 

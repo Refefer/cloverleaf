@@ -264,8 +264,9 @@ pub fn collect_embeddings_from_node<R: Rng>(
     rng: &mut R
 ) {
     let feats = feature_store.get_features(node);
+    // Scale the node weight by the dropout correction so the feature sample stays unbiased.
     let (max_features, scalar) = max_features.sample(feats.len(), true, rng);
-    weight += scalar;
+    weight *= scalar;
     for feat in feats.choose_multiple(rng, max_features) {
         if let Some((_emb, count)) = feat_map.get_mut(feat) {
             *count += weight;
@@ -461,3 +462,41 @@ pub fn mean_embeddings<'a>(
     });
     vs.sum_all() / n as f32
 }
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+    use rand_xorshift::XorShiftRng;
+    use crate::distance::Distance;
+
+    fn store_with_four_features() -> (FeatureStore, EmbeddingStore) {
+        let mut fs = FeatureStore::new(1);
+        fs.set_features(0, ["a", "b", "c", "d"].iter().map(|f| ("f", *f)));
+        let es = EmbeddingStore::new(fs.num_features(), 2, Distance::Cosine);
+        (fs, es)
+    }
+
+    /// The dropout correction is a multiplicative scale on the node weight.
+    #[test]
+    fn test_collect_embeddings_scales_weight() {
+        let (fs, es) = store_with_four_features();
+        let mut rng = XorShiftRng::seed_from_u64(1);
+
+        // No dropout: each feature carries exactly the node weight.
+        let mut fm = HashMap::new();
+        collect_embeddings_from_node(0, 0.5, &fs, &es, &mut fm, Sample::All, &mut rng);
+        assert_eq!(fm.len(), 4);
+        for (_, (_, count)) in fm.iter() {
+            assert_eq!(*count, 0.5);
+        }
+
+        // Keep 2 of 4 features: weight is scaled by n/k = 2.
+        let mut fm = HashMap::new();
+        collect_embeddings_from_node(0, 0.5, &fs, &es, &mut fm, Sample::Fixed(2), &mut rng);
+        assert_eq!(fm.len(), 2);
+        for (_, (_, count)) in fm.iter() {
+            assert_eq!(*count, 1.0);
+        }
+    }
+}
+

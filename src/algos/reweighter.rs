@@ -127,4 +127,21 @@ mod reweighter_tests {
 
     }
 
+    /// Embeddings written through the hogwild path (as every learner does) must be visible to
+    /// the reweighter.
+    #[test]
+    fn test_reweight_with_hogwild_written_embeddings() {
+        use crate::distance::Distance;
+        let es = EmbeddingStore::new(4, 1, Distance::Euclidean);
+        for node in 0..4 {
+            es.get_embedding_mut_hogwild(node)[0] = node as f32;
+        }
+
+        let mut results: HashMap<NodeID, f32> = (0..4).map(|n| (n, 1f32)).collect();
+        Reweighter::new(1.0).reweight(&mut results, &es, &[0f32]);
+
+        // Closest to the context should now outrank the furthest.
+        assert!(results[&0] > results[&3], "reweight was a no-op: {:?}", results);
+    }
+
 }

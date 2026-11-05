@@ -1,4 +1,5 @@
 //! BitSet class; we use it in a few places to know when things have been set, such as embeddings.
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Simple BitSet class, using 32-bit unsized ints for track flags
 #[derive(Clone)]
@@ -27,6 +28,47 @@ impl BitSet {
         self.bitfield[fo] |= bm;
     }
 
+}
+
+/// BitSet which can be set through a shared reference.  Used by the EmbeddingStore, whose hogwild
+/// writers only hold `&self`.
+pub struct AtomicBitSet {
+    bitfield: Vec<AtomicU32>
+}
+
+impl AtomicBitSet {
+    pub fn new(size: usize) -> Self {
+        Self { bitfield: (0..(size / 32) + 1).map(|_| AtomicU32::new(0)).collect() }
+    }
+
+    fn get_bit_idx(&self, idx: &usize) -> (usize, u32) {
+        let field_offset = idx / 32;
+        let bit_offset = idx % 32;
+        (field_offset, 1u32 << bit_offset)
+    }
+
+    pub fn is_set(&self, idx: usize) -> bool {
+        let (fo, bm) = self.get_bit_idx(&idx);
+        (self.bitfield[fo].load(Ordering::Relaxed) & bm) > 0
+    }
+
+    pub fn set_bit(&self, idx: usize) {
+        let (fo, bm) = self.get_bit_idx(&idx);
+        let field = &self.bitfield[fo];
+        // Check first so repeated writes to the same embedding stay read-only on this word.
+        if field.load(Ordering::Relaxed) & bm == 0 {
+            field.fetch_or(bm, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Clone for AtomicBitSet {
+    fn clone(&self) -> Self {
+        let bitfield = self.bitfield.iter()
+            .map(|f| AtomicU32::new(f.load(Ordering::Relaxed)))
+            .collect();
+        AtomicBitSet { bitfield }
+    }
 }
 
 #[cfg(test)]

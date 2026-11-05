@@ -135,7 +135,8 @@ mod grwr_tests {
     use super::*;
     use crate::graph::{CumCSR,CSR};
     use crate::sampler::{Unweighted, Weighted};
-    use crate::embeddings::{EmbeddingStore,Distance};
+    use crate::embeddings::EmbeddingStore;
+    use crate::distance::Distance;
     use float_ord::FloatOrd;
 
     fn build_edges() -> Vec<(usize, usize, f32)> {
@@ -152,7 +153,7 @@ mod grwr_tests {
     fn test_grwr_unweighted() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, false);
         let ccsr = CumCSR::convert(csr);
         let rwr = GuidedRWR {
             steps: Steps::Fixed(1),
@@ -172,7 +173,7 @@ mod grwr_tests {
     fn test_grwr_weighted() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, false);
         let ccsr = CumCSR::convert(csr);
         let rwr = GuidedRWR {
             steps: Steps::Fixed(1),

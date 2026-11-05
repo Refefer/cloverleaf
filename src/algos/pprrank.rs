@@ -568,10 +568,10 @@ mod ep_tests {
     #[test]
     fn test_simple_learn_dist() {
         let edges = build_star_edges();
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, false);
         let ccsr = CumCSR::convert(csr);
         
-        let mut feature_store = FeatureStore::new(ccsr.len(), "feat".to_string());
+        let mut feature_store = FeatureStore::new(ccsr.len());
         feature_store.fill_missing_nodes();
 
     }

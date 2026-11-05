@@ -82,8 +82,8 @@ impl VPCG {
             let node_set = if iter % 2 == 0 { &left } else { &right };
 
             // For each node, grab the edges and propagate from them to it
-            node_set.par_iter().enumerate().chunks(128).for_each(|chunk| {
-                chunk.par_iter().for_each(|(node_id, _mask)| {
+            node_set.par_chunks(128).for_each(|chunk| {
+                chunk.par_iter().for_each(|node_id| {
                     
                     // Sum up features
                     let mut term_map = HashMap::new();
@@ -180,3 +180,59 @@ fn norm_filter_feat<'a>(
         .filter(move |(_t, s)| *s > err)
 }
 
+
+#[cfg(test)]
+mod vpcg_tests {
+    use super::*;
+    use crate::graph::{CSR, CumCSR};
+
+    fn feature_ids(props: &SparseEmbeddings, node: NodeID) -> Vec<usize> {
+        let mut ids: Vec<_> = props[node].iter().map(|(f, _)| *f).collect();
+        ids.sort();
+        ids
+    }
+
+    /// Left/right sides are interleaved node ids, so the position in `left` differs from the node
+    /// id.  Only the left side should be updated on the first pass.
+    #[test]
+    fn test_learn_updates_masked_node_ids() {
+        // Bipartite: left = {1, 3}, right = {0, 2}, fully connected across sides.
+        let mut edges = Vec::new();
+        for l in [1usize, 3] {
+            for r in [0usize, 2] {
+                edges.push((l, r, 1f32));
+                edges.push((r, l, 1f32));
+            }
+        }
+        let graph = CumCSR::convert(CSR::construct_from_edges(edges, false));
+
+        let mut fs = FeatureStore::new(4);
+        for node in 0..4 {
+            fs.set_features(node, [("f", node.to_string())].into_iter());
+        }
+        // Feature ids line up with node ids by construction.
+        for node in 0..4 {
+            assert_eq!(fs.get_features(node), &[node]);
+        }
+
+        let vpcg = VPCG {
+            max_terms: 10,
+            alpha: 1.0,
+            err: 0.0,
+            iterations: 1,
+            feature_weight: FeatureWeight::Uniform
+        };
+
+        let left = [1usize, 3];
+        let right = [0usize, 2];
+        let props = vpcg.learn(&graph, &fs, (&left, &right));
+
+        // Pass 0 propagates into the left side from its (right side) neighbors.
+        assert_eq!(feature_ids(&props, 1), vec![0, 2]);
+        assert_eq!(feature_ids(&props, 3), vec![0, 2]);
+
+        // Right side is untouched on pass 0.
+        assert_eq!(feature_ids(&props, 0), vec![0]);
+        assert_eq!(feature_ids(&props, 2), vec![2]);
+    }
+}

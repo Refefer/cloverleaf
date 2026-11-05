@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use rand::prelude::*;
 
 use crate::graph::NodeID;
-use crate::bitset::BitSet;
+use crate::bitset::AtomicBitSet;
 use crate::hogwild::Hogwild;
 use crate::algos::graph_ann::{TopK,NodeDistance};
 use crate::distance::Distance;
@@ -30,7 +30,7 @@ pub struct EmbeddingStore {
     embeddings: Hogwild<Vec<f32>>,
 
     /// Bitfield measuring if an embedding has been set
-    bitfield: BitSet,
+    bitfield: AtomicBitSet,
 
     /// distance metric to use
     distance: Distance,
@@ -44,7 +44,7 @@ impl EmbeddingStore {
         EmbeddingStore {
             dims,
             distance,
-            bitfield: BitSet::new(nodes),
+            bitfield: AtomicBitSet::new(nodes),
             embeddings: Hogwild::new(vec![0.; nodes * dims]),
             nodes
         }
@@ -60,7 +60,7 @@ impl EmbeddingStore {
             None
         } else {
             //
-            let mut bitfield = BitSet::new(nodes);
+            let bitfield = AtomicBitSet::new(nodes);
             (0..nodes).for_each(|node_id| bitfield.set_bit(node_id));
 
             let es = EmbeddingStore {
@@ -111,6 +111,7 @@ impl EmbeddingStore {
 
     pub fn get_embedding_mut_hogwild(&self, node_id: NodeID) -> &mut [f32] {
         let start = node_id * self.dims;
+        self.bitfield.set_bit(node_id);
         &mut self.embeddings.get()[start..start+self.dims]
     }
 
@@ -191,6 +192,15 @@ pub fn randomize_embedding_store(es: &mut EmbeddingStore, rng: &mut impl Rng) {
 #[cfg(test)]
 mod embedding_tests {
     use super::*;
+
+    #[test]
+    fn test_hogwild_writes_mark_embedding_set() {
+        let es = EmbeddingStore::new(40, 2, Distance::Euclidean);
+        assert_eq!(es.is_set(35), false);
+        es.get_embedding_mut_hogwild(35)[0] = 1.;
+        assert_eq!(es.is_set(35), true);
+        assert_eq!(es.is_set(34), false);
+    }
 
     #[test]
     fn test_embeddings() {

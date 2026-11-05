@@ -217,8 +217,8 @@ mod ann_tests {
         let results = top_k.into_sorted();
 
         println!("results: {:?}", results);
-        assert_eq!(results[0], NodeDistance(0.01, 5));
-        assert_eq!(results[1], NodeDistance(0.1, 1));
-        assert_eq!(results[2], NodeDistance(0.15, 4));
+        assert_eq!(results[0], NodeDistance::new(0.01, 5));
+        assert_eq!(results[1], NodeDistance::new(0.1, 1));
+        assert_eq!(results[2], NodeDistance::new(0.15, 4));
     }
 }

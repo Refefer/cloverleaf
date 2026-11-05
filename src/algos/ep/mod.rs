@@ -357,21 +357,23 @@ impl EmbeddingPropagation {
 
 }
 
-/// We extract the gradients for each unique feature
+/// We extract the gradients for each unique feature.  The same feature can appear as a separate
+/// leaf in h(v), ~h(v) and each h(u), so its total gradient is the sum over every leaf.
 pub fn extract_grads(
     graph: &Graph, 
     grads: &mut HashMap<usize, Vec<f32>>, 
     vars: impl Iterator<Item=(usize, (ANode, f32))>
 ) {
     for (feat_id, (var, _)) in vars {
-        if grads.contains_key(&feat_id) { continue }
-
         if let Some(grad) = graph.get_grad(&var) {
             if grad.iter().all(|gi| !(gi.is_nan() || gi.is_infinite())) {
                 // Can get some nans in weird cases, such as the distance between
                 // a node and it's reconstruction when it shares all features.
                 // Since that's not all that helpful anyways, we simply ignore it and move on
-                grads.insert(feat_id, grad.to_vec());
+                match grads.get_mut(&feat_id) {
+                    Some(acc) => acc.iter_mut().zip(grad.iter()).for_each(|(a, g)| *a += *g),
+                    None => { grads.insert(feat_id, grad); }
+                }
             }
         }
     }
@@ -395,6 +397,29 @@ fn randomize_embedding_store(es: &mut EmbeddingStore, rng: &mut impl Rng) {
 #[cfg(test)]
 mod ep_tests {
     use super::*;
+    use crate::algos::utils::Sample;
+
+    /// A feature can appear as a separate autograd leaf in h(v), ~h(v) and each h(u); its
+    /// gradient is the sum over all of them.
+    #[test]
+    fn test_extract_grads_sums_shared_features() {
+        let a = Variable::new(vec![1., 2.]);
+        let b = Variable::new(vec![1., 2.]);
+        let c = Variable::new(vec![5., 5.]);
+        let loss = a.sum() + b.sum() * 3f32 + c.sum() * 2f32;
+
+        let mut graph = Graph::new();
+        graph.backward(&loss);
+
+        let mut grads = HashMap::new();
+        let first: Vec<(usize, (ANode, f32))> = vec![(7, (a, 1.))];
+        let second: Vec<(usize, (ANode, f32))> = vec![(7, (b, 1.)), (9, (c, 1.))];
+        extract_grads(&graph, &mut grads, first.into_iter());
+        extract_grads(&graph, &mut grads, second.into_iter());
+
+        assert_eq!(grads[&7], vec![4., 4.]);
+        assert_eq!(grads[&9], vec![2., 2.]);
+    }
     use crate::graph::{CumCSR,CSR};
 
     fn build_star_edges() -> Vec<(usize, usize, f32)> {
@@ -412,18 +437,19 @@ mod ep_tests {
     #[test]
     fn test_simple_learn_dist() {
         let edges = build_star_edges();
-        let csr = CSR::construct_from_edges(edges);
+        let csr = CSR::construct_from_edges(edges, false);
         let ccsr = CumCSR::convert(csr);
         
-        let mut feature_store = FeatureStore::new(ccsr.len(), "feat".to_string());
+        let mut feature_store = FeatureStore::new(ccsr.len());
         feature_store.fill_missing_nodes();
 
-        let model = super::model::AveragedFeatureModel::new(None, None);
+        let model = super::model::AveragedFeatureModel::new(Sample::All, Sample::All, false, false);
         let ep = EmbeddingPropagation {
             alpha: 1e-2,
             loss: Loss::MarginLoss(1f32, 1usize),
             batch_size: 32,
             hard_negs: 0,
+            loss_weighting: LossWeighting::None,
             d_model: 5,
             valid_pct: 0.0,
             passes: 50,

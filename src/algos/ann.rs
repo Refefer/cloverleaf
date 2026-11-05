@@ -475,10 +475,11 @@ fn compute_simple_splits(
         //let (diff, pa, pb) = compute_w_vec_from_points(indices, es, rng);
         let (diff, pa, pb) = pseudo_kmeans_w_vec_from_points(indices, es, num_sampled_nodes_split_test, rng);
         
-        // Figure out the vector bias
-        let bias: f32 = diff.iter().zip(pa.iter().zip(pb.iter()))
+        // Bias places the hyperplane through the midpoint m of the two centroids:
+        // dot(diff, x) - dot(diff, m) = 0
+        let bias: f32 = -diff.iter().zip(pa.iter().zip(pb.iter()))
             .map(|(d, (pai, pbi))| d * (pai + pbi) / 2.)
-            .sum();
+            .sum::<f32>();
 
         // Count the number of instances on each side of the hyperplane from random points
         let hp = Hyperplane::new(diff, bias);
@@ -529,3 +530,30 @@ fn compute_normal_rp(
     let bias = -median(rps.as_slice());
     Hyperplane::new(random_vec, bias)
 }
+
+#[cfg(test)]
+mod ann_split_tests {
+    use super::*;
+    use crate::distance::Distance;
+
+    /// The split hyperplane must pass through the midpoint of the two centroids, so data that
+    /// sits away from the origin still gets divided.
+    #[test]
+    fn test_simple_split_divides_offset_data() {
+        let n = 11;
+        let es = EmbeddingStore::new(n, 1, Distance::Euclidean);
+        for node in 0..n {
+            es.get_embedding_mut_hogwild(node)[0] = 10. + node as f32;
+        }
+        let indices: Vec<(NodeID, bool)> = (0..n).map(|i| (i, false)).collect();
+
+        for seed in 0..10 {
+            let mut rng = XorShiftRng::seed_from_u64(seed);
+            let hp = compute_simple_splits(&indices, &es, 5, n, &mut rng);
+            let above = (0..n).filter(|i| hp.point_is_above(es.get_embedding(*i))).count();
+            assert!(above > 0 && above < n,
+                "seed {}: hyperplane put {} of {} points on one side", seed, above, n);
+        }
+    }
+}
+

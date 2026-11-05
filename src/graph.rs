@@ -708,7 +708,7 @@ mod csr_tests {
     fn construct_csr() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges, true);
+        let csr = CSR::construct_from_edges(edges, false);
         assert_eq!(csr.rows, vec![0, 1, 4, 5]);
         assert_eq!(csr.columns, vec![1, 1, 2, 0, 0]);
         assert_eq!(csr.weights, vec![1., 3., 2., 10., 2.5]);
@@ -718,7 +718,7 @@ mod csr_tests {
     fn test_graph() {
         let edges = build_edges();
 
-        let mut csr = CSR::construct_from_edges(edges, true);
+        let mut csr = CSR::construct_from_edges(edges, false);
         assert_eq!(csr.len(), 3);
         assert_eq!(csr.degree(0), 1);
         assert_eq!(csr.degree(1), 3);
@@ -738,7 +738,7 @@ mod csr_tests {
     fn construct_mk() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges, true);
+        let csr = CSR::construct_from_edges(edges, false);
         let mk = NormalizedCSR::convert(csr);
 
         assert_eq!(mk.get_edges(0), (vec![1].as_slice(), vec![1.].as_slice()));
@@ -751,7 +751,7 @@ mod csr_tests {
     fn construct_cdf() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges, true);
+        let csr = CSR::construct_from_edges(edges, false);
         let ccsr = CumCSR::convert(csr);
 
         assert_eq!(ccsr.0.rows, vec![0, 1, 4, 5]);
@@ -764,7 +764,7 @@ mod csr_tests {
     fn construct_cdf_to_p() {
         let edges = build_edges();
 
-        let csr = CSR::construct_from_edges(edges, true);
+        let csr = CSR::construct_from_edges(edges, false);
         let ccsr = CumCSR::convert(csr);
 
         let weights = ccsr.get_edges(1).1;
