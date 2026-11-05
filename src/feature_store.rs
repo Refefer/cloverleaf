@@ -52,7 +52,7 @@ impl FeatureStore {
         node: NodeID, 
         node_features: impl Iterator<Item=usize>
     ) {
-        self.features[node].extend(node_features);
+        self.features[node] = node_features.collect();
     }
 
     pub fn get_features(&self, node: NodeID) -> &[usize] {

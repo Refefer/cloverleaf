@@ -7,7 +7,7 @@ use rand_distr::{Distribution,Uniform};
 use rayon::prelude::*;
 
 use crate::graph::{Graph,NodeID,CDFtoP,CDFGraph};
-use crate::sampler::{Sampler, weighted_sample_cdf};
+use crate::sampler::{Sampler, Weighted, Unweighted, weighted_sample_cdf};
 use crate::algos::utils::Sample;
 
 pub struct RWR {
@@ -202,6 +202,28 @@ impl RWR {
 
 /// Creates a trajectory by randomly walking through the graph, recording it
 /// in the output vector.  We can use this for a variety of other problems, such as SMCI.
+/// Runs one rollout per rng from `start_node`, returning each full path (start node included).
+pub fn rollouts<G>(
+    graph: &G,
+    steps: Sample,
+    weighted: bool,
+    start_node: NodeID,
+    rngs: Vec<XorShiftRng>
+) -> Vec<Vec<NodeID>>
+    where G: Graph + Send + Sync,
+          Weighted: Sampler<G>
+{
+    rngs.into_par_iter().map(|mut rng| {
+        let mut walk = vec![start_node];
+        if weighted {
+            rollout(graph, steps, &Weighted, start_node, &mut rng, &mut walk);
+        } else {
+            rollout(graph, steps, &Unweighted, start_node, &mut rng, &mut walk);
+        };
+        walk
+    }).collect()
+}
+
 pub fn rollout<G: Graph + Send + Sync>(
     graph: &G, 
     steps: Sample, 
@@ -338,6 +360,22 @@ mod rwr_tests {
             .expect("sample_bfs did not terminate with Sample::Fixed(0)");
         assert_eq!(bfs.keys().collect::<Vec<_>>(), vec![&0]);
         assert_eq!(bfs, st);
+    }
+
+    /// `weighted=false` must sample neighbors uniformly regardless of edge weight.
+    #[test]
+    fn test_rollouts_unweighted_ignores_edge_weights() {
+        let edges = vec![(0, 1, 1000.), (0, 2, 1.), (1, 0, 1.), (2, 0, 1.)];
+        let ccsr = CumCSR::convert(CSR::construct_from_edges(edges, false));
+        let n = 4000;
+        let rngs = (0..n).map(|i| XorShiftRng::seed_from_u64(1234 + i)).collect();
+
+        let walks = rollouts(&ccsr, Sample::Fixed(1), false, 0, rngs);
+        assert_eq!(walks.len(), n as usize);
+        let to_light_edge = walks.iter().filter(|w| w[1] == 2).count();
+        let frac = to_light_edge as f32 / n as f32;
+        assert!((0.45..0.55).contains(&frac),
+            "unweighted rollouts took the light edge {} of {} times", to_light_edge, n);
     }
 
 }

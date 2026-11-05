@@ -57,7 +57,7 @@ use rand_xorshift::XorShiftRng;
 use rand_distr::Uniform;
 
 use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID,CDFtoP,Transpose};
-use crate::vocab::Vocab;
+use crate::vocab::{Vocab,TranslationTable};
 use crate::sampler::{Weighted,Unweighted};
 use crate::distance::{Distance as EDist};
 use crate::embeddings::{EmbeddingStore,Entity};
@@ -81,7 +81,7 @@ use crate::algos::pprembed::PPREmbed;
 use crate::algos::pprrank::{PprRank, Loss as PprLoss};
 use crate::algos::policy_evaluation::{PolicyEvaluation as PEA};
 use crate::algos::reweighter::{Reweighter};
-use crate::algos::rwr::{RWR,ppr_estimate,rollout};
+use crate::algos::rwr::{RWR,ppr_estimate,rollouts};
 use crate::algos::smci::SupervisedMCIteration;
 use crate::algos::utils::Sample;
 use crate::algos::vpcg::{VPCG, FeatureWeight as VFeatureWeight};
@@ -1861,8 +1861,9 @@ impl FeatureAggregator {
     #[allow(non_snake_case)]
     #[staticmethod]
     pub fn Weighted(alpha: f32, fs: &FeatureSet) -> Self {
+        // Unigrams are indexed by feature id, so store the feature vocab alongside them.
         let unigrams = Arc::new(UnigramProbability::new(&fs.features));
-        let vocab = fs.vocab.clone();
+        let vocab = Arc::new(fs.features.clone_vocab());
         FeatureAggregator { at: AggregatorType::Weighted {alpha, vocab, unigrams} }
     }
 
@@ -1904,14 +1905,11 @@ impl FeatureAggregator {
                     .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
                 writeln!(&mut bw, "{}", alpha)
                     .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-                for (node, p_wi) in unigrams.iter().enumerate() {
-                    if let Some((f_node_type, f_name)) = vocab.get_name(node) {
-                        writeln!(&mut bw, "{}\t{}\t{}", f_node_type, f_name, *p_wi as f64)
-                            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-                    } else {
-                        // We've moved to node individual embeddings
-                        break
-                    }
+                for (feat_id, p_wi) in unigrams.iter().enumerate() {
+                    let (f_node_type, f_name) = vocab.get_name(feat_id)
+                        .ok_or_else(|| PyValueError::new_err("feature vocab and unigrams mismatch"))?;
+                    writeln!(&mut bw, "{}\t{}\t{}", f_node_type, f_name, *p_wi as f64)
+                        .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
                 }
             }
         }
@@ -3572,6 +3570,12 @@ struct Smci {
     rewards: Vec<(NodeID,NodeID,f32)>
 }
 
+/// Builds a table indexed by graph node id which yields the matching embedding id, if any.
+fn graph_to_embedding_table(graph_vocab: &Vocab, embedding_vocab: &Vocab) -> TranslationTable {
+    // create_translation_table is indexed by the receiver's ids and yields ids in `to_vocab`.
+    graph_vocab.create_translation_table(embedding_vocab)
+}
+
 #[pymethods]
 impl Smci {
     #[new]
@@ -3621,7 +3625,7 @@ impl Smci {
         };
 
         let embs = embeddings.map(|e| {
-            let tt = e.vocab.create_translation_table(self.vocab.deref());
+            let tt = graph_to_embedding_table(self.vocab.deref(), e.vocab.deref());
             (&e.embeddings, tt)
         });
         let weights = smci.learn(self.graph.deref(), &self.rewards, embs);
@@ -4701,7 +4705,7 @@ impl TournamentBuilder {
     ///    positions.  For example, [Racer1, Racer3, Racer2], gets contructed as:
     ///    1. Racer1 > Racer3
     ///    2. Racer1 > Racer2
-    ///    3. Racer3 > Racer1
+    ///    3. Racer3 > Racer2
     ///    
     ///    Parameters
     ///    ----------
@@ -4718,7 +4722,7 @@ impl TournamentBuilder {
         weight: f32
     ) {
         for i in 0..order.len() {
-            for j in 1..order.len() {
+            for j in (i+1)..order.len() {
                 self.add_outcome(order[i].clone(), order[j].clone(), weight)
             }
         }
@@ -4968,21 +4972,13 @@ impl RandomPath {
         //let sampler: Box<dyn Sampler<_>> = if weighted { Box::new(Weighted) } else { Box::new(Unweighted) };
         let g = graph.graph.as_ref();
 
-        let mut outputs: Vec<Vec<NodeID>> = vec![Vec::new(); count];
         let rngs: Vec<_> = (0..count as u64)
             .map(|i| XorShiftRng::seed_from_u64(self.rng.gen::<u64>() + i))
             .collect();
 
         let vocab = graph.vocab.deref(); 
         let node_id = get_node_id(vocab, node.0, node.1)?;
-        outputs.par_iter_mut().zip(rngs.into_par_iter()).for_each(|(walk, mut rng)| {
-            walk.push(node_id);
-            if weighted {
-                rollout(g, steps, &Weighted, node_id, &mut rng, walk);
-            } else {
-                rollout(g, steps, &Weighted, node_id, &mut rng, walk);
-            };
-        });
+        let outputs = rollouts(g, steps, weighted, node_id, rngs);
 
         let it = outputs.into_iter().map(|walk| walk.into_iter().map(|node_id| {
             convert_node_id_to_fqn(vocab, node_id)
@@ -5093,3 +5089,74 @@ fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PolicyEvaluation>()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod binding_tests {
+    //! Only exercise code paths that don't touch the Python C API: with the `extension-module`
+    //! feature, libpython symbols are unresolved when linking test binaries.
+    use super::*;
+
+    fn fqn(name: &str) -> FQNode {
+        ("team".to_string(), name.to_string())
+    }
+
+    /// [A, B, C] means A > B, A > C, B > C.  Edges point loser -> winner.
+    #[test]
+    fn test_add_ranked_outcomes_pairs() {
+        let mut tb = TournamentBuilder::new();
+        tb.add_ranked_outcomes(vec![fqn("A"), fqn("B"), fqn("C")], 1.0);
+
+        let id = |n: &str| tb.gb.vocab.get_node_id("team", n).unwrap();
+        let (a, b, c) = (id("A"), id("B"), id("C"));
+
+        let mut edges: Vec<_> = tb.gb.edges.iter().map(|(f, t, _)| (*f, *t)).collect();
+        edges.sort();
+        let mut expected = vec![(b, a), (c, a), (c, b)];
+        expected.sort();
+        assert_eq!(edges, expected);
+    }
+
+    /// SMCI indexes the table with graph node ids and uses the result as embedding ids.
+    #[test]
+    fn test_graph_to_embedding_table_direction() {
+        let mut graph_vocab = Vocab::new();
+        for n in ["a", "b", "c"] { graph_vocab.get_or_insert("n", n); }
+        let mut emb_vocab = Vocab::new();
+        for n in ["c", "a"] { emb_vocab.get_or_insert("n", n); }
+
+        let table = graph_to_embedding_table(&graph_vocab, &emb_vocab);
+        let g = |n: &str| graph_vocab.get_node_id("n", n).unwrap();
+        let e = |n: &str| emb_vocab.get_node_id("n", n);
+
+        assert_eq!(table.len(), graph_vocab.len());
+        assert_eq!(table[g("a")], e("a"));
+        assert_eq!(table[g("b")], None);
+        assert_eq!(table[g("c")], e("c"));
+    }
+
+    /// Unigram probabilities are indexed by feature id, so the stored vocab must be the feature
+    /// vocab rather than the node vocab.
+    #[test]
+    fn test_weighted_aggregator_stores_feature_vocab() {
+        let mut node_vocab = Vocab::new();
+        node_vocab.get_or_insert("node", "n0");
+        node_vocab.get_or_insert("node", "n1");
+
+        // More features than nodes.
+        let mut features = FeatureStore::new(2);
+        features.set_features(0, [("f", "a"), ("f", "b"), ("f", "c")].into_iter());
+        features.set_features(1, [("f", "c")].into_iter());
+        let fs = FeatureSet { vocab: Arc::new(node_vocab), features };
+
+        let agg = FeatureAggregator::Weighted(0.5, &fs);
+        let AggregatorType::Weighted { vocab, .. } = &agg.at else {
+            panic!("expected a Weighted aggregator")
+        };
+        let feat_vocab = fs.features.get_vocab();
+        assert_eq!(vocab.len(), feat_vocab.len());
+        for feat_id in 0..feat_vocab.len() {
+            assert_eq!(vocab.get_name(feat_id), feat_vocab.get_name(feat_id));
+        }
+    }
+}
+

@@ -435,7 +435,10 @@ impl CumCSR {
 
         // Test that the weights are properly CDF
         for node_id in 0..graph.len() {
-            let weights = self.get_edges(node_id).1;
+            let weights = graph.get_edges(node_id).1;
+            if weights.first().map_or(false, |w| *w < 0.0) {
+                Err("Edge weight is negative, illegal in CDF")?
+            }
             for pair in weights.windows(2) {
                 let &[p, n] = pair else { panic!("Should never hit!") };
                 if p > 1.0 {
@@ -693,6 +696,24 @@ pub fn convert_edges_to_cdf(weights: &mut [f32], sum: Option<f32>) {
 #[cfg(test)]
 mod csr_tests {
     use super::*;
+
+    /// The CDF check has to validate the new weights, not the existing ones.
+    #[test]
+    fn test_clone_with_edges_rejects_invalid_cdf() {
+        let edges = vec![(0, 1, 1.), (0, 2, 1.), (0, 3, 1.), (1, 0, 1.), (2, 0, 1.), (3, 0, 1.)];
+        let cum = CumCSR::convert(CSR::construct_from_edges(edges, false));
+
+        // Decreasing CDF for node 0.
+        let decreasing = vec![0.9, 0.5, 1.0, 1.0, 1.0, 1.0];
+        assert!(cum.clone_with_edges(decreasing).is_err());
+
+        // Negative first entry.
+        let negative = vec![-0.5, 0.5, 1.0, 1.0, 1.0, 1.0];
+        assert!(cum.clone_with_edges(negative).is_err());
+
+        let valid = vec![0.2, 0.5, 1.0, 1.0, 1.0, 1.0];
+        assert!(cum.clone_with_edges(valid).is_ok());
+    }
 
     fn build_edges() -> Vec<(usize, usize, f32)> {
         vec![

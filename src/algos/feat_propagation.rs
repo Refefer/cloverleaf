@@ -97,6 +97,21 @@ pub fn propagate_features(
 #[cfg(test)]
 mod pf_tests {
     use super::*;
-    use crate::graph::CSR;
+    use crate::graph::{CSR, CumCSR};
 
+    /// Re-propagating a node across iterations must replace its features, not append to them.
+    #[test]
+    fn test_propagation_does_not_duplicate_features() {
+        // Chain 0 - 1 - 2; only node 0 starts with a feature.
+        let edges = vec![(0, 1, 1.), (1, 0, 1.), (1, 2, 1.), (2, 1, 1.)];
+        let graph = CumCSR::convert(CSR::construct_from_edges(edges, false));
+        let mut fs = FeatureStore::new(3);
+        fs.set_features(0, [("f", "a")].into_iter());
+
+        propagate_features(&graph, &mut fs, 3, 5, 0.0);
+
+        for node in 0..3 {
+            assert_eq!(fs.get_features(node), &[0], "node {}", node);
+        }
+    }
 }

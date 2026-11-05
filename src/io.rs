@@ -133,6 +133,29 @@ impl RecordReader {
 
 pub struct EmbeddingReader; 
 
+/// Errors from loading an embeddings file, independent of the Python bindings.
+#[derive(Debug)]
+pub enum EmbeddingLoadError {
+    Io(std::io::Error),
+    Parse(String),
+    DuplicateNode(usize),
+    DimensionMismatch
+}
+
+impl From<EmbeddingLoadError> for PyErr {
+    fn from(e: EmbeddingLoadError) -> PyErr {
+        match e {
+            EmbeddingLoadError::Io(e) => PyIOError::new_err(format!("{:?}", e)),
+            EmbeddingLoadError::Parse(line) => 
+                PyValueError::new_err(format!("Error parsing line: {}", line)),
+            EmbeddingLoadError::DuplicateNode(i) => 
+                PyKeyError::new_err(format!("found duplicate node at {}!", i)),
+            EmbeddingLoadError::DimensionMismatch => 
+                PyValueError::new_err("Embeddings have different sizes!")
+        }
+    }
+}
+
 impl EmbeddingReader {
 
     pub fn load(
@@ -142,17 +165,27 @@ impl EmbeddingReader {
         chunk_size: Option<usize>,
         skip_rows: Option<usize>
     ) -> PyResult<(Vocab, EmbeddingStore)> {
+        Ok(EmbeddingReader::load_store(path, distance, filter_type, chunk_size, skip_rows)?)
+    }
+
+    pub fn load_store(
+        path: &str, 
+        distance: Distance, 
+        filter_type: &Option<&HashSet<String>>, 
+        chunk_size: Option<usize>,
+        skip_rows: Option<usize>
+    ) -> Result<(Vocab, EmbeddingStore), EmbeddingLoadError> {
 
         // Convert filter types to something more efficient
         let ft_strs = filter_type
             .map(|hs| hs.iter().map(|s| s.as_str()).collect());
         let ft_refs = ft_strs.as_ref();
 
-        let num_embeddings = count_lines(path, ft_refs)
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+        let num_embeddings = count_lines(path, ft_refs, skip_rows.unwrap_or(0))
+            .map_err(EmbeddingLoadError::Io)?;
 
         let reader = open_file_for_reading(path)
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
+            .map_err(EmbeddingLoadError::Io)?;
 
         let mut vocab = Vocab::new();
         
@@ -171,7 +204,7 @@ impl EmbeddingReader {
                }
 
                Some(line_to_embedding(&line)
-                    .ok_or_else(|| PyValueError::new_err(format!("Error parsing line: {}", line))))
+                    .ok_or_else(|| EmbeddingLoadError::Parse(line.clone())))
             },
             |_, record| {
                 let (node_type, node_name, emb) = record?;
@@ -182,11 +215,11 @@ impl EmbeddingReader {
 
                 let node_id = vocab.get_or_insert(node_type, node_name);
                 if node_id < i {
-                    return Err(PyKeyError::new_err(format!("found duplicate node at {}!", i)));
+                    return Err(EmbeddingLoadError::DuplicateNode(i));
                 }
                 let m = es.get_embedding_mut(node_id);
                 if m.len() != emb.len() {
-                    return Err(PyValueError::new_err("Embeddings have different sizes!"));
+                    return Err(EmbeddingLoadError::DimensionMismatch);
                 }
                 m.copy_from_slice(&emb);
                 i += 1;
@@ -233,16 +266,18 @@ fn is_node_type(line: &str, filter_types: &HashSet<&str>) -> bool {
 /// Count the number of lines in an embeddings file so we only have to do one allocation.  If
 /// NodeEmbeddings internal memory structure changes, such as using slabs, this might be less
 /// relevant.
-fn count_lines(path: &str, node_type: Option<&HashSet<&str>>) -> IOResult<usize> {
+fn count_lines(path: &str, node_type: Option<&HashSet<&str>>, skip: usize) -> IOResult<usize> {
     let reader = open_file_for_reading(path)?;
     let mut count = 0;
+    // Skipped rows (eg. headers) are never loaded, so don't count them.
+    let lines = reader.lines().skip(skip);
     if let Some(fts) = node_type.as_ref() {
-        for line in reader.lines() {
+        for line in lines {
             let line = line?;
             if is_node_type(&line, fts) { count += 1}
         }
     } else {
-        for line in reader.lines() {
+        for line in lines {
             line?;
             count += 1;
         }
@@ -321,3 +356,26 @@ impl GraphReader {
         Ok((vocab, CumCSR::convert(csr)))
     }
 }
+
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+
+    /// Skipped header rows must not be counted as embeddings.
+    #[test]
+    fn test_load_store_skip_rows_sizes_store_to_vocab() {
+        let path = std::env::temp_dir()
+            .join(format!("cloverleaf-skip-rows-{}.emb", std::process::id()));
+        std::fs::write(&path, "node_type\tname\tembedding\nn\ta\t[1,2]\nn\tb\t[3,4]\n").unwrap();
+
+        let result = EmbeddingReader::load_store(
+            path.to_str().unwrap(), Distance::Euclidean, &None, None, Some(1));
+        std::fs::remove_file(&path).unwrap();
+
+        let (vocab, es) = result.expect("load failed");
+        assert_eq!(vocab.len(), 2);
+        assert_eq!(es.len(), vocab.len());
+        assert_eq!(es.get_embedding(1), &[3., 4.]);
+    }
+}
+
