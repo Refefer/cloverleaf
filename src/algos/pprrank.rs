@@ -129,7 +129,7 @@ impl PprRank {
         let valid_idxs = node_idxs.split_off(graph.len() - valid_idx);
 
         // Number of update stpes
-        let steps_per_pass = (node_idxs.len() as f32 / self.batch_size as f32) as usize;
+        let steps_per_pass = (node_idxs.len() as f32 / self.batch_size as f32).ceil() as usize;
 
         // Enable/disable shared memory pool
         use_shared_pool(true);

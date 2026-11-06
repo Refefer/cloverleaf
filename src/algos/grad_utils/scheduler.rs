@@ -37,8 +37,11 @@ impl LRScheduler {
     pub fn compute(&self, cur_step: usize) -> f32 {
         match self {
             LRScheduler::CosDecay {min_alpha, alpha, warmup_steps, max_steps} => {
-                if cur_step > *warmup_steps {
-                    let ratio = cur_step as f32 / *max_steps as f32;
+                if *max_steps == 0 {
+                    // No planned steps, so there is no schedule to follow.
+                    *alpha
+                } else if cur_step > *warmup_steps {
+                    let ratio = (cur_step as f32 / *max_steps as f32).min(1f32);
                     min_alpha + 0.5 * (alpha - min_alpha) * (1f32 + (std::f32::consts::PI * ratio).cos())
                 } else {
                     let ratio = cur_step as f32 / *warmup_steps as f32;
@@ -56,3 +59,28 @@ impl LRScheduler {
 }
 
 
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    /// Fewer examples than one batch means zero planned steps; the LR must stay finite.
+    #[test]
+    fn test_cos_decay_zero_steps_is_finite() {
+        let s = LRScheduler::cos_decay(0.01, 1.0, 0, 0);
+        for step in 0..3 {
+            assert!(s.compute(step).is_finite(), "step {} -> {}", step, s.compute(step));
+        }
+    }
+
+    /// Steps past max_steps must not climb back up the cosine.
+    #[test]
+    fn test_cos_decay_does_not_rise_past_max_steps() {
+        let s = LRScheduler::cos_decay(0.01, 1.0, 2, 10);
+        let at_end = s.compute(10);
+        for step in 11..15 {
+            assert!(s.compute(step) <= at_end + 1e-6,
+                "step {} -> {} > {}", step, s.compute(step), at_end);
+        }
+    }
+}

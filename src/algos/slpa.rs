@@ -75,6 +75,12 @@ pub fn construct_slpa_embedding(
                 memory[memory_offset+idx]
             }).collect();
             
+            // A node with no out edges hears nothing, so it repeats its most recent label.
+            if proposed_clusters.is_empty() {
+                *new_cluster = memory[node_id * memory_size + (pass - 1) % memory_size];
+                return
+            }
+
             // Select the "best" cluster based on a rule
             *new_cluster = match rule {
                 ListenerRule::Best => {
@@ -151,5 +157,16 @@ mod slpa_tests {
             println!("{}: {:?}", node_id, es.get_embedding(node_id));
         }
         //panic!();
+    }
+
+    /// Node 2 has an inbound edge but no outbound edges.
+    #[test]
+    fn test_slpa_handles_sink_nodes() {
+        let graph = CSR::construct_from_edges(vec![(0, 1, 1.), (1, 0, 1.), (0, 2, 1.)], false);
+        for rule in [ListenerRule::Best, ListenerRule::Probabilistic] {
+            let es = construct_slpa_embedding(&graph, rule, 5, 1, 4, 1234);
+            // A sink only ever remembers its own label.
+            assert_eq!(es.get_embedding(2)[0], 2.);
+        }
     }
 }

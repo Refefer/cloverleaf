@@ -34,6 +34,8 @@ pub fn lpa(
             // Count neighbors
             let node_edges = graph.get_edges(*idx).0;
             let n = node_edges.len();
+            // Nothing to listen to; keep the current label.
+            if n == 0 { continue }
             for (t_node, count) in node_edges.iter().zip(counts.iter_mut()) {
                 *count = clusters[*t_node];
             }
@@ -76,3 +78,19 @@ pub fn construct_lpa_embedding(
 
 }
 
+
+#[cfg(test)]
+mod lpa_tests {
+    use super::*;
+    use crate::graph::CSR;
+
+    /// Node 2 has an inbound edge but no outbound edges.
+    #[test]
+    fn test_lpa_handles_sink_nodes() {
+        let graph = CSR::construct_from_edges(vec![(0, 1, 1.), (1, 0, 1.), (0, 2, 1.)], false);
+        let clusters = lpa(&graph, 3, 1234);
+        assert_eq!(clusters.len(), 3);
+        // With no neighbors to listen to, a sink keeps its own label.
+        assert_eq!(clusters[2], 2);
+    }
+}

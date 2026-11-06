@@ -2,7 +2,7 @@
 //! centroid of their neighborhood.  For graphs which have strong homophily, it can help
 //! signifciantly improve both transductive and inductive algorithms.  In cases where structure is
 //! more important, tends to have a lower effect (although light alignments often are beneficial).
-use crate::graph::{Graph,NodeID};
+use crate::graph::{Graph,NodeID,CDFtoP};
 use crate::embeddings::EmbeddingStore;
 
 /// Neighborhood Aligner.  
@@ -30,11 +30,15 @@ impl NeighborhoodAligner {
         new_emb: &mut [f32]
     ) {
         let (edges, weights) = graph.get_edges(node);
-        
-        // Convert CSR into probabilities
-        // TODO: Use the CDFtoP struct
-        let p = std::iter::once(weights[0])
-            .chain(weights.windows(2).map(|arr| arr[1] - arr[0]));
+
+        // No neighborhood to align toward: keep the original embedding.
+        if edges.is_empty() {
+            new_emb.copy_from_slice(embeddings.get_embedding(node));
+            return
+        }
+
+        // Convert CDF into probabilities
+        let p = CDFtoP::new(weights);
 
         // limit by max neighbors
         let emb_set = edges.iter().zip(p);
@@ -74,4 +78,30 @@ impl NeighborhoodAligner {
         });
     }
 
+}
+
+#[cfg(test)]
+mod alignment_tests {
+    use super::*;
+    use crate::graph::{CSR, CumCSR};
+    use crate::distance::Distance;
+
+    /// A node with no out edges has no neighborhood, so it keeps its embedding.
+    #[test]
+    fn test_align_sink_node_keeps_embedding() {
+        let graph = CumCSR::convert(
+            CSR::construct_from_edges(vec![(0, 1, 1.), (1, 0, 1.), (0, 2, 1.)], false));
+        let es = EmbeddingStore::new(3, 2, Distance::Cosine);
+        for node in 0..3 {
+            let e = es.get_embedding_mut_hogwild(node);
+            e[0] = node as f32 + 1.;
+            e[1] = -(node as f32);
+        }
+        for alpha in [None, Some(0.5)] {
+            let aligner = NeighborhoodAligner::new(alpha, None);
+            let mut out = vec![0f32; 2];
+            aligner.align(&graph, &es, 2, &mut out);
+            assert_eq!(out, es.get_embedding(2).to_vec(), "alpha={:?}", alpha);
+        }
+    }
 }

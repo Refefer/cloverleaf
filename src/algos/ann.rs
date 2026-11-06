@@ -265,7 +265,8 @@ impl Ann {
         indices: &mut [(NodeID, bool)],
         rng: &mut impl Rng
     ) -> TreeIndex {
-        if indices.len() < config.max_nodes_per_leaf {
+        // A split needs two distinct points, so groups of fewer than two are always leaves.
+        if indices.len() < config.max_nodes_per_leaf.max(2) {
             let node_ids = indices.iter().map(|(node_id, _)| *node_id).collect();
             tree_table.push(Tree::Leaf { indices: node_ids });
             return tree_table.len() - 1
@@ -338,6 +339,10 @@ impl Ann {
         // Sort by Score and Node ID
         all_scores.par_sort();
 
+        if all_scores.is_empty() {
+            return all_scores
+        }
+
         // Deduplicate nodes which show up in multiple trees
         let mut cur_pointer = 1;
         let mut cur_node_id = all_scores[0].1;
@@ -400,11 +405,7 @@ fn compute_w_vec_from_points<'a>(
 ) -> (Vec<f32>, &'a [f32], &'a [f32]) {
  
     // Select two points to create the hyperplane
-    let idx_1 = indices.choose(rng).unwrap().0;
-    let mut idx_2 = idx_1;
-    while idx_1 == idx_2 {
-        idx_2 = indices.choose(rng).unwrap().0;
-    }
+    let (idx_1, idx_2) = choose_two(indices, rng);
 
     let pa = es.get_embedding(idx_1); 
     let pb = es.get_embedding(idx_2); 
@@ -412,6 +413,14 @@ fn compute_w_vec_from_points<'a>(
     // Compute the hyperplane
     let delta = pa.iter().zip(pb.iter()).map(|(pai, pbi)| pai - pbi).collect();
     (delta, pa, pb)
+}
+
+/// Picks two entries at different positions.  Requires at least two entries.
+fn choose_two(indices: &[(NodeID, bool)], rng: &mut impl Rng) -> (NodeID, NodeID) {
+    let i = rng.gen_range(0, indices.len());
+    let mut j = rng.gen_range(0, indices.len() - 1);
+    if j >= i { j += 1; }
+    (indices[i].0, indices[j].0)
 }
 
 fn update_point(centroid: &mut [f32], new_point: &[f32], count: usize) {
@@ -429,11 +438,7 @@ fn pseudo_kmeans_w_vec_from_points<'a>(
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
  
     // Select two initial points for seeding the centroid
-    let idx_1 = indices.choose(rng).unwrap().0;
-    let mut idx_2 = idx_1;
-    while idx_1 == idx_2 {
-        idx_2 = indices.choose(rng).unwrap().0;
-    }
+    let (idx_1, idx_2) = choose_two(indices, rng);
 
     let mut pa = es.get_embedding(idx_1).to_vec(); 
     let mut pb = es.get_embedding(idx_2).to_vec(); 
@@ -555,5 +560,47 @@ mod ann_split_tests {
                 "seed {}: hyperplane put {} of {} points on one side", seed, above, n);
         }
     }
-}
 
+    fn line_store(n: usize) -> EmbeddingStore {
+        let es = EmbeddingStore::new(n, 1, Distance::Euclidean);
+        for node in 0..n {
+            es.get_embedding_mut_hogwild(node)[0] = node as f32;
+        }
+        es
+    }
+
+    fn fit_with_timeout(n: usize, max_nodes_per_leaf: usize, node_ids: Option<Vec<NodeID>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let es = line_store(n);
+            let mut ann = Ann::new();
+            ann.fit(&es, 2, max_nodes_per_leaf, None, None, node_ids, 1234);
+            tx.send(ann.num_trees()).unwrap();
+        });
+        let trees = rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("Ann::fit did not terminate");
+        assert_eq!(trees, 2);
+    }
+
+    /// A one-node group can't be split by two distinct points.
+    #[test]
+    fn test_fit_max_nodes_per_leaf_one_terminates() {
+        fit_with_timeout(8, 1, None);
+    }
+
+    /// Repeated node ids give a group with only one distinct node.
+    #[test]
+    fn test_fit_duplicate_node_ids_terminates() {
+        fit_with_timeout(8, 2, Some(vec![3, 3, 3, 3]));
+    }
+
+    /// An index over no nodes returns no neighbors rather than panicking.
+    #[test]
+    fn test_predict_empty_index_returns_empty() {
+        let es = line_store(4);
+        let mut ann = Ann::new();
+        ann.fit(&es, 2, 2, None, None, Some(Vec::new()), 1234);
+        let res = ann.predict(&es, &[1.0], 3, None);
+        assert!(res.is_empty());
+    }
+}
