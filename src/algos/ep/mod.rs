@@ -21,6 +21,7 @@ use crate::embeddings::EmbeddingStore;
 use crate::distance::Distance;
 use crate::progress::CLProgressBar;
 use crate::feature_store::FeatureStore;
+use crate::algos::utils::node_seed;
 use crate::algos::grad_utils::scheduler::LRScheduler;
 use crate::algos::grad_utils::optimizer::{Optimizer,AdamOptimizer};
 use crate::algos::grad_utils::node_sampler::*;
@@ -182,7 +183,7 @@ impl EmbeddingPropagation {
                 // Compute grads for batch
                 let grads: Vec<_> = nodes.par_iter().filter_map(|node_id| {
                     let n_id = **node_id;
-                    let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + n_id) as u64);
+                    let mut rng = XorShiftRng::seed_from_u64(node_seed(self.seed, pass, i, n_id));
                     let (mut loss, hv_vars, thv_vars, hu_vars) = self.run_forward_pass(
                         graph, n_id, &features, &feature_embeddings, 
                         model, &sampler, &mut rng);
@@ -239,7 +240,7 @@ impl EmbeddingPropagation {
                     if self.noise > 0.0 {
                         let noise = noise_scheduler.compute(cur_step);
                         all_grads.par_iter_mut().for_each(|(feat, emb)| {
-                            let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + feat) as u64);
+                            let mut rng = XorShiftRng::seed_from_u64(node_seed(self.seed, pass, i, *feat));
                             emb.iter_mut().for_each(|ei| {
                                 *ei += noise * rng.sample::<f32,StandardNormal>(StandardNormal);
                             });
@@ -248,7 +249,7 @@ impl EmbeddingPropagation {
 
                     // Backpropagate embeddings
                     let alpha = lr_scheduler.compute(cur_step);
-                    optimizer.update(&feature_embeddings, all_grads, alpha, pass as f32);
+                    optimizer.update(&feature_embeddings, all_grads, alpha, cur_step as f32);
                 }
 
                 // Update progress bar
@@ -270,7 +271,7 @@ impl EmbeddingPropagation {
                     let sampler = (&valid_random_sampler).initialize_batch(&nodes, graph, features);
 
                     nodes.par_iter().map(|node_id| {
-                        let mut rng = XorShiftRng::seed_from_u64(self.seed - 1);
+                        let mut rng = XorShiftRng::seed_from_u64(self.seed.wrapping_sub(1));
                         let loss = self.run_forward_pass(
                             graph, **node_id, &features, &feature_embeddings, 
                             model, &sampler, &mut rng).0;

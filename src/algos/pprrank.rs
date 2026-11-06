@@ -11,7 +11,7 @@ use rand_xorshift::XorShiftRng;
 use crate::autograd::*;
 
 use crate::algos::rwr::RWR;
-use crate::algos::utils::Sample;
+use crate::algos::utils::{Sample,node_seed};
 use crate::sampler::Weighted;
 use crate::graph::{Graph as CGraph, CDFGraph, NodeID};
 use crate::embeddings::{EmbeddingStore,randomize_embedding_store};
@@ -187,7 +187,7 @@ impl PprRank {
                 
                 // Compute grads for batch
                 nodes.par_iter().map(|node_id| {
-                    let mut rng = XorShiftRng::seed_from_u64(self.seed + (i + **node_id) as u64);
+                    let mut rng = XorShiftRng::seed_from_u64(node_seed(self.seed, pass, i, **node_id));
                     let (loss, feat_maps) = self.run_forward_pass(
                         graph, **node_id, &walk_lib, &features, &feature_embeddings, &sampler, &mut rng);
 
@@ -219,7 +219,7 @@ impl PprRank {
 
                 // Backpropagate embeddings
                 let alpha = lr_scheduler.compute(cur_step);
-                optimizer.update(&feature_embeddings, all_grads, alpha, pass as f32);
+                optimizer.update(&feature_embeddings, all_grads, alpha, cur_step as f32);
 
                 // Update progress bar
                 pb.inc(1);

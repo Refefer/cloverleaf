@@ -156,14 +156,9 @@ impl EmbeddingStore {
         where F: Sync + Fn(NodeID) -> bool 
     {
         let query_emb = self.extract_vec(q);
-        (0..self.len()).into_par_iter().map(|node_id| {
-            let dist = if filter(node_id) {
-                let node_emb = self.get_embedding(node_id);
-                self.distance.compute(query_emb, node_emb)
-            } else {
-                std::f32::MAX
-            };
-            (node_id, dist)
+        (0..self.len()).into_par_iter().filter(|node_id| filter(*node_id)).map(|node_id| {
+            let node_emb = self.get_embedding(node_id);
+            (node_id, self.distance.compute(query_emb, node_emb))
         }).fold(|| TopK::new(k), |mut acc, (node_id, dist)| {
             acc.push(node_id, dist);
             acc
@@ -246,4 +241,17 @@ mod embedding_tests {
         assert_eq!(overlap_d, 1. - 1. / 4.);
     }
 
+
+    /// Nodes rejected by the filter must not be returned, even if fewer than k pass.
+    #[test]
+    fn test_nearest_neighbor_excludes_filtered_nodes() {
+        let es = EmbeddingStore::new(3, 1, Distance::Euclidean);
+        for node in 0..3 {
+            es.get_embedding_mut_hogwild(node)[0] = node as f32;
+        }
+        let q = [0f32];
+        let res = es.nearest_neighbor(&Entity::Embedding(&q), 2, |node_id| node_id == 2);
+        let ids: Vec<_> = res.iter().map(|nd| nd.to_tup_cloned().0).collect();
+        assert_eq!(ids, vec![2]);
+    }
 }

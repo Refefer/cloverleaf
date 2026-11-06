@@ -76,6 +76,8 @@ impl Vocab {
             node_id.clone()
         } else {
             let new_idx = self.node_id_to_node.len();
+            // Adding a node changes the vocab, so it no longer matches any clone of it.
+            self.vocab_id = VOCAB_ID.fetch_add(1, Ordering::SeqCst);
             self.vocab_to_idx.insert((t.0.clone(), t.1.clone()), new_idx.clone());
             self.node_id_to_node.push((t.0, t.1));
             new_idx
@@ -149,4 +151,17 @@ mod vocab_tests {
         });
     }
 
+
+    /// A clone that gains nodes is no longer the same vocab, so translation must go by name.
+    #[test]
+    fn test_mutated_clone_is_not_identical() {
+        let mut a = Vocab::new();
+        a.get_or_insert("n", "x");
+        let mut b = a.clone();
+        b.get_or_insert("n", "y");
+
+        assert!(!a.is_identical(&b));
+        assert_eq!(b.create_translation_table(&a), vec![Some(0), None]);
+        assert_eq!(a.translate_node(&b, 1), None);
+    }
 }

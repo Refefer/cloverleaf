@@ -82,17 +82,6 @@ impl Attention {
         Attention {query, key, value}
     }
 
-    fn scale(&self, scalar: f32) -> Attention {
-        if scalar != 1f32 {
-            Attention {
-                query: scalar * &self.query,
-                key: scalar * &self.key,
-                value: scalar * &self.value
-            }
-        } else {
-            self.clone()
-        }
-    }
 }
 
 /// The big chalupa: given attention and a set of vectors, computes the attention according to the
@@ -104,16 +93,22 @@ pub fn attention_mean<'a>(
 ) -> ANode {
 
     let features = it.collect::<Vec<_>>();
+
+    // A lone feature attends only to itself, so each head returns its value slice.
+    if features.len() == 1 {
+        let node = &features[0].0;
+        let values = (0..mha.num_heads)
+            .map(|head| mha.get_value_vec(node, head))
+            .collect::<Vec<_>>();
+        return values.sum_all() / (mha.num_heads as f32)
+    }
+
     let mut averages = Vec::with_capacity(mha.num_heads);
     for head in 0..mha.num_heads {
         let items: Vec<_> = features.iter().map(|(node, count)| {
             (Attention::new(node, mha, head), *count)
         }).collect();
 
-        if items.len() == 1 {
-            return items[0].0.value.clone()
-        }
-        
         // Compute attention matrix
         let attention_matrix = compute_attention_matrix(&items, &mha.attention_type, rng);
         
@@ -224,11 +219,9 @@ fn compute_random_attention_matrix(
     rng: &mut impl Rng
 ) -> AttentionMatrix {
     
-    // Sample K features and scale
-    let (k, scale) = sample.sample(items.len(), true, rng);
-    let items = items.iter()
-        .map(|(at, w)| (at.scale(scale), w))
-        .collect::<Vec<_>>();
+    // Sample K features.  The softmax normalizes over whichever keys were sampled, so the logits
+    // need no correction for the sampling rate.
+    let (k, _) = sample.sample(items.len(), true, rng);
 
     // Get the attention for each feature
     let mut scaled = vec![vec![None; items.len()]; items.len()];
@@ -426,4 +419,41 @@ mod attention_tests {
     }
 
 
+
+    /// Layout per feature with d_k=1, 2 heads, d_model=1: [Q1, Q2, K1, K2, V1, V2].  One feature
+    /// gives the mean over heads of V_h, the same as the general path.
+    #[test]
+    fn test_single_feature_uses_all_heads() {
+        let mha = MultiHeadedAttention::new(2, 1, AttentionType::Full);
+        let feats = vec![(Variable::new(vec![0., 0., 0., 0., 1., 3.]), 1f32)];
+        let mut rng = XorShiftRng::seed_from_u64(0);
+        let out = attention_mean(feats.iter(), &mha, &mut rng);
+        assert_eq!(out.value(), &[2.]);
+    }
+
+    /// Sampling keys must not change the logits of the keys that were sampled: each should be
+    /// the plain q_i . k_j, as in Full attention.  Softmax already normalizes over the sample.
+    #[test]
+    fn test_random_attention_does_not_rescale_logits() {
+        let mha = MultiHeadedAttention::new(1, 1, AttentionType::Random {
+            num_features: Sample::Fixed(2)
+        });
+        let items: Vec<_> = (0..4).map(|i| {
+            let e = Variable::new(vec![1. + i as f32, 2. - i as f32, 1.]);
+            (Attention::new(&e, &mha, 0), 1f32)
+        }).collect();
+        let mut rng = XorShiftRng::seed_from_u64(0);
+        let m = compute_attention_matrix(&items, &mha.attention_type, &mut rng);
+        let mut checked = 0;
+        for (i, row) in m.iter().enumerate() {
+            for (j, logit) in row.iter().enumerate() {
+                if let Some(l) = logit {
+                    let expected = (1. + i as f32) * (2. - j as f32);
+                    assert_eq!(l.value(), &[expected], "logit ({}, {})", i, j);
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 8);
+    }
 }

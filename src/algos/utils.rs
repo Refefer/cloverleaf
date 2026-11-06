@@ -44,6 +44,22 @@ impl <'a> Iterator for Counter<'a> {
     }
 }
 
+/// Seed for the RNG used by one item (node or feature) within one batch of one pass.
+/// Mixes every input so seeds change each pass and distinct (batch, id) pairs don't collide.
+pub fn node_seed(seed: u64, pass: usize, batch: usize, id: usize) -> u64 {
+    // SplitMix64 finalizer
+    fn mix(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+        x ^ (x >> 31)
+    }
+    let h = mix(seed);
+    let h = mix(h ^ pass as u64);
+    let h = mix(h ^ batch as u64);
+    mix(h ^ id as u64)
+}
+
 pub fn get_best_count<R: Rng>(counts: &[usize], rng: &mut R) -> usize {
     let mut best_count = 0;
     let mut ties = Vec::new();
@@ -320,5 +336,12 @@ mod utils_tests {
 
     }
 
-}
 
+    /// Each pass must draw fresh samples, and (batch, id) pairs must not collide.
+    #[test]
+    fn test_node_seed_varies_by_pass_and_does_not_collide() {
+        assert_ne!(node_seed(7, 1, 0, 5), node_seed(7, 2, 0, 5));
+        assert_ne!(node_seed(7, 1, 0, 5), node_seed(7, 1, 1, 4));
+        assert_ne!(node_seed(7, 1, 0, 5), node_seed(7, 1, 5, 0));
+    }
+}

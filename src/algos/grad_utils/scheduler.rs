@@ -41,7 +41,13 @@ impl LRScheduler {
                     // No planned steps, so there is no schedule to follow.
                     *alpha
                 } else if cur_step > *warmup_steps {
-                    let ratio = (cur_step as f32 / *max_steps as f32).min(1f32);
+                    // Decay runs over the steps after warmup, so it starts at alpha
+                    let decay_steps = max_steps.saturating_sub(*warmup_steps);
+                    let ratio = if decay_steps == 0 {
+                        1f32
+                    } else {
+                        ((cur_step - warmup_steps) as f32 / decay_steps as f32).min(1f32)
+                    };
                     min_alpha + 0.5 * (alpha - min_alpha) * (1f32 + (std::f32::consts::PI * ratio).cos())
                 } else {
                     let ratio = cur_step as f32 / *warmup_steps as f32;
@@ -82,5 +88,13 @@ mod scheduler_tests {
             assert!(s.compute(step) <= at_end + 1e-6,
                 "step {} -> {} > {}", step, s.compute(step), at_end);
         }
+    }
+
+    /// The decay phase must start where warmup ends.
+    #[test]
+    fn test_cos_decay_is_continuous_after_warmup() {
+        let s = LRScheduler::cos_decay(0.01, 1.0, 100, 1000);
+        let (a, b) = (s.compute(100), s.compute(101));
+        assert!((a - b).abs() < 1e-3, "warmup end {} -> {}", a, b);
     }
 }

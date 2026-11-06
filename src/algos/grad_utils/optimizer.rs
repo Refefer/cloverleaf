@@ -13,7 +13,8 @@ pub trait Optimizer {
         feature_embeddings: &EmbeddingStore,
         grads: CHashMap<usize, Vec<f32>>,
         alpha: f32,
-        t: f32
+        // 1-based count of updates applied so far, including this one
+        step: f32
     );
 
 }
@@ -45,9 +46,9 @@ impl Optimizer for AdamOptimizer {
         feature_embeddings: &EmbeddingStore,
         grads: CHashMap<usize, Vec<f32>>,
         alpha: f32,
-        t: f32
+        step: f32
     ) {
-        let t = t + 1.;
+        let t = step;
         grads.into_par_iter().for_each(|(feat_id, grad)| {
 
             // Can get some nans in weird cases, such as the distance between
@@ -81,3 +82,25 @@ impl Optimizer for AdamOptimizer {
     }
 }
 
+
+#[cfg(test)]
+mod optimizer_tests {
+    use super::*;
+
+    /// With bias correction at step t, a constant gradient gives m_hat = g and v_hat = g^2, so
+    /// every Adam step moves the weight by exactly alpha (minus eps).
+    #[test]
+    fn test_adam_steps_are_alpha_sized_with_constant_grad() {
+        let fe = EmbeddingStore::new(1, 1, Distance::Cosine);
+        let adam = AdamOptimizer::new(0.9, 0.999, 1, 1);
+        let mut last = 0f32;
+        for step in 1..6 {
+            let mut grads = CHashMap::new();
+            grads.insert(0usize, vec![2f32]);
+            adam.update(&fe, grads, 0.1, step as f32);
+            let cur = fe.get_embedding(0)[0];
+            assert!(((last - cur) - 0.1).abs() < 1e-4, "step {} moved {}", step, last - cur);
+            last = cur;
+        }
+    }
+}
