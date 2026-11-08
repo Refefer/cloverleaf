@@ -422,24 +422,17 @@ impl PprRank {
         node_id: NodeID
     ) -> ANode {
 
-        let yi = compute_distances(query_node, ranked_nodes, false);
+        let logits = ranked_nodes.iter().map(|n| {
+            query_node.dot(n)
+        }).collect::<Vec<_>>().concat();
 
-        // Compute the plackett luce model for each score
-        let n = ranked_nodes.len();
-        let pl: Vec<_> = (0..n).map(|i| {
-            yi.slice(i,1) / yi.slice(i, n - i).sum()
-        }).collect();
-
-        let pl_loss = pl.iter().fold(Constant::scalar(1f32), |acc, x| acc * x);
-
-        let loss = -pl_loss.ln();
+        let loss = plackett_luce_nll(&logits);
         if loss.value()[0].is_nan() || loss.value()[0].is_infinite() {
-            println!("yi: {:?}",yi.value());
-            println!("pl: {:?}", pl.concat().value());
+            println!("logits: {:?}", logits.value());
             Constant::scalar(0f32)
         } else {
             if node_id == 0 {
-                println!("loss:{}, {:?} -> {:?}", loss.value()[0], node_weights, yi.value());
+                println!("loss:{}, {:?} -> {:?}", loss.value()[0], node_weights, logits.value());
             }
             loss
         }
@@ -484,6 +477,25 @@ fn compute_distances(query_node: &ANode, ranked_nodes: &[ANode], cosine: bool) -
         //}).collect::<Vec<_>>().concat()
         
     }
+}
+
+/// Negative log likelihood of the Plackett-Luce model for items already in ranked order.
+/// Sums log probabilities rather than multiplying probabilities, which underflows for long lists.
+fn plackett_luce_nll(logits: &ANode) -> ANode {
+    let values = logits.value();
+    let n = values.len();
+    if n == 0 {
+        return Constant::scalar(0f32)
+    }
+    let terms: Vec<_> = (0..n).map(|i| {
+        // Shift by the tail's max so the largest exp is 1: exp can't overflow and the tail sum is
+        // at least 1, so its log can't be -inf.  The shift cancels out of the term.
+        let shift = Constant::scalar(
+            values[i..].iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+        let log_tail_sum = (logits.slice(i, n - i) - &shift).exp().sum().ln();
+        log_tail_sum - (logits.slice(i, 1) - &shift)
+    }).collect();
+    terms.sum_all()
 }
 
 fn il2norm(v: &ANode) -> ANode {
@@ -589,4 +601,32 @@ mod ep_tests {
         assert_eq!(ws, &[1., 2.]);
     }
 
+
+    fn plackett_luce_reference(logits: &[f64]) -> f64 {
+        (0..logits.len()).map(|i| {
+            let tail = &logits[i..];
+            let m = tail.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let lse = m + tail.iter().map(|l| (l - m).exp()).sum::<f64>().ln();
+            lse - logits[i]
+        }).sum()
+    }
+
+    /// A badly ordered list has a tiny likelihood; the loss must stay finite, not underflow.
+    #[test]
+    fn test_plackett_luce_nll_no_underflow() {
+        let logits: Vec<f32> = (0..10).map(|i| i as f32 * 5.).collect();
+        let reference = plackett_luce_reference(&logits.iter().map(|l| *l as f64).collect::<Vec<_>>());
+        let loss = plackett_luce_nll(&Variable::new(logits)).value()[0];
+        assert!(((loss as f64 - reference) / reference).abs() < 1e-4,
+            "loss {} reference {}", loss, reference);
+    }
+
+    /// Large logits must not overflow exp.
+    #[test]
+    fn test_plackett_luce_nll_no_overflow() {
+        let logits = vec![100f32, 0.];
+        let reference = plackett_luce_reference(&[100., 0.]);
+        let loss = plackett_luce_nll(&Variable::new(logits)).value()[0];
+        assert!((loss as f64 - reference).abs() < 1e-5, "loss {} reference {}", loss, reference);
+    }
 }

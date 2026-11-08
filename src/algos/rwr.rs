@@ -3,7 +3,7 @@
 use hashbrown::{HashMap,HashSet};
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
-use rand_distr::{Distribution,Uniform};
+use rand_distr::{Binomial,Distribution,Uniform};
 use rayon::prelude::*;
 
 use crate::graph::{Graph,NodeID,CDFtoP,CDFGraph};
@@ -56,7 +56,8 @@ impl RWR {
 
         ret.par_iter_mut()
             .for_each(|(k, v)| {
-                let d = (graph.degree(*k) as f32).powf(self.beta);
+                // Walks can end on nodes without out edges; treat them as degree 1.
+                let d = (graph.degree(*k).max(1) as f32).powf(self.beta);
                 *v /= (self.walks as f32) * d;
             });
         ret
@@ -78,7 +79,8 @@ impl RWR {
 
         counts.iter_mut()
             .for_each(|(k, v)| {
-                let d = (graph.degree(*k) as f32).powf(self.beta);
+                // Walks can end on nodes without out edges; treat them as degree 1.
+                let d = (graph.degree(*k).max(1) as f32).powf(self.beta);
                 *v /= (self.walks as f32) * d;
             });
         counts 
@@ -89,6 +91,7 @@ impl RWR {
         graph: &G, 
         start_node: NodeID,
         walks: usize,
+        origin: NodeID,
         rng: &mut impl Rng,
         entries: &mut HashMap<NodeID, usize>
     ) {
@@ -108,7 +111,8 @@ impl RWR {
                 *entries.entry(edges[cur_idx]).or_insert(0) += 1;
             }
         } else {
-            *entries.entry(start_node).or_insert(0) += 1;
+            // Like `walk`, every walk at a dead end restarts from the origin.
+            *entries.entry(origin).or_insert(0) += walks;
         }
     }
 
@@ -133,7 +137,7 @@ impl RWR {
         loop {
             if counts.len() == 0 { break }
             counts.drain().for_each(|(node_id, num_walks)| {
-                self.sample_level(graph, node_id, num_walks, &mut rng, &mut next_counts);
+                self.sample_level(graph, node_id, num_walks, start_node, &mut rng, &mut next_counts);
             });
 
             match self.steps {
@@ -146,7 +150,11 @@ impl RWR {
                 },
                 Sample::Probability(p) => {
                     next_counts.drain().map(|(node_id, count)| {
-                        let discount = (count as f32 * p).ceil() as usize;
+                        // Each walk stops here independently with probability p.  Rounding the
+                        // expected count instead stops every lone walk.
+                        let discount = Binomial::new(count as u64, p as f64)
+                            .expect("p is validated by Sample")
+                            .sample(&mut rng) as usize;
                         let rem = count - discount;
                         *ret.entry(node_id).or_insert(0usize) += discount;
                         (node_id, rem)
@@ -160,7 +168,8 @@ impl RWR {
         }
         ret.into_iter()
             .map(|(k, v)| {
-                let d = (graph.degree(k) as f32).powf(self.beta);
+                // Walks can end on nodes without out edges; treat them as degree 1.
+                let d = (graph.degree(k).max(1) as f32).powf(self.beta);
                 let v = v as f32 / ((self.walks as f32) * d);
                 (k, v)
             })
@@ -378,5 +387,51 @@ mod rwr_tests {
             "unweighted rollouts took the light edge {} of {} times", to_light_edge, n);
     }
 
-}
 
+    /// Node 0 fans out to 100 children; child i leads to grandchild 100 + i, which loops on
+    /// itself.  With restart probability p, a walk stops on a child with probability p, so 90%
+    /// of walks should end past the children.
+    fn fan_out_graph() -> CumCSR {
+        let mut edges = Vec::new();
+        for i in 1..=100 {
+            edges.push((0, i, 1.));
+            edges.push((i, 100 + i, 1.));
+            edges.push((100 + i, 100 + i, 1.));
+        }
+        CumCSR::convert(CSR::construct_from_edges(edges, false))
+    }
+
+    #[test]
+    fn test_sample_bfs_restarts_are_unbiased_when_walks_spread() {
+        let graph = fan_out_graph();
+        let rwr = RWR { steps: Sample::Probability(0.1), walks: 100, beta: 0.,
+                        single_threaded: false, seed: 1234 };
+        let scores = rwr.sample_bfs(&graph, 0);
+        let past_children: f32 = scores.iter().filter(|(k, _)| **k > 100).map(|(_, v)| *v).sum();
+        assert!((past_children - 0.9).abs() < 0.1, "fraction past children: {}", past_children);
+    }
+
+    /// Like `walk`, every walk at a node without out edges restarts from the start node.
+    #[test]
+    fn test_sample_bfs_restarts_all_walks_at_dead_ends() {
+        let graph = CumCSR::convert(CSR::construct_from_edges(vec![(0, 1, 1.)], false));
+        let rwr = RWR { steps: Sample::Fixed(2), walks: 100, beta: 0.,
+                        single_threaded: false, seed: 1234 };
+        let scores = rwr.sample_bfs(&graph, 0);
+        assert_eq!(scores.len(), 1, "{:?}", scores);
+        assert_eq!(scores.get(&0), Some(&1.0), "{:?}", scores);
+    }
+
+    /// A walk can end on a node with no out edges; its degree of zero must not make the score
+    /// inf on any sampling path.
+    #[test]
+    fn test_scores_finite_at_zero_degree_nodes() {
+        let graph = CumCSR::convert(CSR::construct_from_edges(vec![(0, 1, 1.)], false));
+        for single_threaded in [false, true] {
+            let rwr = RWR { steps: Sample::Fixed(1), walks: 100, beta: 0.5,
+                            single_threaded, seed: 1234 };
+            assert_eq!(rwr.sample_bfs(&graph, 0).get(&1), Some(&1.0));
+            assert_eq!(rwr.sample(&graph, &Unweighted, 0).get(&1), Some(&1.0));
+        }
+    }
+}

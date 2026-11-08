@@ -23,6 +23,7 @@ pub enum LandmarkSelection {
 
 /// Ignores edge weights and computes it assuming each edge has the same weight.  This radically
 /// changes the compute costs since we can avoid Djikstra's algorithm which is very expensive.
+/// Distances are a u8 to keep memory low; 255 means 255 or more hops, or unreachable.
 pub fn unweighted_walk_distance(
     graph: &impl Graph,
     start_node: NodeID
@@ -33,14 +34,14 @@ pub fn unweighted_walk_distance(
 
     seen.set_bit(start_node);
     distance[start_node] = 0;
-    queue.push_back((start_node, 0));
+    queue.push_back((start_node, 0u8));
 
     while let Some((vert, cur_dist)) = queue.pop_front() {
         distance[vert] = cur_dist;
         for out_edge in graph.get_edges(vert).0.iter() {
             if !seen.is_set(*out_edge) {
                 seen.set_bit(*out_edge);
-                queue.push_back((*out_edge, cur_dist + 1));
+                queue.push_back((*out_edge, cur_dist.saturating_add(1)));
             }
         }
     }   
@@ -155,4 +156,15 @@ mod dist_tests {
         assert_eq!(es.get_embedding(3), vec![2f32, 1f32]);
     }
 
+
+    /// Distances past 255 hops must saturate at 255, not wrap back toward 0.
+    #[test]
+    fn test_distance_saturates_on_long_paths() {
+        let edges: Vec<_> = (0..299).map(|i| (i, i + 1, 1.)).collect();
+        let csr = CSR::construct_from_edges(edges, false);
+        let distances = unweighted_walk_distance(&csr, 0);
+        for (node, d) in distances.iter().enumerate() {
+            assert_eq!(*d as usize, node.min(255), "node {}", node);
+        }
+    }
 }

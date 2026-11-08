@@ -3,76 +3,60 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap,HashSet};
 
 use crate::NodeID;
-use crate::bitset::BitSet;
 use crate::graph::{Graph,CDFtoP};
 
 use crate::embeddings::EmbeddingStore;
 use crate::distance::Distance;
 
-/// Find the connected components of a graph
+/// Find the connected components of a graph.  Labels are stored as f32, which is exact only up
+/// to 2^24 components; use `component_labels` when exact labels matter.
 pub fn find_connected_components(
     graph: &impl Graph
 ) -> EmbeddingStore {
-    let mut es = EmbeddingStore::new(graph.len(), 1, Distance::Hamming);
+    let n = graph.len();
+    // u32 and f32 have the same size and alignment, so this reuses the label buffer in place.
+    let labels: Vec<f32> = component_labels(graph).into_iter().map(|l| l as f32).collect();
+    EmbeddingStore::new_with_vec(n, 1, Distance::Hamming, labels)
+        .expect("one label per node")
+}
 
-    let mut last_start_idx = 0usize;
-    let mut local = BitSet::new(graph.len());
-    let mut buffer = Vec::new();
-
-    let mut cluster_idx = 1;
-    loop {
-        let mut all_done = true;
-        // Find the first unseen index.  We track the last start index so it's O(n) instead of
-        // O(n^2)
-        for idx in last_start_idx..graph.len() {
-            if es.get_embedding(idx)[0] == 0.0 {
-                last_start_idx = idx;
-                all_done = false;
-                break
-            }
-        }
-        // We've seen all the nodes, all done
-        if all_done { break }
-
-        local.set_bit(last_start_idx);
-        buffer.push(last_start_idx);
-
-        while buffer.len() > 0 {
-            let node_id = buffer.pop().expect("Shouldn't be empty!");
-            es.get_embedding_mut(node_id)[0] = cluster_idx as f32;
+/// Component label for every node, following out edges; labels are 1-based.  u32 keeps labels
+/// exact past 2^24 components at the same 4 bytes per node as an f32, and a zero label doubles as
+/// the "seen" marker so no separate bitset is needed.
+pub fn component_labels(graph: &impl Graph) -> Vec<u32> {
+    let n = graph.len();
+    let mut labels = vec![0u32; n];
+    let mut buffer: Vec<NodeID> = Vec::new();
+    let mut label = 0u32;
+    for start in 0..n {
+        if labels[start] != 0 { continue }
+        label = label.checked_add(1).expect("more than u32::MAX components");
+        labels[start] = label;
+        buffer.push(start);
+        while let Some(node_id) = buffer.pop() {
             for edge in graph.get_edges(node_id).0.iter() {
-                if !local.is_set(*edge) {
-                    local.set_bit(*edge);
+                if labels[*edge] == 0 {
+                    labels[*edge] = label;
                     buffer.push(*edge);
                 }
             }
         }
-
-        cluster_idx += 1;
     }
-    es
-}
-
-fn get_component(
-    embs: &EmbeddingStore, 
-    node_id: NodeID
-) -> usize {
-    embs.get_embedding(node_id)[0] as usize
+    labels
 }
 
 pub fn prune_graph_components(
     graph: &impl Graph,
     k: usize
 ) -> Vec<(NodeID,NodeID,f32)> {
-    let es = find_connected_components(graph);
-    
-    // Component ids are 1-based.  Size the counts by the components that actually exist rather
-    // than by the node count, which can be far larger.
-    let n = graph.len();
-    let num_components = (0..n).map(|node_id| get_component(&es, node_id)).max().unwrap_or(0);
-    let mut counts = vec![0usize; num_components + 1];
-    for node_id in 0..n {
-        counts[get_component(&es, node_id)] += 1;
+    let labels = component_labels(graph);
+
+    // Labels are 1-based.  Size the counts by the components that actually exist rather than by
+    // the node count, which can be far larger.
+    let num_components = labels.iter().max().map(|m| *m as usize).unwrap_or(0);
+    let mut counts = vec![0u32; num_components + 1];
+    for label in labels.iter() {
+        counts[*label as usize] += 1;
     }
 
     // Keep the K largest components with a K-sized min-heap instead of sorting every component.
@@ -86,8 +70,7 @@ pub fn prune_graph_components(
 
     let mut subgraph = Vec::new();
     for node_id in 0..graph.len() {
-        let component_id = get_component(&es, node_id);
-        if clusters.contains(&component_id) {
+        if clusters.contains(&(labels[node_id] as usize)) {
             let (edges, weights) = graph.get_edges(node_id);
             let p = CDFtoP::new(weights);
             for (edge, weight) in edges.iter().zip(p) {
@@ -180,5 +163,18 @@ mod connected_tests {
 
         let pruned = prune_graph_components(&graph, 2);
         assert_eq!(pruned.len(), 2);
+    }
+
+    /// Component ids past 2^24 can't be told apart in an f32.  Every node here except the last
+    /// two-node pair is its own component, so the last two nodes need different labels.
+    #[test]
+    fn test_component_labels_past_f32_precision() {
+        let n = (1usize << 24) + 3;
+        let graph = CSR::construct_from_edges(vec![(n - 1, n - 1, 1.)], false);
+        let labels = component_labels(&graph);
+        assert_eq!(labels.len(), n);
+        // Node i is the (i + 1)th component found.
+        let tail: Vec<usize> = labels[n - 3..].iter().map(|l| *l as usize).collect();
+        assert_eq!(tail, vec![n - 2, n - 1, n]);
     }
 }

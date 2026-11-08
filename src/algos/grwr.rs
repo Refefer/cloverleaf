@@ -11,6 +11,8 @@ use crate::graph::{Graph,NodeID};
 use crate::sampler::Sampler;
 use crate::embeddings::EmbeddingStore;
 use crate::algos::reweighter::Reweighter;
+use crate::algos::utils::node_seed;
+use rand_distr::{Binomial,Distribution};
 
 /// Determins if we used Fixed steps or a restart Probability
 pub enum Steps {
@@ -89,7 +91,8 @@ impl GuidedRWR {
         // Discount by node degree
         counts.par_iter_mut()
            .for_each(|(k, v)| {
-               let d = (graph.degree(*k) as f32).powf(self.beta);
+               // Walks can end on nodes without out edges; treat them as degree 1.
+               let d = (graph.degree(*k).max(1) as f32).powf(self.beta);
                *v /= (self.walks as f32) * d;
            });
         counts
@@ -117,15 +120,21 @@ impl GuidedRWR {
 
         // Compute teleport if restart probability
         if let Steps::Probability(p, _iterations) = self.steps {
-            let teleport = next.par_values_mut().map(|cnt| {
-                let discount = (*cnt * (1. - p)).floor();
-                let teleport = *cnt - discount;
-                *cnt = discount;
+            // Each walk teleports home independently with probability p.  Flooring the expected
+            // count instead sends every lone walk home.
+            let teleport_seed: u64 = rng.gen();
+            let teleport = next.par_iter_mut().map(|(node, cnt)| {
+                let mut node_rng = XorShiftRng::seed_from_u64(node_seed(teleport_seed, 0, 0, *node));
+                let stay = Binomial::new(*cnt as u64, (1. - p) as f64)
+                    .expect("p must be in (0, 1)")
+                    .sample(&mut node_rng) as f32;
+                let teleport = *cnt - stay;
+                *cnt = stay;
                 teleport
             }).sum::<f32>();
             
             // Update start node
-            *next.entry(*start_node).or_insert(0.) += teleport.round();
+            *next.entry(*start_node).or_insert(0.) += teleport;
         }
     }
 }
@@ -195,4 +204,27 @@ mod grwr_tests {
         assert_eq!(candidates[2].0, 2);
     }
 
+
+    /// Same fan-out as the RWR test: after one hop with restart probability 0.1, about 90% of
+    /// walks should sit on the children rather than teleport home.
+    #[test]
+    fn test_grwr_restarts_are_unbiased_when_walks_spread() {
+        let mut edges = Vec::new();
+        for i in 1..=100 {
+            edges.push((0, i, 1.));
+            edges.push((i, 0, 1.));
+        }
+        let ccsr = CumCSR::convert(CSR::construct_from_edges(edges, false));
+        let rwr = GuidedRWR {
+            steps: Steps::Probability(0.1, 1),
+            walks: 100,
+            alpha: 0.,
+            beta: 0.,
+            seed: 1234
+        };
+        let es = EmbeddingStore::new(ccsr.len(), 1, Distance::Cosine);
+        let scores = rwr.sample(&ccsr, &Unweighted, &es, 0, &[0f32]);
+        let on_children: f32 = scores.iter().filter(|(k, _)| **k > 0).map(|(_, v)| *v).sum();
+        assert!((on_children - 0.9).abs() < 0.1, "fraction on children: {}", on_children);
+    }
 }

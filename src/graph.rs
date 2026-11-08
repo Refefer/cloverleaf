@@ -72,6 +72,11 @@ impl CSR {
         deduplicate: bool
     ) -> Self {
 
+        // No edges means no nodes
+        if edges.is_empty() {
+            return CSR { rows: vec![0], columns: Vec::new(), weights: Vec::new() }
+        }
+
         if deduplicate {
             CSR::deduplicate_edges(&mut edges);
         }
@@ -947,5 +952,15 @@ mod csr_tests {
                 assert_eq!(x, i as f32);
             }
         }
+    }
+
+    /// No edges means no nodes, not a single phantom node 0.
+    #[test]
+    fn test_empty_edges_build_empty_graph() {
+        let csr = CSR::construct_from_edges(Vec::new(), false);
+        assert_eq!(csr.len(), 0);
+        assert_eq!(csr.edges(), 0);
+        let ccsr = CumCSR::convert(csr);
+        assert_eq!(ccsr.len(), 0);
     }
 }
