@@ -1,5 +1,6 @@
 //! Finds all connected components in the graph and returns a connected component list
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap,HashSet};
 
 use crate::NodeID;
 use crate::bitset::BitSet;
@@ -65,19 +66,23 @@ pub fn prune_graph_components(
 ) -> Vec<(NodeID,NodeID,f32)> {
     let es = find_connected_components(graph);
     
-    // Component ids are 1-based and every node can be its own component (eg. self loops or
-    // nodes without out edges), so there are at most N components.
+    // Component ids are 1-based.  Size the counts by the components that actually exist rather
+    // than by the node count, which can be far larger.
     let n = graph.len();
-    let mut counts = vec![0usize; n + 1];
-
+    let num_components = (0..n).map(|node_id| get_component(&es, node_id)).max().unwrap_or(0);
+    let mut counts = vec![0usize; num_components + 1];
     for node_id in 0..n {
-        let component_id = get_component(&es, node_id);
-        counts[component_id] += 1;
+        counts[get_component(&es, node_id)] += 1;
     }
-    let mut idxs: Vec<usize> = (0..counts.len()).collect();
-    idxs.sort_by_key(|v| counts[*v]);
-    // Grab the top K clusters
-    let clusters = idxs.iter().rev().take(k).collect::<HashSet<_>>();
+
+    // Keep the K largest components with a K-sized min-heap instead of sorting every component.
+    let mut heap = BinaryHeap::with_capacity(k + 1);
+    for (component_id, count) in counts.iter().enumerate().skip(1) {
+        heap.push(Reverse((*count, component_id)));
+        if heap.len() > k { heap.pop(); }
+    }
+    drop(counts);
+    let clusters: HashSet<usize> = heap.into_iter().map(|Reverse((_, c))| c).collect();
 
     let mut subgraph = Vec::new();
     for node_id in 0..graph.len() {
