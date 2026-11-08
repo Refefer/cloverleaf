@@ -31,6 +31,8 @@ The library is broken up into a few different methods:
 4. `RUSTFLAGS="-C target-cpu=native" maturin develop --release`
 5. Profit!
 
+To run the tests, `cargo test --release` covers the Rust side; for the Python bindings, `pip install pytest`, build the module as above, then run `pytest`.
+
 ## Data Format
 
 Graphs can be defined either adhoc or loaded from files.  Notably, Cloverleaf does _not_ allow for live graph updating currently; this allows it to make a number of optimizations to maximize the memory and compute efficiency of the graph.
