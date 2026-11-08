@@ -25,9 +25,9 @@ The library is broken up into a few different methods:
 
 ## Installation
 
-1. Create a new python virtualenv
-2. `pip install maturin numpy`
-3. Ensure you have the latest Rust compiler
+1. Create a new python virtualenv (Python 3.9 or newer)
+2. `pip install "maturin>=1.9.4" numpy`
+3. Ensure you have the latest Rust compiler (1.85 or newer)
 4. `RUSTFLAGS="-C target-cpu=native" maturin develop --release`
 5. Profit!
 

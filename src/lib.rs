@@ -180,7 +180,7 @@ enum QueryType {
 }
 
 /// Type of Query to issue: a direct node lookup or an embedding
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct Query {
     qt: QueryType
@@ -250,8 +250,8 @@ impl Query {
 ///    Contains the set of distance metrics used by NodeEmbeddings, typically application
 ///    dependent.
 ///
-#[pyclass]
-#[derive(Clone)]
+#[pyclass(eq, eq_int, from_py_object)]
+#[derive(Clone,PartialEq)]
 pub enum Distance {
     /// Uses Cosine distance - useful for general embedding problems.
     Cosine,
@@ -401,6 +401,7 @@ impl Graph {
     ///
     ///     Throws a KeyError if the node doesn't exist in the graph
     ///     
+    #[pyo3(signature = (node, normalized=None))]
     pub fn get_edges(&self, node: FQNode, normalized: Option<bool>) -> PyResult<(Vec<FQNode>, Vec<f32>)> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
         let (edges, weights) = self.graph.get_edges(node_id);
@@ -441,6 +442,7 @@ impl Graph {
     ///    Returns
     ///    -------
     ///     
+    #[pyo3(signature = (path, comp_level=None))]
     pub fn save(&self, path: &str, comp_level: Option<u32>) -> PyResult<()> {
         let mut bw = open_file_for_writing(path, comp_level)?;
         for node in 0..self.graph.len() {
@@ -499,6 +501,7 @@ impl Graph {
     ///    -------
     ///    Self - Can throw exception
     ///        
+    #[pyo3(signature = (path, edge_type, chunk_size=None, skip_rows=None, weighted=None, deduplicate=None))]
     pub fn load(
         py: Python<'_>,
         path: &str, 
@@ -509,7 +512,7 @@ impl Graph {
         deduplicate: Option<bool>
     ) -> PyResult<Self> {
 
-        py.allow_threads(move || {
+        py.detach(move || {
             let (vocab, csr) = GraphReader::load(
                 path, 
                 edge_type, 
@@ -566,6 +569,7 @@ impl RandomWalker {
     ///    Self
     ///        
     #[new]
+    #[pyo3(signature = (restarts, walks, beta=None))]
     fn new(restarts: f32, walks: usize, beta: Option<f32>) -> PyResult<Self> {
         // Reject 0 and NaN explicitly: neither is a meaningful restart probability or walk length.
         if !(restarts > 0f32) {
@@ -609,13 +613,14 @@ impl RandomWalker {
     ///    List[(FQNode, Float)] - Can throw exception
     ///        List of fully qualified nodes and their fractional scores.
     ///
+    #[pyo3(signature = (graph, node, seed=None, k=None, filter_type=None, single_threaded=None, weighted=None))]
     pub fn walk(
         &self, 
         graph: &Graph,
         node: FQNode, 
         seed: Option<u64>, 
         k: Option<usize>, 
-        filter_type: Option<&PyAny>,
+        filter_type: Option<&Bound<'_, PyAny>>,
         single_threaded: Option<bool>,
         weighted: Option<bool>
     ) -> PyResult<Vec<(FQNode, f32)>> {
@@ -690,6 +695,7 @@ impl BiasedRandomWalker {
     ///    -------
     ///    Self
     ///        
+    #[pyo3(signature = (restarts, walks, beta=None, blend=None))]
     fn new(restarts: f32, walks: usize, beta: Option<f32>, blend: Option<f32>) -> Self {
         BiasedRandomWalker { restarts, walks, beta, blend }
     }
@@ -735,6 +741,7 @@ impl BiasedRandomWalker {
     ///    List[(FQNode, Float)] - Can throw exception
     ///        List of fully qualified nodes and their fractional scores.
     ///        
+    #[pyo3(signature = (graph, embeddings, node, context, k=None, seed=None, rerank_context=None, filter_type=None))]
     pub fn walk(
         &self, 
         graph: &Graph,
@@ -744,7 +751,7 @@ impl BiasedRandomWalker {
         k: Option<usize>, 
         seed: Option<u64>, 
         rerank_context: Option<&Query>,
-        filter_type: Option<&PyAny>
+        filter_type: Option<&Bound<'_, PyAny>>
     ) -> PyResult<Vec<(FQNode, f32)>> {
         ensure_aligned(&graph.vocab, &embeddings.vocab, "Graph and NodeEmbeddings")?;
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
@@ -821,6 +828,7 @@ impl SparsePPR {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (restarts, eps=None))]
     fn new(restarts: f32, eps: Option<f32>) -> PyResult<Self> {
         if restarts <= 0f32 || restarts >= 1f32 {
             return Err(PyValueError::new_err("restarts must be between (0, 1)"))
@@ -854,12 +862,13 @@ impl SparsePPR {
     ///    List[(FQNode, f32)] - Can throw exception
     ///        List of fully qualified nodes and their fractional scores
     ///    
+    #[pyo3(signature = (graph, node, k=None, filter_type=None))]
     pub fn compute(
         &self, 
         graph: &Graph,
         node: FQNode, 
         k: Option<usize>, 
-        filter_type: Option<&PyAny>
+        filter_type: Option<&Bound<'_, PyAny>>
     ) -> PyResult<Vec<(FQNode, f32)>> {
 
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
@@ -874,8 +883,8 @@ impl SparsePPR {
 
 
 /// Type of edge.  Undirected edges internally get converted to two directed edges.
-#[pyclass]
-#[derive(Clone)]
+#[pyclass(eq, eq_int, from_py_object)]
+#[derive(Clone,PartialEq)]
 pub enum EdgeType {
     Directed,
     Undirected
@@ -950,6 +959,7 @@ impl GraphBuilder {
     ///    Graph - Optional
     ///        Creates a Graph for usage.  If no edges have been specified, returns None.
     ///    
+    #[pyo3(signature = (deduplicate=None))]
     pub fn build_graph(&mut self, deduplicate: Option<bool>) -> Option<Graph> {
         if self.edges.len() == 0 {
             return None
@@ -971,7 +981,7 @@ impl GraphBuilder {
 
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 struct LossWeighting {
     loss: EPLW
@@ -995,7 +1005,7 @@ impl LossWeighting {
 }
 
 /// A python wrapper for the internal ADT used for defining losses
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 struct EPLoss {
     loss: Loss
@@ -1021,6 +1031,7 @@ impl EPLoss {
     ///        
     ///    
     #[staticmethod]
+    #[pyo3(signature = (gamma, negatives=None))]
     pub fn margin(gamma: f32, negatives: Option<usize>) -> Self {
         EPLoss { loss: Loss::MarginLoss(gamma, negatives.unwrap_or(1)) }
     }
@@ -1237,6 +1248,7 @@ impl EmbeddingPropagator {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention=None, attention_heads=None, context_window=None, noise=None))]
     pub fn new(
         // Learning rate
         alpha: Option<f32>, 
@@ -1359,6 +1371,7 @@ impl EmbeddingPropagator {
     ///    NodeEmbeddings
     ///        A mapping from features -> embedding
     ///    
+    #[pyo3(signature = (graph, features, feature_embeddings=None))]
     pub fn learn_features(
         &mut self, 
         graph: &Graph, 
@@ -1424,7 +1437,7 @@ pub enum FeatureNs {
     Prefix(String)
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct FeatureNamespace(FeatureNs);
 
@@ -1529,6 +1542,7 @@ impl FeatureSet {
     ///        
     ///    
     #[staticmethod]
+    #[pyo3(signature = (path, namespace=None))]
     pub fn new_from_file(
         path: String, 
         namespace: Option<FeatureNamespace>
@@ -1606,6 +1620,7 @@ impl FeatureSet {
     ///    () - Can throw exception
     ///        
     ///    
+    #[pyo3(signature = (path, f_ns=None))]
     pub fn load_into(
         &mut self,
         path: String,
@@ -1750,6 +1765,7 @@ impl FeaturePropagator {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (k, threshold=None, max_iters=None))]
     pub fn new(k: usize, threshold: Option<f32>, max_iters: Option<usize>) -> Self {
         FeaturePropagator { 
             k: k, 
@@ -1807,7 +1823,7 @@ enum AggregatorType {
 }
 
 /// This constructs node embeddings based on the AggregatorType and a set of FeatureEmbeddings.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct FeatureAggregator {
     at: AggregatorType
@@ -1859,6 +1875,7 @@ impl FeatureAggregator {
     ///    
     #[allow(non_snake_case)]
     #[staticmethod]
+    #[pyo3(signature = (num_heads, d_k, window=None))]
     pub fn Attention(num_heads: usize, d_k: usize, window: Option<usize>) -> Self {
         FeatureAggregator { at: AggregatorType::Attention {num_heads, d_k, window} }
     }
@@ -2168,6 +2185,7 @@ impl NodeEmbedder {
     ///    List[Float] - Can throw exception
     ///        Embedding
     ///    
+    #[pyo3(signature = (features, feature_embeddings, strict=None))]
     pub fn embed_adhoc(
         &self, 
         features: Vec<FQNode>,
@@ -2216,6 +2234,7 @@ impl NodeEmbedder {
     ///    List[List[Float]] - Can throw exception
     ///        
     ///    
+    #[pyo3(signature = (features_set, feature_embeddings, strict=None))]
     pub fn bulk_embed_adhoc(&self, 
         features_set: Vec<Vec<FQNode>>,
         feature_embeddings: &NodeEmbeddings,
@@ -2267,6 +2286,7 @@ impl DistanceEmbedder {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (n_landmarks, seed=None))]
     pub fn new(n_landmarks: usize, seed: Option<u64>) -> Self {
         let ls = if let Some(seed) = seed {
             algos::dist::LandmarkSelection::Random(seed)
@@ -2339,6 +2359,7 @@ impl ClusterLPAEmbedder {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (k, passes, seed=None))]
     pub fn new(k: usize, passes: usize, seed: Option<u64>) -> Self {
         ClusterLPAEmbedder {
             k, passes, seed
@@ -2373,8 +2394,8 @@ impl ClusterLPAEmbedder {
     }
 }
 
-#[pyclass]
-#[derive(Clone,Copy)]
+#[pyclass(eq, eq_int, from_py_object)]
+#[derive(Clone,Copy,PartialEq)]
 pub enum ListenerRule {
     Best,
     Probabilistic
@@ -2419,6 +2440,7 @@ impl SLPAEmbedder {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (t, threshold, memory_size=None, rule=None, seed=None))]
     pub fn new(
         t: usize, 
         threshold: usize, 
@@ -2513,6 +2535,7 @@ impl PageRank {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (iterations, damping=None, eps=None))]
     pub fn new(iterations: usize, damping: Option<f64>, eps: Option<f64>) -> Self {
         PageRank {iterations, damping: damping.unwrap_or(0.85), eps: eps.unwrap_or(1e-5) }
     }
@@ -2537,6 +2560,7 @@ impl PageRank {
     ///    NodeEmbeddings
     ///        NodeEmbeddings of dimension=1, where the value is the page rank score.
     ///    
+    #[pyo3(signature = (graph, indicator=None))]
     pub fn learn(&self, graph: &Graph, indicator: Option<bool>) -> NodeEmbeddings {
         let page_rank = crate::algos::pagerank::PageRank::new(self.iterations, self.damping, self.eps);
         let scores = page_rank.compute(graph.graph.as_ref(), indicator.unwrap_or(true));
@@ -2704,11 +2728,12 @@ impl NodeEmbeddings {
     ///    List[(FQNode, f32)]
     ///        Set of fully qualified nodes and distances.
     ///    
+    #[pyo3(signature = (emb, k, filter_type=None))]
     pub fn nearest_neighbor(
         &self, 
         emb: Vec<f32>, 
         k: usize,
-        filter_type: Option<&PyAny>
+        filter_type: Option<&Bound<'_, PyAny>>
     ) -> PyResult<Vec<(FQNode, f32)>> {
         let emb = Entity::Embedding(&emb);
         let fts = convert_filter_type(filter_type)?;
@@ -2833,6 +2858,7 @@ impl NodeEmbeddings {
     ///    () - Can throw exception
     ///        
     ///    
+    #[pyo3(signature = (path, comp_level=None))]
     pub fn save(&self, path: &str, comp_level: Option<u32>) -> PyResult<()> {
         let mut writer = EmbeddingWriter::new(path, self.vocab.as_ref(), comp_level)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -2873,17 +2899,18 @@ impl NodeEmbeddings {
     ///        
     ///    
     #[staticmethod]
+    #[pyo3(signature = (path, distance=None, filter_type=None, chunk_size=None, skip_rows=None))]
     pub fn load(
         py: Python<'_>,
         path: &str, 
         distance: Option<Distance>, 
-        filter_type: Option<&PyAny>, 
+        filter_type: Option<&Bound<'_, PyAny>>, 
         chunk_size: Option<usize>,
         skip_rows: Option<usize>
     ) -> PyResult<Self> {
         let fts = convert_filter_type(filter_type)?;
         let fts_ref = fts.as_ref();
-        py.allow_threads(move || {
+        py.detach(move || {
             let (vocab, es) = EmbeddingReader::load(
                 path, 
                 distance.unwrap_or(Distance::Cosine).to_edist(), 
@@ -3009,18 +3036,15 @@ impl VocabIterator {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
-        Python::with_gil(|py| -> Option<PyObject> {
-            if slf.cur_idx < slf.vocab.len() {
-                let (node_type, name) = slf.vocab.get_name(slf.cur_idx).unwrap();
-                let node_type = (*node_type).clone().into_py(py);
-                let name = name.to_string().into_py(py);
-                slf.cur_idx += 1;
-                Some((node_type, name).into_py(py))
-            } else {
-                None
-            }
-        })
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<FQNode> {
+        if slf.cur_idx < slf.vocab.len() {
+            let (node_type, name) = slf.vocab.get_name(slf.cur_idx).unwrap();
+            let fqn = ((*node_type).clone(), name.to_string());
+            slf.cur_idx += 1;
+            Some(fqn)
+        } else {
+            None
+        }
     }
 }
 
@@ -3054,6 +3078,7 @@ impl NeighborhoodAligner {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (alpha=None, max_neighbors=None))]
     pub fn new(alpha: Option<f32>, max_neighbors: Option<usize>) -> Self {
         let aligner = NA::new(alpha, max_neighbors);
         NeighborhoodAligner {aligner}
@@ -3126,6 +3151,7 @@ impl NeighborhoodAligner {
     ///    () - Can throw exception
     ///        
     ///    
+    #[pyo3(signature = (path, embeddings, graph, chunk_size=None, comp_level=None))]
     pub fn align_to_disk(
         &self, 
         path: &str,
@@ -3200,6 +3226,7 @@ impl EmbeddingAligner {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (num_nodes, random_nodes=None, alpha=None, error=None, max_iters=None))]
     pub fn new(
         num_nodes: usize, 
         random_nodes: Option<usize>,
@@ -3245,6 +3272,7 @@ impl EmbeddingAligner {
     ///    List[Float] - Can throw exception
     ///        Returns the new embedding
     ///
+    #[pyo3(signature = (orig_embeddings, orig_ann, translated_embeddings, emb, seed=None))]
     pub fn align(&self, 
         orig_embeddings: &NodeEmbeddings, 
         orig_ann: &EmbAnn,
@@ -3313,6 +3341,7 @@ impl EmbeddingAligner {
     ///    List[List[Float]] - Can throw exception
     ///        
     ///    
+    #[pyo3(signature = (orig_embeddings, orig_ann, translated_embeddings, queries, seed=None))]
     pub fn bulk_align(&self, 
         orig_embeddings: &NodeEmbeddings, 
         orig_ann: &EmbAnn,
@@ -3361,6 +3390,7 @@ impl GraphAnn {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (graph, max_steps=None))]
     pub fn new(graph: &Graph, max_steps: Option<usize>) -> Self {
         GraphAnn {
             graph: graph.graph.clone(),
@@ -3396,6 +3426,7 @@ impl GraphAnn {
     ///    List[(FQNode, f32)] - Can throw exception
     ///        Set of fully qualified nodes and associated scores.
     ///    
+    #[pyo3(signature = (query, embeddings, k, seed=None))]
     pub fn find(
         &self, 
         query: &Query,
@@ -3454,13 +3485,14 @@ impl EmbAnn {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (embs, n_trees, max_nodes_per_leaf, test_hp_per_split=None, num_sampled_nodes_split_test=None, filter_type=None, seed=None))]
     pub fn new(
         embs: &NodeEmbeddings, 
         n_trees: usize,
         max_nodes_per_leaf: usize,
         test_hp_per_split: Option<usize>,
         num_sampled_nodes_split_test: Option<usize>,
-        filter_type: Option<&PyAny>,
+        filter_type: Option<&Bound<'_, PyAny>>,
         seed: Option<u64>
     ) -> PyResult<Self> {
         let mut ann = Ann::new();
@@ -3511,6 +3543,7 @@ impl EmbAnn {
     ///    List[(FQNode, f32)] - Can throw exception
     ///        List of fully qualified nodes and their associated distances.
     ///    
+    #[pyo3(signature = (embeddings, query, k, min_search_size=None))]
     pub fn find(
         &self, 
         embeddings: &NodeEmbeddings,
@@ -3584,6 +3617,7 @@ impl Smci {
         Ok(())
     }
 
+    #[pyo3(signature = (iterations, num_walks, alpha, discount, step_penalty, explore_pct, restart_prob, compression=None, embeddings=None, seed=None))]
     pub fn optimize(
         &self, 
         iterations: usize,
@@ -3675,6 +3709,7 @@ impl PolicyEvaluation {
     ///    -------
     ///    Self
     #[new]
+    #[pyo3(signature = (graph, gamma=None, iterations=None, eps=None, temperature=None))]
     pub fn new(
         graph: &Graph,
         gamma: Option<f32>,
@@ -3781,6 +3816,7 @@ impl PolicyEvaluation {
     ///    Returns
     ///    -------
     ///    () - Can throw exception
+    #[pyo3(signature = (graph, no_copy=None, indicator=None))]
     pub fn optimize(
         &self,
         graph: &mut Graph,
@@ -3939,6 +3975,7 @@ impl PprRankLearner {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (alpha, batch_size, dims, passes, steps, walks, k, negatives, loss=None, compression=None, beta=None, num_features=None, weight_decay=None, valid_pct=None))]
     fn new(
          // Learning rate
         alpha: f32, 
@@ -4045,6 +4082,7 @@ impl PprRankLearner {
     ///    NodeEmbeddings
     ///        Learned Feature Embeddings.
     ///    
+    #[pyo3(signature = (graph, features, feature_embeddings=None, indicator=None, seed=None))]
     pub fn learn_features(
         &self, 
         graph: &Graph, 
@@ -4148,8 +4186,8 @@ impl VpcgFeatureMappings {
 }
 
 /// Tells the VPCG algorithm how to weight the initial features
-#[pyclass]
-#[derive(Clone)]
+#[pyclass(eq, eq_int, from_py_object)]
+#[derive(Clone,PartialEq)]
 pub enum FeatureWeight {
     /// All features are initialized uniformly: 1 / feat
     Uniform,
@@ -4227,6 +4265,7 @@ impl VpcgEmbedder {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (max_terms, passes, dims, alpha=None, err=None, feature_weight=None))]
     pub fn new(
         max_terms: usize, 
         passes: usize, 
@@ -4272,7 +4311,7 @@ impl VpcgEmbedder {
     pub fn learn(&self, 
         graph: &Graph, 
         features: &mut FeatureSet,
-        start_node_type: &PyAny
+        start_node_type: &Bound<'_, PyAny>
     ) -> PyResult<NodeEmbeddings> {
         let feature_maps = self.learn_feature_mapping(graph, features, start_node_type)?;
         let embs = VPCG::convert_to_es(features.num_features(), self.dims, feature_maps.feature_mappings);
@@ -4305,7 +4344,7 @@ impl VpcgEmbedder {
     pub fn learn_feature_mapping(&self, 
         graph: &Graph, 
         features: &mut FeatureSet,
-        start_node_type: &PyAny
+        start_node_type: &Bound<'_, PyAny>
     ) -> PyResult<VpcgFeatureMappings> {
         let start_node_types = single_or_multistring(start_node_type)?;
 
@@ -4387,6 +4426,7 @@ impl PPREmbedder {
     ///        
     ///    
     #[new]
+    #[pyo3(signature = (dims, num_walks, steps, beta=None, eps=None))]
     pub fn new(
         dims: usize,
         num_walks: usize, 
@@ -4426,6 +4466,7 @@ impl PPREmbedder {
     ///    -------
     ///    NodeEmbeddings - Can throw exception
     ///    
+    #[pyo3(signature = (graph, features, seed=None))]
     pub fn learn(&self, 
         graph: &Graph, 
         features: &mut FeatureSet,
@@ -4509,6 +4550,7 @@ impl InstantEmbeddings {
     ///        
     ///    
     #[staticmethod]
+    #[pyo3(signature = (dims, hashes, num_walks, steps, beta=None, seed=None))]
     pub fn random_walk(
         dims: usize,
         hashes: usize,
@@ -4565,6 +4607,7 @@ impl InstantEmbeddings {
     ///        
     ///    
     #[staticmethod]
+    #[pyo3(signature = (dims, hashes, steps, eps=None))]
     pub fn sparse_ppr(
         dims: usize,
         hashes: usize,
@@ -4818,6 +4861,7 @@ impl LSR {
     ///    NodeEmbeddings 
     ///        Logits for rankings
     ///    
+    #[pyo3(signature = (tournament, indicator=None))]
     pub fn learn(
         &self,
         tournament: &Tournament,
@@ -4914,6 +4958,7 @@ struct RandomPath {
 impl RandomPath {
 
     #[new]
+    #[pyo3(signature = (seed=None))]
     pub fn new(seed: Option<u64>) -> Self {
         let rng = XorShiftRng::seed_from_u64(seed.unwrap_or(SEED + 125));
         RandomPath { rng }
@@ -5009,7 +5054,7 @@ fn convert_node_distance(
         }).collect()
 }
 
-fn single_or_multistring(xs: &PyAny) -> PyResult<HashSet<String>> {
+fn single_or_multistring(xs: &Bound<'_, PyAny>) -> PyResult<HashSet<String>> {
     // Try to extract a single string first.
     let mut hs = HashSet::new();
     if let Ok(s) = xs.extract::<String>() {
@@ -5026,13 +5071,15 @@ fn single_or_multistring(xs: &PyAny) -> PyResult<HashSet<String>> {
 }
 
 fn convert_filter_type(
-    filter_type: Option<&PyAny>
+    filter_type: Option<&Bound<'_, PyAny>>
 ) -> PyResult<Option<HashSet<String>>> {
     filter_type.map(|pa| single_or_multistring(pa)).transpose()
 }
 
-#[pymodule]
-fn cloverleaf(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+// Training shares embedding stores across rayon threads without locks, so keep the GIL on
+// free-threaded interpreters rather than letting Python threads race on the same objects.
+#[pymodule(gil_used = true)]
+fn cloverleaf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Graph>()?;
     m.add_class::<Distance>()?;
     m.add_class::<GraphBuilder>()?;
