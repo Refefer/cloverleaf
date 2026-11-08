@@ -35,6 +35,13 @@ impl Vocab {
         self.vocab_id == other.vocab_id
     }
 
+    /// True when both vocabs give every node the same id, so ids from one can index data built
+    /// on the other.  Free when they are the same vocab; otherwise one lookup per node.
+    pub fn is_aligned_with(&self, other: &Vocab) -> bool {
+        self.is_identical(other) || (self.len() == other.len()
+            && (0..self.len()).all(|id| self.translate_node(other, id) == Some(id)))
+    }
+
     pub fn get_node_id<A: Into<String>, B: AsRef<str>>(&self, node_type: A, name: B) -> Option<NodeID> {
         self.get_node_id_int(&Arc::new(node_type.into()), name.as_ref())
     }
@@ -163,5 +170,21 @@ mod vocab_tests {
         assert!(!a.is_identical(&b));
         assert_eq!(b.create_translation_table(&a), vec![Some(0), None]);
         assert_eq!(a.translate_node(&b, 1), None);
+    }
+
+    fn vocab_of(names: &[&str]) -> Vocab {
+        let mut v = Vocab::new();
+        names.iter().for_each(|n| { v.get_or_insert("n", *n); });
+        v
+    }
+
+    #[test]
+    fn test_is_aligned_with() {
+        let a = vocab_of(&["x", "y", "z"]);
+        assert!(a.is_aligned_with(&a.clone()));
+        assert!(a.is_aligned_with(&vocab_of(&["x", "y", "z"])));
+        assert!(!a.is_aligned_with(&vocab_of(&["y", "x", "z"])));
+        assert!(!a.is_aligned_with(&vocab_of(&["x", "y"])));
+        assert!(!a.is_aligned_with(&vocab_of(&["x", "y", "w"])));
     }
 }

@@ -60,9 +60,9 @@ use crate::graph::{CSR,CumCSR,Graph as CGraph,NodeID,CDFtoP,Transpose};
 use crate::vocab::{Vocab,TranslationTable};
 use crate::sampler::{Weighted,Unweighted};
 use crate::distance::{Distance as EDist};
-use crate::embeddings::{EmbeddingStore,Entity};
+use crate::embeddings::{EmbeddingStore,EmbeddingBuffer,DimensionMismatch,Entity};
 use crate::feature_store::FeatureStore;
-use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader,open_file_for_reading,open_file_for_writing};
+use crate::io::{EmbeddingWriter,EmbeddingReader,GraphReader,open_file_for_reading,open_file_for_writing,read_feature_vocab};
 
 use crate::algos::aggregator::{WeightedAggregator,UnigramProbability,AvgAggregator,AttentionAggregator, EmbeddingBuilder};
 use crate::algos::alignment::{NeighborhoodAligner as NA};
@@ -131,6 +131,34 @@ fn convert_node_id_to_fqn(
 
 
 /// Convenience method for getting an internal node id from pretty name
+/// Errors unless node ids from `a` index the same nodes in `b`.
+fn ensure_aligned(a: &Vocab, b: &Vocab, what: &str) -> PyResult<()> {
+    if a.is_aligned_with(b) {
+        Ok(())
+    } else {
+        Err(PyValueError::new_err(format!(
+            "{} must have the same nodes in the same order (build one from the other)", what)))
+    }
+}
+
+fn dimension_error(e: DimensionMismatch) -> PyErr {
+    PyValueError::new_err(format!(
+        "Embedding has {} dimensions, expected {}", e.actual, e.expected))
+}
+
+/// Resolves a Python-style index, where negative values count back from the end.
+fn resolve_index(mut idx: isize, len: usize) -> Option<usize> {
+    let len = len as isize;
+    if idx < 0 {
+        idx += len;
+    }
+    if idx < 0 || idx >= len {
+        None
+    } else {
+        Some(idx as usize)
+    }
+}
+
 fn get_node_id<A: AsRef<str>, B: AsRef<str>>(
     vocab: &Vocab, 
     node_type: A,
@@ -718,6 +746,7 @@ impl BiasedRandomWalker {
         rerank_context: Option<&Query>,
         filter_type: Option<&PyAny>
     ) -> PyResult<Vec<(FQNode, f32)>> {
+        ensure_aligned(&graph.vocab, &embeddings.vocab, "Graph and NodeEmbeddings")?;
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
         let g_emb = lookup_embedding(context, embeddings)?;
         
@@ -1335,9 +1364,14 @@ impl EmbeddingPropagator {
         graph: &Graph, 
         features: &mut FeatureSet,
         feature_embeddings: Option<&mut NodeEmbeddings>
-    ) -> NodeEmbeddings {
+    ) -> PyResult<NodeEmbeddings> {
 
+        ensure_aligned(&graph.vocab, &features.vocab, "Graph and FeatureSet")?;
         features.features.fill_missing_nodes();
+        if let Some(fes) = feature_embeddings.as_deref() {
+            ensure_aligned(features.features.get_vocab(), &fes.vocab,
+                           "FeatureSet features and warm-start feature embeddings")?;
+        }
 
         // Pull out the EmbeddingStore
         let feature_embeddings = feature_embeddings.map(|fes| {
@@ -1371,7 +1405,7 @@ impl EmbeddingPropagator {
             vocab: Arc::new(vocab),
             embeddings: feat_embeds};
 
-        feature_embeddings
+        Ok(feature_embeddings)
 
     }
     
@@ -1400,8 +1434,8 @@ impl FeatureNamespace {
             FeatureNs::Static(ref s) => Some((s, token)),
             FeatureNs::NodeType => Some((node_type, token)),
             FeatureNs::Prefix(ref delim) => {
-                token.find(delim).map(|idx| {
-                    (&token[..idx], &token[(idx+1)..])
+                token.find(delim.as_str()).map(|idx| {
+                    (&token[..idx], &token[(idx + delim.len())..])
                 })
             }
         }
@@ -1421,8 +1455,11 @@ impl FeatureNamespace {
     }
 
     #[staticmethod]
-    pub fn prefix(delim: String) -> Self {
-        FeatureNamespace(FeatureNs::Prefix(delim))
+    pub fn prefix(delim: String) -> PyResult<Self> {
+        if delim.is_empty() {
+            return Err(PyValueError::new_err("Prefix delimiter must not be empty"))
+        }
+        Ok(FeatureNamespace(FeatureNs::Prefix(delim)))
     }
 
 }
@@ -1444,20 +1481,7 @@ pub struct FeatureSet {
 impl FeatureSet {
 
     fn read_vocab_from_file(path: &str) -> PyResult<Vocab> {
-        let mut vocab = Vocab::new();
-        let f = File::open(path)
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
-
-        let br = BufReader::new(f);
-        for line in br.lines() {
-            let line = line.unwrap();
-            let pieces: Vec<_> = line.split('\t').collect();
-            if pieces.len() != 3 {
-                return Err(PyValueError::new_err("Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ..."))
-            }
-            vocab.get_or_insert(pieces[0], pieces[1]);
-        }
-        Ok(vocab)
+        Ok(read_feature_vocab(path)?)
     }
 }
 
@@ -1592,7 +1616,7 @@ impl FeatureSet {
 
         let f_ns = f_ns.unwrap_or_default();
         for (i, line) in reader.lines().enumerate() {
-            let line = line.unwrap();
+            let line = line.map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
             let pieces: Vec<_> = line.split('\t').collect();
             if pieces.len() != 3 {
                 let line_id = i + 1;
@@ -1674,17 +1698,11 @@ impl FeatureSet {
     ///    (FQNode) - Can throw exception
     ///        
     ///    
-    pub fn __getitem__(&self, mut idx: isize) -> PyResult<FQNode> {
-        let len = self.features.num_features() as isize;
-        // Negative indexing
-        if idx < 0 {
-            idx += len;
-        }
-        if idx >= len {
-            return Err(PyIndexError::new_err(format!("Feature Index larger than FeatureSet!")));
-        }
+    pub fn __getitem__(&self, idx: isize) -> PyResult<FQNode> {
+        let idx = resolve_index(idx, self.features.num_features())
+            .ok_or_else(|| PyIndexError::new_err("Feature index out of range for FeatureSet!"))?;
 
-        let fqn = self.features.get_pretty_feature(idx as usize);
+        let fqn = self.features.get_pretty_feature(idx);
         Ok(fqn)
     }
 
@@ -1758,13 +1776,15 @@ impl FeaturePropagator {
     pub fn propagate(&self,
         graph: &Graph,
         features: &mut FeatureSet
-    ) {
+    ) -> PyResult<()> {
+        ensure_aligned(&graph.vocab, &features.vocab, "Graph and FeatureSet")?;
         propagate_features(
             graph.graph.deref(), 
             &mut features.features, 
             self.max_iters,
             self.k,
             self.threshold);
+        Ok(())
     }
 
 }
@@ -2577,28 +2597,19 @@ impl NodeEmbeddings {
     pub fn new_from_list(
         list: Vec<((String, String), Vec<f32>)>, 
         distance: Distance
-    ) -> Self {
+    ) -> PyResult<Self> {
         let mut vocab = Vocab::new();
-        let mut embs = Vec::with_capacity(list.len());
-        let mut max_emb_size = 0;
-
-        // Add to vocab
-        list.into_iter().for_each(|((node_type, node_name), emb)| {
+        let mut embeddings = EmbeddingBuffer::new();
+        for ((node_type, node_name), emb) in list.into_iter() {
+            embeddings.check(emb.len()).map_err(dimension_error)?;
             let node_id = vocab.get_or_insert(node_type, node_name);
-            max_emb_size = max_emb_size.max(emb.len());
-            embs.push((node_id, emb))
-        });
-
-        // Update embeddings
-        let mut es = EmbeddingStore::new(vocab.len(), max_emb_size, distance.to_edist());
-        embs.into_iter().for_each(|(node_id, emb)| {
-            es.set_embedding(node_id, &emb);
-        });
-
-        NodeEmbeddings {
-            vocab: Arc::new(vocab),
-            embeddings: es
+            embeddings.set(node_id, &emb).map_err(dimension_error)?;
         }
+
+        Ok(NodeEmbeddings {
+            vocab: Arc::new(vocab),
+            embeddings: embeddings.into_store(distance.to_edist())
+        })
     }
 
     /// Simple Python representation 
@@ -2657,9 +2668,7 @@ impl NodeEmbeddings {
     ///    
     pub fn set_embedding(&mut self, node: FQNode, embedding: Vec<f32>) -> PyResult<()> {
         let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
-        let es = &mut self.embeddings;
-        es.set_embedding(node_id, &embedding);
-        Ok(())
+        self.embeddings.set_embedding(node_id, &embedding).map_err(dimension_error)
     }
 
     ///    Iterates over the Nodes defined in the NodeEmbeddings.
@@ -2789,17 +2798,12 @@ impl NodeEmbeddings {
     ///    (FQNode, List[Float]) - Can throw exception
     ///        
     ///    
-    pub fn __getitem__(&self, mut idx: isize) -> PyResult<(FQNode, Vec<f32>)> {
-        let len = self.embeddings.len() as isize;
-        if idx < 0 {
-            idx += len;
-        }
-        if idx >= len {
-            return Err(PyIndexError::new_err(format!("Index larger than embedding store!")));
-        }
+    pub fn __getitem__(&self, idx: isize) -> PyResult<(FQNode, Vec<f32>)> {
+        let idx = resolve_index(idx, self.embeddings.len())
+            .ok_or_else(|| PyIndexError::new_err("Index out of range for embedding store!"))?;
 
-        let emb = self.embeddings.get_embedding(idx as usize).to_vec();
-        let (nt, nn) = self.vocab.get_name(idx as usize).expect("Already validated bounds, something borked");
+        let emb = self.embeddings.get_embedding(idx).to_vec();
+        let (nt, nn) = self.vocab.get_name(idx).expect("Already validated bounds, something borked");
         Ok((((*nt).clone(), nn.to_string()), emb))
     }
 
@@ -2902,7 +2906,7 @@ impl NodeEmbeddings {
 struct NodeEmbeddingsBuilder {
     vocab: Vocab,
     distance: Distance,
-    embeddings: Vec<Vec<f32>>
+    embeddings: EmbeddingBuffer
 }
 
 #[pymethods]
@@ -2924,7 +2928,7 @@ impl NodeEmbeddingsBuilder {
         NodeEmbeddingsBuilder {
             distance: dist,
             vocab: Vocab::new(),
-            embeddings: Vec::new()
+            embeddings: EmbeddingBuffer::new()
         }
     }
     /// Simple Python representation 
@@ -2953,18 +2957,10 @@ impl NodeEmbeddingsBuilder {
         embedding: Vec<f32>
     ) -> PyResult<()> {
 
-        let n = self.embeddings.len();
-        if n > 1 && self.embeddings[0].len() != embedding.len() {
-            return Err(PyValueError::new_err("Embedding dimensions mismatch!"));
-        }
-
+        // Check before inserting, so a rejected node doesn't stay in the vocab.
+        self.embeddings.check(embedding.len()).map_err(dimension_error)?;
         let node_id = self.vocab.get_or_insert(node.0, node.1);
-        if node_id < self.embeddings.len() {
-            self.embeddings[node_id] = embedding;
-        } else {
-            self.embeddings.push(embedding);
-        }
-        Ok(())
+        self.embeddings.set(node_id, &embedding).map_err(dimension_error)
     }
 
     ///    Creates the NodeEmbeddings.
@@ -2978,23 +2974,10 @@ impl NodeEmbeddingsBuilder {
         if self.embeddings.len() == 0 {
             return None
         }
-        // We swap the internal buffers with new buffers; we do this to preserve memory whenever
-        // possible.
-        let mut vocab = Vocab::new(); 
-        let mut embeddings = Vec::new();
-        std::mem::swap(&mut vocab, &mut self.vocab);
-        std::mem::swap(&mut embeddings, &mut self.embeddings);
-
-        let es = EmbeddingStore::new(embeddings.len(), 
-                                     embeddings[0].len(),
-                                     self.distance.to_edist());
-
-        embeddings.par_iter_mut().enumerate().for_each(|(i, emb)| {
-            let e = es.get_embedding_mut_hogwild(i);
-            e.iter_mut().zip(emb.iter()).for_each(|(ei, emb_i)| {
-                *ei = *emb_i;
-            });
-        });
+        // Take the internal buffers; the flat embedding buffer becomes the store without a copy.
+        let vocab = std::mem::replace(&mut self.vocab, Vocab::new());
+        let embeddings = std::mem::take(&mut self.embeddings);
+        let es = embeddings.into_store(self.distance.to_edist());
 
         Some(NodeEmbeddings {
             vocab: Arc::new(vocab),
@@ -3099,7 +3082,8 @@ impl NeighborhoodAligner {
     pub fn align(&self, 
         embeddings: &NodeEmbeddings, 
         graph: &Graph
-    ) -> NodeEmbeddings {
+    ) -> PyResult<NodeEmbeddings> {
+        ensure_aligned(&graph.vocab, &embeddings.vocab, "Graph and NodeEmbeddings")?;
         
         let new_embeddings = EmbeddingStore::new(embeddings.embeddings.len(), 
                                                  embeddings.embeddings.dims(),
@@ -3110,10 +3094,10 @@ impl NeighborhoodAligner {
             self.aligner.align(&(*graph.graph), &embeddings.embeddings, node, new_emb);
         });
 
-        NodeEmbeddings {
+        Ok(NodeEmbeddings {
             embeddings: new_embeddings,
             vocab: embeddings.vocab.clone()
-        }
+        })
     }
 
     ///    Instead of aligning embeddings in memory, instead progressively writes them out.  This
@@ -3150,6 +3134,7 @@ impl NeighborhoodAligner {
         chunk_size: Option<usize>,
         comp_level: Option<u32>
     ) -> PyResult<()> {
+        ensure_aligned(&graph.vocab, &embeddings.vocab, "Graph and NodeEmbeddings")?;
        
         let mut writer = EmbeddingWriter::new(path, embeddings.vocab.as_ref(), comp_level)
             .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?;
@@ -4098,7 +4083,12 @@ impl PprRankLearner {
             seed: seed.unwrap_or(SEED)
         };
 
+        ensure_aligned(&graph.vocab, &features.vocab, "Graph and FeatureSet")?;
         features.features.fill_missing_nodes();
+        if let Some(fes) = feature_embeddings.as_deref() {
+            ensure_aligned(features.features.get_vocab(), &fes.vocab,
+                           "FeatureSet features and warm-start feature embeddings")?;
+        }
 
         // Pull out the EmbeddingStore
         let feature_embeddings = feature_embeddings.map(|fes| {
@@ -4151,11 +4141,8 @@ impl VpcgFeatureMappings {
         &self, 
         node_id: NodeID 
     ) -> PyResult<Vec<(usize, f32)>> {
-        if node_id > self.vocab.len() {
-            Err(PyIndexError::new_err("Node index larger than embedding size!"))
-        } else {
-            Ok(self.feature_mappings[node_id].clone())
-        }
+        self.feature_mappings.get(node_id).cloned()
+            .ok_or_else(|| PyIndexError::new_err("Node index larger than embedding size!"))
     }
 
 }
@@ -5158,5 +5145,29 @@ mod binding_tests {
             assert_eq!(vocab.get_name(feat_id), feat_vocab.get_name(feat_id));
         }
     }
-}
 
+    /// Python indexing: -len..len is valid, everything else is out of range.
+    #[test]
+    fn test_resolve_index() {
+        assert_eq!(resolve_index(0, 3), Some(0));
+        assert_eq!(resolve_index(-1, 3), Some(2));
+        assert_eq!(resolve_index(-3, 3), Some(0));
+        assert_eq!(resolve_index(3, 3), None);
+        assert_eq!(resolve_index(-4, 3), None);
+        assert_eq!(resolve_index(-1, 0), None);
+    }
+
+    /// The name starts after the whole delimiter, however many bytes it is.
+    #[test]
+    fn test_prefix_namespace_multibyte_delimiter() {
+        let ns = FeatureNamespace(FeatureNs::Prefix("::".into()));
+        assert_eq!(ns.parse("n", "color::red"), Some(("color", "red")));
+        let ns = FeatureNamespace(FeatureNs::Prefix("\u{2192}".into()));
+        let res = std::panic::catch_unwind(|| {
+            FeatureNamespace(FeatureNs::Prefix("\u{2192}".into()))
+                .parse("n", "color\u{2192}red").map(|(a, b)| (a.to_string(), b.to_string()))
+        });
+        assert_eq!(res.ok().flatten(), Some(("color".to_string(), "red".to_string())));
+        let _ = ns;
+    }
+}

@@ -91,11 +91,18 @@ impl EmbeddingStore {
         self.distance
     }
 
-    pub fn set_embedding(&mut self, node_id: NodeID, embedding: &[f32]) {
-        self.get_embedding_mut(node_id).iter_mut().zip(embedding.iter()).for_each(|(ei, wi)| {
-            *ei = *wi;
-        });
+    /// Sets a node's embedding.  A wrong-length embedding is rejected without writing anything.
+    pub fn set_embedding(
+        &mut self, 
+        node_id: NodeID, 
+        embedding: &[f32]
+    ) -> Result<(), DimensionMismatch> {
+        if embedding.len() != self.dims {
+            return Err(DimensionMismatch { expected: self.dims, actual: embedding.len() })
+        }
+        self.get_embedding_mut(node_id).copy_from_slice(embedding);
         self.bitfield.set_bit(node_id);
+        Ok(())
     }
 
     pub fn get_embedding(&self, node_id: NodeID) -> &[f32] {
@@ -170,6 +177,63 @@ impl EmbeddingStore {
 
 }
 
+/// An embedding whose length doesn't match the dimensions it is meant for.
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub struct DimensionMismatch {
+    pub expected: usize,
+    pub actual: usize
+}
+
+/// Row-major embeddings built up one node at a time, as a single flat buffer so building millions
+/// of nodes costs no per-node allocation and converts to an EmbeddingStore without copying.  The
+/// first embedding fixes the dimensions.
+#[derive(Debug,Default)]
+pub struct EmbeddingBuffer {
+    dims: Option<usize>,
+    nodes: usize,
+    data: Vec<f32>
+}
+
+impl EmbeddingBuffer {
+    pub fn new() -> Self {
+        EmbeddingBuffer::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes
+    }
+
+    /// Checks an embedding length against the dimensions fixed so far.
+    pub fn check(&self, len: usize) -> Result<(), DimensionMismatch> {
+        match self.dims {
+            Some(dims) if dims != len => Err(DimensionMismatch { expected: dims, actual: len }),
+            _ => Ok(())
+        }
+    }
+
+    /// Sets an existing node or appends the next one.  Node ids must be assigned densely, as a
+    /// Vocab does, so `node_id` may be at most `len()`.
+    pub fn set(&mut self, node_id: NodeID, embedding: &[f32]) -> Result<(), DimensionMismatch> {
+        self.check(embedding.len())?;
+        let dims = *self.dims.get_or_insert(embedding.len());
+        if node_id < self.nodes {
+            self.data[node_id * dims..(node_id + 1) * dims].copy_from_slice(embedding);
+        } else {
+            assert_eq!(node_id, self.nodes, "node ids must be added densely");
+            self.data.extend_from_slice(embedding);
+            self.nodes += 1;
+        }
+        Ok(())
+    }
+
+    /// Converts into an EmbeddingStore, reusing the buffer.  An empty buffer has no dimensions.
+    pub fn into_store(self, distance: Distance) -> EmbeddingStore {
+        let dims = self.dims.unwrap_or(0);
+        EmbeddingStore::new_with_vec(self.nodes, dims, distance, self.data)
+            .expect("buffer holds nodes * dims values")
+    }
+}
+
 /// Randomize embeddings.  
 pub fn randomize_embedding_store(es: &mut EmbeddingStore, rng: &mut impl Rng) {
     for idx in 0..es.len() {
@@ -202,14 +266,14 @@ mod embedding_tests {
         let mut es = EmbeddingStore::new(100, 2, Distance::Euclidean);
 
         assert_eq!(es.is_set(0), false);
-        es.set_embedding(0, &[0., 1.]);
+        es.set_embedding(0, &[0., 1.]).unwrap();
         assert_eq!(es.is_set(0), true);
 
         assert_eq!(es.is_set(35), false);
-        es.set_embedding(35, &[2., 3.]);
+        es.set_embedding(35, &[2., 3.]).unwrap();
         assert_eq!(es.is_set(35), true);
 
-        es.set_embedding(1, &[1., 2.]);
+        es.set_embedding(1, &[1., 2.]).unwrap();
 
         assert_eq!(es.get_embedding(0), &[0., 1.]);
         assert_eq!(es.get_embedding(1), &[1., 2.]);
@@ -253,5 +317,41 @@ mod embedding_tests {
         let res = es.nearest_neighbor(&Entity::Embedding(&q), 2, |node_id| node_id == 2);
         let ids: Vec<_> = res.iter().map(|nd| nd.to_tup_cloned().0).collect();
         assert_eq!(ids, vec![2]);
+    }
+
+    /// A wrong-length embedding must not be partially written.
+    #[test]
+    fn test_set_embedding_rejects_wrong_length() {
+        let mut es = EmbeddingStore::new(2, 3, Distance::Euclidean);
+        assert_eq!(es.set_embedding(0, &[1.]), Err(DimensionMismatch { expected: 3, actual: 1 }));
+        assert!(es.set_embedding(1, &[1., 2., 3., 4.]).is_err());
+        assert_eq!(es.get_embedding(0), &[0., 0., 0.]);
+        assert_eq!(es.get_embedding(1), &[0., 0., 0.]);
+        assert!(!es.is_set(0) && !es.is_set(1));
+    }
+
+    /// The first embedding fixes the dimensions; later ones must match, and a rejected
+    /// embedding leaves the buffer unchanged.
+    #[test]
+    fn test_embedding_buffer_enforces_dims() {
+        let mut buf = EmbeddingBuffer::new();
+        buf.set(0, &[1., 2., 3.]).unwrap();
+        assert_eq!(buf.set(1, &[1., 2., 3., 4., 5.]),
+                   Err(DimensionMismatch { expected: 3, actual: 5 }));
+        assert_eq!(buf.set(1, &[1., 2.]), Err(DimensionMismatch { expected: 3, actual: 2 }));
+        assert_eq!(buf.len(), 1);
+        buf.set(1, &[4., 5., 6.]).unwrap();
+        buf.set(0, &[7., 8., 9.]).unwrap();
+
+        let es = buf.into_store(Distance::Euclidean);
+        assert_eq!((es.len(), es.dims()), (2, 3));
+        assert_eq!(es.get_embedding(0), &[7., 8., 9.]);
+        assert_eq!(es.get_embedding(1), &[4., 5., 6.]);
+    }
+
+    #[test]
+    fn test_empty_embedding_buffer_builds_empty_store() {
+        let es = EmbeddingBuffer::new().into_store(Distance::Cosine);
+        assert_eq!((es.len(), es.dims()), (0, 0));
     }
 }

@@ -156,6 +156,39 @@ impl From<EmbeddingLoadError> for PyErr {
     }
 }
 
+/// Errors reading a node_type<TAB>name<TAB>features file.
+#[derive(Debug)]
+pub enum FeatureFileError {
+    Io(std::io::Error),
+    /// 1-based line number
+    Malformed(usize)
+}
+
+impl From<FeatureFileError> for PyErr {
+    fn from(e: FeatureFileError) -> PyErr {
+        match e {
+            FeatureFileError::Io(e) => PyIOError::new_err(format!("{:?}", e)),
+            FeatureFileError::Malformed(line) => PyValueError::new_err(format!(
+                "Line {}: Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ...", line))
+        }
+    }
+}
+
+/// Reads the nodes of a feature file into a vocab, in file order.
+pub fn read_feature_vocab(path: &str) -> Result<Vocab, FeatureFileError> {
+    let mut vocab = Vocab::new();
+    let reader = open_file_for_reading(path).map_err(FeatureFileError::Io)?;
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.map_err(FeatureFileError::Io)?;
+        let pieces: Vec<_> = line.split('\t').collect();
+        if pieces.len() != 3 {
+            return Err(FeatureFileError::Malformed(i + 1))
+        }
+        vocab.get_or_insert(pieces[0], pieces[1]);
+    }
+    Ok(vocab)
+}
+
 impl EmbeddingReader {
 
     pub fn load(
@@ -295,8 +328,11 @@ fn line_to_embedding(line: &String) -> Option<(String,String,Vec<f32>)> {
 
     let node_type = pieces[0];
     let name = pieces[1];
-    let e = pieces[2];
-    let emb: Result<Vec<f32>,_> = e[1..e.len() - 1].split(',')
+    // Strip the enclosing brackets by character, so short or non-ASCII fields can't panic.
+    let mut chars = pieces[2].chars();
+    chars.next()?;
+    chars.next_back()?;
+    let emb: Result<Vec<f32>,_> = chars.as_str().split(',')
         .map(|wi| parse(wi.trim())).collect();
 
     emb.ok().map(|e| (node_type.to_string(), name.to_string(), e))
@@ -377,5 +413,37 @@ mod io_tests {
         assert_eq!(es.len(), vocab.len());
         assert_eq!(es.get_embedding(1), &[3., 4.]);
     }
-}
 
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("cloverleaf-{}-{}", std::process::id(), name))
+    }
+
+    /// Feature files may be gzipped, as `load_into` already supports.
+    #[test]
+    fn test_read_feature_vocab_gz() {
+        let path = temp_path("features.gz");
+        {
+            let mut w = open_file_for_writing(path.to_str().unwrap(), Some(6)).unwrap();
+            w.write_all(b"user\ta\tf1 f2\nuser\tb\tf3\n").unwrap();
+        }
+        let vocab = read_feature_vocab(path.to_str().unwrap());
+        std::fs::remove_file(&path).unwrap();
+        let vocab = vocab.expect("gzipped feature file should load");
+        assert_eq!(vocab.len(), 2);
+        assert_eq!(vocab.get_node_id("user", "b"), Some(1));
+    }
+
+    /// Malformed embedding fields are parse failures, not panics.
+    #[test]
+    fn test_line_to_embedding_rejects_malformed_fields() {
+        for line in ["a\tb\t", "a\tb\t[", "a\tb\t[1,x]"] {
+            let res = std::panic::catch_unwind(|| line_to_embedding(&line.to_string()));
+            assert!(matches!(res, Ok(None)), "{:?} -> {:?}", line, res);
+        }
+        // Brackets are stripped by position, as before; a multi-byte one must not panic.
+        let res = std::panic::catch_unwind(|| line_to_embedding(&"a\tb\t\u{e9}1,2\u{e9}".to_string()));
+        assert!(res.is_ok());
+        assert_eq!(line_to_embedding(&"a\tb\t[1,2]".to_string()),
+                   Some(("a".to_string(), "b".to_string(), vec![1., 2.])));
+    }
+}
