@@ -23,7 +23,7 @@ use crate::progress::CLProgressBar;
 use crate::feature_store::FeatureStore;
 use crate::algos::utils::node_seed;
 use crate::algos::grad_utils::scheduler::LRScheduler;
-use crate::algos::grad_utils::optimizer::{Optimizer,AdamOptimizer};
+use crate::algos::grad_utils::optimizer::{Optimizer,AdamOptimizer,OptimizerKind};
 use crate::algos::grad_utils::node_sampler::*;
 
 use self::loss::*;
@@ -72,7 +72,10 @@ pub struct EmbeddingPropagation {
     pub noise: f32,
 
     /// Whether to show a pretty indicator
-    pub indicator: bool
+    pub indicator: bool,
+
+    /// Optimizer for the feature embeddings
+    pub optimizer: OptimizerKind
 }
 
 impl EmbeddingPropagation {
@@ -110,11 +113,9 @@ impl EmbeddingPropagation {
             fe
         };
 
-        // Initializer SGD optimizer.  Right now we hard code the parameters for the optimizer but
-        // in the future we could allow for this to be parameterized.
-        let optimizer = AdamOptimizer::new(0.9, 0.999,
-            feature_embeddings.dims(), 
-            feature_embeddings.len()); 
+        let optimizer = AdamOptimizer::new(self.optimizer,
+            feature_embeddings.dims(),
+            feature_embeddings.len());
 
         // Pull out validation idxs;
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();
@@ -456,7 +457,8 @@ mod ep_tests {
             passes: 50,
             noise: 0.0,
             seed: 202220222,
-            indicator: false
+            indicator: false,
+            optimizer: OptimizerKind::Adam
         };
 
         let embeddings = ep.learn_feature_embeddings(&ccsr, &feature_store, None, &model);

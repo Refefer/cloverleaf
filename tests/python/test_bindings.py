@@ -157,3 +157,33 @@ def test_empty_edge_file(tmp_path):
     g = cl.Graph.load(str(path), cl.EdgeType.Directed)
     assert g.nodes() == 0
     g.save(str(tmp_path / "empty.out"))
+
+
+# Optimizers
+
+
+@pytest.mark.parametrize("weight_decay", [-0.1, float("nan"), float("inf")])
+def test_adamw_rejects_invalid_weight_decay(weight_decay):
+    with pytest.raises(ValueError):
+        cl.Optimizer.adamw(weight_decay)
+
+
+def test_optimizer_repr():
+    assert repr(cl.Optimizer.adam()) == "Optimizer.adam()"
+    assert repr(cl.Optimizer.adamw()) == "Optimizer.adamw(weight_decay=0.01)"
+
+
+@pytest.mark.parametrize("optimizer", [None, cl.Optimizer.adam(), cl.Optimizer.adamw(0.1)])
+def test_embedding_propagator_accepts_optimizer(graph, optimizer):
+    ep = cl.EmbeddingPropagator(dims=4, passes=2, valid_pct=0.0, indicator=False,
+                                optimizer=optimizer)
+    feats = ep.learn_features(graph, cl.FeatureSet.new_from_graph(graph))
+    assert feats.dims() == 4
+
+
+@pytest.mark.parametrize("optimizer", [None, cl.Optimizer.adamw(0.1)])
+def test_ppr_rank_accepts_optimizer(graph, optimizer):
+    learner = cl.PprRankLearner(0.1, 2, 4, 2, 3.0, 2, 2, 1, valid_pct=0.0,
+                                optimizer=optimizer)
+    feats = learner.learn_features(graph, cl.FeatureSet.new_from_graph(graph), indicator=False)
+    assert feats.dims() == 4

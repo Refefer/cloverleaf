@@ -22,7 +22,7 @@ use crate::algos::ep::attention::softmax;
 use crate::algos::ep::model::{construct_node_embedding,NodeCounts};
 use crate::algos::ep::extract_grads;
 use crate::algos::grad_utils::node_sampler::{RandomWalkHardStrategy,NodeSampler,BatchSamplerStrategy};
-use crate::algos::grad_utils::optimizer::{Optimizer,AdamOptimizer};
+use crate::algos::grad_utils::optimizer::{Optimizer,AdamOptimizer,OptimizerKind};
 use crate::algos::grad_utils::scheduler::LRScheduler;
 
 #[derive(Copy,Clone)]
@@ -79,7 +79,10 @@ pub struct PprRank {
     pub valid_pct: f32,
 
     /// Whether to show a pretty indicator
-    pub indicator: bool
+    pub indicator: bool,
+
+    /// Optimizer for the feature embeddings
+    pub optimizer: OptimizerKind
 }
 
 impl PprRank {
@@ -116,11 +119,9 @@ impl PprRank {
             fe
         };
 
-        // Initializer SGD optimizer.  Right now we hard code the parameters for the optimizer but
-        // in the future we could allow for this to be parameterized.
-        let optimizer = AdamOptimizer::new(0.9, 0.999,
-            feature_embeddings.dims(), 
-            feature_embeddings.len()); 
+        let optimizer = AdamOptimizer::new(self.optimizer,
+            feature_embeddings.dims(),
+            feature_embeddings.len());
 
         // Pull out validation idxs;
         let mut node_idxs: Vec<_> = (0..graph.len()).into_iter().collect();

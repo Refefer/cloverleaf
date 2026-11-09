@@ -79,6 +79,7 @@ use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
 use crate::algos::lsr::{LSR as ALSR};
 use crate::algos::pprembed::PPREmbed;
 use crate::algos::pprrank::{PprRank, Loss as PprLoss};
+use crate::algos::grad_utils::optimizer::{OptimizerKind, WeightDecay};
 use crate::algos::policy_evaluation::{PolicyEvaluation as PEA};
 use crate::algos::reweighter::{Reweighter};
 use crate::algos::rwr::{RWR,ppr_estimate,rollouts};
@@ -1004,6 +1005,58 @@ impl LossWeighting {
 
 }
 
+/// Optimizer used by the learners (EmbeddingPropagator, PprRankLearner) to update the feature
+/// embeddings.
+#[pyclass(name = "Optimizer", from_py_object)]
+#[derive(Clone)]
+struct OptimizerSpec {
+    kind: OptimizerKind
+}
+
+#[pymethods]
+impl OptimizerSpec {
+
+    ///    Adam.  This is the default.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///    
+    #[staticmethod]
+    pub fn adam() -> Self {
+        OptimizerSpec { kind: OptimizerKind::Adam }
+    }
+
+    ///    AdamW: Adam with decoupled weight decay.  Each update also shrinks the weights by
+    ///    learning_rate * weight_decay, independently of the gradient.  Weight decay only applies
+    ///    to features updated in a batch, so rare features are decayed less often.
+    ///    
+    ///    Parameters
+    ///    ----------
+    ///    weight_decay : Float - Optional
+    ///        Decay rate; must be finite and non-negative.  Default is 0.01.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    Self - Can throw exception
+    ///    
+    #[staticmethod]
+    #[pyo3(signature = (weight_decay=None))]
+    pub fn adamw(weight_decay: Option<f32>) -> PyResult<Self> {
+        let rate = weight_decay.unwrap_or(0.01);
+        let wd = WeightDecay::new(rate).ok_or_else(|| PyValueError::new_err(
+            format!("weight_decay must be finite and non-negative, got {}", rate)))?;
+        Ok(OptimizerSpec { kind: OptimizerKind::AdamW(wd) })
+    }
+
+    pub fn __repr__(&self) -> String {
+        match self.kind {
+            OptimizerKind::Adam => "Optimizer.adam()".into(),
+            OptimizerKind::AdamW(wd) => format!("Optimizer.adamw(weight_decay={})", wd.rate())
+        }
+    }
+}
+
 /// A python wrapper for the internal ADT used for defining losses
 #[pyclass(from_py_object)]
 #[derive(Clone)]
@@ -1252,13 +1305,18 @@ impl EmbeddingPropagator {
     ///
     ///        Default is None.
     ///
+    ///    optimizer : Optimizer - Optional
+    ///        Optimizer for the feature embeddings, e.g. Optimizer.adamw(0.01).
+    ///
+    ///        Default is Optimizer.adam().
+    ///
     ///    Returns
     ///    -------
     ///    Self
     ///        
     ///    
     #[new]
-    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention=None, attention_heads=None, context_window=None, noise=None))]
+    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention=None, attention_heads=None, context_window=None, noise=None, optimizer=None))]
     pub fn new(
         // Learning rate
         alpha: Option<f32>, 
@@ -1313,7 +1371,10 @@ impl EmbeddingPropagator {
         context_window: Option<usize>,
 
         // Use gradient noise where we sample from the normal distribution and blend with `noise`
-        noise: Option<f32>
+        noise: Option<f32>,
+
+        // Optimizer for the feature embeddings
+        optimizer: Option<OptimizerSpec>
     ) -> PyResult<Self> {
         let loss_weighting = loss_weighting.map(|lw| lw.loss).unwrap_or(EPLW::None);
         let ep = EmbeddingPropagation {
@@ -1327,7 +1388,8 @@ impl EmbeddingPropagator {
             valid_pct: valid_pct.unwrap_or(0.1),
             seed: seed.unwrap_or(SEED),
             indicator: indicator.unwrap_or(true),
-            noise: noise.unwrap_or(0.0)
+            noise: noise.unwrap_or(0.0),
+            optimizer: optimizer.map(|o| o.kind).unwrap_or(OptimizerKind::Adam)
         };
 
         let wns = weighted_neighbor_sampling.unwrap_or(false);
@@ -3905,7 +3967,8 @@ struct PprRankLearner {
     num_features: Option<f32>,
     compression: f32,
     valid_pct: f32,
-    beta: f32
+    beta: f32,
+    optimizer: OptimizerKind
 }
 
 #[pymethods]
@@ -3979,13 +4042,19 @@ impl PprRankLearner {
     ///    valid_pct : Float - Optional
     ///        If provided, uses a subset of the graph for validation.
     ///    
+    ///    optimizer : Optimizer - Optional
+    ///        Optimizer for the feature embeddings, e.g. Optimizer.adamw(0.01).  Unrelated to
+    ///        `weight_decay` above, which adds a penalty term to the loss.
+    ///
+    ///        Default is Optimizer.adam().
+    ///    
     ///    Returns
     ///    -------
     ///    Self - Can throw exception
     ///        
     ///    
     #[new]
-    #[pyo3(signature = (alpha, batch_size, dims, passes, steps, walks, k, negatives, loss=None, compression=None, beta=None, num_features=None, weight_decay=None, valid_pct=None))]
+    #[pyo3(signature = (alpha, batch_size, dims, passes, steps, walks, k, negatives, loss=None, compression=None, beta=None, num_features=None, weight_decay=None, valid_pct=None, optimizer=None))]
     fn new(
          // Learning rate
         alpha: f32, 
@@ -4028,6 +4097,9 @@ impl PprRankLearner {
         // Percentage of nodes to use for validation
         valid_pct: Option<f32>,
 
+        // Optimizer for the feature embeddings
+        optimizer: Option<OptimizerSpec>,
+
     ) -> PyResult<Self> {
 
         let steps = if steps >= 1. {
@@ -4052,7 +4124,8 @@ impl PprRankLearner {
             loss: loss.unwrap_or_else(||"listnet".into()),
             compression: compression.unwrap_or(1f32),
             valid_pct: valid_pct.unwrap_or(0.1),
-            beta: beta.unwrap_or(0.8)
+            beta: beta.unwrap_or(0.8),
+            optimizer: optimizer.map(|o| o.kind).unwrap_or(OptimizerKind::Adam)
         })
     }
     
@@ -4128,7 +4201,8 @@ impl PprRankLearner {
             compression: self.compression,
             valid_pct: self.valid_pct,
             indicator: indicator.unwrap_or(true),
-            seed: seed.unwrap_or(SEED)
+            seed: seed.unwrap_or(SEED),
+            optimizer: self.optimizer
         };
 
         ensure_aligned(&graph.vocab, &features.vocab, "Graph and FeatureSet")?;
@@ -5101,6 +5175,7 @@ fn cloverleaf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NodeEmbeddings>()?;
     m.add_class::<VocabIterator>()?;
     m.add_class::<EPLoss>()?;
+    m.add_class::<OptimizerSpec>()?;
     m.add_class::<GraphAnn>()?;
     m.add_class::<EmbAnn>()?;
     m.add_class::<FeatureNamespace>()?;
