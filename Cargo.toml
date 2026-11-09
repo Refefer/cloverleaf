@@ -13,6 +13,10 @@ cuda = ["candle-core/cuda"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 name = "cloverleaf"
 crate-type = ["cdylib", "rlib"]
+# The doc comments in src/lib.rs are numpy-style Python docstrings (pyo3 exposes them as
+# __doc__).  Their indented parameter descriptions parse as Rust code blocks, so rustdoc would
+# try to compile them.  The crate has no Rust doc examples to run.
+doctest = false
 
 [dependencies]
 ahash = "0.8"
