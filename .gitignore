@@ -24,3 +24,16 @@ Cargo.lock
 
 # Vim
 *.swp
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# Pinterest example: uncompressed copies of the tracked .gz files, derived VPCG output
+# and trained embeddings.  Large and regenerable via run.sh.
+/examples/dataset/pinterest/pinterest.edges
+/examples/dataset/pinterest/pinterest.test
+/examples/dataset/pinterest/pinterest.vpcg
+/examples/dataset/pinterest/cloverleaf.*
+
+# Python bytecode
+__pycache__/
