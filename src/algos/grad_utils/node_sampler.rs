@@ -38,19 +38,22 @@ pub trait NodeSampler {
 /// Finds hard negatives through exploration of local graph walks.  It will fill the negatives with
 /// both easy negatives and hard negatives.  The take so far is random walks are perhaps too close
 /// to being weak positives rather than hard negatives.
-pub struct RandomWalkHardStrategy {
-    /// Fills 
+///
+/// Borrows the node list easy negatives are drawn from instead of copying it: the list has an
+/// entry per node, which is gigabytes on large graphs.
+pub struct RandomWalkHardStrategy<'a> {
+    /// Maximum number of negatives to find with random walks; the rest are drawn uniformly.
     num_hard_negatives: usize,
-    train_idxs: Vec<NodeID>
+    train_idxs: &'a [NodeID]
 }
 
-impl RandomWalkHardStrategy {
-   pub fn new(num_hard_negatives: usize, train_idxs: &[NodeID]) -> Self {
-        RandomWalkHardStrategy { num_hard_negatives, train_idxs: train_idxs.to_vec() }
+impl <'a> RandomWalkHardStrategy<'a> {
+   pub fn new(num_hard_negatives: usize, train_idxs: &'a [NodeID]) -> Self {
+        RandomWalkHardStrategy { num_hard_negatives, train_idxs }
     }
 }
 
-impl <'a> BatchSamplerStrategy for &'a RandomWalkHardStrategy {
+impl <'a, 'b> BatchSamplerStrategy for &'b RandomWalkHardStrategy<'a> {
     type Sampler = RandomWalkHardSampler<'a>;
 
      fn initialize_batch<
@@ -66,7 +69,7 @@ impl <'a> BatchSamplerStrategy for &'a RandomWalkHardStrategy {
             // Hard coded right now; should be parameterized
             p: 0.25, 
             num_hard_negatives: self.num_hard_negatives,
-            train_idxs: self.train_idxs.as_slice()
+            train_idxs: self.train_idxs
         }
     }
 }
@@ -139,3 +142,17 @@ fn random_walk<R: Rng, G: CGraph>(
     }
 }
 
+
+#[cfg(test)]
+mod node_sampler_tests {
+    use super::*;
+
+    /// The index lists hold one entry per node, so the strategy must draw from the caller's slice
+    /// rather than keep its own copy.
+    #[test]
+    fn test_strategy_borrows_train_idxs() {
+        let idxs: Vec<NodeID> = (0..1000).collect();
+        let strategy = RandomWalkHardStrategy::new(0, &idxs);
+        assert!(std::ptr::eq(strategy.train_idxs.as_ptr(), idxs.as_ptr()));
+    }
+}

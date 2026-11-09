@@ -146,7 +146,6 @@ impl PprRank {
         };
 
         // Initialize samplers for negatives.
-        let random_sampler = RandomWalkHardStrategy::new(0, &node_idxs);
         let valid_random_sampler = RandomWalkHardStrategy::new(0, &valid_idxs);
 
         let mut last_error = std::f32::INFINITY;
@@ -177,6 +176,8 @@ impl PprRank {
 
             // Shuffle for SGD
             node_idxs.shuffle(&mut rng);
+            // Borrows the shuffled node list for easy negatives, so it's rebuilt every pass.
+            let random_sampler = RandomWalkHardStrategy::new(0, &node_idxs);
             let err: Vec<_> = node_idxs.par_iter().chunks(self.batch_size).enumerate().map(|(i, nodes)| {
 
                 let mut grads = Vec::with_capacity(self.batch_size);

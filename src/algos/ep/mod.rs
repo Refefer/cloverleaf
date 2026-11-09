@@ -148,7 +148,6 @@ impl EmbeddingPropagation {
         };
 
         // Initialize samplers for negatives.
-        let random_sampler = RandomWalkHardStrategy::new(self.hard_negs, &node_idxs);
         let valid_random_sampler = RandomWalkHardStrategy::new(self.hard_negs, &valid_idxs);
 
         let mut last_error = std::f32::INFINITY;
@@ -173,6 +172,8 @@ impl EmbeddingPropagation {
 
             // Shuffle for SGD
             node_idxs.shuffle(&mut rng);
+            // Borrows the shuffled node list for easy negatives, so it's rebuilt every pass.
+            let random_sampler = RandomWalkHardStrategy::new(self.hard_negs, &node_idxs);
             let err_cnt: (f32, usize) = node_idxs.par_iter().chunks(self.batch_size).enumerate().map(|(i, nodes)| {
 
                 let sampler = (&random_sampler).initialize_batch(
