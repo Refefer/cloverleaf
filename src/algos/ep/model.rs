@@ -352,38 +352,39 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     weighted_neighbor_averaging: bool,
     rng: &mut R
 ) -> (NodeCounts, ANode) {
-    let (edges, weights) = &graph.get_edges(node);
-    
+    let (edges, cdf) = graph.get_edges(node);
+    let degree = edges.len() as f32;
     let (nodes_to_sample, scale_weight) = max_nodes.sample(edges.len(), true, rng);
-    let weights: Box<dyn Iterator<Item=f32>> = if weighted_neighbor_averaging {
-        Box::new(CDFtoP::new(weights).map(|p| scale_weight * p * edges.len() as f32))
+
+    // Edge probabilities, scaled so the average neighbor has weight 1.
+    let neighbors = || edges.iter().cloned().zip(CDFtoP::new(cdf).map(move |p| p * degree));
+
+    // Each branch picks the neighbors and their averaging weights.  When weighted averaging is
+    // on, the reconstruction is an estimate of the edge-weighted neighborhood mean.
+    let blend = move |(n, w): (NodeID, f32)| {
+        (n, scale_weight * if weighted_neighbor_averaging { w } else { 1f32 })
+    };
+    let sampled: Box<dyn Iterator<Item=(NodeID, f32)>> = if nodes_to_sample == edges.len() {
+        // Nothing to sample: blend all neighbors directly, streaming rather than collecting
+        // since hub nodes can have millions of edges.
+        Box::new(neighbors().map(blend))
+    } else if weighted_neighbor_sampling {
+        // Neighbors are drawn in proportion to edge weight, which already biases the sample
+        // toward heavy edges.  Averaging it uniformly estimates the weighted mean; weighting it
+        // again would count the edge weight twice.
+        let sample = weighted_reservoir_sample(neighbors(), nodes_to_sample, rng);
+        Box::new(sample.into_iter().map(move |(n, _)| (n, scale_weight)))
     } else {
-        Box::new(std::iter::repeat(scale_weight))
+        // A uniform sample, so weighted averaging has to apply the edge weights itself.
+        Box::new(reservoir_sample(neighbors(), nodes_to_sample, rng).into_iter().map(blend))
     };
 
-    let it = edges.iter().cloned().zip(weights);
-
-    if edges.len() == nodes_to_sample {
-        construct_from_multiple_nodes(it,
-            feature_store,
-            feature_embeddings,
-            max_features,
-            mha,
-            rng)
-    } else {
-        let it:Box<dyn Iterator<Item=(NodeID, f32)>> = if weighted_neighbor_sampling {
-            Box::new(weighted_reservoir_sample(it, nodes_to_sample, rng).into_iter())
-        } else {
-            Box::new(reservoir_sample(it, nodes_to_sample, rng).into_iter())
-        };
-
-        construct_from_multiple_nodes(it,
-            feature_store,
-            feature_embeddings,
-            max_features,
-            mha,
-            rng)
-    }
+    construct_from_multiple_nodes(sampled,
+        feature_store,
+        feature_embeddings,
+        max_features,
+        mha,
+        rng)
 }
 
 fn construct_from_multiple_nodes<I: Iterator<Item=(NodeID, f32)>, R: Rng>(
@@ -468,6 +469,7 @@ mod model_tests {
     use super::*;
     use rand_xorshift::XorShiftRng;
     use crate::distance::Distance;
+    use crate::graph::{CSR, CumCSR};
 
     fn store_with_four_features() -> (FeatureStore, EmbeddingStore) {
         let mut fs = FeatureStore::new(1);
@@ -496,6 +498,76 @@ mod model_tests {
         assert_eq!(fm.len(), 2);
         for (_, (_, count)) in fm.iter() {
             assert_eq!(*count, 1.0);
+        }
+    }
+
+    /// Node 0 has a heavy edge to node 1 (weight 98) and light edges to nodes 2 and 3 (weight 1
+    /// each).  Every node has a single feature of its own.
+    fn weighted_star() -> (CumCSR, FeatureStore, EmbeddingStore) {
+        let csr = CSR::construct_from_edges(vec![(0, 1, 98.), (0, 2, 1.), (0, 3, 1.)], false);
+        let graph = CumCSR::convert(csr);
+        let mut fs = FeatureStore::new(graph.len());
+        for node in 0..graph.len() {
+            fs.set_features(node, std::iter::once(("f", node.to_string())));
+        }
+        let es = EmbeddingStore::new(fs.num_features(), 2, Distance::Cosine);
+        (graph, fs, es)
+    }
+
+    fn feature_of(fs: &FeatureStore, node: NodeID) -> usize {
+        fs.get_features(node)[0]
+    }
+
+    /// Weighted sampling must pick neighbors in proportion to edge weight even when weighted
+    /// averaging is off.
+    #[test]
+    fn test_weighted_neighbor_sampling_follows_edge_weights() {
+        let (graph, fs, es) = weighted_star();
+        let model = AveragedFeatureModel::new(Sample::All, Sample::Fixed(1), true, false);
+        let heavy = feature_of(&fs, 1);
+
+        let trials = 2000;
+        let heavy_picks = (0..trials).filter(|seed| {
+            let mut rng = XorShiftRng::seed_from_u64(*seed);
+            let (counts, _) = model.reconstruct_node_embedding(&graph, 0, &fs, &es, &mut rng);
+            assert_eq!(counts.len(), 1);
+            counts.contains_key(&heavy)
+        }).count();
+
+        // Expected rate is 98%; uniform sampling would give about 33%.
+        let rate = heavy_picks as f32 / trials as f32;
+        assert!(rate > 0.95, "heavy neighbor picked {:.3} of the time", rate);
+    }
+
+    /// Weighted sampling already favors heavy edges, so a weighted sample is averaged uniformly.
+    /// Weighting it again would count the edge weight twice (an effective weight of w^2).
+    #[test]
+    fn test_weighted_sampling_and_averaging_do_not_double_count() {
+        let (graph, fs, es) = weighted_star();
+        let model = AveragedFeatureModel::new(Sample::All, Sample::Fixed(2), true, true);
+
+        for seed in 0..50 {
+            let mut rng = XorShiftRng::seed_from_u64(seed);
+            let (counts, _) = model.reconstruct_node_embedding(&graph, 0, &fs, &es, &mut rng);
+            let weights: Vec<f32> = counts.values().map(|(_, w)| *w).collect();
+            assert_eq!(weights.len(), 2);
+            assert!((weights[0] - weights[1]).abs() < 1e-6,
+                    "seed {}: sampled neighbors weighted {:?}", seed, weights);
+        }
+    }
+
+    /// When the whole neighborhood is used there is nothing to sample, so weighted averaging
+    /// blends neighbors by edge weight whether or not weighted sampling is on.
+    #[test]
+    fn test_weighted_averaging_over_full_neighborhood() {
+        let (graph, fs, es) = weighted_star();
+        for wns in [false, true] {
+            let model = AveragedFeatureModel::new(Sample::All, Sample::All, wns, true);
+            let mut rng = XorShiftRng::seed_from_u64(0);
+            let (counts, _) = model.reconstruct_node_embedding(&graph, 0, &fs, &es, &mut rng);
+            let w = |node| counts[&feature_of(&fs, node)].1;
+            assert!((w(1) / w(2) - 98.).abs() < 1e-3, "wns={}: {} vs {}", wns, w(1), w(2));
+            assert!((w(2) - w(3)).abs() < 1e-6);
         }
     }
 }

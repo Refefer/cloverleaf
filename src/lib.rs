@@ -1200,6 +1200,16 @@ impl EmbeddingPropagator {
     ///        The larger the number, the better the estimate, but is more computationally
     ///        expensive.  These nodes are randomly selected each pass. Default is all.
     ///    
+    ///    weighted_neighbor_sampling : Bool - Optional
+    ///        When max_nodes subsamples a neighborhood, picks neighbors in proportion to their
+    ///        edge weights instead of uniformly.  A weighted sample is averaged with equal weights,
+    ///        so combined with weighted_neighbor_averaging the edge weights are counted once, not
+    ///        twice.  Has no effect when the whole neighborhood is used.  Default is False.
+    ///
+    ///    weighted_neighbor_averaging : Bool - Optional
+    ///        Reconstructs the node from the edge-weighted mean of its neighbors rather than the
+    ///        plain mean.  Ignored by attention models.  Default is False.
+    ///
     ///    max_features : Int/Float - Optional
     ///        Maximum number of features to use to construct a node embedding.  These features
     ///        will be randomly selected every node construction.  If given a float between (0,1),
