@@ -1,8 +1,8 @@
 # Embedding Propagation — Product Requirements Document
 
-**Version:** 3
+**Version:** 4
 **Status:** Draft
-**Date:** 2026-03-10
+**Date:** 2026-11-09
 
 ---
 
@@ -130,10 +130,21 @@ Selects from the direct one-hop neighbors of the anchor node. This is the standa
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `max_nodes` | `FeatureDropout` | All | How many neighbors to include. Uses the FeatureDropout enum (§9) for fixed-count or probabilistic subsampling. |
-| `weighted_sampling` | bool | `false` | When subsampling neighbors, select proportionally to edge weight (A-Res weighted reservoir sampling) rather than uniformly. |
-| `weighted_averaging` | bool | `false` | Weight each selected neighbor's contribution by its edge weight when aggregating. When false, all selected neighbors contribute equally. |
+| `weighted_sampling` | bool | `false` | When subsampling neighbors, select proportionally to edge weight (A-Res weighted reservoir sampling) rather than uniformly. No effect when the whole neighborhood is used. |
+| `weighted_averaging` | bool | `false` | Target the edge-weighted neighborhood mean rather than the plain mean. When false, all selected neighbors contribute equally. |
 
-**Unbiased reweighting:** When fewer than all neighbors are used, each selected neighbor's contribution is upscaled by the inverse sampling factor so the expected value of `~h(v)` equals the full-neighborhood aggregate.
+**Combining the two flags.** Each selected neighbor's weight `w(u)` (§6) is set so that edge weight is counted exactly once:
+
+| Neighbors used | `weighted_sampling = false` | `weighted_sampling = true` |
+|---|---|---|
+| All | `w(u) = 1`, or edge weight if `weighted_averaging` | same; nothing is sampled |
+| Subsampled | uniform sample; `w(u) = 1`, or edge weight if `weighted_averaging` | weighted sample; `w(u) = 1` regardless of `weighted_averaging` |
+
+A weighted sample already favors heavy edges, so averaging it uniformly estimates the edge-weighted mean. Weighting it again would give an effective weight of `edge_weight²`. Consequently, `weighted_sampling` with a subsampled neighborhood approximates the edge-weighted mean whether or not `weighted_averaging` is set.
+
+Edge weights used for averaging are normalized so the average neighbor has weight 1 (`p(u) · degree(v)`, where `p(u)` is the neighbor's edge probability).
+
+**Unbiased reweighting:** When fewer than all neighbors are used, each selected neighbor's contribution is upscaled by the inverse sampling factor so the expected value of `~h(v)` equals the full-neighborhood aggregate. This holds exactly for uniform sampling. A-Res samples without replacement, so a weighted sample's mean only approximates the edge-weighted mean: neighbors whose weight dominates the neighborhood are included at most once.
 
 ### 5.3 RandomWalk
 
@@ -172,7 +183,7 @@ All features across all selected neighbor nodes are pooled and averaged uniforml
 ~h(v) = (1 / Z) · Σ_{u ∈ neighbors} w(u) · Σ_{f ∈ F̃(u)} scale(f) · E[f]
 ```
 
-where `w(u)` is the neighbor weight (from PositiveSampler), `scale(f)` is the feature dropout reweighting, and `Z` is the normalizing sum of weights.
+where `w(u)` is the neighbor weight (from PositiveSampler, §5.2), `scale(f)` is the feature dropout reweighting, and `Z` is the normalizing sum of weights.
 
 ### 6.3 Weighted (SIF-style)
 
@@ -342,9 +353,12 @@ The **Optimizer** is a first-class configuration choice.
 
 ```
 Optimizer::Adam { beta1: float, beta2: float, eps: float }
+Optimizer::AdamW { beta1: float, beta2: float, eps: float, weight_decay: WeightDecay }
 ```
 
-_(Additional optimizers are future work.)_
+`WeightDecay` is a validated rate: finite and non-negative. Invalid values are rejected when the optimizer is constructed, so an `AdamW` with a negative or non-finite decay cannot exist.
+
+_(Further optimizers are future work.)_
 
 #### Adam
 
@@ -360,7 +374,23 @@ v̂_t = v_t / (1 - β₂^t)
 
 Default hyperparameters: `β₁ = 0.9`, `β₂ = 0.999`, `ε = 1e-8`. Updates applied with lock-free (Hogwild-style) parallelism across features.
 
-**Note:** The current implementation uses the training pass number as the time step `t` (updated once per pass, not per batch). This is a deliberate simplification.
+**Time step:** `t` is the 1-based count of optimizer updates (mini-batches) applied so far, counted globally across passes. It is the same step counter that drives the LRScheduler (§11.4).
+
+#### AdamW
+
+Adam with decoupled weight decay (Loshchilov & Hutter, 2019). The decay is applied directly to the weights instead of being added to the gradient, so it is not rescaled by Adam's per-parameter step sizes:
+
+```
+θ ← θ · (1 - α · λ) - α · m̂_t / (√v̂_t + ε)
+```
+
+where `λ` is `weight_decay` and `α` is the scheduled learning rate for the step. Moments and bias correction are identical to Adam, and AdamW needs no memory beyond Adam's two moment buffers. With `λ = 0` it is exactly Adam.
+
+Default `weight_decay` when AdamW is selected without one: `0.01`.
+
+**Sparse decay:** Updates are sparse: only features with a gradient in the current mini-batch are updated, so only those features are decayed. Rare features are therefore decayed less often than common ones. This is intentional; decaying every feature on every step would touch the whole table per batch.
+
+**Interaction with losses:** Cosine-based losses (StarSpace, Contrastive, and the StarSpace term of RankSpace) are invariant to embedding norm, so decay there mainly shrinks norms, which increases the effective step size of later updates. It acts as a true regularizer for norm-sensitive losses (MarginLoss, RankLoss).
 
 ### 11.4 LR Scheduler
 
@@ -477,7 +507,7 @@ Inference is stateless and trivially parallelizable across nodes.
 | `reconstruction_aggregator` | `ReconstructionAggregator` enum | `Averaged` | How neighbor features are combined. See §6. |
 | `negative_sampler` | `NegativeSampler` enum | `UniformWithHardNegatives { 0 }` | How negatives are selected. See §7. |
 | `feature_dropout` | `FeatureDropout` enum | `All` | Feature subsampling per forward pass. See §9. |
-| `optimizer` | `Optimizer` enum | `Adam { 0.9, 0.999, 1e-8 }` | Gradient optimizer. See §11.3. |
+| `optimizer` | `Optimizer` enum | `Adam { 0.9, 0.999, 1e-8 }` | Gradient optimizer: `Adam` or `AdamW` (default `weight_decay` 0.01). See §11.3. |
 | `lr_scheduler` | `LRScheduler` enum | `CosineDecayWithWarmup { 0.2 }` | Learning rate schedule. See §11.4. |
 | `batch_size` | int | `50` | Mini-batch size. |
 | `dims` | int | `100` | Embedding dimensionality. |
@@ -533,7 +563,7 @@ An attention model that replaces simple averaging with scaled multi-head self-at
 
 ### Additional Optimizers and Schedulers
 
-The `Optimizer` and `LRScheduler` enums have extension points for SGD, momentum, polynomial decay, etc. No immediate plans.
+AdamW was added in v4. The `Optimizer` and `LRScheduler` enums have further extension points for SGD, momentum, polynomial decay, etc. No immediate plans.
 
 ### Additional NegativeSampler Variants
 
@@ -548,3 +578,4 @@ Mining-based negative selection (e.g., online hard negative mining using current
 | v1 | 2026-03-10 | Initial PRD. Covers averaged model, all 6 loss functions, negative sampling, subsampling, degree weighting, training loop, warm-start, and inference. Attention excluded pending separate treatment. |
 | v2 | 2026-03-10 | Moved `num_negatives` out of loss function parameters into EP-level config. Loss functions now define only loss-specific parameters and operate on a fixed interface. PPR's positive-construction count renamed `num_walk_samples`. |
 | v3 | 2026-03-10 | Introduced first-class enums: `PositiveSampler` (LocalNeighborhood, RandomWalk), `NegativeSampler` (UniformWithHardNegatives), `ReconstructionAggregator` (Averaged, Weighted), `FeatureDropout` (All, Fixed, Probability), `Optimizer` (Adam), `LRScheduler` (CosineDecayWithWarmup, ExponentialDecay, Constant), and `Model` (Averaged; Parameterized as future work). `max_nodes` and `weighted_*` parameters moved into `PositiveSampler::LocalNeighborhood`. PPR loss deprecated in favor of `MarginLoss` + `PositiveSampler::RandomWalk`. Model established as a serializable component to support future parameterized variants. |
+| v4 | 2026-11-09 | Added `Optimizer::AdamW` with a validated `WeightDecay` (§11.3). Specified how `weighted_sampling` and `weighted_averaging` combine so edge weight is counted once (§5.2). Corrected the Adam time step: `t` counts mini-batch updates, not passes. |
