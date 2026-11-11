@@ -33,6 +33,8 @@ The library is broken up into a few different methods:
 
 To run the tests, `cargo test --release` covers the Rust side; for the Python bindings, `pip install pytest`, build the module as above, then run `pytest`.
 
+`examples/dataset/pinterest/bench_rp3b.py` benchmarks the RP3b random walker against the published RP3beta results on Pinterest (`pip install numpy scipy`, then run it from that directory; see the script for details).
+
 ## Data Format
 
 Graphs can be defined either adhoc or loaded from files.  Notably, Cloverleaf does _not_ allow for live graph updating currently; this allows it to make a number of optimizations to maximize the memory and compute efficiency of the graph.
