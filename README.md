@@ -33,7 +33,7 @@ The library is broken up into a few different methods:
 
 To run the tests, `cargo test --release` covers the Rust side; for the Python bindings, `pip install pytest`, build the module as above, then run `pytest`.
 
-`examples/dataset/pinterest/bench_rp3b.py` benchmarks the RP3b random walker against the published RP3beta results on Pinterest (`pip install numpy scipy`, then run it from that directory; see the script for details).
+`examples/dataset/pinterest/bench_rp3b.py` benchmarks the RP3b random walker against the published RP3beta results on Pinterest, and `bench_ep.py` beside it does the same for Embedding Propagation (`pip install numpy scipy`, then run it from that directory; see the script for details).
 
 ## Data Format
 
