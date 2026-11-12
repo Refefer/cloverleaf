@@ -102,9 +102,14 @@ impl <'a> NodeSampler for RandomWalkHardSampler<'a> {
             if negatives.len() >= num_hard_negs { break }
         }
 
+        // The anchor is never its own negative, unless there is nothing else to draw.
         let dist = Uniform::new(0, self.train_idxs.len());
+        let only_anchor = self.train_idxs.len() == 1 && self.train_idxs[0] == anchor;
         while negatives.len() < num_negs {
-            negatives.push(self.train_idxs[dist.sample(rng)]);
+            let node = self.train_idxs[dist.sample(rng)];
+            if node != anchor || only_anchor {
+                negatives.push(node);
+            }
         }
     }
 }
@@ -154,5 +159,40 @@ mod node_sampler_tests {
         let idxs: Vec<NodeID> = (0..1000).collect();
         let strategy = RandomWalkHardStrategy::new(0, &idxs);
         assert!(std::ptr::eq(strategy.train_idxs.as_ptr(), idxs.as_ptr()));
+    }
+
+    /// A node is never its own negative (the EP paper samples u from V \ {v}).
+    #[test]
+    fn test_anchor_is_never_its_own_negative() {
+        use crate::graph::{CSR, CumCSR};
+        use rand_xorshift::XorShiftRng;
+        let edges = vec![(0, 1, 1f32), (1, 0, 1f32), (1, 2, 1f32), (2, 1, 1f32)];
+        let graph = CumCSR::convert(CSR::construct_from_edges(edges, false));
+        let fs = FeatureStore::new(3);
+        let idxs: Vec<NodeID> = vec![0, 1, 2];
+        let strategy = RandomWalkHardStrategy::new(0, &idxs);
+        let sampler = (&strategy).initialize_batch::<_, NodeID>(&[], &graph, &fs);
+        let mut rng = XorShiftRng::seed_from_u64(0);
+        let mut negatives = Vec::new();
+        for _ in 0..1000 {
+            negatives.clear();
+            sampler.sample_negatives(&graph, 0, &mut negatives, 1, &mut rng);
+            assert_ne!(negatives, vec![0]);
+        }
+    }
+
+    /// With nothing else to draw from, the anchor is still returned rather than looping forever.
+    #[test]
+    fn test_lone_node_can_be_its_own_negative() {
+        use crate::graph::{CSR, CumCSR};
+        use rand_xorshift::XorShiftRng;
+        let graph = CumCSR::convert(CSR::construct_from_edges(vec![(0, 0, 1f32)], false));
+        let fs = FeatureStore::new(1);
+        let idxs: Vec<NodeID> = vec![0];
+        let strategy = RandomWalkHardStrategy::new(0, &idxs);
+        let sampler = (&strategy).initialize_batch::<_, NodeID>(&[], &graph, &fs);
+        let mut negatives = Vec::new();
+        sampler.sample_negatives(&graph, 0, &mut negatives, 1, &mut XorShiftRng::seed_from_u64(0));
+        assert_eq!(negatives, vec![0]);
     }
 }

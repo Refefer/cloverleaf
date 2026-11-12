@@ -29,6 +29,28 @@ use crate::algos::grad_utils::node_sampler::*;
 use self::loss::*;
 use self::model::{Model,NodeCounts};
 
+/// How the learning rate changes over training.
+#[derive(Clone,Copy,Debug,PartialEq)]
+pub enum LearningRateSchedule {
+    /// Linear warmup from alpha / 100 over the first 20% of updates, then cosine decay back to
+    /// alpha / 100 by the last update.
+    CosineWarmup,
+
+    /// alpha throughout, as in the EP paper.
+    Constant
+}
+
+/// How feature embeddings are initialised when no warm start is given.
+#[derive(Clone,Copy,Debug,PartialEq)]
+pub enum EmbeddingInit {
+    /// Each coordinate uniform in [-1, 1), then the embedding is scaled to unit length.
+    UnitNorm,
+
+    /// Glorot (Xavier) uniform, as in the EP paper: each coordinate from U(-l, l) with
+    /// l = sqrt(6 / (num_features + dims)).
+    GlorotUniform
+}
+
 #[derive(Clone,Copy,Debug)]
 pub enum LossWeighting {
     DegreeLog,
@@ -75,7 +97,13 @@ pub struct EmbeddingPropagation {
     pub indicator: bool,
 
     /// Optimizer for the feature embeddings
-    pub optimizer: OptimizerKind
+    pub optimizer: OptimizerKind,
+
+    /// Learning rate schedule
+    pub lr_schedule: LearningRateSchedule,
+
+    /// Initialisation of the feature embeddings when no warm start is given
+    pub init: EmbeddingInit
 }
 
 impl EmbeddingPropagation {
@@ -109,7 +137,7 @@ impl EmbeddingPropagation {
         } else {
             let mut fe = EmbeddingStore::new(features.num_features(), dims, Distance::Cosine);
             // Initialize embeddings as random
-            randomize_embedding_store(&mut fe, &mut rng);
+            initialize_embedding_store(&mut fe, self.init, &mut rng);
             fe
         };
 
@@ -132,10 +160,13 @@ impl EmbeddingPropagation {
         use_shared_pool(false);
 
         let total_updates = steps_per_pass * self.passes;
-        let lr_scheduler = {
-            let warm_up_steps = (total_updates as f32 / 5f32) as usize;
-            let max_steps = self.passes * steps_per_pass;
-            LRScheduler::cos_decay(self.alpha / 100f32, self.alpha, warm_up_steps, max_steps)
+        let lr_scheduler = match self.lr_schedule {
+            LearningRateSchedule::CosineWarmup => {
+                let warm_up_steps = (total_updates as f32 / 5f32) as usize;
+                let max_steps = self.passes * steps_per_pass;
+                LRScheduler::cos_decay(self.alpha / 100f32, self.alpha, warm_up_steps, max_steps)
+            },
+            LearningRateSchedule::Constant => LRScheduler::constant(self.alpha)
         };
 
         // Noise 
@@ -383,6 +414,20 @@ pub fn extract_grads(
 }
 
 // Randomize embeddings.  Might make more sense to have in the embedding file.
+fn initialize_embedding_store(es: &mut EmbeddingStore, init: EmbeddingInit, rng: &mut impl Rng) {
+    match init {
+        EmbeddingInit::UnitNorm => randomize_embedding_store(es, rng),
+        EmbeddingInit::GlorotUniform => {
+            let limit = (6f32 / (es.len() + es.dims()) as f32).sqrt();
+            for idx in 0..es.len() {
+                es.get_embedding_mut(idx).iter_mut().for_each(|ei| {
+                    *ei = limit * (2f32 * rng.gen::<f32>() - 1f32);
+                });
+            }
+        }
+    }
+}
+
 fn randomize_embedding_store(es: &mut EmbeddingStore, rng: &mut impl Rng) {
     for idx in 0..es.len() {
         let e = es.get_embedding_mut(idx);
@@ -459,13 +504,46 @@ mod ep_tests {
             noise: 0.0,
             seed: 202220222,
             indicator: false,
-            optimizer: OptimizerKind::Adam
+            optimizer: OptimizerKind::Adam,
+            lr_schedule: LearningRateSchedule::CosineWarmup,
+            init: EmbeddingInit::UnitNorm
         };
 
         let embeddings = ep.learn_feature_embeddings(&ccsr, &feature_store, None, &model);
         for idx in 0..embeddings.len() {
             let e = embeddings.get_embedding(idx);
             println!("{:?} -> {:?}", idx, e);
+        }
+    }
+
+    /// Glorot uniform draws every coordinate from U(-l, l) with l = sqrt(6 / (rows + dims)).
+    #[test]
+    fn test_glorot_uniform_init() {
+        let (rows, dims) = (1000, 128);
+        let mut es = EmbeddingStore::new(rows, dims, Distance::Cosine);
+        let mut rng = XorShiftRng::seed_from_u64(0);
+        initialize_embedding_store(&mut es, EmbeddingInit::GlorotUniform, &mut rng);
+        let limit = (6f32 / (rows + dims) as f32).sqrt();
+        let mut max_abs = 0f32;
+        for idx in 0..rows {
+            for v in es.get_embedding(idx) {
+                assert!(v.abs() <= limit, "{} outside +-{}", v, limit);
+                max_abs = max_abs.max(v.abs());
+            }
+        }
+        // The draws should fill the range, not collapse near zero.
+        assert!(max_abs > 0.99 * limit, "max |v| {} for limit {}", max_abs, limit);
+    }
+
+    /// The default initialisation gives every embedding unit length.
+    #[test]
+    fn test_unit_norm_init() {
+        let mut es = EmbeddingStore::new(10, 16, Distance::Cosine);
+        let mut rng = XorShiftRng::seed_from_u64(0);
+        initialize_embedding_store(&mut es, EmbeddingInit::UnitNorm, &mut rng);
+        for idx in 0..10 {
+            let norm = es.get_embedding(idx).iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!((norm - 1f32).abs() < 1e-5, "row {} has norm {}", idx, norm);
         }
     }
 

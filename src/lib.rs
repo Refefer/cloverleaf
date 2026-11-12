@@ -69,7 +69,7 @@ use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::ann::Ann;
 use crate::algos::connected::{find_connected_components,prune_graph_components};
 use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
-use crate::algos::ep::{EmbeddingPropagation,LossWeighting as EPLW};
+use crate::algos::ep::{EmbeddingPropagation,EmbeddingInit,LearningRateSchedule,LossWeighting as EPLW};
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
 use crate::algos::feat_propagation::propagate_features;
@@ -1310,13 +1310,28 @@ impl EmbeddingPropagator {
     ///
     ///        Default is Optimizer.adam().
     ///
+    ///    lr_schedule : String - Optional
+    ///        "cosine" warms the learning rate up from alpha / 100 over the first 20% of updates,
+    ///        then decays it along a cosine back to alpha / 100.  "constant" keeps it at alpha,
+    ///        as in the EP paper.
+    ///
+    ///        Default is "cosine".
+    ///
+    ///    init : String - Optional
+    ///        Initialisation of the feature embeddings when none are passed to learn_features.
+    ///        "unit" draws each coordinate from U(-1, 1) and scales the embedding to unit length.
+    ///        "glorot" draws each coordinate from U(-l, l) with l = sqrt(6 / (features + dims)),
+    ///        as in the EP paper.
+    ///
+    ///        Default is "unit".
+    ///
     ///    Returns
     ///    -------
     ///    Self
     ///        
     ///    
     #[new]
-    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention=None, attention_heads=None, context_window=None, noise=None, optimizer=None))]
+    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention=None, attention_heads=None, context_window=None, noise=None, optimizer=None, lr_schedule=None, init=None))]
     pub fn new(
         // Learning rate
         alpha: Option<f32>, 
@@ -1374,8 +1389,26 @@ impl EmbeddingPropagator {
         noise: Option<f32>,
 
         // Optimizer for the feature embeddings
-        optimizer: Option<OptimizerSpec>
+        optimizer: Option<OptimizerSpec>,
+
+        // Learning rate schedule: "cosine" or "constant"
+        lr_schedule: Option<String>,
+
+        // Feature embedding initialisation: "unit" or "glorot"
+        init: Option<String>
     ) -> PyResult<Self> {
+        let lr_schedule = match lr_schedule.as_deref().unwrap_or("cosine") {
+            "cosine" => LearningRateSchedule::CosineWarmup,
+            "constant" => LearningRateSchedule::Constant,
+            other => return Err(PyValueError::new_err(
+                format!("lr_schedule must be \"cosine\" or \"constant\", got {:?}", other)))
+        };
+        let init = match init.as_deref().unwrap_or("unit") {
+            "unit" => EmbeddingInit::UnitNorm,
+            "glorot" => EmbeddingInit::GlorotUniform,
+            other => return Err(PyValueError::new_err(
+                format!("init must be \"unit\" or \"glorot\", got {:?}", other)))
+        };
         let loss_weighting = loss_weighting.map(|lw| lw.loss).unwrap_or(EPLW::None);
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(0.9),
@@ -1389,7 +1422,9 @@ impl EmbeddingPropagator {
             seed: seed.unwrap_or(SEED),
             indicator: indicator.unwrap_or(true),
             noise: noise.unwrap_or(0.0),
-            optimizer: optimizer.map(|o| o.kind).unwrap_or(OptimizerKind::Adam)
+            optimizer: optimizer.map(|o| o.kind).unwrap_or(OptimizerKind::Adam),
+            lr_schedule,
+            init
         };
 
         let wns = weighted_neighbor_sampling.unwrap_or(false);

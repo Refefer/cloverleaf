@@ -187,3 +187,21 @@ def test_ppr_rank_accepts_optimizer(graph, optimizer):
                                 optimizer=optimizer)
     feats = learner.learn_features(graph, cl.FeatureSet.new_from_graph(graph), indicator=False)
     assert feats.dims() == 4
+
+
+# Embedding Propagation training options
+
+
+@pytest.mark.parametrize("kwargs", [dict(lr_schedule="linear"), dict(init="xavier")])
+def test_embedding_propagator_rejects_unknown_options(kwargs):
+    with pytest.raises(ValueError):
+        cl.EmbeddingPropagator(**kwargs)
+
+
+@pytest.mark.parametrize("lr_schedule", ["cosine", "constant"])
+@pytest.mark.parametrize("init", ["unit", "glorot"])
+def test_embedding_propagator_schedules_and_inits(graph, lr_schedule, init):
+    ep = cl.EmbeddingPropagator(dims=4, passes=2, valid_pct=0.0, indicator=False,
+                                lr_schedule=lr_schedule, init=init)
+    feats = ep.learn_features(graph, cl.FeatureSet.new_from_graph(graph))
+    assert feats.dims() == 4

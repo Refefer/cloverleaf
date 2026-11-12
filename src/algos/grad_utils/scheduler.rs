@@ -17,6 +17,10 @@ pub enum LRScheduler {
         alpha: f32,
         decay: f32
     },
+    /// Returns alpha at every step
+    Constant {
+        alpha: f32
+    },
     /// Returns zero
     Noop
 }
@@ -28,6 +32,10 @@ impl LRScheduler {
 
     pub fn exp_decay(min_alpha: f32, alpha: f32, decay: f32) -> Self {
         LRScheduler::ExpDecay { min_alpha, alpha, decay }
+    }
+
+    pub fn constant(alpha: f32) -> Self {
+        LRScheduler::Constant { alpha }
     }
 
     pub fn noop() -> Self {
@@ -57,6 +65,7 @@ impl LRScheduler {
             LRScheduler::ExpDecay { min_alpha, alpha, decay } => {
                 (alpha * decay.powf(cur_step as f32)).max(*min_alpha)
             },
+            LRScheduler::Constant { alpha } => *alpha,
             LRScheduler::Noop => 0.0
         }
 
@@ -96,5 +105,14 @@ mod scheduler_tests {
         let s = LRScheduler::cos_decay(0.01, 1.0, 100, 1000);
         let (a, b) = (s.compute(100), s.compute(101));
         assert!((a - b).abs() < 1e-3, "warmup end {} -> {}", a, b);
+    }
+
+    /// A constant schedule returns alpha at every step, including step 0.
+    #[test]
+    fn test_constant_schedule() {
+        let s = LRScheduler::constant(0.001);
+        for step in [0usize, 1, 100, 1_000_000] {
+            assert_eq!(s.compute(step), 0.001);
+        }
     }
 }
