@@ -1,9 +1,18 @@
 """Benchmark: Embedding Propagation on the Pinterest leave-one-out split.
 
 Same splits, protocol and metrics as bench_rp3b.py (see there): leave-one-out with sampled negatives,
-seen items ranked last, ties broken at random.  EP learns one embedding per node (each node's only
-feature is its own id) and a board is scored by the cosine similarity of the user and board node
-embeddings, optionally after neighborhood alignment.
+seen items ranked last, ties broken at random.  A board is scored by the cosine similarity of the
+user and board node embeddings, optionally after neighborhood alignment.
+
+The dataset has no content features, so --features picks features derived from the graph:
+
+  ids              Each node's only feature is its own id: EP learns one free embedding per node.
+  user-boards      A user is the bag of boards they pinned; a board is its own id.  EP learns only
+                   board embeddings and builds users from them, like an item-based model.
+  user-boards+id   As user-boards, plus the user's own id.
+
+Features come from the edges the model is trained on, so validation users never see their
+held-out board.
 
 Each configuration is trained on a validation split carved out of the training edges, and the
 alignment strength is picked on validation HR@5.  The configuration is then retrained on the full
@@ -14,9 +23,11 @@ Usage (from this directory, after `maturin develop --release` and `pip install n
 
     python bench_ep.py                              # the run.sh recipe
     python bench_ep.py --configs margin adamw       # several configurations
+    python bench_ep.py --features ids user-boards   # several feature modes
     python bench_ep.py --split ncf --ncf-dir DIR
 """
 import argparse
+import itertools
 import json
 import os
 import tempfile
@@ -41,6 +52,8 @@ BASE = dict(dims=128, passes=200, alpha=0.9, batch_size=1024, max_nodes=10)
 
 ALIGNMENTS = [None, 0.1, 0.3, 0.5, 0.7]
 
+FEATURE_MODES = ["ids", "user-boards", "user-boards+id"]
+
 
 def make_loss(spec):
     kind, *params = spec
@@ -54,12 +67,31 @@ def make_optimizer(spec):
     return getattr(cl.Optimizer, kind)(*params)
 
 
-def train(R, config, seed, tmp):
+def build_features(graph, R, mode):
+    """Feature set for the graph; see the module docstring for the modes."""
+    features = cl.FeatureSet.new_from_graph(graph)
+    if mode == "ids":
+        # Nodes without features get their own id when EP fills in missing nodes.
+        return features
+    for b in np.flatnonzero(np.diff(R.tocsc().indptr)):
+        features.set_features(("board", str(b)), [("board", str(b))])
+    for u in range(R.shape[0]):
+        boards = R.indices[R.indptr[u]:R.indptr[u + 1]]
+        if len(boards) == 0:
+            continue
+        feats = [("board", str(b)) for b in boards]
+        if mode == "user-boards+id":
+            feats.append(("user", str(u)))
+        features.set_features(("user", str(u)), feats)
+    return features
+
+
+def train(R, config, feature_mode, seed, tmp):
     """Trains EP on the edges in R and returns the graph and the node embeddings."""
     path = os.path.join(tmp, "train.edges")
     write_graph(R, path)
     graph = cl.Graph.load(path, cl.EdgeType.Undirected)
-    features = cl.FeatureSet.new_from_graph(graph)
+    features = build_features(graph, R, feature_mode)
     kwargs = dict(config)
     kwargs["loss"] = make_loss(kwargs["loss"])
     kwargs["optimizer"] = make_optimizer(kwargs.get("optimizer"))
@@ -104,6 +136,7 @@ def main():
     p.add_argument("--test", default=os.path.join(HERE, "pinterest.test.gz"))
     p.add_argument("--ncf-dir", default=None)
     p.add_argument("--configs", nargs="+", default=["margin"], choices=list(CONFIGS))
+    p.add_argument("--features", nargs="+", default=["ids"], choices=FEATURE_MODES)
     p.add_argument("--passes", type=int, default=BASE["passes"])
     p.add_argument("--dims", type=int, default=BASE["dims"])
     p.add_argument("--alignments", type=float, nargs="*", default=None,
@@ -138,14 +171,15 @@ def main():
 
     published = PUBLISHED[args.split]["RP3beta"]
     results = {"published RP3beta": {"params": {}, "test": published}}
-    for name in args.configs:
-        config = dict(BASE, passes=args.passes, dims=args.dims, **CONFIGS[name])
+    for config_name, feature_mode in itertools.product(args.configs, args.features):
+        name = config_name if feature_mode == "ids" else f"{config_name}, {feature_mode}"
+        config = dict(BASE, passes=args.passes, dims=args.dims, **CONFIGS[config_name])
         with tempfile.TemporaryDirectory() as tmp:
             if args.no_tune:
                 candidates = alignments
             else:
                 log(f"{name}: training on the validation split")
-                graph, ne, secs = train(R_val, config, args.seed, tmp)
+                graph, ne, secs = train(R_val, config, feature_mode, args.seed, tmp)
                 log(f"{name}: trained in {secs:.0f}s")
                 val = {}
                 for a in alignments:
@@ -157,14 +191,14 @@ def main():
                 candidates = [best]
 
             log(f"{name}: training on the full training edges")
-            graph, ne, secs = train(R, config, args.seed, tmp)
+            graph, ne, secs = train(R, config, feature_mode, args.seed, tmp)
             log(f"{name}: trained in {secs:.0f}s")
             for a in candidates:
                 test = evaluate(graph, ne, a, R.shape, test_users, test_cands, test_seen,
                                 args.seed)
                 label = f"EP {name}" + (f" (align {a})" if a is not None else "")
                 params = {k: v for k, v in config.items()}
-                params.update(alignment=a, train_seconds=round(secs))
+                params.update(features=feature_mode, alignment=a, train_seconds=round(secs))
                 results[label] = {"params": params, "test": test}
                 if not args.no_tune:
                     results[label]["valid"] = val[a]
