@@ -216,6 +216,8 @@ Embedding Propagation is a node embedding method which uses both the graph struc
 2. Average or Attention-based node feature aggregation with Full, Random, and sliding window approaches (useful for textual node features).
 3. Neighborhood Alignment - Uses graph topology to influence node feature-based embeddings.
 
+The paper's results reproduce: `examples/ep_paper/reproduce.py` trains EP-B with the paper's settings (`loss=EPLoss.margin(gamma, 1)`, `alpha=0.001`, `lr_schedule="constant"`, `init="glorot"`, `batch_size=64`, `passes=200`) and matches its node classification results on Cora, Citeseer, Pubmed, PPI and POS, and on BlogCatalog with 5 sampled neighbors (`max_nodes=5`).  See `examples/ep_paper/README.md` for the numbers.
+
 To maximize cpu utilization, Hogwild [8] is used to update weights lock free.  This has the side effect of non-determinism in runs as well; similarly, if collisions between features are likely, the fidelity of the embeddings will be impacted.  In practice it's a non-issue but worth paying attention to, especially if reproducability is critical.
 
 The result of the optimization phase is feature embeddings, which can be used to construct node embeddings dynamically or in batch.
@@ -234,6 +236,9 @@ The result of the optimization phase is feature embeddings, which can be used to
 11. `noise` - Adds gradient noise to the updates; likely to be removed in the future.
 12. `hard_negatives` - Computes hard negatives through a fixed random walk from the anchor node, providing a similar but non-neighbor to the node.
 13. `valid_pct` - Percentage of nodes in the graph to use for validation.
+14. `optimizer` - `cloverleaf.Optimizer.adam()` (default) or `cloverleaf.Optimizer.adamw(weight_decay)`.
+15. `lr_schedule` - `"cosine"` (default) warms the learning rate up over the first 20% of updates, then decays it along a cosine; `"constant"` keeps it at `alpha`, as in the paper.
+16. `init` - `"unit"` (default) starts each feature embedding as a random unit vector; `"glorot"` uses Glorot uniform, as in the paper.
 
 #### Example
 

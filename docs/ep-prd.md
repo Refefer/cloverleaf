@@ -1,8 +1,8 @@
 # Embedding Propagation — Product Requirements Document
 
-**Version:** 4
+**Version:** 5
 **Status:** Draft
-**Date:** 2026-11-09
+**Date:** 2026-11-12
 
 ---
 
@@ -59,7 +59,7 @@ The core supervision signal is the *positive reconstruction* `~h(v)`: an estimat
 
 ## 3. Algorithm Overview
 
-1. **Initialize** the feature embedding table at random (unit-normalized vectors). Initialize any Model parameters.
+1. **Initialize** the feature embedding table at random (unit-normalized vectors by default, or Glorot uniform; see §11.7). Initialize any Model parameters.
 2. For each training pass:
    a. Shuffle the training node set.
    b. Split into mini-batches.
@@ -217,7 +217,7 @@ _(Single variant for now; additional strategies are future work.)_
 Fills the requested `num_negatives` slots using a two-phase strategy:
 
 1. **Hard negatives (first `hard_negatives` slots):** Random-walk from the anchor, accepting only nodes that are not the anchor and not a direct neighbor of the anchor. Up to `2 × hard_negatives` walk attempts are made. Restart probability is fixed at `0.25`; max walk steps is `10`.
-2. **Random negatives (remaining slots):** Drawn uniformly from the full training node index.
+2. **Random negatives (remaining slots):** Drawn uniformly from the full training node index, excluding the anchor itself (the paper samples `u ∈ V \ {v}`). A draw of the anchor is redrawn, unless the anchor is the only node in the index.
 
 When `hard_negatives = 0`, all slots are filled with uniform random negatives.
 
@@ -343,7 +343,7 @@ All nodes are randomly shuffled and partitioned into a **training set** and a **
 
 ### 11.2 Mini-Batch Parallelism
 
-Training nodes are shuffled each pass and chunked into mini-batches. Nodes within a batch are processed in parallel. Gradients for shared features are accumulated (summed) across the batch before the optimizer step.
+Training nodes are shuffled each pass and chunked into mini-batches. Nodes within a batch are processed in parallel, and so are the batches themselves: they update the shared feature embeddings and optimizer state lock-free (Hogwild). Gradients for shared features are accumulated (summed) across the batch before the optimizer step.
 
 ### 11.3 Optimizer
 
@@ -412,8 +412,8 @@ Linear warmup from `α / 100` to `α` over the first `warmup_pct` fraction of to
 # Warmup (step ≤ warmup_steps):
 lr(step) = α_min + (step / warmup_steps) · (α - α_min)
 
-# Decay (step > warmup_steps):
-lr(step) = α_min + 0.5 · (α - α_min) · (1 + cos(π · step / max_steps))
+# Decay (step > warmup_steps), starting from α where warmup ends:
+lr(step) = α_min + 0.5 · (α - α_min) · (1 + cos(π · (step - warmup_steps) / (max_steps - warmup_steps)))
 ```
 
 Default: `warmup_pct = 0.2` (first 20% of steps).
@@ -428,7 +428,9 @@ The decay rate controls how quickly the learning rate falls. `α_min` serves as 
 
 #### Constant
 
-Learning rate is fixed at `α` for the entire training run. No scheduling.
+Learning rate is fixed at `α` for the entire training run. No scheduling. This is the EP paper's setup.
+
+EmbeddingPropagator exposes `CosineDecayWithWarmup` and `Constant` as `lr_schedule="cosine"` (default) and `lr_schedule="constant"`; `ExponentialDecay` is used only by gradient noise (§9.5).
 
 ### 11.5 Validation
 
@@ -439,6 +441,18 @@ At the end of each pass, the forward pass is run (no gradient tracking) on all v
 - Losses of exactly `0.0` are skipped (no gradient).
 - NaN losses are silently dropped.
 - Gradients containing NaN or infinite values are not applied.
+
+### 11.7 Initialization
+
+Without a warm start (§12), the feature embedding table is initialized at random.
+
+```
+EmbeddingInit::UnitNorm        # default
+EmbeddingInit::GlorotUniform
+```
+
+- **UnitNorm:** each coordinate is drawn from `U(-1, 1)`, then the embedding is scaled to unit length.
+- **GlorotUniform:** each coordinate is drawn from `U(-l, l)` with `l = sqrt(6 / (num_features + dims))`, as in the EP paper. The embeddings start much smaller than with `UnitNorm`, which matters for the Euclidean margin loss: γ is measured against embedding distances.
 
 ---
 
@@ -508,7 +522,8 @@ Inference is stateless and trivially parallelizable across nodes.
 | `negative_sampler` | `NegativeSampler` enum | `UniformWithHardNegatives { 0 }` | How negatives are selected. See §7. |
 | `feature_dropout` | `FeatureDropout` enum | `All` | Feature subsampling per forward pass. See §9. |
 | `optimizer` | `Optimizer` enum | `Adam { 0.9, 0.999, 1e-8 }` | Gradient optimizer: `Adam` or `AdamW` (default `weight_decay` 0.01). See §11.3. |
-| `lr_scheduler` | `LRScheduler` enum | `CosineDecayWithWarmup { 0.2 }` | Learning rate schedule. See §11.4. |
+| `lr_scheduler` | `LRScheduler` enum | `CosineDecayWithWarmup { 0.2 }` | Learning rate schedule (`lr_schedule="cosine"` or `"constant"` in Python). See §11.4. |
+| `init` | `EmbeddingInit` enum | `UnitNorm` | Feature embedding initialization (`init="unit"` or `"glorot"` in Python). See §11.7. |
 | `batch_size` | int | `50` | Mini-batch size. |
 | `dims` | int | `100` | Embedding dimensionality. |
 | `passes` | int | `100` | Number of full training passes. |
@@ -517,6 +532,12 @@ Inference is stateless and trivially parallelizable across nodes.
 | `loss_weighting` | enum | `None` | Per-node degree-based loss scaling. See §10. |
 | `noise` | float | `0.0` | Initial gradient noise std dev. See §9.5. |
 | `indicator` | bool | `true` | Show progress bar. |
+
+### Reproducing EP-B
+
+The paper's EP-B (García-Durán and Niepert, NIPS 2017) corresponds to: `MarginLoss(γ)` with `num_negatives = 1`, `alpha = 0.001`, `lr_scheduler = Constant`, `init = GlorotUniform`, `batch_size = 64`, `passes = 200`, `dims = 128`, and the `Averaged` model. The paper learns one embedding table per label type with its own loss and concatenates them; that is equivalent to one EP run per label type.
+
+With these settings cloverleaf reproduces the paper's node classification results on Cora, Citeseer, Pubmed, PPI and POS. On BlogCatalog it does so when 5 neighbors are sampled per reconstruction (`max_nodes = 5`); using every neighbor leaves it 5–8 points short. See `examples/ep_paper/README.md` for the full results.
 
 ### Loss-Specific Parameters
 
@@ -579,3 +600,4 @@ Mining-based negative selection (e.g., online hard negative mining using current
 | v2 | 2026-03-10 | Moved `num_negatives` out of loss function parameters into EP-level config. Loss functions now define only loss-specific parameters and operate on a fixed interface. PPR's positive-construction count renamed `num_walk_samples`. |
 | v3 | 2026-03-10 | Introduced first-class enums: `PositiveSampler` (LocalNeighborhood, RandomWalk), `NegativeSampler` (UniformWithHardNegatives), `ReconstructionAggregator` (Averaged, Weighted), `FeatureDropout` (All, Fixed, Probability), `Optimizer` (Adam), `LRScheduler` (CosineDecayWithWarmup, ExponentialDecay, Constant), and `Model` (Averaged; Parameterized as future work). `max_nodes` and `weighted_*` parameters moved into `PositiveSampler::LocalNeighborhood`. PPR loss deprecated in favor of `MarginLoss` + `PositiveSampler::RandomWalk`. Model established as a serializable component to support future parameterized variants. |
 | v4 | 2026-11-09 | Added `Optimizer::AdamW` with a validated `WeightDecay` (§11.3). Specified how `weighted_sampling` and `weighted_averaging` combine so edge weight is counted once (§5.2). Corrected the Adam time step: `t` counts mini-batch updates, not passes. |
+| v5 | 2026-11-12 | Exposed the `Constant` learning rate schedule (§11.4) and added `EmbeddingInit` with Glorot uniform (§11.7). Uniform negatives exclude the anchor (§7.2). Corrected the cosine decay formula and noted Hogwild batch parallelism (§11.2). Added the EP-B reproduction settings and results (§14). |
