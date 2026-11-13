@@ -417,8 +417,8 @@ fn compute_w_vec_from_points<'a>(
 
 /// Picks two entries at different positions.  Requires at least two entries.
 fn choose_two(indices: &[(NodeID, bool)], rng: &mut impl Rng) -> (NodeID, NodeID) {
-    let i = rng.gen_range(0, indices.len());
-    let mut j = rng.gen_range(0, indices.len() - 1);
+    let i = rng.gen_range(0..indices.len());
+    let mut j = rng.gen_range(0..indices.len() - 1);
     if j >= i { j += 1; }
     (indices[i].0, indices[j].0)
 }

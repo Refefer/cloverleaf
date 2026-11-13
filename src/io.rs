@@ -5,7 +5,6 @@ use std::io::{Write,BufWriter,Result as IOResult,BufReader,BufRead};
 use std::convert::AsRef;
 use std::collections::HashSet;
 
-use fast_float::parse;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -333,7 +332,7 @@ fn line_to_embedding(line: &String) -> Option<(String,String,Vec<f32>)> {
     chars.next()?;
     chars.next_back()?;
     let emb: Result<Vec<f32>,_> = chars.as_str().split(',')
-        .map(|wi| parse(wi.trim())).collect();
+        .map(|wi| wi.trim().parse::<f32>()).collect();
 
     emb.ok().map(|e| (node_type.to_string(), name.to_string(), e))
 }
