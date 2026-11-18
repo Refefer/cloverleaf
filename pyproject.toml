@@ -17,5 +17,8 @@ classifiers = [
 test = ["pytest"]
 bench = ["numpy", "scipy"]
 
+[tool.maturin]
+features = ["python"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

@@ -2,8 +2,14 @@
 //! centroid of their neighborhood.  For graphs which have strong homophily, it can help
 //! signifciantly improve both transductive and inductive algorithms.  In cases where structure is
 //! more important, tends to have a lower effect (although light alignments often are beneficial).
+use itertools::Itertools;
+use rayon::prelude::*;
+
 use crate::graph::{Graph,NodeID,CDFtoP};
-use crate::embeddings::EmbeddingStore;
+use crate::embeddings::{EmbeddingStore, NodeEmbeddings};
+use crate::error::{Error, ensure_aligned};
+use crate::io::EmbeddingWriter;
+use crate::named_graph::NamedGraph;
 
 /// Neighborhood Aligner.  
 pub struct NeighborhoodAligner {
@@ -20,6 +26,49 @@ impl NeighborhoodAligner {
 
     pub fn new(alpha: Option<f32>, max_neighbors: Option<usize>) -> Self {
         NeighborhoodAligner { alpha, max_neighbors }
+    }
+
+    /// Aligns every node's embedding toward its neighbourhood in `graph`.  The embeddings must
+    /// be indexed by the graph's nodes.
+    pub fn align_all(&self, embeddings: &NodeEmbeddings, graph: &NamedGraph) -> Result<NodeEmbeddings, Error> {
+        ensure_aligned(&graph.vocab, &embeddings.vocab, "Graph and NodeEmbeddings")?;
+        let es = &embeddings.embeddings;
+        let aligned = EmbeddingStore::new(es.len(), es.dims(), es.distance());
+        (0..graph.nodes()).into_par_iter().for_each(|node| {
+            // Each node writes only its own row.
+            self.align(graph.graph(), es, node, aligned.get_embedding_mut_hogwild(node));
+        });
+        Ok(NodeEmbeddings { vocab: embeddings.vocab.clone(), embeddings: aligned })
+    }
+
+    /// `align_all`, streaming the aligned embeddings to `path` `chunk_size` nodes at a time
+    /// instead of holding them all in memory.
+    pub fn align_to_disk(
+        &self,
+        path: &str,
+        embeddings: &NodeEmbeddings,
+        graph: &NamedGraph,
+        chunk_size: usize,
+        comp_level: Option<u32>
+    ) -> Result<(), Error> {
+        ensure_aligned(&graph.vocab, &embeddings.vocab, "Graph and NodeEmbeddings")?;
+        if chunk_size == 0 {
+            return Err(Error::InvalidArgument("chunk_size must be at least 1".into()))
+        }
+        let mut writer = EmbeddingWriter::new(path, embeddings.vocab.as_ref(), comp_level)?;
+        let mut buffer = vec![vec![0.; embeddings.dims()]; chunk_size];
+        let mut ids = Vec::with_capacity(chunk_size);
+        for chunk in &(0..graph.nodes()).chunks(chunk_size) {
+            ids.clear();
+            ids.extend(chunk);
+            ids.par_iter().zip(buffer.par_iter_mut()).for_each(|(node, new_emb)| {
+                new_emb.iter_mut().for_each(|wi| *wi = 0f32);
+                self.align(graph.graph(), &embeddings.embeddings, *node, new_emb);
+            });
+            writer.stream(ids.iter().copied().zip(buffer.iter()))?;
+        }
+        writer.finish()?;
+        Ok(())
     }
 
     pub fn align(

@@ -9,6 +9,8 @@
 //! random walks toward higher-value states, acting as a correction to the
 //! original weights.
 
+use crate::error::Error;
+use crate::named_graph::NamedGraph;
 use rayon::prelude::*;
 use std::fmt::Write;
 
@@ -21,6 +23,29 @@ pub struct PolicyEvaluation {
     pub eps: f32,
     pub temperature: f32,
     pub indicator: bool,
+}
+
+impl PolicyEvaluation {
+    /// Runs policy evaluation with a reward per node and rewrites the graph's edge weights to
+    /// the resulting policy.  A graph shared with other `NamedGraph`s is copied first; check
+    /// [`NamedGraph::graph_mut`] beforehand to avoid that.
+    pub fn optimize(&self, graph: &mut NamedGraph, rewards: &[f32]) -> Result<(), Error> {
+        if rewards.len() != graph.nodes() {
+            return Err(Error::InvalidArgument(format!(
+                "{} rewards for {} nodes", rewards.len(), graph.nodes())))
+        }
+        let csr = graph.make_graph_mut();
+        let values = self.compute(csr, rewards);
+        self.update_policy_weights_in_place(csr, &values);
+        Ok(())
+    }
+}
+
+/// The defaults the Python bindings use.
+impl Default for PolicyEvaluation {
+    fn default() -> Self {
+        PolicyEvaluation::new(0.99, 100, 1e-6, 1.0, true)
+    }
 }
 
 impl PolicyEvaluation {

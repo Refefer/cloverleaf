@@ -20,7 +20,11 @@ use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::EmbeddingStore;
 use crate::distance::Distance;
 use crate::progress::CLProgressBar;
-use crate::feature_store::FeatureStore;
+use crate::feature_store::{FeatureStore, FeatureSet};
+use crate::embeddings::NodeEmbeddings;
+use crate::error::Error;
+use crate::named_graph::NamedGraph;
+use std::sync::Arc;
 use crate::algos::utils::node_seed;
 use crate::algos::grad_utils::scheduler::LRScheduler;
 use crate::algos::grad_utils::optimizer::{Optimizer,AdamOptimizer,OptimizerKind};
@@ -104,6 +108,46 @@ pub struct EmbeddingPropagation {
 
     /// Initialisation of the feature embeddings when no warm start is given
     pub init: EmbeddingInit
+}
+
+impl EmbeddingPropagation {
+    /// Learns feature embeddings over a named graph and returns them named by feature.  Nodes
+    /// without features get one of their own; `warm_start` continues from earlier feature
+    /// embeddings, which must be indexed by the features.
+    pub fn learn_features<M: Model>(
+        &self,
+        graph: &NamedGraph,
+        features: &mut FeatureSet,
+        warm_start: Option<NodeEmbeddings>,
+        model: &M
+    ) -> Result<NodeEmbeddings, Error> {
+        features.prepare_for_learning(graph, warm_start.as_ref())?;
+        let embeddings = self.learn(graph.graph(), &features.features,
+                                    warm_start.map(|w| w.embeddings), model);
+        Ok(NodeEmbeddings { vocab: Arc::new(features.features.clone_vocab()), embeddings })
+    }
+}
+
+/// The defaults the Python bindings use.
+impl Default for EmbeddingPropagation {
+    fn default() -> Self {
+        EmbeddingPropagation {
+            alpha: 0.9,
+            loss: Loss::MarginLoss(1f32, 1),
+            batch_size: 50,
+            d_model: 100,
+            passes: 100,
+            hard_negs: 0,
+            loss_weighting: LossWeighting::None,
+            seed: crate::DEFAULT_SEED,
+            valid_pct: 0.1,
+            noise: 0.0,
+            indicator: true,
+            optimizer: OptimizerKind::Adam,
+            lr_schedule: LearningRateSchedule::CosineWarmup,
+            init: EmbeddingInit::UnitNorm
+        }
+    }
 }
 
 impl EmbeddingPropagation {

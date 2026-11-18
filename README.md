@@ -31,7 +31,35 @@ The library is broken up into a few different methods:
 4. `RUSTFLAGS="-C target-cpu=native" maturin develop --release`
 5. Profit!
 
-To run the tests, `cargo test --release` covers the Rust side; for the Python bindings, `pip install pytest`, build the module as above, then run `pytest`.
+To run the tests, `cargo test --release --features python` covers the Rust side, including the binding code; for the Python bindings themselves, `pip install pytest`, build the module as above, then run `pytest`.  `tests/python/test_snapshot.py` checks the bindings' results against a recorded snapshot; after an intended change to them, rerun it with `python tests/python/test_snapshot.py --update` and review the diff to `snapshot.json`.
+
+### Using Cloverleaf from Rust
+
+Cloverleaf is also a Rust library.  The Python bindings sit behind the `python` feature, which maturin turns on, so a Rust project that depends on cloverleaf doesn't build pyo3 or need Python:
+
+```toml
+[dependencies]
+cloverleaf = { git = "https://github.com/Refefer/cloverleaf" }
+```
+
+The Rust API mirrors the Python one: `NamedGraph`, `FeatureSet` and `NodeEmbeddings` play the roles of `Graph`, `FeatureSet` and `NodeEmbeddings`, the algorithms live under `cloverleaf::algos`, and files are read and written in the same formats.  The Python classes are thin wrappers over these types.  `examples/embed.rs` trains Embedding Propagation on a graph file end to end:
+
+```rust
+let graph = NamedGraph::load("graph.edges", EdgeType::Undirected, &GraphLoadOptions::default())?;
+let mut features = FeatureSet::from_graph(&graph);
+let ep = EmbeddingPropagation { d_model: 64, passes: 50, ..EmbeddingPropagation::default() };
+let model = AveragedFeatureModel::new(Sample::All, Sample::Fixed(10), false, false);
+let feature_embeddings = ep.learn_features(&graph, &mut features, None, &model)?;
+let nodes = NodeEmbedder::new(FeatureAggregator::averaged())
+    .embed_feature_set(&features, &feature_embeddings)?;
+nodes.save("embeddings.out", None)?;
+```
+
+```
+cargo run --release --example embed -- graph.edges embeddings.out [features.txt]
+```
+
+`cargo doc --open` documents the API, including a table mapping each Python class to its Rust counterpart.
 
 `examples/dataset/pinterest/bench_rp3b.py` benchmarks the RP3b random walker against the published RP3beta results on Pinterest, and `bench_ep.py` beside it does the same for Embedding Propagation (`pip install numpy scipy`, then run it from that directory; see the script for details).
 

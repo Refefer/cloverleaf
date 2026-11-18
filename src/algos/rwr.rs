@@ -19,6 +19,11 @@ pub struct RWR {
 }
 
 impl RWR {
+    /// A walker with the defaults the Python bindings use: beta of 0.5, multithreaded, and the
+    /// default seed.
+    pub fn new(steps: Sample, walks: usize) -> Self {
+        RWR { steps, walks, beta: 0.5, single_threaded: false, seed: crate::DEFAULT_SEED }
+    }
 
     pub fn sample<G: Graph + Send + Sync>(
         &self, 
