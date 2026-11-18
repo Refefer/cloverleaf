@@ -177,7 +177,24 @@ pub fn weighted_reservoir_sample<A>(
     bh.into_iter().map(|of| of.0.1).collect()
 }
 
+/// A sample size that is negative or NaN.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct IllegalSample;
+
+/// The `k` highest scores (all of them when `k` is None) among nodes `keep` accepts, highest
+/// first.
+pub fn top_k_scores(
+    scores: impl IntoIterator<Item=(NodeID, f32)>,
+    k: Option<usize>,
+    keep: impl Fn(NodeID) -> bool
+) -> Vec<(NodeID, f32)> {
+    let mut scores: Vec<_> = scores.into_iter().filter(|(node_id, _)| keep(*node_id)).collect();
+    scores.sort_by_key(|(_, s)| FloatOrd(-*s));
+    if let Some(k) = k {
+        scores.truncate(k);
+    }
+    scores
+}
 
 #[derive(Clone,Copy,Debug)]
 pub enum Sample {
@@ -187,6 +204,17 @@ pub enum Sample {
 }
 
 impl Sample {
+    /// A walk length: n >= 1 walks n steps, 0 < n < 1 stops after each step with probability n.
+    pub fn steps(n: f32) -> Result<Sample,IllegalSample> {
+        if !(n > 0f32) {
+            Err(IllegalSample)
+        } else if n >= 1f32 {
+            Ok(Sample::Fixed(n as usize))
+        } else {
+            Ok(Sample::Probability(n))
+        }
+    }
+
     pub fn new(n: f32) -> Result<Sample,IllegalSample> {
         // Negated so NaN is rejected as well.
         if !(n >= 0f32) {
@@ -343,5 +371,23 @@ mod utils_tests {
         assert_ne!(node_seed(7, 1, 0, 5), node_seed(7, 2, 0, 5));
         assert_ne!(node_seed(7, 1, 0, 5), node_seed(7, 1, 1, 4));
         assert_ne!(node_seed(7, 1, 0, 5), node_seed(7, 1, 5, 0));
+    }
+
+    #[test]
+    fn test_sample_steps() {
+        assert!(matches!(Sample::steps(4.), Ok(Sample::Fixed(4))));
+        assert!(matches!(Sample::steps(1.), Ok(Sample::Fixed(1))));
+        assert!(matches!(Sample::steps(0.25), Ok(Sample::Probability(p)) if p == 0.25));
+        for bad in [0., -1., f32::NAN] {
+            assert!(Sample::steps(bad).is_err(), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn test_top_k_scores() {
+        let scores = vec![(0, 0.1), (1, 0.9), (2, 0.5), (3, 0.7)];
+        assert_eq!(top_k_scores(scores.clone(), Some(2), |_| true), vec![(1, 0.9), (3, 0.7)]);
+        assert_eq!(top_k_scores(scores.clone(), Some(2), |id| id % 2 == 0), vec![(2, 0.5), (0, 0.1)]);
+        assert_eq!(top_k_scores(scores, None, |_| true).len(), 4);
     }
 }

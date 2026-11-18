@@ -10,6 +10,13 @@ use rayon::iter::plumbing::{bridge, Consumer, Producer, ProducerCallback, Uninde
 
 pub type NodeID = usize;
 
+/// Type of edge.  Undirected edges are stored as two directed edges.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum EdgeType {
+    Directed,
+    Undirected
+}
+
 pub trait Graph {
     /// Get number of nodes in graph
     fn len(&self) -> usize;

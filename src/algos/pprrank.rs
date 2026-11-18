@@ -17,7 +17,10 @@ use crate::graph::{Graph as CGraph, CDFGraph, NodeID};
 use crate::embeddings::{EmbeddingStore,randomize_embedding_store};
 use crate::distance::Distance;
 use crate::progress::CLProgressBar;
-use crate::feature_store::FeatureStore;
+use crate::feature_store::{FeatureStore, FeatureSet};
+use crate::embeddings::NodeEmbeddings;
+use crate::error::Error;
+use crate::named_graph::NamedGraph;
 use crate::algos::ep::attention::softmax;
 use crate::algos::ep::model::{construct_node_embedding,NodeCounts};
 use crate::algos::ep::extract_grads;
@@ -88,6 +91,20 @@ pub struct PprRank {
 impl PprRank {
 
     /// Learns the feature embeddings.
+    /// Learns feature embeddings over a named graph and returns them named by feature.  Nodes
+    /// without features get one of their own; `warm_start` continues from earlier feature
+    /// embeddings, which must be indexed by the features.
+    pub fn learn_features(
+        &self,
+        graph: &NamedGraph,
+        features: &mut FeatureSet,
+        warm_start: Option<NodeEmbeddings>
+    ) -> Result<NodeEmbeddings, Error> {
+        features.prepare_for_learning(graph, warm_start.as_ref())?;
+        let embeddings = self.learn(graph.graph(), &features.features, warm_start.map(|w| w.embeddings));
+        Ok(NodeEmbeddings { vocab: std::sync::Arc::new(features.features.clone_vocab()), embeddings })
+    }
+
     pub fn learn<G: CGraph + CDFGraph + Send + Sync>(
         &self, 
         graph: &G, 

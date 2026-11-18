@@ -16,7 +16,15 @@ use crate::embeddings::{EmbeddingStore,Entity};
 use crate::graph::*;
 use crate::hogwild::{Hogwild};
 use crate::sampler::{GreedySampler};
-use crate::vocab::TranslationTable;
+use crate::vocab::{TranslationTable, Vocab};
+use crate::embeddings::NodeEmbeddings;
+use crate::named_graph::NamedGraph;
+
+/// Maps graph node ids to embedding ids, so SMCI can index the embeddings with graph nodes.
+fn graph_to_embedding_table(graph_vocab: &Vocab, embedding_vocab: &Vocab) -> TranslationTable {
+    // create_translation_table is indexed by the receiver's ids and yields ids in `to_vocab`.
+    graph_vocab.create_translation_table(embedding_vocab)
+}
 
 pub struct SupervisedMCIteration {
     // number of full passes over the dataset
@@ -50,6 +58,21 @@ pub struct SupervisedMCIteration {
 }
 
 impl SupervisedMCIteration {
+    /// Learns new edge weights for a named graph from `(from, to, reward)` rewards, returning a
+    /// copy of the graph with them.  `embeddings`, when given, are matched to the graph's nodes
+    /// by name.
+    pub fn learn_graph(
+        &self,
+        graph: &NamedGraph,
+        rewards: &[(NodeID, NodeID, f32)],
+        embeddings: Option<&NodeEmbeddings>
+    ) -> NamedGraph {
+        let distances = embeddings.map(|e| (&e.embeddings, graph_to_embedding_table(graph.vocab(), &e.vocab)));
+        let weights = self.learn(graph.graph(), rewards, distances);
+        let new_graph = graph.graph().clone_with_edges(weights).expect("one weight per edge");
+        NamedGraph { graph: std::sync::Arc::new(new_graph), vocab: graph.vocab().clone() }
+    }
+
     pub fn learn(
         &self,
         graph: &(impl CDFGraph + Send + Sync),
@@ -198,4 +221,75 @@ fn scale_weights(weights: &mut [f32], pow: f32) {
 #[cfg(test)]
 mod test_supervised_mc_iteration {
     use super::*;
+
+    /// SMCI indexes the table with graph node ids and uses the result as embedding ids.
+    #[test]
+    fn test_graph_to_embedding_table_direction() {
+        let mut graph_vocab = Vocab::new();
+        for n in ["a", "b", "c"] { graph_vocab.get_or_insert("n", n); }
+        let mut emb_vocab = Vocab::new();
+        for n in ["c", "a"] { emb_vocab.get_or_insert("n", n); }
+
+        let table = graph_to_embedding_table(&graph_vocab, &emb_vocab);
+        let g = |n: &str| graph_vocab.get_node_id("n", n).unwrap();
+        let e = |n: &str| emb_vocab.get_node_id("n", n);
+
+        assert_eq!(table.len(), graph_vocab.len());
+        assert_eq!(table[g("a")], e("a"));
+        assert_eq!(table[g("b")], None);
+        assert_eq!(table[g("c")], e("c"));
+    }
+
+    /// a -> {b, c}, b -> d, c -> d, d -> a.
+    fn diamond() -> NamedGraph {
+        let mut gb = crate::named_graph::GraphBuilder::new();
+        for (f, t) in [("a", "b"), ("a", "c"), ("b", "d"), ("c", "d"), ("d", "a")] {
+            gb.add_edge(("n", f), ("n", t), 1., crate::graph::EdgeType::Directed);
+        }
+        gb.build(false).unwrap()
+    }
+
+    fn smci() -> SupervisedMCIteration {
+        SupervisedMCIteration {
+            iterations: 10, num_walks: 20, alpha: 0., discount: 0.9, step_penalty: 0.,
+            explore_pct: 0., compression: 1., restart_prob: 0.1, seed: 3
+        }
+    }
+
+    fn prob(g: &NamedGraph, from: &str, to: &str) -> f32 {
+        let to_id = g.node_id("n", to).unwrap();
+        let (edges, probs) = g.get_edges("n", from, true).unwrap();
+        edges.iter().zip(probs).find(|(id, _)| **id == to_id).unwrap().1
+    }
+
+    /// Rewarding a -> d through b moves a's probability toward b, in a copy of the graph.
+    #[test]
+    fn test_learn_graph_shifts_toward_rewarded_paths() {
+        let g = diamond();
+        let a = g.node_id("n", "a").unwrap();
+        let b = g.node_id("n", "b").unwrap();
+        let learned = smci().learn_graph(&g, &[(a, b, 1.)], None);
+        assert!(std::sync::Arc::ptr_eq(g.vocab(), learned.vocab()));
+        assert_eq!((learned.nodes(), learned.edges()), (g.nodes(), g.edges()));
+        assert!((prob(&g, "a", "b") - 0.5).abs() < 1e-6, "original graph untouched");
+        assert!(prob(&learned, "a", "b") > prob(&learned, "a", "c"),
+                "{} <= {}", prob(&learned, "a", "b"), prob(&learned, "a", "c"));
+    }
+
+    /// Embeddings with their own vocab are matched to the graph by name.
+    #[test]
+    fn test_learn_graph_with_embeddings() {
+        let g = diamond();
+        let mut b = crate::embeddings::NodeEmbeddingsBuilder::new(crate::distance::Distance::Euclidean);
+        for (n, e) in [("d", [0., 1.]), ("b", [0., 0.9]), ("c", [5., 5.])] {
+            b.add_embedding("n", n, &e).unwrap();
+        }
+        let embs = b.build().unwrap();
+        let a = g.node_id("n", "a").unwrap();
+        let d = g.node_id("n", "d").unwrap();
+        let learned = smci().learn_graph(&g, &[(a, d, 1.)], Some(&embs));
+        assert_eq!(learned.edges(), g.edges());
+        let total: f32 = learned.get_edges("n", "a", true).unwrap().1.iter().sum();
+        assert!((total - 1.).abs() < 1e-5 && total.is_finite());
+    }
 }

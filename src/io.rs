@@ -1,4 +1,4 @@
-//! The beginnings of a refactor of load/save methods currently defined within lib.rs
+//! Reading and writing graphs, embeddings and feature files.  Files may be gzipped.
 use crate::graph::NodeID;
 use std::fs::File;
 use std::io::{Write,BufWriter,Result as IOResult,BufReader,BufRead};
@@ -9,16 +9,14 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use itertools::Itertools;
-use pyo3::exceptions::{PyValueError,PyKeyError,PyIOError};
-use pyo3::prelude::{PyResult,PyErr};
 use rayon::prelude::*;
 use ryu::Buffer;
 
 use crate::vocab::Vocab;
+use crate::error::Error;
 use crate::embeddings::EmbeddingStore;
 use crate::distance::Distance;
-use crate::graph::CumCSR;
-use crate::{CSR,EdgeType};
+use crate::graph::{CSR,CumCSR,EdgeType};
 
 /// Streaming writer for NodeEmbeddings.  Since Embeddings are often gigantic, creating them adhoc
 /// then streaming them to disk is beneficial.
@@ -63,6 +61,11 @@ impl <'a> EmbeddingWriter<'a> {
         }
 
         Ok(())
+    }
+
+    /// Flushes buffered output, reporting any write error that dropping the writer would hide.
+    pub fn finish(mut self) -> IOResult<()> {
+        self.output.flush()
     }
 
     fn format_embedding(buff: &mut Buffer, output: &mut String, emb: &[f32]) {
@@ -132,7 +135,7 @@ impl RecordReader {
 
 pub struct EmbeddingReader; 
 
-/// Errors from loading an embeddings file, independent of the Python bindings.
+/// Errors from loading an embeddings file.
 #[derive(Debug)]
 pub enum EmbeddingLoadError {
     Io(std::io::Error),
@@ -141,21 +144,21 @@ pub enum EmbeddingLoadError {
     DimensionMismatch
 }
 
-impl From<EmbeddingLoadError> for PyErr {
-    fn from(e: EmbeddingLoadError) -> PyErr {
-        match e {
-            EmbeddingLoadError::Io(e) => PyIOError::new_err(format!("{:?}", e)),
-            EmbeddingLoadError::Parse(line) => 
-                PyValueError::new_err(format!("Error parsing line: {}", line)),
-            EmbeddingLoadError::DuplicateNode(i) => 
-                PyKeyError::new_err(format!("found duplicate node at {}!", i)),
-            EmbeddingLoadError::DimensionMismatch => 
-                PyValueError::new_err("Embeddings have different sizes!")
+
+impl std::fmt::Display for EmbeddingLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmbeddingLoadError::Io(e) => write!(f, "{:?}", e),
+            EmbeddingLoadError::Parse(line) => write!(f, "Error parsing line: {}", line),
+            EmbeddingLoadError::DuplicateNode(i) => write!(f, "found duplicate node at {}!", i),
+            EmbeddingLoadError::DimensionMismatch => write!(f, "Embeddings have different sizes!")
         }
     }
 }
 
-/// Errors reading a node_type<TAB>name<TAB>features file.
+impl std::error::Error for EmbeddingLoadError {}
+
+/// Errors reading a `node_type<TAB>name<TAB>features` file.
 #[derive(Debug)]
 pub enum FeatureFileError {
     Io(std::io::Error),
@@ -163,14 +166,36 @@ pub enum FeatureFileError {
     Malformed(usize)
 }
 
-impl From<FeatureFileError> for PyErr {
-    fn from(e: FeatureFileError) -> PyErr {
-        match e {
-            FeatureFileError::Io(e) => PyIOError::new_err(format!("{:?}", e)),
-            FeatureFileError::Malformed(line) => PyValueError::new_err(format!(
-                "Line {}: Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ...", line))
+
+impl std::fmt::Display for FeatureFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeatureFileError::Io(e) => write!(f, "{:?}", e),
+            FeatureFileError::Malformed(line) => write!(f,
+                "Line {}: Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ...", line)
         }
     }
+}
+
+impl std::error::Error for FeatureFileError {}
+
+/// Reads a `node_type<TAB>name<TAB>value` file, such as Policy Evaluation rewards, as
+/// `(node id, value)` pairs.  Every node must be in `vocab`.
+pub fn read_node_values(path: &str, vocab: &Vocab) -> Result<Vec<(NodeID, f32)>, Error> {
+    let reader = open_file_for_reading(path)?;
+    let mut values = Vec::new();
+    for (i, line) in reader.lines().enumerate() {
+        let line = line?;
+        let pieces: Vec<_> = line.split('\t').collect();
+        if pieces.len() != 3 {
+            return Err(Error::Malformed { line: i + 1,
+                message: "Malformed line! Need node_type<TAB>name<TAB>value".into() })
+        }
+        let value: f32 = pieces[2].trim().parse().map_err(|_| Error::Malformed {
+            line: i + 1, message: format!("Invalid value: {}", pieces[2]) })?;
+        values.push((vocab.node_id(pieces[0], pieces[1].trim())?, value));
+    }
+    Ok(values)
 }
 
 /// Reads the nodes of a feature file into a vocab, in file order.
@@ -190,17 +215,9 @@ pub fn read_feature_vocab(path: &str) -> Result<Vocab, FeatureFileError> {
 
 impl EmbeddingReader {
 
+    /// Reads a `node_type<TAB>name<TAB>[e1,e2,...]` file, keeping only the node types in
+    /// `filter_type` when given.
     pub fn load(
-        path: &str, 
-        distance: Distance, 
-        filter_type: &Option<&HashSet<String>>, 
-        chunk_size: Option<usize>,
-        skip_rows: Option<usize>
-    ) -> PyResult<(Vocab, EmbeddingStore)> {
-        Ok(EmbeddingReader::load_store(path, distance, filter_type, chunk_size, skip_rows)?)
-    }
-
-    pub fn load_store(
         path: &str, 
         distance: Distance, 
         filter_type: &Option<&HashSet<String>>, 
@@ -337,10 +354,39 @@ fn line_to_embedding(line: &String) -> Option<(String,String,Vec<f32>)> {
     emb.ok().map(|e| (node_type.to_string(), name.to_string(), e))
 }
 
+/// Errors from loading a graph file.
+#[derive(Debug)]
+pub enum GraphLoadError {
+    Io(std::io::Error),
+    /// A line didn't have the five tab separated fields.  `record` is the 0-based record number,
+    /// after any skipped rows.
+    WrongFieldCount { record: usize },
+    /// The weight field didn't parse as a float.
+    BadWeight { record: usize, value: String, error: std::num::ParseFloatError }
+}
+
+impl std::fmt::Display for GraphLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GraphLoadError::Io(e) => write!(f, "{:?}", e),
+            GraphLoadError::WrongFieldCount { record } =>
+                write!(f, "{}: Malformed graph file: Expected 5 fields!", record),
+            GraphLoadError::BadWeight { record, value, error } =>
+                write!(f, "{}: Malformed graph file! {} - {:?}", record, error, value)
+        }
+    }
+}
+
+impl std::error::Error for GraphLoadError {}
+
+/// Loads graphs from `node_type<TAB>name<TAB>node_type<TAB>name<TAB>weight` files.
 pub struct GraphReader; 
 
 impl GraphReader {
     
+    /// Reads a graph file, reading `chunk_size` lines at a time and skipping the first
+    /// `skip_rows`.  Weights are ignored (set to 1) unless `weighted`; `deduplicate` merges
+    /// repeated edges.
     pub fn load(
         path: &str, 
         edge_type: EdgeType,
@@ -348,10 +394,13 @@ impl GraphReader {
         skip_rows: usize,
         weighted: bool,
         deduplicate: bool
-    ) -> PyResult<(Vocab,CumCSR)> {
+    ) -> Result<(Vocab,CumCSR), GraphLoadError> {
+        // Stop at the first read error and report it once the records read so far are drained.
+        let mut read_error = None;
         let reader = open_file_for_reading(path)
-            .map_err(|e| PyIOError::new_err(format!("{:?}", e)))?
-            .lines().map(|l| l.unwrap());
+            .map_err(GraphLoadError::Io)?
+            .lines()
+            .map_while(|l| l.map_err(|e| read_error = Some(e)).ok());
 
         let mut vocab = Vocab::new();
         let mut edges = Vec::new();
@@ -360,14 +409,15 @@ impl GraphReader {
             |i, line| {
                 let pieces: Vec<_> = line.split('\t').collect();
                 if pieces.len() != 5 {
-                    return Some(Err(PyValueError::new_err(format!("{}: Malformed graph file: Expected 5 fields!", i))))
+                    return Some(Err(GraphLoadError::WrongFieldCount { record: i }))
                 }
                 let from_node = (pieces[0].to_string(), pieces[1].to_string());
                 let to_node = (pieces[2].to_string(), pieces[3].to_string());
                 let w = if weighted {
-                    let w = pieces[4].parse::<f32>();
-                    match w {
-                        Err(e) => return Some(Err(PyValueError::new_err(format!("{}: Malformed graph file! {} - {:?}", i, e, pieces[4])))),
+                    match pieces[4].parse::<f32>() {
+                        Err(error) => return Some(Err(GraphLoadError::BadWeight {
+                            record: i, value: pieces[4].to_string(), error
+                        })),
                         Ok(w) => w
                     }
                 } else {
@@ -380,11 +430,15 @@ impl GraphReader {
                 let f_id = vocab.get_or_insert(from_node.0, from_node.1);
                 let t_id = vocab.get_or_insert(to_node.0, to_node.1);
                 edges.push((f_id, t_id, w));
-                if matches!(edge_type, EdgeType::Undirected) {
+                if edge_type == EdgeType::Undirected {
                     edges.push((t_id, f_id, w));
                 }
-                Ok::<(), PyErr>(())
+                Ok(())
             })?;
+
+        if let Some(e) = read_error {
+            return Err(GraphLoadError::Io(e))
+        }
 
         let csr = CSR::construct_from_edges(edges, deduplicate);
 
@@ -403,7 +457,7 @@ mod io_tests {
             .join(format!("cloverleaf-skip-rows-{}.emb", std::process::id()));
         std::fs::write(&path, "node_type\tname\tembedding\nn\ta\t[1,2]\nn\tb\t[3,4]\n").unwrap();
 
-        let result = EmbeddingReader::load_store(
+        let result = EmbeddingReader::load(
             path.to_str().unwrap(), Distance::Euclidean, &None, None, Some(1));
         std::fs::remove_file(&path).unwrap();
 
@@ -444,5 +498,52 @@ mod io_tests {
         assert!(res.is_ok());
         assert_eq!(line_to_embedding(&"a\tb\t[1,2]".to_string()),
                    Some(("a".to_string(), "b".to_string(), vec![1., 2.])));
+    }
+
+    fn load_graph(contents: &str) -> Result<(Vocab, CumCSR), GraphLoadError> {
+        let path = temp_path(&format!("graph-{}.edges", contents.len()));
+        std::fs::write(&path, contents).unwrap();
+        let result = GraphReader::load(path.to_str().unwrap(), EdgeType::Directed, 1, 1, true, false);
+        std::fs::remove_file(&path).unwrap();
+        result
+    }
+
+    fn load_graph_err(contents: &str) -> GraphLoadError {
+        load_graph(contents).err().expect("load should fail")
+    }
+
+    /// Malformed graph files report the record, counted after the skipped header.
+    #[test]
+    fn test_graph_load_errors() {
+        let header = "from_type\tfrom\tto_type\tto\tweight\n";
+        let ok = load_graph(&format!("{}a\t1\ta\t2\t2.5\n", header)).unwrap();
+        assert_eq!((ok.0.len(), crate::graph::Graph::edges(&ok.1)), (2, 1));
+
+        let e = load_graph_err(&format!("{}a\t1\ta\t2\t1\na\t1\ta\n", header));
+        assert!(matches!(e, GraphLoadError::WrongFieldCount { record: 1 }), "{:?}", e);
+        assert_eq!(e.to_string(), "1: Malformed graph file: Expected 5 fields!");
+
+        let e = load_graph_err(&format!("{}a\t1\ta\t2\theavy\n", header));
+        assert!(matches!(&e, GraphLoadError::BadWeight { record: 0, value, .. } if value == "heavy"), "{:?}", e);
+        assert!(e.to_string().starts_with("0: Malformed graph file! "), "{}", e);
+
+        let missing = GraphReader::load("/nonexistent/cloverleaf.edges", EdgeType::Directed, 1, 0, true, false);
+        assert!(matches!(missing, Err(GraphLoadError::Io(_))));
+    }
+
+    #[test]
+    fn test_read_node_values_errors() {
+        let mut vocab = Vocab::new();
+        vocab.get_or_insert("n", "a");
+        let path = temp_path("values.txt");
+        let read = |contents: &str| {
+            std::fs::write(&path, contents).unwrap();
+            read_node_values(path.to_str().unwrap(), &vocab)
+        };
+        assert_eq!(read("n\ta\t0.5\n").unwrap(), vec![(0, 0.5)]);
+        assert!(matches!(read("n\ta\n"), Err(Error::Malformed { line: 1, .. })));
+        assert!(matches!(read("n\ta\t1\nn\ta\tlots\n"), Err(Error::Malformed { line: 2, .. })));
+        assert!(matches!(read("n\tb\t1\n"), Err(Error::UnknownNode { .. })));
+        std::fs::remove_file(&path).unwrap();
     }
 }

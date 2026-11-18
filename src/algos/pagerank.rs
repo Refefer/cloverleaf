@@ -3,6 +3,8 @@ use rayon::prelude::*;
 use std::fmt::Write;
 use crate::graph::{CDFGraph, CDFtoP};
 use crate::progress::CLProgressBar;
+use crate::embeddings::NodeEmbeddings;
+use crate::named_graph::NamedGraph;
 
 pub struct PageRank {
     damping: f64,
@@ -14,6 +16,25 @@ impl PageRank {
 
     pub fn new(iterations:usize, damping: f64, eps: f64) -> Self {
         PageRank {damping, iterations, eps}
+    }
+
+    pub fn damping(&self) -> f64 {
+        self.damping
+    }
+
+    pub fn eps(&self) -> f64 {
+        self.eps
+    }
+
+    /// PageRank with the defaults the Python bindings use: damping of 0.85 and eps of 1e-5.
+    pub fn with_iterations(iterations: usize) -> Self {
+        PageRank::new(iterations, 0.85, 1e-5)
+    }
+
+    /// Each node's PageRank, as one-dimensional embeddings.
+    pub fn learn(&self, graph: &NamedGraph, indicator: bool) -> NodeEmbeddings {
+        let scores = self.compute(graph.graph(), indicator);
+        NodeEmbeddings::from_scores(graph.vocab().clone(), &scores).expect("one score per node")
     }
 
     pub fn compute(&self, graph: &impl CDFGraph, indicator: bool) -> Vec<f64> {

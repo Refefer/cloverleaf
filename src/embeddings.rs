@@ -8,6 +8,11 @@ use crate::bitset::AtomicBitSet;
 use crate::hogwild::Hogwild;
 use crate::algos::graph_ann::{TopK,NodeDistance};
 use crate::distance::Distance;
+use crate::error::Error;
+use crate::io::{EmbeddingLoadError, EmbeddingReader, EmbeddingWriter};
+use crate::vocab::Vocab;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Entity allows for adhoc embeddings versus looking up by NodeID within the embedding set
 #[derive(Clone,Copy,Debug)]
@@ -231,6 +236,184 @@ impl EmbeddingBuffer {
         let dims = self.dims.unwrap_or(0);
         EmbeddingStore::new_with_vec(self.nodes, dims, distance, self.data)
             .expect("buffer holds nodes * dims values")
+    }
+}
+
+/// Embeddings for named nodes: an [`EmbeddingStore`] indexed by the ids of a [`Vocab`].
+#[derive(Clone)]
+pub struct NodeEmbeddings {
+    pub(crate) vocab: Arc<Vocab>,
+    pub(crate) embeddings: EmbeddingStore
+}
+
+impl NodeEmbeddings {
+    /// Pairs a store with the vocab whose ids index it.
+    pub fn new(vocab: Arc<Vocab>, embeddings: EmbeddingStore) -> Result<Self, Error> {
+        if vocab.len() != embeddings.len() {
+            return Err(Error::InvalidArgument(format!(
+                "vocab has {} nodes but the embeddings have {}", vocab.len(), embeddings.len())))
+        }
+        Ok(NodeEmbeddings { vocab, embeddings })
+    }
+
+    /// Zeroed embeddings for every node in `vocab`.
+    pub fn zeros(vocab: Arc<Vocab>, dims: usize, distance: Distance) -> Self {
+        let embeddings = EmbeddingStore::new(vocab.len(), dims, distance);
+        NodeEmbeddings { vocab, embeddings }
+    }
+
+    /// One-dimensional embeddings holding a score per node, as PageRank and LSR produce.
+    pub fn from_scores(vocab: Arc<Vocab>, scores: &[f64]) -> Result<Self, Error> {
+        let values = scores.iter().map(|s| *s as f32).collect();
+        let embeddings = EmbeddingStore::new_with_vec(scores.len(), 1, Distance::Euclidean, values)
+            .expect("one value per node");
+        NodeEmbeddings::new(vocab, embeddings)
+    }
+
+    /// Loads a `node_type<TAB>name<TAB>[e1,e2,...]` file, keeping only `node_types` when given.
+    pub fn load(
+        path: &str,
+        distance: Distance,
+        node_types: Option<&HashSet<String>>,
+        chunk_size: Option<usize>,
+        skip_rows: Option<usize>
+    ) -> Result<Self, EmbeddingLoadError> {
+        let (vocab, embeddings) = EmbeddingReader::load(
+            path, distance, &node_types, chunk_size, skip_rows)?;
+        Ok(NodeEmbeddings { vocab: Arc::new(vocab), embeddings })
+    }
+
+    /// Writes the embeddings in the format `load` reads, gzipped when the path ends in `.gz`.
+    pub fn save(&self, path: &str, comp_level: Option<u32>) -> std::io::Result<()> {
+        let mut writer = EmbeddingWriter::new(path, self.vocab.as_ref(), comp_level)?;
+        writer.stream((0..self.len()).map(|node_id| (node_id, self.embeddings.get_embedding(node_id))))?;
+        writer.finish()
+    }
+
+    pub fn vocab(&self) -> &Arc<Vocab> {
+        &self.vocab
+    }
+
+    pub fn store(&self) -> &EmbeddingStore {
+        &self.embeddings
+    }
+
+    pub fn store_mut(&mut self) -> &mut EmbeddingStore {
+        &mut self.embeddings
+    }
+
+    pub fn into_parts(self) -> (Arc<Vocab>, EmbeddingStore) {
+        (self.vocab, self.embeddings)
+    }
+
+    pub fn len(&self) -> usize {
+        self.embeddings.len()
+    }
+
+    pub fn dims(&self) -> usize {
+        self.embeddings.dims()
+    }
+
+    pub fn distance(&self) -> Distance {
+        self.embeddings.distance()
+    }
+
+    pub fn node_id(&self, node_type: &str, name: &str) -> Result<NodeID, Error> {
+        self.vocab.node_id(node_type, name)
+    }
+
+    pub fn contains(&self, node_type: &str, name: &str) -> bool {
+        self.vocab.get_node_id(node_type, name).is_some()
+    }
+
+    pub fn get_embedding(&self, node_type: &str, name: &str) -> Result<&[f32], Error> {
+        Ok(self.embeddings.get_embedding(self.node_id(node_type, name)?))
+    }
+
+    /// The embedding at `node_id`, erroring when it's out of range.
+    pub fn get_embedding_by_id(&self, node_id: NodeID) -> Result<&[f32], Error> {
+        if node_id < self.len() {
+            Ok(self.embeddings.get_embedding(node_id))
+        } else {
+            Err(Error::NodeIdOutOfRange { node_id, len: self.len() })
+        }
+    }
+
+    pub fn set_embedding(&mut self, node_type: &str, name: &str, embedding: &[f32]) -> Result<(), Error> {
+        let node_id = self.node_id(node_type, name)?;
+        Ok(self.embeddings.set_embedding(node_id, embedding)?)
+    }
+
+    /// The `k` nodes closest to `embedding`, closest first, optionally only those whose type is
+    /// in `node_types`.
+    pub fn nearest_neighbor(
+        &self,
+        embedding: &[f32],
+        k: usize,
+        node_types: Option<&HashSet<String>>
+    ) -> Vec<NodeDistance> {
+        let query = Entity::Embedding(embedding);
+        match node_types {
+            Some(nts) => self.embeddings.nearest_neighbor(&query, k, |id| self.vocab.has_node_type(id, nts)),
+            None => self.embeddings.nearest_neighbor(&query, k, |_id| true)
+        }
+    }
+
+    /// Scales every embedding to unit length.  All-zero embeddings are left as they are.
+    pub fn l2_normalize(&mut self) {
+        let es = &self.embeddings;
+        (0..es.len()).into_par_iter().for_each(|idx| {
+            let e = es.get_embedding_mut_hogwild(idx);
+            let norm = e.iter().map(|ei| ei.powf(2.)).sum::<f32>().sqrt();
+            if norm > 0f32 {
+                e.iter_mut().for_each(|ei| *ei /= norm);
+            }
+        });
+    }
+}
+
+/// Builds [`NodeEmbeddings`] one named node at a time.  The first embedding fixes the dimensions.
+pub struct NodeEmbeddingsBuilder {
+    vocab: Vocab,
+    distance: Distance,
+    embeddings: EmbeddingBuffer
+}
+
+impl NodeEmbeddingsBuilder {
+    pub fn new(distance: Distance) -> Self {
+        NodeEmbeddingsBuilder { vocab: Vocab::new(), distance, embeddings: EmbeddingBuffer::new() }
+    }
+
+    pub fn distance(&self) -> Distance {
+        self.distance
+    }
+
+    pub fn len(&self) -> usize {
+        self.embeddings.len()
+    }
+
+    /// Adds or replaces a node's embedding.  A rejected embedding leaves the builder unchanged.
+    pub fn add_embedding(
+        &mut self,
+        node_type: &str,
+        name: &str,
+        embedding: &[f32]
+    ) -> Result<(), DimensionMismatch> {
+        // Check before inserting, so a rejected node doesn't stay in the vocab.
+        self.embeddings.check(embedding.len())?;
+        let node_id = self.vocab.get_or_insert(node_type, name);
+        self.embeddings.set(node_id, embedding)
+    }
+
+    /// Takes what's been added, leaving the builder empty.  None if nothing was added.
+    pub fn build(&mut self) -> Option<NodeEmbeddings> {
+        if self.embeddings.len() == 0 {
+            return None
+        }
+        // The flat buffer becomes the store without a copy.
+        let vocab = std::mem::replace(&mut self.vocab, Vocab::new());
+        let embeddings = std::mem::take(&mut self.embeddings).into_store(self.distance);
+        Some(NodeEmbeddings { vocab: Arc::new(vocab), embeddings })
     }
 }
 

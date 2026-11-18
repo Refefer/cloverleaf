@@ -2,6 +2,9 @@ use lasso::{Rodeo,Spur};
 use hashbrown::HashMap;
 use crate::graph::NodeID;
 use std::sync::Arc;
+use std::collections::HashSet;
+
+use crate::error::Error;
 use std::sync::atomic::{AtomicUsize,Ordering};
 
 static VOCAB_ID: AtomicUsize = AtomicUsize::new(0);
@@ -101,6 +104,31 @@ impl Vocab {
 
     pub fn len(&self) -> usize {
         self.node_id_to_node.len()
+    }
+
+    /// Looks a node up by name, erroring when it's missing.
+    pub fn node_id(&self, node_type: &str, name: &str) -> Result<NodeID, Error> {
+        self.get_node_id(node_type, name).ok_or_else(|| Error::unknown_node(node_type, name))
+    }
+
+    /// The node's (type, name) as owned strings.
+    pub fn get_name_owned(&self, node: NodeID) -> Option<(String, String)> {
+        self.get_name(node).map(|(nt, name)| ((*nt).clone(), name.to_string()))
+    }
+
+    /// True when the node's type is one of `node_types`.
+    pub fn has_node_type(&self, node: NodeID, node_types: &HashSet<String>) -> bool {
+        self.get_node_type(node).map(|nt| node_types.contains(nt.as_str())).unwrap_or(false)
+    }
+
+    /// Nodes whose type is one of `node_types`, in id order.
+    pub fn nodes_of_types(&self, node_types: &HashSet<String>) -> Vec<NodeID> {
+        (0..self.len()).filter(|id| self.has_node_type(*id, node_types)).collect()
+    }
+
+    /// (node type, name) for every node, in id order.
+    pub fn iter(&self) -> impl Iterator<Item=(Arc<String>, &str)> + '_ {
+        (0..self.len()).map(move |id| self.get_name(id).expect("ids below len are in the vocab"))
     }
 
     pub fn translate_node(&self, other: &Vocab, other_node_id: NodeID) -> Option<NodeID> {

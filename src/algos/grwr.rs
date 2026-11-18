@@ -8,6 +8,7 @@ use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
 
 use crate::graph::{Graph,NodeID};
+use crate::error::Error;
 use crate::sampler::Sampler;
 use crate::embeddings::EmbeddingStore;
 use crate::algos::reweighter::Reweighter;
@@ -23,6 +24,21 @@ pub enum Steps {
     /// than a restart probability and terminal probability, but is much more efficient to query
     /// using BFS.
     Probability(f32, usize)
+}
+
+impl Steps {
+    /// `restarts` >= 1 walks that many steps; 0 < `restarts` < 1 restarts with that probability,
+    /// capped at the length a walk survives with 1% probability.
+    pub fn from_restarts(restarts: f32) -> Result<Steps, Error> {
+        if restarts >= 1. {
+            Ok(Steps::Fixed(restarts as usize))
+        } else if restarts > 0. {
+            let one_percent = 0.01f32.ln() / (1. - restarts).ln();
+            Ok(Steps::Probability(restarts, one_percent.ceil() as usize))
+        } else {
+            Err(Error::InvalidArgument("restarts must be in (0, 1) or [1, inf)".into()))
+        }
+    }
 }
 
 impl Steps {
@@ -52,6 +68,11 @@ pub struct GuidedRWR {
 }
 
 impl GuidedRWR {
+    /// A walker with the defaults the Python bindings use: alpha and beta of 0.5 and the
+    /// default seed.
+    pub fn new(steps: Steps, walks: usize) -> Self {
+        GuidedRWR { steps, walks, alpha: 0.5, beta: 0.5, seed: crate::DEFAULT_SEED }
+    }
 
     /// This uses a diffusion type method to shift counts at each step.  The advantage of this is
     /// significantly better cache coherence since we only have to look up weights once per node.
@@ -226,5 +247,16 @@ mod grwr_tests {
         let scores = rwr.sample(&ccsr, &Unweighted, &es, 0, &[0f32]);
         let on_children: f32 = scores.iter().filter(|(k, _)| **k > 0).map(|(_, v)| *v).sum();
         assert!((on_children - 0.9).abs() < 0.1, "fraction on children: {}", on_children);
+    }
+
+    #[test]
+    fn test_steps_from_restarts() {
+        assert!(matches!(Steps::from_restarts(3.), Ok(Steps::Fixed(3))));
+        assert!(matches!(Steps::from_restarts(1.), Ok(Steps::Fixed(1))));
+        // A walk restarting with probability .5 survives 7 steps with < 1% probability.
+        assert!(matches!(Steps::from_restarts(0.5), Ok(Steps::Probability(p, 7)) if p == 0.5));
+        for bad in [0., -1., f32::NAN] {
+            assert!(Steps::from_restarts(bad).is_err(), "{}", bad);
+        }
     }
 }

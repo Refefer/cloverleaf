@@ -5,6 +5,8 @@ edition = "2021"
 
 [features]
 default = []
+# The Python bindings.  maturin turns this on (see pyproject.toml); Rust users don't need it.
+python = ["dep:pyo3"]
 accelerate = ["candle-core/accelerate"]
 metal = ["candle-core/metal"]
 cuda = ["candle-core/cuda"]
@@ -13,10 +15,6 @@ cuda = ["candle-core/cuda"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 name = "cloverleaf"
 crate-type = ["cdylib", "rlib"]
-# The doc comments in src/lib.rs are numpy-style Python docstrings (pyo3 exposes them as
-# __doc__).  Their indented parameter descriptions parse as Rust code blocks, so rustdoc would
-# try to compile them.  The crate has no Rust doc examples to run.
-doctest = false
 
 [dependencies]
 ahash = "0.8"
@@ -26,7 +24,7 @@ rand_distr = "0.4"
 rayon = "1.5"
 float-ord = "0.2"
 atomic_float = "0.1"
-pyo3 = "0.30"
+pyo3 = { version = "0.30", optional = true }
 candle-core = "0.11.1"
 indicatif = "0.18.6"
 itertools = "0.10.5"
