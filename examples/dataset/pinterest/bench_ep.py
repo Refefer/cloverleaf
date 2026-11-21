@@ -44,7 +44,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Embedding Propagation settings.  "margin" is the recipe in run.sh.
 CONFIGS = {
     "margin": dict(loss=("margin", 10.0, 10)),
-    "adamw": dict(loss=("margin", 10.0, 10), optimizer=("adamw", 0.01)),
+    "adamw": dict(loss=("margin", 10.0, 10), optimizer=("adamw", 0.001)),
     "starspace": dict(loss=("starspace", 10.0, 10)),
     "hard-negs": dict(loss=("margin", 10.0, 10), hard_negatives=2),
 }

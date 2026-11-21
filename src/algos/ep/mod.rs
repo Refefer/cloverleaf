@@ -29,6 +29,7 @@ use crate::algos::utils::node_seed;
 use crate::algos::grad_utils::scheduler::LRScheduler;
 use crate::algos::grad_utils::optimizer::{Optimizer,AdamOptimizer,OptimizerKind};
 use crate::algos::grad_utils::node_sampler::*;
+use crate::algos::grad_utils::accumulator::GradientAccumulator;
 
 use self::loss::*;
 use self::model::{Model,NodeCounts};
@@ -53,6 +54,20 @@ pub enum EmbeddingInit {
     /// Glorot (Xavier) uniform, as in the EP paper: each coordinate from U(-l, l) with
     /// l = sqrt(6 / (num_features + dims)).
     GlorotUniform
+}
+
+/// How often the feature embeddings are updated.
+#[derive(Clone,Copy,Debug,PartialEq)]
+pub enum UpdateFrequency {
+    /// After every batch: batches run in parallel and each applies its own update as it
+    /// finishes.
+    Batch,
+
+    /// Once per epoch (pass): every batch computes its gradients against the same embeddings,
+    /// they are summed over the whole pass, and one update applies the sum at the end.  Lower
+    /// variance, but only `passes` updates in total, so it generally needs a larger learning rate
+    /// or more passes.  Keeps an extra gradient table the size of the feature embeddings.
+    Epoch
 }
 
 #[derive(Clone,Copy,Debug)]
@@ -107,7 +122,10 @@ pub struct EmbeddingPropagation {
     pub lr_schedule: LearningRateSchedule,
 
     /// Initialisation of the feature embeddings when no warm start is given
-    pub init: EmbeddingInit
+    pub init: EmbeddingInit,
+
+    /// Whether updates are applied after every batch or once per epoch
+    pub update_frequency: UpdateFrequency
 }
 
 impl EmbeddingPropagation {
@@ -145,7 +163,8 @@ impl Default for EmbeddingPropagation {
             indicator: true,
             optimizer: OptimizerKind::Adam,
             lr_schedule: LearningRateSchedule::CosineWarmup,
-            init: EmbeddingInit::UnitNorm
+            init: EmbeddingInit::UnitNorm,
+            update_frequency: UpdateFrequency::Batch
         }
     }
 }
@@ -203,12 +222,19 @@ impl EmbeddingPropagation {
         // Enable/disable shared memory pool
         use_shared_pool(false);
 
-        let total_updates = steps_per_pass * self.passes;
+        // Epoch updates sum every batch's gradients here and apply them at the end of the pass.
+        let epoch_grads = match self.update_frequency {
+            UpdateFrequency::Batch => None,
+            UpdateFrequency::Epoch => Some(GradientAccumulator::new(
+                feature_embeddings.len(), feature_embeddings.dims()))
+        };
+
+        let updates_per_pass = if epoch_grads.is_some() { 1 } else { steps_per_pass };
+        let total_updates = updates_per_pass * self.passes;
         let lr_scheduler = match self.lr_schedule {
             LearningRateSchedule::CosineWarmup => {
                 let warm_up_steps = (total_updates as f32 / 5f32) as usize;
-                let max_steps = self.passes * steps_per_pass;
-                LRScheduler::cos_decay(self.alpha / 100f32, self.alpha, warm_up_steps, max_steps)
+                LRScheduler::cos_decay(self.alpha / 100f32, self.alpha, warm_up_steps, total_updates)
             },
             LearningRateSchedule::Constant => LRScheduler::constant(self.alpha)
         };
@@ -310,9 +336,11 @@ impl EmbeddingPropagation {
                     err
                 }).sum::<f32>();
 
-                let cur_step = step.fetch_add(1, Ordering::Relaxed);
-
-                if cnt > 0 {
+                if let Some(acc) = &epoch_grads {
+                    // Applied once the whole pass is done.
+                    all_grads.par_iter().for_each(|(feat, grad)| acc.add(*feat, grad));
+                } else if cnt > 0 {
+                    let cur_step = step.fetch_add(1, Ordering::Relaxed);
                     // Add gaussian noise to help regulate embeddings
                     if self.noise > 0.0 {
                         let noise = noise_scheduler.compute(cur_step);
@@ -327,6 +355,8 @@ impl EmbeddingPropagation {
                     // Backpropagate embeddings
                     let alpha = lr_scheduler.compute(cur_step);
                     optimizer.update(&feature_embeddings, all_grads, alpha, cur_step as f32);
+                } else {
+                    step.fetch_add(1, Ordering::Relaxed);
                 }
 
                 // Update progress bar
@@ -341,6 +371,29 @@ impl EmbeddingPropagation {
             .reduce(|| (0f32, 0usize), |a, b| (a.0 + b.0, a.1 + b.1));
 
             last_error = err_cnt.0 / if err_cnt.1 > 0 { err_cnt.1 as f32} else { 1f32 };
+
+            if let Some(acc) = &epoch_grads {
+                let cur_step = step.fetch_add(1, Ordering::Relaxed);
+                let alpha = lr_scheduler.compute(cur_step);
+                let noise = noise_scheduler.compute(cur_step);
+                (0..acc.rows()).into_par_iter().for_each_init(|| vec![0f32; acc.dims()], |grad, feat| {
+                    // Features no node in the pass touched aren't updated, as with batch updates.
+                    if acc.take_row(feat, grad) {
+                        if self.noise > 0.0 {
+                            let mut rng = XorShiftRng::seed_from_u64(node_seed(self.seed, pass, 0, feat));
+                            grad.iter_mut().for_each(|gi| {
+                                *gi += noise * rng.sample::<f32,StandardNormal>(StandardNormal);
+                            });
+                        }
+                        optimizer.update_row(&feature_embeddings, feat, grad, alpha, cur_step as f32);
+                    }
+                });
+            }
+
+            // Once-per-pass regularisation (AdamW's weight decay), at the schedule's position
+            // after the pass's last update.
+            let last_step = step.load(Ordering::Relaxed).saturating_sub(1).max(1);
+            optimizer.end_pass(&feature_embeddings, lr_scheduler.multiplier(last_step));
             
             if valid_idxs.len() > 0 {
                 // Validate.  We use the same random seed for consistency across iterations.
@@ -550,13 +603,108 @@ mod ep_tests {
             indicator: false,
             optimizer: OptimizerKind::Adam,
             lr_schedule: LearningRateSchedule::CosineWarmup,
-            init: EmbeddingInit::UnitNorm
+            init: EmbeddingInit::UnitNorm,
+            update_frequency: UpdateFrequency::Batch
         };
 
         let embeddings = ep.learn_feature_embeddings(&ccsr, &feature_store, None, &model);
         for idx in 0..embeddings.len() {
             let e = embeddings.get_embedding(idx);
             println!("{:?} -> {:?}", idx, e);
+        }
+    }
+
+    /// Two 20-node cliques joined by a single edge.
+    fn two_cliques() -> CumCSR {
+        let mut edges = Vec::new();
+        for c in 0..2 {
+            for a in 0..20 {
+                for b in 0..20 {
+                    if a != b { edges.push((c * 20 + a, c * 20 + b, 1f32)); }
+                }
+            }
+        }
+        edges.push((0, 20, 1.));
+        edges.push((20, 0, 1.));
+        CumCSR::convert(CSR::construct_from_edges(edges, false))
+    }
+
+    fn quick_ep(update_frequency: UpdateFrequency, alpha: f32, passes: usize) -> EmbeddingPropagation {
+        EmbeddingPropagation {
+            alpha, passes, batch_size: 8, d_model: 8, valid_pct: 0.0, indicator: false,
+            lr_schedule: LearningRateSchedule::Constant, init: EmbeddingInit::GlorotUniform,
+            update_frequency, ..EmbeddingPropagation::default()
+        }
+    }
+
+    /// The initial and trained feature embeddings, one feature per node.
+    fn train(update_frequency: UpdateFrequency, alpha: f32, passes: usize) -> (EmbeddingStore, EmbeddingStore) {
+        let graph = two_cliques();
+        let mut features = FeatureStore::new(graph.len());
+        features.fill_missing_nodes();
+        let model = super::model::AveragedFeatureModel::new(Sample::All, Sample::All, false, false);
+        // Same seed, so zero passes gives the starting point.
+        let init = quick_ep(update_frequency, alpha, 0).learn_feature_embeddings(&graph, &features, None, &model);
+        let trained = quick_ep(update_frequency, alpha, passes).learn_feature_embeddings(&graph, &features, None, &model);
+        (init, trained)
+    }
+
+    /// The largest change to any coordinate between two stores.
+    fn max_change(a: &EmbeddingStore, b: &EmbeddingStore) -> f32 {
+        (0..a.len()).flat_map(|i| a.get_embedding(i).iter().zip(b.get_embedding(i))
+            .map(|(x, y)| (x - y).abs()).collect::<Vec<_>>()).fold(0f32, f32::max)
+    }
+
+    /// One pass of epoch updates is a single Adam step, which moves each coordinate by at most
+    /// alpha; batch updates take one step per batch.
+    #[test]
+    fn test_epoch_updates_apply_once_per_pass() {
+        let alpha = 0.01;
+        let (init, epoch) = train(UpdateFrequency::Epoch, alpha, 1);
+        let moved = max_change(&init, &epoch);
+        assert!(moved <= alpha * 1.0001 && moved > alpha * 0.5, "moved {} for alpha {}", moved, alpha);
+
+        let (init, batch) = train(UpdateFrequency::Batch, alpha, 1);
+        let moved = max_change(&init, &batch);
+        assert!(moved > alpha * 1.5, "batch updates moved only {}", moved);
+    }
+
+    /// Epoch updates still learn: each clique ends up closer to itself than to the other.
+    #[test]
+    fn test_epoch_updates_learn() {
+        let (_, embs) = train(UpdateFrequency::Epoch, 0.02, 100);
+        let dist = |a: usize, b: usize| Distance::Cosine.compute(embs.get_embedding(a), embs.get_embedding(b));
+        let within = (2..20).map(|i| dist(1, i)).sum::<f32>() / 18.;
+        let across = (21..40).map(|i| dist(1, i)).sum::<f32>() / 19.;
+        // Untrained, both are near 1.
+        assert!(across - within > 1.0, "within-clique distance {}, across {}", within, across);
+    }
+
+    /// AdamW's weight decay is once per pass, so every feature decays by the same factor with
+    /// batch and epoch updates alike, however many updates touched it.  A tiny learning rate
+    /// makes the gradient steps negligible next to the decay.
+    #[test]
+    fn test_adamw_decay_is_per_pass_in_both_modes() {
+        use crate::algos::grad_utils::optimizer::WeightDecay;
+        let graph = two_cliques();
+        let mut features = FeatureStore::new(graph.len());
+        features.fill_missing_nodes();
+        let model = super::model::AveragedFeatureModel::new(Sample::All, Sample::All, false, false);
+        let (rate, passes) = (1f32, 3);
+        let expected = (-rate * passes as f32).exp();
+        for mode in [UpdateFrequency::Batch, UpdateFrequency::Epoch] {
+            let ep = |passes| EmbeddingPropagation {
+                optimizer: OptimizerKind::AdamW(WeightDecay::new(rate).unwrap()),
+                ..quick_ep(mode, 1e-6, passes)
+            };
+            let init = ep(0).learn_feature_embeddings(&graph, &features, None, &model);
+            let trained = ep(passes).learn_feature_embeddings(&graph, &features, None, &model);
+            for i in 0..init.len() {
+                for (a, b) in init.get_embedding(i).iter().zip(trained.get_embedding(i)) {
+                    assert!((a * expected - b).abs() < 1e-4,
+                        "{:?}: feature {} went from {} to {}, expected {}", mode, i, a, b, a * expected);
+                }
+            }
         }
     }
 

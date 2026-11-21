@@ -31,7 +31,7 @@ use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::ann::Ann;
 use crate::algos::connected::find_connected_components;
 use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
-use crate::algos::ep::{EmbeddingPropagation,EmbeddingInit,LearningRateSchedule,LossWeighting as EPLW};
+use crate::algos::ep::{EmbeddingPropagation,EmbeddingInit,LearningRateSchedule,UpdateFrequency,LossWeighting as EPLW};
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
 use crate::algos::feat_propagation::propagate_features;
@@ -960,14 +960,17 @@ impl OptimizerSpec {
         OptimizerSpec { kind: OptimizerKind::Adam }
     }
 
-    ///    AdamW: Adam with decoupled weight decay.  Each update also shrinks the weights by
-    ///    learning_rate * weight_decay, independently of the gradient.  Weight decay only applies
-    ///    to features updated in a batch, so rare features are decayed less often.
+    ///    AdamW: Adam with decoupled weight decay.  At the end of every pass, every feature
+    ///    embedding is multiplied by exp(-m * weight_decay), independently of the gradient, where
+    ///    m is the learning rate schedule's current value relative to its peak (1 for a constant
+    ///    schedule).  The decay per pass is the same for every feature, for batch and epoch
+    ///    updates, and at any learning rate.
     ///    
     ///    Parameters
     ///    ----------
     ///    weight_decay : Float - Optional
-    ///        Decay rate; must be finite and non-negative.  Default is 0.01.
+    ///        Decay rate per pass; must be finite and non-negative.  Default is 0.001, which
+    ///        shrinks weights by about 0.1% a pass.
     ///    
     ///    Returns
     ///    -------
@@ -976,7 +979,7 @@ impl OptimizerSpec {
     #[staticmethod]
     #[pyo3(signature = (weight_decay=None))]
     pub fn adamw(weight_decay: Option<f32>) -> PyResult<Self> {
-        let rate = weight_decay.unwrap_or(0.01);
+        let rate = weight_decay.unwrap_or(0.001);
         let wd = WeightDecay::new(rate).ok_or_else(|| PyValueError::new_err(
             format!("weight_decay must be finite and non-negative, got {}", rate)))?;
         Ok(OptimizerSpec { kind: OptimizerKind::AdamW(wd) })
@@ -1258,13 +1261,23 @@ impl EmbeddingPropagator {
     ///
     ///        Default is "unit".
     ///
+    ///    update_frequency : String - Optional
+    ///        "batch" updates the feature embeddings after every batch.  "epoch" still processes
+    ///        nodes in batches, but every batch computes its gradients against the same
+    ///        embeddings; the gradients are summed over the pass and applied in one update at its
+    ///        end.  That lowers the variance of each update but leaves only `passes` updates, so
+    ///        it usually wants a larger alpha or more passes.  It also keeps an extra gradient
+    ///        table as large as the feature embeddings.
+    ///
+    ///        Default is "batch".
+    ///
     ///    Returns
     ///    -------
     ///    Self
     ///        
     ///    
     #[new]
-    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention=None, attention_heads=None, context_window=None, noise=None, optimizer=None, lr_schedule=None, init=None))]
+    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention=None, attention_heads=None, context_window=None, noise=None, optimizer=None, lr_schedule=None, init=None, update_frequency=None))]
     pub fn new(
         // Learning rate
         alpha: Option<f32>, 
@@ -1328,7 +1341,10 @@ impl EmbeddingPropagator {
         lr_schedule: Option<String>,
 
         // Feature embedding initialisation: "unit" or "glorot"
-        init: Option<String>
+        init: Option<String>,
+
+        // When to update the feature embeddings: "batch" or "epoch"
+        update_frequency: Option<String>
     ) -> PyResult<Self> {
         let lr_schedule = match lr_schedule.as_deref().unwrap_or("cosine") {
             "cosine" => LearningRateSchedule::CosineWarmup,
@@ -1341,6 +1357,12 @@ impl EmbeddingPropagator {
             "glorot" => EmbeddingInit::GlorotUniform,
             other => return Err(PyValueError::new_err(
                 format!("init must be \"unit\" or \"glorot\", got {:?}", other)))
+        };
+        let update_frequency = match update_frequency.as_deref().unwrap_or("batch") {
+            "batch" => UpdateFrequency::Batch,
+            "epoch" => UpdateFrequency::Epoch,
+            other => return Err(PyValueError::new_err(
+                format!("update_frequency must be \"batch\" or \"epoch\", got {:?}", other)))
         };
         let loss_weighting = loss_weighting.map(|lw| lw.loss).unwrap_or(EPLW::None);
         let d = EmbeddingPropagation::default();
@@ -1358,7 +1380,8 @@ impl EmbeddingPropagator {
             noise: noise.unwrap_or(d.noise),
             optimizer: optimizer.map(|o| o.kind).unwrap_or(d.optimizer),
             lr_schedule,
-            init
+            init,
+            update_frequency
         };
 
         let wns = weighted_neighbor_sampling.unwrap_or(false);

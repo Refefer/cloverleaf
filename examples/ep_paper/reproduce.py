@@ -49,6 +49,7 @@ import warnings
 from dataclasses import dataclass
 
 import numpy as np
+from joblib import parallel_backend
 import scipy.io as sio
 import scipy.sparse as sp
 from sklearn.linear_model import LogisticRegression
@@ -205,7 +206,8 @@ def train_label_type(ds, graph, label_type, gamma, seed, args):
     ep = cl.EmbeddingPropagator(
         alpha=args.lr, loss=cl.EPLoss.margin(float(gamma), 1), batch_size=args.batch_size,
         dims=args.dims, passes=args.passes, seed=seed, max_nodes=args.max_nodes,
-        valid_pct=0.0, indicator=False, lr_schedule=args.lr_schedule, init=args.init)
+        valid_pct=0.0, indicator=False, lr_schedule=args.lr_schedule, init=args.init,
+        update_frequency=args.update_frequency, optimizer=optimizer(args))
     fe = ep.learn_features(graph, features)
     lookup = {}
     for i in range(len(fe)):
@@ -219,6 +221,12 @@ def train_label_type(ds, graph, label_type, gamma, seed, args):
     return H
 
 
+def optimizer(args):
+    if args.weight_decay is None:
+        return cl.Optimizer.adam()
+    return cl.Optimizer.adamw(args.weight_decay)
+
+
 EP_SETTINGS = ["dims", "passes", "batch_size", "lr", "lr_schedule", "init", "max_nodes", "seed"]
 
 
@@ -227,6 +235,11 @@ def embed(ds, graph, gamma, seed, args):
     path = None
     if args.cache:
         tag = "-".join(f"{k}={getattr(args, k)}" for k in EP_SETTINGS)
+        # Added after the others, so caches of per-batch runs keep their names.
+        if args.update_frequency != "batch":
+            tag += f"-update_frequency={args.update_frequency}"
+        if args.weight_decay is not None:
+            tag += f"-adamw={args.weight_decay}"
         path = os.path.join(args.cache, f"{ds.name}-gamma={gamma:g}-{tag}.npy")
         if os.path.exists(path):
             return np.load(path), 0.0
@@ -251,7 +264,10 @@ def top_k(scores, k):
 
 def multilabel_scores(Xtr, Ytr, Xte, Yte, C):
     clf = OneVsRestClassifier(LogisticRegression(solver="liblinear", C=C), n_jobs=-1)
-    clf.fit(Xtr, Ytr)
+    # liblinear releases the GIL while it trains, so threads run the per-label fits in parallel
+    # without starting a worker process per core.
+    with parallel_backend("threading"):
+        clf.fit(Xtr, Ytr)
     # predict_proba, not decision_function: a label missing from the training split gets a
     # constant decision score of 0, which outranks every real label with a negative score.
     pred = top_k(clf.predict_proba(Xte), Yte.sum(axis=1))
@@ -360,6 +376,10 @@ def main():
     p.add_argument("--lr", type=float, default=0.001)
     p.add_argument("--lr-schedule", default="constant", choices=["constant", "cosine"])
     p.add_argument("--init", default="glorot", choices=["glorot", "unit"])
+    p.add_argument("--update-frequency", default="batch", choices=["batch", "epoch"],
+                   help="Update after every batch, or sum each pass's gradients into one update.")
+    p.add_argument("--weight-decay", type=float, default=None,
+                   help="Train with AdamW and this decoupled weight decay (default: Adam).")
     p.add_argument("--max-nodes", type=float, default=None,
                    help="Neighbours sampled per reconstruction (default: all).")
     p.add_argument("--out", default=None, help="Write results as JSON to this path.")

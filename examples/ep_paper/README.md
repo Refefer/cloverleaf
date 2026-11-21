@@ -14,6 +14,8 @@ See the script's docstring for the evaluation protocol and where to download the
 ```
 python reproduce.py --data DIR --cache CACHE_DIR --out results.json
 python reproduce.py --data DIR --datasets blogcatalog --max-nodes 5   # sample 5 neighbours
+python reproduce.py --data DIR --update-frequency epoch --lr 0.05     # one update per pass
+python reproduce.py --data DIR --weight-decay 0.001                   # AdamW instead of Adam
 ```
 
 ## Results
@@ -53,18 +55,62 @@ BlogCatalog, PPI and POS at Tr = 0.1, micro / macro F1 is:
 | PPI | 6.71 / 1.69 | 6.15 / 1.58 |
 | POS | 40.44 / 3.26 | 40.40 / 3.38 |
 
+## Batch vs epoch updates
+
+EP-B updates the embeddings after every batch. With `--update-frequency epoch`, batches are still
+processed in the same order, but their gradients are summed over the pass and applied as one
+update at its end: 200 updates in all instead of 200 × batches. That needs a larger learning rate;
+0.01–0.05 worked best everywhere, and 0.5 and 0.9 were the worst setting on every dataset.
+
+The best epoch learning rate against per-batch updates, each with its γ above, all neighbours
+(micro / macro F1 at Tr = 0.5; accuracy for the citation datasets):
+
+| | average degree | per batch (lr 0.001) | epoch, best lr | change |
+|---|---|---|---|---|
+| BlogCatalog | 65 | 33.26 / 16.84 | 38.83 / 24.21 (0.05) | +5.6 / +7.4 |
+| BlogCatalog, 5 sampled neighbours | 65 | 38.50 / 23.77 | 39.51 / 25.75 (0.01) | +1.0 / +2.0 |
+| POS | 39 | 50.21 / 10.14 | 52.28 / 11.63 (0.05) | +2.1 / +1.5 |
+| PPI | 19 | 22.42 / 18.21 | 23.69 / 19.47 (0.05) | +1.3 / +1.3 |
+| Pubmed | 4.5 | 80.00 | 78.02 (0.01) | −2.0 |
+| Cora | 3.9 | 78.48 | 77.73 (0.05) | −0.8 |
+| Citeseer | 2.7 | 70.78 | 69.19 (0.05) | −1.6 |
+
+Tr = 0.1 and 0.9 follow the same pattern. With epoch updates, BlogCatalog with every neighbour
+comes within 0.6 points of the paper (34.83 / 19.45, 38.83 / 24.21, 39.89 / 25.33 at Tr = 0.1,
+0.5, 0.9), BlogCatalog with 5 sampled neighbours beats it everywhere, and POS macro F1 at
+Tr = 0.9 rises to 11.7 against the paper's 12.2.
+
+AdamW (`--weight-decay 0.001`) gives the same picture: every best result is within about 0.5
+points of Adam's. Its decay helps a little at large learning rates, where it is 0.0–0.6 points
+better than Adam on every multi-label run with lr ≥ 0.1.
+
+These are single EP trainings with the learning rate picked on the same evaluation, so
+differences of a point or so are within noise; BlogCatalog's are not.
+
+**Which to use.** Epoch updates help on dense graphs and hurt a little on sparse ones. Per-batch
+updates give a high-degree node's features a gradient in every batch that holds the node or one of
+its neighbours, so dozens of small, noisy steps a pass; summing them first removes that noise.
+Sampling neighbours (`--max-nodes`) helps BlogCatalog for the same reason. On the sparse citation
+graphs a feature appears in only a few batches a pass anyway, and per-batch updates' extra steps
+win. A rough rule: average degree in the tens or more, use epoch updates with lr 0.01–0.05; single
+digits, keep per-batch updates. The citation datasets are also the ones with word features, so
+this split can't separate density from attributes. Epoch updates keep a gradient table the size of
+the feature embeddings.
+
 ## Findings
 
 - **Five of the six datasets reproduce with the paper's settings.** Cora, Citeseer, Pubmed, PPI and
   POS land within about one standard deviation of the paper. The one exception is POS macro F1 at
-  Tr = 0.9, which comes out at 10.4–10.8 against the paper's 12.2.
-- **BlogCatalog only reproduces with neighbour sampling.** Using every neighbour leaves it 5–8 points
-  short. BlogCatalog is dense: the average degree is 65 and the largest is 3,992. Sampling 5
-  neighbours per reconstruction closes all but about 1 point. On one split, 1, 2, 5, 10, 20 and 50
+  Tr = 0.9, which comes out at 10.4–10.8 against the paper's 12.2 (11.7 with epoch updates).
+- **BlogCatalog with per-batch updates only reproduces with neighbour sampling.** Using every
+  neighbour leaves it 5–8 points short; epoch updates close the gap without sampling (see above).
+  BlogCatalog is dense: the average degree is 65 and the largest is 3,992. Sampling 5 neighbours
+  per reconstruction closes all but about 1 point. On one split, 1, 2, 5, 10, 20 and 50
   sampled neighbours give micro F1 of 36.2, 36.7, 38.0, 37.1, 35.9 and 34.0, against 33.1 with every
   neighbour. The paper samples neighbours (its κ) in Figure 4, but doesn't say what it used for
   Table 3. Sampling makes no real difference on PPI and POS.
-- **What didn't cause the BlogCatalog gap:**
+- **What caused the BlogCatalog gap:** noise from per-batch updates on high-degree nodes, which
+  epoch updates and neighbour sampling both reduce. What didn't:
   - Hogwild parallelism: a single-threaded run scores the same.
   - The classifier's regulariser: C beyond the paper's grid adds at most 0.3 points.
   - Underfitting: EP's final training loss is low.

@@ -170,7 +170,7 @@ def test_adamw_rejects_invalid_weight_decay(weight_decay):
 
 def test_optimizer_repr():
     assert repr(cl.Optimizer.adam()) == "Optimizer.adam()"
-    assert repr(cl.Optimizer.adamw()) == "Optimizer.adamw(weight_decay=0.01)"
+    assert repr(cl.Optimizer.adamw()) == "Optimizer.adamw(weight_decay=0.001)"
 
 
 @pytest.mark.parametrize("optimizer", [None, cl.Optimizer.adam(), cl.Optimizer.adamw(0.1)])
@@ -205,3 +205,16 @@ def test_embedding_propagator_schedules_and_inits(graph, lr_schedule, init):
                                 lr_schedule=lr_schedule, init=init)
     feats = ep.learn_features(graph, cl.FeatureSet.new_from_graph(graph))
     assert feats.dims() == 4
+
+
+@pytest.mark.parametrize("update_frequency", ["batch", "epoch"])
+def test_embedding_propagator_update_frequency(graph, update_frequency):
+    ep = cl.EmbeddingPropagator(dims=4, passes=2, indicator=False, valid_pct=0.0,
+                                update_frequency=update_frequency)
+    fe = ep.learn_features(graph, cl.FeatureSet.new_from_graph(graph))
+    assert fe.dims() == 4
+
+
+def test_embedding_propagator_rejects_unknown_update_frequency():
+    with pytest.raises(ValueError, match="update_frequency"):
+        cl.EmbeddingPropagator(update_frequency="step")

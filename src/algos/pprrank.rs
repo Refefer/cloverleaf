@@ -245,6 +245,10 @@ impl PprRank {
                 if cnt > 0f32 { error / cnt } else { 0f32 }
             }).collect();
 
+            // Once-per-pass regularisation (AdamW's weight decay).
+            let last_step = step.load(Ordering::Relaxed).saturating_sub(1).max(1);
+            optimizer.end_pass(&feature_embeddings, lr_scheduler.multiplier(last_step));
+
             // Some losses go toward infinity.  This is a bug we should fix.
             last_error = err.iter()
                 .filter(|x| !x.is_infinite() )
