@@ -2917,16 +2917,16 @@ impl EmbeddingAligner {
     ///    Parameters
     ///    ----------
     ///    orig_embeddings : NodeEmbeddings
-    ///        Original embeddings.
+    ///        Embeddings before alignment, in the query's space.  The anchors are searched for here.
     ///    
     ///    orig_ann : EmbAnn
-    ///        Approximate Nearest Neighbor instance to find nearest neighbors.
+    ///        Approximate Nearest Neighbor index over orig_embeddings.
     ///    
     ///    translated_embeddings : NodeEmbeddings
-    ///        Translated NodeEmbeddings.
+    ///        The same nodes' embeddings after alignment: the space to map into.
     ///    
     ///    emb : Query
-    ///        Embedding to use
+    ///        An embedding in orig_embeddings' space, or a node looked up in orig_embeddings.
     ///    
     ///    seed : Int - Optional
     ///        If provided, uses the random seed.  Default is global seed
@@ -2944,7 +2944,8 @@ impl EmbeddingAligner {
         emb: &Query,
         seed: Option<u64>
     ) -> PyResult<Vec<f32>> {
-        let query_embedding = lookup_embedding(emb, translated_embeddings)?;
+        // The query lives in the original space: that's where its anchors are searched for.
+        let query_embedding = lookup_embedding(emb, orig_embeddings)?;
         Ok(self.aligner.align(&orig_embeddings.inner, &orig_ann.ann, &translated_embeddings.inner,
                               query_embedding, seed.unwrap_or(SEED + 123123)))
     }
@@ -2954,16 +2955,16 @@ impl EmbeddingAligner {
     ///    Parameters
     ///    ----------
     ///    orig_embeddings : NodeEmbeddings
-    ///        Original embeddings.
+    ///        Embeddings before alignment, in the query's space.  The anchors are searched for here.
     ///    
     ///    orig_ann : EmbAnn
-    ///        Approximate Nearest Neighbor instance to find nearest neighbors.
+    ///        Approximate Nearest Neighbor index over orig_embeddings.
     ///    
     ///    translated_embeddings : NodeEmbeddings
-    ///        Translated NodeEmbeddings.
+    ///        The same nodes' embeddings after alignment: the space to map into.
     ///    
-    ///    emb : List[Query]
-    ///        Set of embeddings to use
+    ///    queries : List[Query]
+    ///        Embeddings in orig_embeddings' space, or nodes looked up in orig_embeddings.
     ///    
     ///    seed : Int - Optional
     ///        If provided, uses the random seed.  Default is global seed

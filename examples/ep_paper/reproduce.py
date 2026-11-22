@@ -227,14 +227,14 @@ def neighbours(ds):
     return adj
 
 
-def train_label_type(ds, graph, edges, label_type, gamma, seed, args, removed=None):
+def train_label_type(ds, graph, edges, label_type, gamma, seed, args, removed=None, loss=None):
     """Runs EP on one label type over `edges` and returns an embedding for every node.
 
     A node in the training graph gets h(v), the mean of its label embeddings.  A node in
     `removed`, left out of training, gets h~(v), EP-B's reconstruction from its neighbours: the
     mean over all its neighbours' labels that have an embedding.  Removed neighbours' ids don't,
     so only nodes seen in training contribute their ids; their words do wherever the word was
-    seen in training.
+    seen in training.  `loss` defaults to EP-B's margin loss with margin gamma and one negative.
     """
     features = cl.FeatureSet.new_from_graph(graph)
     in_graph = np.zeros(ds.num_nodes, bool)
@@ -242,7 +242,7 @@ def train_label_type(ds, graph, edges, label_type, gamma, seed, args, removed=No
     for v in np.flatnonzero(in_graph):
         features.set_features(("n", str(v)), node_labels(ds, label_type, v))
     ep = cl.EmbeddingPropagator(
-        alpha=args.lr, loss=cl.EPLoss.margin(float(gamma), 1), batch_size=args.batch_size,
+        alpha=args.lr, loss=loss or cl.EPLoss.margin(float(gamma), 1), batch_size=args.batch_size,
         dims=args.dims, passes=args.passes, seed=seed, max_nodes=args.max_nodes,
         valid_pct=0.0, indicator=False, lr_schedule=args.lr_schedule, init=args.init,
         update_frequency=args.update_frequency, optimizer=optimizer(args))
@@ -279,6 +279,17 @@ def optimizer(args):
 EP_SETTINGS = ["dims", "passes", "batch_size", "lr", "lr_schedule", "init", "max_nodes", "seed"]
 
 
+def cache_tag(args):
+    """Names the EP settings in a cache file."""
+    tag = "-".join(f"{k}={getattr(args, k)}" for k in EP_SETTINGS)
+    # Added after the others, so caches of per-batch runs keep their names.
+    if args.update_frequency != "batch":
+        tag += f"-update_frequency={args.update_frequency}"
+    if args.weight_decay is not None:
+        tag += f"-adamw={args.weight_decay}"
+    return tag
+
+
 def embed(ds, graph, edges, gamma, seed, args, removed=None, split_tag=None):
     """EP-B embeddings for every node, read from --cache when an identical run is there.
 
@@ -287,12 +298,7 @@ def embed(ds, graph, edges, gamma, seed, args, removed=None, split_tag=None):
     """
     path = None
     if args.cache:
-        tag = "-".join(f"{k}={getattr(args, k)}" for k in EP_SETTINGS)
-        # Added after the others, so caches of per-batch runs keep their names.
-        if args.update_frequency != "batch":
-            tag += f"-update_frequency={args.update_frequency}"
-        if args.weight_decay is not None:
-            tag += f"-adamw={args.weight_decay}"
+        tag = cache_tag(args)
         if split_tag is not None:
             tag += f"-inductive-{split_tag}"
         path = os.path.join(args.cache, f"{ds.name}-gamma={gamma:g}-{tag}.npy")
@@ -314,14 +320,15 @@ def kept_edges(ds, removed):
     return ds.edges[~(gone[ds.edges[:, 0]] | gone[ds.edges[:, 1]])]
 
 
-def inductive_embeddings(ds, removed, split_tag, args, tmp):
-    """Trains EP without the `removed` nodes for every gamma, and embeds them inductively."""
+def inductive_embeddings(ds, removed, split_tag, args, tmp, embed_fn=embed):
+    """Trains EP without the `removed` nodes for every gamma, and embeds them inductively.
+    `embed_fn` has `embed`'s signature; experiments.py substitutes its own."""
     edges = kept_edges(ds, removed)
     graph = load_graph(ds, edges, tmp)
     embeddings = {}
     for gamma in args.gammas:
-        embeddings[gamma], seconds = embed(ds, graph, edges, gamma, args.seed, args, removed,
-                                           split_tag)
+        embeddings[gamma], seconds = embed_fn(ds, graph, edges, gamma, args.seed, args, removed,
+                                              split_tag)
         log(f"  {split_tag}: trained gamma={gamma:g} in {seconds:.0f}s")
     return embeddings
 
@@ -391,7 +398,7 @@ def choose_gamma_multilabel(embeddings, Y, seed):
     return max(scores, key=scores.get), scores
 
 
-def evaluate_multilabel_inductive(ds, fraction, args, tmp):
+def evaluate_multilabel_inductive(ds, fraction, args, tmp, embed_fn=embed):
     """Table 4: removes `fraction` of the nodes before training, trains the classifier on
     Tr = 0.1 of all nodes drawn from the rest, and scores it on the removed nodes.
 
@@ -407,7 +414,8 @@ def evaluate_multilabel_inductive(ds, fraction, args, tmp):
         cut = int(round(fraction * n))
         removed, kept = np.sort(perm[:cut]), perm[cut:]
         tr = kept[:int(round(0.1 * n))]
-        embeddings = inductive_embeddings(ds, removed, f"removed={fraction:g}-run={run}", args, tmp)
+        embeddings = inductive_embeddings(ds, removed, f"removed={fraction:g}-run={run}", args, tmp,
+                                          embed_fn)
         for m in ("micro", "macro"):
             run_best = None
             for g, H in embeddings.items():
@@ -475,13 +483,13 @@ def fmt(mean_std):
     return f"{mean_std[0]:6.2f} ± {mean_std[1]:4.2f}"
 
 
-def run_inductive(ds, args, tmp):
+def run_inductive(ds, args, tmp, embed_fn=embed):
     paper = PAPER_INDUCTIVE[ds.name]
     r = {"paper": paper}
     if ds.name in MULTI_LABEL:
         r["results"] = {}
         for fraction in args.removed:
-            res = evaluate_multilabel_inductive(ds, fraction, args, tmp)
+            res = evaluate_multilabel_inductive(ds, fraction, args, tmp, embed_fn)
             r["results"][fraction] = res
             ref = paper.get(fraction)
             vs = lambda m: f" (paper {ref[m]:.2f}, gamma={ref['gamma']})" if ref else ""
@@ -491,7 +499,8 @@ def run_inductive(ds, args, tmp):
                             for g, v in res["per_gamma"].items()))
     else:
         embeddings_for = lambda run, te: inductive_embeddings(ds, np.sort(te),
-                                                              f"planetoid-run={run}", args, tmp)
+                                                              f"planetoid-run={run}", args, tmp,
+                                                              embed_fn)
         r["results"] = evaluate_attributed(embeddings_for, ds.labels, args.gammas, args.runs,
                                            args.seed)
         log(f"  inductive accuracy {fmt(r['results']['accuracy'])} "
@@ -500,8 +509,9 @@ def run_inductive(ds, args, tmp):
     return r
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+def build_parser(description=__doc__.split("\n")[0]):
+    """The command line arguments: the datasets, the evaluation and EP's settings."""
+    p = argparse.ArgumentParser(description=description)
     p.add_argument("--data", required=True, help="Directory with the downloaded datasets.")
     p.add_argument("--datasets", nargs="+", default=MULTI_LABEL + ATTRIBUTED,
                    choices=MULTI_LABEL + ATTRIBUTED)
@@ -529,8 +539,11 @@ def main():
     p.add_argument("--out", default=None, help="Write results as JSON to this path.")
     p.add_argument("--cache", default=None,
                    help="Directory to keep trained embeddings in, so reruns skip training.")
-    args = p.parse_args()
+    return p
 
+
+def run(args, embed_fn=embed):
+    """Trains and evaluates every dataset in args; `embed_fn` has `embed`'s signature."""
     results = {"settings": vars(args), "datasets": {}}
     with tempfile.TemporaryDirectory() as tmp:
         for name in args.datasets:
@@ -538,7 +551,7 @@ def main():
             log(f"{name}: {ds.num_nodes} nodes, {len(ds.edges)} edges"
                 + (f", {sum(map(len, ds.words))} word labels" if ds.words else ""))
             if args.setting == "inductive":
-                results["datasets"][name] = run_inductive(ds, args, tmp)
+                results["datasets"][name] = run_inductive(ds, args, tmp, embed_fn)
                 if args.out:
                     with open(args.out, "w") as f:
                         json.dump(results, f, indent=2, default=str)
@@ -547,8 +560,8 @@ def main():
             graph = load_graph(ds, ds.edges, tmp)
             embeddings, seconds = {}, {}
             for gamma in args.gammas:
-                embeddings[gamma], seconds[gamma] = embed(ds, graph, ds.edges, gamma, args.seed,
-                                                          args)
+                embeddings[gamma], seconds[gamma] = embed_fn(ds, graph, ds.edges, gamma,
+                                                             args.seed, args)
                 log(f"  trained gamma={gamma:g} in {seconds[gamma]:.0f}s")
 
             paper = PAPER[name]
@@ -577,6 +590,10 @@ def main():
             if args.out:
                 with open(args.out, "w") as f:
                     json.dump(results, f, indent=2, default=str)
+
+
+def main():
+    run(build_parser().parse_args())
 
 
 if __name__ == "__main__":

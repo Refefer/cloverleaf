@@ -148,6 +148,22 @@ def test_align_accepts_aligned_embeddings(graph):
     assert out.dims() == 2
 
 
+def test_embedding_aligner_node_query_uses_original_embedding():
+    # A node query is a point in the original space, where its anchors are searched for: it must
+    # map exactly like the raw embedding the node has there, not its translated one.
+    orig = cl.NodeEmbeddings.new_from_list(
+        [(n(i), e) for i, e in enumerate([[0., 0.], [1., 0.], [0., 1.], [1., 1.]])],
+        cl.Distance.Euclidean)
+    translated = cl.NodeEmbeddings.new_from_list(
+        [(n(i), e) for i, e in enumerate([[0., 0.], [3., 0.], [0., 3.], [3., 3.]])],
+        cl.Distance.Euclidean)
+    ann = cl.EmbAnn(orig, 2, 2, seed=1)
+    aligner = cl.EmbeddingAligner(3, 0, 0.1, 0.0, 20)
+    by_node = aligner.align(orig, ann, translated, cl.Query.node(*n(1)), seed=1)
+    by_embedding = aligner.align(orig, ann, translated, cl.Query.embedding([1., 0.]), seed=1)
+    assert by_node == by_embedding
+
+
 # Graph IO
 
 
