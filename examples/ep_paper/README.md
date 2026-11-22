@@ -21,7 +21,8 @@ python reproduce.py --data DIR --setting inductive --gammas 5         # test nod
 
 ## Results
 
-All results are transductive. Each is the mean ± standard deviation over 10 random splits, with
+These results are transductive; the inductive setting is [below](#inductive-setting). Each is the
+mean ± standard deviation over 10 random splits, with
 EP trained once per dataset and γ. The margin γ is the one the paper reports choosing; our own
 cross validation picks γ = 1 for PPI and POS, which scores about the same.
 
@@ -56,6 +57,55 @@ BlogCatalog, PPI and POS at Tr = 0.1, micro / macro F1 is:
 | PPI | 6.71 / 1.69 | 6.15 / 1.58 |
 | POS | 40.44 / 3.26 | 40.40 / 3.38 |
 
+## Inductive setting
+
+With `--setting inductive` the test nodes are removed from the graph before EP trains, and are
+embedded afterwards from their neighbours' trained label embeddings (EP-B's reconstruction h~).
+BlogCatalog, PPI and POS remove 20% of the nodes and train the classifier on 10% of all nodes;
+Cora, Citeseer and Pubmed remove their 1,000 test nodes. Each dataset uses the γ the paper reports
+for this setting, and EP is retrained for every split. Means over 3 splits, at 200 passes
+(accuracy, or micro / macro F1):
+
+| | γ | per batch (lr 0.001) | epoch (lr 0.05) | paper |
+|---|---|---|---|---|
+| Cora | 5 | 75.10 ± 1.36 | 74.00 ± 1.63 | 73.09 ± 1.75 |
+| Citeseer | 5 | 67.30 ± 1.36 | 65.30 ± 1.93 | 68.61 ± 1.69 |
+| Pubmed | 1 | 76.73 ± 0.95 | 74.33 ± 0.05 | 79.94 ± 2.30 |
+| PPI | 10 | 16.66 / 11.91 | 17.95 / 13.36 | 16.63 / 11.55 |
+| POS | 10 | 46.38 / 8.17 | 46.70 / 8.32 | 43.23 / 5.47 |
+| BlogCatalog | 10 | 25.64 / 11.99 | 28.56 / 12.78 | 29.22 / 12.12 |
+
+Per-batch updates reproduce PPI, beat the paper on Cora and POS, and are within noise on
+Citeseer. BlogCatalog is 3.6 points of micro F1 short with per-batch updates but matches the paper
+with epoch updates, as in the transductive setting. Pubmed is 3.2 points short in both modes. A
+removed node's word embedding is reconstructed from its neighbours' words here; the paper may have
+used the node's own words, which it would have when it is added.
+
+**Training length.** Held-out scores at 50, 100, 200 and 400 passes:
+
+| | | 50 | 100 | 200 | 400 |
+|---|---|---|---|---|---|
+| Cora | per batch | 74.70 | 74.60 | 75.10 | 75.53 |
+| | epoch | 74.07 | 74.33 | 74.00 | 71.53 |
+| Citeseer | per batch | 66.83 | 66.93 | 67.30 | 67.13 |
+| | epoch | 66.10 | 65.23 | 65.30 | 64.40 |
+| Pubmed | per batch | 76.37 | 76.17 | 76.73 | 76.80 |
+| | epoch | 71.77 | 74.57 | 74.33 | 74.63 |
+| PPI | per batch | 15.34 / 11.76 | 16.06 / 12.01 | 16.66 / 11.91 | 16.62 / 12.45 |
+| | epoch | 17.38 / 12.96 | 18.38 / 12.42 | 17.95 / 13.36 | 18.29 / 12.92 |
+| POS | per batch | 45.53 / 7.95 | 45.72 / 8.04 | 46.38 / 8.17 | 46.57 / 8.68 |
+| | epoch | 46.01 / 7.62 | 47.09 / 8.45 | 46.70 / 8.32 | 45.88 / 7.74 |
+| BlogCatalog | per batch | 26.05 / 11.63 | 25.56 / 11.69 | 25.64 / 11.99 | 24.01 / 11.75 |
+| | epoch | 27.99 / 13.21 | 28.34 / 13.43 | 28.56 / 12.78 | 28.80 / 12.77 |
+
+In transductive runs the training loss was still falling at 200 passes (with per-batch updates on
+Cora, almost linearly to 400), but held-out scores level off by pass 50–200 and never gain more
+than about half a point after 200. Training longer mostly fits the training graph: per-batch
+updates on BlogCatalog peak at pass 50 and lose 2 points by 400, and epoch updates on Cora,
+Citeseer and POS peak by pass 100 and lose 1–3 points by 400. Transductive scores can still rise over those
+passes (BlogCatalog per batch gains 1.4 points of micro F1 from 200 to 400), because there the test
+nodes are part of the training graph. To choose the number of passes, stop on a held-out split.
+
 ## Batch vs epoch updates
 
 EP-B updates the embeddings after every batch. With `--update-frequency epoch`, batches are still
@@ -88,15 +138,20 @@ better than Adam on every multi-label run with lr ≥ 0.1.
 These are single EP trainings with the learning rate picked on the same evaluation, so
 differences of a point or so are within noise; BlogCatalog's are not.
 
-**Which to use.** Epoch updates help on dense graphs and hurt a little on sparse ones. Per-batch
+**Which to use.** Epoch updates help on dense graphs and hurt a little on sparse ones, for test
+nodes inside the training graph and for unseen ones alike. Per-batch
 updates give a high-degree node's features a gradient in every batch that holds the node or one of
 its neighbours, so dozens of small, noisy steps a pass; summing them first removes that noise.
 Sampling neighbours (`--max-nodes`) helps BlogCatalog for the same reason. On the sparse citation
 graphs a feature appears in only a few batches a pass anyway, and per-batch updates' extra steps
-win. A rough rule: average degree in the tens or more, use epoch updates with lr 0.01–0.05; single
-digits, keep per-batch updates. The citation datasets are also the ones with word features, so
-this split can't separate density from attributes. Epoch updates keep a gradient table the size of
-the feature embeddings.
+win. On unseen nodes (the inductive setting, 200 passes) epoch updates gain 2.9 points of micro F1
+on BlogCatalog (average degree 65) and 1.3 on PPI (19), tie on POS (39), and lose 1–2.5 points of
+accuracy on the citation graphs. A rough rule: on graphs with an average degree in the tens or
+more, try epoch updates with lr 0.01–0.05; with single digits, keep per-batch updates. The
+citation datasets are also the ones with word features, so this split can't separate density from
+attributes, and POS shows density alone doesn't decide it. Epoch updates reach their best held-out
+score in about 100 passes and can overfit after that, so stop them on a held-out split. They also
+keep a gradient table the size of the feature embeddings.
 
 ## Findings
 
@@ -114,7 +169,8 @@ the feature embeddings.
   epoch updates and neighbour sampling both reduce. What didn't:
   - Hogwild parallelism: a single-threaded run scores the same.
   - The classifier's regulariser: C beyond the paper's grid adds at most 0.3 points.
-  - Underfitting: EP's final training loss is low.
+  - Underfitting: held-out F1 with per-batch updates peaks by pass 50 and falls with more
+    passes (see the inductive setting), although the training loss keeps falling.
 - **A pitfall in the multi-label evaluation.** One-vs-rest gives a label missing from a training
   split a constant decision score of 0. That outranks every real label with a negative score, so
   the script ranks labels with `predict_proba` instead. Scoring with `decision_function` cost POS
