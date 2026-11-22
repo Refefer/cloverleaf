@@ -125,8 +125,13 @@ def load(edges_path, features_path=None, directed=False, namespace="node_type"):
     feat_ptr = np.concatenate([[0], np.cumsum(lengths)])
     feat_idx = np.fromiter((f for fs in node_feats for f in fs), np.int64, int(feat_ptr[-1]))
 
+    # Node and feature ids fit in int32 below 2^31, halving the largest arrays.  Offsets index
+    # edges and node-feature pairs, which can pass 2^31 on huge graphs, so they stay int64.
+    def ids(a, count):
+        return torch.from_numpy(a.astype(np.int32 if count < 2**31 else np.int64))
     t = torch.from_numpy
-    return Graph(types, names, t(adj_ptr), t(adj_idx), t(adj_w), t(feat_ptr), t(feat_idx),
+    return Graph(types, names, t(adj_ptr), ids(adj_idx, n), t(adj_w), t(feat_ptr),
+                 ids(feat_idx, len(feature_keys)),
                  feature_keys)
 
 
@@ -137,7 +142,7 @@ def load_cached(cache_path, edges_path, features_path=None, directed=False, name
     key = {"edges": os.path.abspath(edges_path), "edges_mtime": os.path.getmtime(edges_path),
            "features": features_path and os.path.abspath(features_path),
            "features_mtime": features_path and os.path.getmtime(features_path),
-           "directed": directed, "namespace": namespace}
+           "directed": directed, "namespace": namespace, "format": 2}
     if os.path.exists(cache_path):
         saved = torch.load(cache_path, weights_only=False)
         if saved["key"] == key:

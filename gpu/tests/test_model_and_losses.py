@@ -140,3 +140,24 @@ def test_attention_handles_any_dims_and_heads(dims, heads):
     x, w = torch.randn(2, 5, dims), torch.ones(2, 5)
     out = pool(x, w)
     assert out.shape == (2, dims) and torch.isfinite(out).all()
+
+
+def test_infonce_is_cross_entropy_over_scaled_cosines():
+    t = torch.tensor([[1., 0.]])
+    h = torch.tensor([[2., 0.]])
+    hu = torch.tensor([[[0., 3.], [-1., 0.]]])
+    logits = torch.tensor([1.0, 0.0, -1.0]) / 0.5
+    expected = -torch.log_softmax(logits, dim=0)[0]
+    assert torch.allclose(losses.infonce(t, h, hu, 0.5), expected[None], atol=1e-6)
+
+
+def test_infonce_pool_matches_gathering_every_pool_node():
+    torch.manual_seed(0)
+    t, h, pool = torch.randn(3, 4), torch.randn(3, 4), torch.randn(5, 4)
+    nodes, pool_nodes = torch.tensor([7, 2, 9]), torch.tensor([1, 2, 3, 4, 5])
+    exclude = pool_nodes[None, :] == nodes[:, None]
+    got = losses.infonce_pool(t, h, pool, exclude, 0.1)
+    for i in range(3):
+        keep = ~exclude[i]
+        ref = losses.infonce(t[i:i + 1], h[i:i + 1], pool[keep][None], 0.1)
+        assert torch.allclose(got[i], ref[0], atol=1e-5)

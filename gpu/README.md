@@ -74,6 +74,25 @@ default).  A bfloat16 table's updates are computed in float32 and written back w
 rounding, so steps smaller than bfloat16's spacing still move the weights on average.  The peak
 GPU memory of a run is printed when it finishes.
 
+## Large graphs
+
+Node and feature ids are stored as int32 whenever they fit, halving the largest index arrays.
+`graph_device cpu` keeps the graph in host memory and samples there, copying each batch's ids
+to the GPU; `table_device cpu` keeps the feature table and its optimiser state in pinned host
+memory, copying each batch's distinct rows to the GPU and their gradients back.  With both, GPU
+memory holds only the dense attention weights and one batch's activations, whatever the graph's
+size.
+
+## Losses and reconstruction
+
+* `loss`: margin, starspace, rank, rankspace (as cloverleaf) or `infonce`: cross entropy over
+  cosine similarities divided by a temperature (`gamma`).  With `pool_negatives`, each node's
+  softmax runs over the whole negative pool with one matrix multiply.
+* `neighbour_pooling` ("mean" by default) combines a nested reconstruction's neighbours.  A
+  weighted mean keeps h~(v) in the same space as the node embeddings it's compared with;
+  attention there learns its own transform, which lowers the training loss but makes nodes
+  worse at retrieving their neighbours.
+
 ## Export
 
 Embeddings are written with `cloverleaf.write_embeddings` when the installed cloverleaf has it:

@@ -173,3 +173,9 @@ def test_neighbour_features_one_row_per_neighbour(tiny):
     assert sorted(map(sorted, rows_a)) == sorted(map(sorted, [features(g, 1), features(g, 2)]))
     assert w[1].tolist() == [1.0, 0.0]
     assert not fmask[k + 1].any(), "a padded neighbour contributes no features"
+
+
+def test_ids_are_int32_and_offsets_int64(tiny):
+    g = data.load(*tiny)
+    assert g.adj_idx.dtype == torch.int32 and g.feat_idx.dtype == torch.int32
+    assert g.adj_ptr.dtype == torch.int64 and g.feat_ptr.dtype == torch.int64

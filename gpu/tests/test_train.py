@@ -121,3 +121,37 @@ def test_memory_saving_options_learn(two_cliques, optimizer, table_dtype):
     model = train(two_cliques, cfg, log=lambda m: None)
     assert model.features.weight.dtype == (torch.bfloat16 if table_dtype == "bfloat16" else torch.float32)
     assert separation(node_embeddings(model, two_cliques).float()) > 0.3
+
+
+def test_attention_with_mean_neighbour_pooling(two_cliques):
+    from ep_gpu import sampling
+    from ep_gpu.model import EPModel, MeanPool
+    m = EPModel(two_cliques.num_features, 8, pooling="attention", heads=2, seed=0)
+    assert isinstance(m.neighbour_pool, MeanPool)
+    torch.nn.init.normal_(m.pool.out.weight)
+    fidx, fmask, w = sampling.neighbour_features(two_cliques, torch.tensor([0, 5]))
+    per_neighbour = m.embed(fidx, fmask.float()).view(2, w.shape[1], -1)
+    expected = (per_neighbour * w[..., None]).sum(1) / w.sum(1, keepdim=True)
+    assert torch.allclose(m.combine_neighbours(per_neighbour, w), expected, atol=1e-6)
+    cfg = Config(dims=16, passes=40, batch_size=8, lr=0.05, negatives=3, pooling="attention", heads=2,
+                 device="cpu", seed=3)
+    assert separation(node_embeddings(train(two_cliques, cfg, log=lambda m: None), two_cliques)) > 0.3
+
+
+def test_unknown_neighbour_pooling_is_rejected(two_cliques):
+    with pytest.raises(ValueError):
+        train(two_cliques, Config(dims=4, passes=1, pooling="attention", neighbour_pooling="max", device="cpu"),
+              log=lambda m: None)
+
+
+@pytest.mark.parametrize("pool_negatives", [False, True])
+def test_infonce_trains(two_cliques, pool_negatives):
+    cfg = Config(dims=16, passes=40, batch_size=8, lr=0.05, negatives=3, loss="infonce", gamma=0.1,
+                 negative_pool=16, pool_negatives=pool_negatives, device="cpu", seed=3)
+    assert separation(node_embeddings(train(two_cliques, cfg, log=lambda m: None), two_cliques)) > 0.3
+
+
+def test_pool_negatives_needs_infonce(two_cliques):
+    with pytest.raises(ValueError):
+        train(two_cliques, Config(dims=4, passes=1, loss="starspace", pool_negatives=True, device="cpu"),
+              log=lambda m: None)

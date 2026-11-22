@@ -68,7 +68,7 @@ class AttentionPool(nn.Module):
 
 class EPModel(nn.Module):
     def __init__(self, num_features, dims, pooling="mean", heads=4, init="unit", seed=None,
-                 table_dtype=torch.float32):
+                 table_dtype=torch.float32, neighbour_pooling="mean"):
         super().__init__()
         self.features = nn.Embedding(num_features, dims, sparse=True)
         g = torch.Generator().manual_seed(seed) if seed is not None else None
@@ -85,12 +85,29 @@ class EPModel(nn.Module):
         # Initialised in float32, then stored as table_dtype (bfloat16 halves the table).
         self.features.to(table_dtype)
         if pooling == "mean":
-            self.pool, self.neighbour_pool = MeanPool(), MeanPool()
+            self.pool = MeanPool()
         elif pooling == "attention":
-            # Separate parameters for pooling features and for pooling neighbours.
-            self.pool, self.neighbour_pool = AttentionPool(dims, heads), AttentionPool(dims, heads)
+            self.pool = AttentionPool(dims, heads)
         else:
             raise ValueError(f"pooling must be 'mean' or 'attention', got {pooling!r}")
+        # How a nested reconstruction combines its neighbours.  A weighted mean keeps h~(v) in the
+        # same space as the node embeddings it's compared with, so training optimises node-to-node
+        # similarity directly; attention here learns its own transform of that space.
+        if neighbour_pooling == "mean":
+            self.neighbour_pool = MeanPool()
+        elif neighbour_pooling == "attention":
+            self.neighbour_pool = AttentionPool(dims, heads)
+        else:
+            raise ValueError(f"neighbour_pooling must be 'mean' or 'attention', got {neighbour_pooling!r}")
+
+    @property
+    def device(self):
+        """Where embeddings are computed: set by train.build, else wherever the table is."""
+        return self.__dict__.get("_compute_device") or self.features.weight.device
+
+    @device.setter
+    def device(self, value):
+        self.__dict__["_compute_device"] = torch.device(value)
 
     def embed(self, feature_ids, weights):
         """feature_ids, weights: (B, T); weights are 0 for padding."""
@@ -108,8 +125,11 @@ class EPModel(nn.Module):
         valids = [w > 0 for _, w in groups]
         ids = torch.cat([f[v] for (f, _), v in zip(groups, valids)])
         unique, inverse = torch.unique(ids, return_inverse=True)
-        # Computed in float32 whatever the table's storage type.
-        table = self.features(unique).float()
+        # Computed in float32 whatever the table's storage type.  The table may live in host
+        # memory: only this batch's distinct rows are copied over, and their gradients copied
+        # back, through autograd.
+        table_device = self.features.weight.device
+        table = self.features(unique.to(table_device)).to(unique.device, non_blocking=True).float()
         attention = isinstance(self.pool, AttentionPool)
         # A token's query, key and value depend only on its feature, so they're projected once
         # per distinct feature rather than once per (padded) token.

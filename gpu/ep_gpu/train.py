@@ -33,6 +33,8 @@ class Config:
     negatives: int = 1
     negative_pool: int | None = 2048  # nodes embedded once per batch that every anchor draws its
                                       # negatives from; 0 or None draws independent ones per anchor
+    pool_negatives: bool = False     # infonce only: use the whole pool as each node's negatives
+                                     # (one matrix multiply) instead of `negatives` drawn from it
     max_nodes: int | None = None     # neighbours per reconstruction; None for all
     max_features: float | int | None = None   # features per node; a fraction, a count or None for all
     weighted_sampling: bool = False
@@ -40,6 +42,8 @@ class Config:
     pooling: str = "mean"            # "mean" or "attention"
     reconstruction: str = "auto"     # h~(v): "flat" (cloverleaf), "nested", or "auto": flat for
                                      # mean pooling, nested for attention
+    neighbour_pooling: str = "mean"  # nested h~(v)'s second level: a weighted "mean" of the
+                                     # neighbours (same space as h(v)) or "attention"
     heads: int = 4
     precision: str = "bf16"          # "bf16": the forward pass under bfloat16 autocast (fastest for
                                      # attention); "tf32": float32 matrix multiplies on tensor
@@ -48,6 +52,10 @@ class Config:
     optimizer: str = "adam"          # the feature table's: adam, rowwise_adam or rowwise_adagrad
                                      # (see optim.py for the memory each needs)
     table_dtype: str = "float32"     # "float32" or "bfloat16" (updates stochastically rounded)
+    graph_device: str = "same"       # "same" (as device) or "cpu": keep the graph in host memory
+                                     # and sample there, copying each batch's ids over
+    table_device: str = "same"       # "same" or "cpu": keep the feature table and its optimiser
+                                     # state in pinned host memory, copying each batch's rows over
     valid_pct: float = 0.0           # nodes held out of the anchors; their loss is reported
     seed: int = 2017
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -78,12 +86,35 @@ def autocast(cfg, device):
 TABLE_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 
 
+def check_loss(cfg):
+    if cfg.loss not in losses.LOSSES:
+        raise ValueError(f"loss must be one of {', '.join(losses.LOSSES)}, got {cfg.loss!r}")
+    if cfg.pool_negatives and (cfg.loss != "infonce" or not cfg.negative_pool):
+        raise ValueError("pool_negatives needs loss infonce and a negative_pool")
+
+
+def placement(cfg, setting):
+    """The device for graph_device or table_device: "same" as cfg.device, or "cpu"."""
+    value = getattr(cfg, setting)
+    if value not in ("same", "cpu"):
+        raise ValueError(f"{setting} must be 'same' or 'cpu', got {value!r}")
+    return torch.device(cfg.device if value == "same" else "cpu")
+
+
 def build(cfg, num_features, device, generator=None):
     """The model, the feature table's optimiser and, with attention, an Adam for its weights."""
     if cfg.table_dtype not in TABLE_DTYPES:
         raise ValueError(f"table_dtype must be float32 or bfloat16, got {cfg.table_dtype!r}")
     model = EPModel(num_features, cfg.dims, cfg.pooling, cfg.heads, cfg.init, cfg.seed,
-                    TABLE_DTYPES[cfg.table_dtype]).to(device)
+                    TABLE_DTYPES[cfg.table_dtype], cfg.neighbour_pooling).to(device)
+    model.device = device
+    table_device = placement(cfg, "table_device")
+    if table_device != device:
+        model.features.to(table_device)
+        if device.type == "cuda":
+            # Pinned, so each batch's rows copy to the GPU asynchronously.
+            model.features.weight.data = model.features.weight.data.pin_memory()
+        generator = torch.Generator(device=table_device).manual_seed(cfg.seed + 2)
     table_opt = SparseTableOptimizer(model.features.weight, cfg.optimizer, cfg.lr, generator=generator)
     dense = model.dense_parameters()
     dense_opt = torch.optim.Adam(dense, lr=cfg.dense_lr) if dense else None
@@ -97,7 +128,8 @@ def nested_reconstruction(cfg):
 
 
 def batch_loss(model, graph, nodes, cfg, generator):
-    """Mean EP loss over `nodes` that have neighbours."""
+    """Mean EP loss over `nodes` that have neighbours.  Sampling runs where the graph is (nodes and
+    generator are on its device); the embedding and loss run on model.device."""
     fidx, fmask = sampling.sample_features(graph, nodes, cfg.max_features, generator)
     nested = nested_reconstruction(cfg)
     neighbours = (sampling.neighbour_features if nested else sampling.neighbourhood_tokens)(
@@ -116,35 +148,49 @@ def batch_loss(model, graph, nodes, cfg, generator):
     else:
         neg_nodes = sampling.sample_negatives(graph.num_nodes, nodes, cfg.negatives, generator).reshape(-1)
     nidx, nmask = sampling.sample_features(graph, neg_nodes, cfg.max_features, generator)
-    with autocast(cfg, nodes.device):
+    device = model.device
+    move = lambda x: x.to(device, non_blocking=True)
+    fidx, fmask, tidx, tw, nidx, nmask = map(move, (fidx, fmask, tidx, tw, nidx, nmask))
+    if nested:
+        nw = move(nw)
+    if cfg.negative_pool:
+        pick = move(pick)
+    with autocast(cfg, device):
         h, t, neg = model.embed_groups([(fidx, fmask.float()), (tidx, tw), (nidx, nmask.float())])
         if nested:
             t = model.combine_neighbours(t.view(len(nodes), nw.shape[1], -1), nw)
             tw = nw
     # Losses in float32: they normalise and take logs.
     h, t, neg = h.float(), t.float(), neg.float()
-    hu = neg[pick] if cfg.negative_pool else neg.view(len(nodes), cfg.negatives, -1)
-    per_node = losses.LOSSES[cfg.loss](t, h, hu, cfg.gamma)
+    if cfg.pool_negatives:
+        exclude = pool.to(device)[None, :] == nodes.to(device)[:, None]
+        per_node = losses.infonce_pool(t, h, neg, exclude, cfg.gamma)
+    else:
+        hu = neg[pick] if cfg.negative_pool else neg.view(len(nodes), cfg.negatives, -1)
+        per_node = losses.LOSSES[cfg.loss](t, h, hu, cfg.gamma)
     has_neighbours = tw.sum(dim=1) > 0
     return (per_node * has_neighbours).sum() / has_neighbours.sum().clamp(min=1)
 
 
 def train(graph, cfg, log=print):
     device = torch.device(cfg.device)
+    check_loss(cfg)
     set_precision(cfg, device)
-    g = graph.to(device)
+    graph_device = placement(cfg, "graph_device")
+    g = graph.to(graph_device)
     torch.manual_seed(cfg.seed)
-    gen = torch.Generator(device=device).manual_seed(cfg.seed)
-    model, table_opt, dense_opt = build(cfg, g.num_features, device, gen)
+    gen = torch.Generator(device=graph_device).manual_seed(cfg.seed)
+    model, table_opt, dense_opt = build(cfg, g.num_features, device,
+                                        torch.Generator(device=device).manual_seed(cfg.seed + 2))
 
-    order = torch.randperm(g.num_nodes, device=device, generator=gen)
+    order = torch.randperm(g.num_nodes, device=graph_device, generator=gen)
     n_valid = int(g.num_nodes * cfg.valid_pct)
     valid, anchors = order[:n_valid], order[n_valid:]
     steps_per_pass = math.ceil(len(anchors) / cfg.batch_size)
     total, step = steps_per_pass * cfg.passes, 0
     for p in range(cfg.passes):
         start, running, lr = time.time(), 0.0, learning_rate(cfg, step, total)
-        perm = anchors[torch.randperm(len(anchors), device=device, generator=gen)]
+        perm = anchors[torch.randperm(len(anchors), device=graph_device, generator=gen)]
         model.train()
         for b in range(steps_per_pass):
             nodes = perm[b * cfg.batch_size:(b + 1) * cfg.batch_size]
@@ -165,7 +211,7 @@ def train(graph, cfg, log=print):
         message = f"pass {p + 1}/{cfg.passes}: loss {float(running) / len(anchors):.5f}, lr {lr:.5f}"
         if len(valid):
             model.eval()
-            vgen = torch.Generator(device=device).manual_seed(cfg.seed + 1)
+            vgen = torch.Generator(device=graph_device).manual_seed(cfg.seed + 1)
             total_vl = torch.zeros((), device=device)
             with torch.no_grad():
                 # In training-sized batches: attention pads every row, so all the held-out nodes
@@ -180,14 +226,14 @@ def train(graph, cfg, log=print):
 
 @torch.no_grad()
 def node_embeddings(model, graph, batch_size=8192):
-    """Every node, pooled from all its features."""
+    """Every node, pooled from all its features.  Gathered in host memory a batch at a time, so
+    exporting needs no GPU memory for the whole set."""
     model.eval()
-    g = graph.to(next(model.parameters()).device)
     out = []
-    for s in range(0, g.num_nodes, batch_size):
-        nodes = torch.arange(s, min(s + batch_size, g.num_nodes), device=g.adj_ptr.device)
-        fidx, fmask = sampling.sample_features(g, nodes, None)
-        out.append(model.embed(fidx, fmask.float()))
+    for s in range(0, graph.num_nodes, batch_size):
+        nodes = torch.arange(s, min(s + batch_size, graph.num_nodes), device=graph.adj_ptr.device)
+        fidx, fmask = sampling.sample_features(graph, nodes, None)
+        out.append(model.embed(fidx.to(model.device), fmask.float().to(model.device)).float().cpu())
     return torch.cat(out)
 
 
@@ -197,7 +243,7 @@ def embed_feature_sets(model, feature_index, feature_sets):
     training.  Features missing from the training vocabulary are skipped; a set with none left
     embeds to zeros."""
     model.eval()
-    device = next(model.parameters()).device
+    device = model.device
     ids = [[feature_index[f] for f in fs if f in feature_index] for fs in feature_sets]
     width = max((len(x) for x in ids), default=0) or 1
     idx = torch.zeros(len(ids), width, dtype=torch.long, device=device)

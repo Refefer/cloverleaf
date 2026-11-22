@@ -41,4 +41,24 @@ def rankspace(t, h, hu, gamma):
     return starspace(t, h, hu, gamma) + rank(t, h, hu, gamma)
 
 
-LOSSES = {"margin": margin, "starspace": starspace, "rank": rank, "rankspace": rankspace}
+def infonce(t, h, hu, temperature):
+    """-log p(positive) under a softmax over cosine similarities divided by the temperature:
+    [cos(h, t), cos(h, hu_1), ..., cos(h, hu_n)] / temperature.  Always on, unlike rank."""
+    hn = F.normalize(h, dim=-1)
+    pos = (hn * F.normalize(t, dim=-1)).sum(-1, keepdim=True)
+    neg = (F.normalize(hu, dim=-1) * hn[:, None, :]).sum(-1)
+    return -torch.log_softmax(torch.cat([pos, neg], dim=1) / temperature, dim=1)[:, 0]
+
+
+def infonce_pool(t, h, pool, exclude, temperature):
+    """infonce against every node of a shared negative pool at once: one (B, P) matrix multiply
+    rather than gathering P negatives per node.  exclude: (B, P), True where the pool node is the
+    anchor itself."""
+    hn = F.normalize(h, dim=-1)
+    pos = (hn * F.normalize(t, dim=-1)).sum(-1, keepdim=True)
+    neg = (hn @ F.normalize(pool, dim=-1).T).masked_fill(exclude, float("-inf"))
+    return -torch.log_softmax(torch.cat([pos, neg], dim=1) / temperature, dim=1)[:, 0]
+
+
+LOSSES = {"margin": margin, "starspace": starspace, "rank": rank, "rankspace": rankspace,
+          "infonce": infonce}
