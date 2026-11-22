@@ -25,6 +25,14 @@ Evaluation follows the paper:
   the classifier, 1,000 nodes validate and another 1,000 test.  gamma and the regulariser are
   picked on the validation nodes.
 
+  Inductive (--setting inductive; Table 4 and Table 5's lower half): the test nodes are removed
+  from the graph before EP trains, and are embedded afterwards by EP-B's reconstruction h~(v),
+  the mean of their neighbours' trained label embeddings.  On BlogCatalog, PPI and POS a fraction
+  (--removed, 20% and 40% in the paper) of the nodes is removed, the classifier trains on
+  Tr = 0.1 of all nodes drawn from the rest, and the removed nodes are the test nodes.  On Cora,
+  Citeseer and Pubmed the 1,000 test nodes are removed.  The split changes every run, so EP is
+  retrained for every run.
+
 Results are means and standard deviations over --runs random splits.  EP itself is trained once per
 dataset and gamma (the paper doesn't say whether its 10 runs retrain EP).
 
@@ -39,6 +47,7 @@ Needs numpy, scipy and scikit-learn.
 
     python reproduce.py --data DIR                         # every dataset
     python reproduce.py --data DIR --datasets cora pos     # a subset
+    python reproduce.py --data DIR --setting inductive --gammas 5 --runs 3
 """
 import argparse
 import json
@@ -77,6 +86,19 @@ PAPER = {
     "cora": {"gamma": 20, "accuracy": 78.05},
     "citeseer": {"gamma": 10, "accuracy": 71.01},
     "pubmed": {"gamma": 1, "accuracy": 79.56},
+}
+# Inductive results (Table 4 at Tr = 0.1, and Table 5's lower half) and their margins.  For the
+# multi-label datasets they are keyed by the fraction of nodes removed before training.
+PAPER_INDUCTIVE = {
+    "blogcatalog": {0.2: {"gamma": 10, "micro": 29.22, "macro": 12.12},
+                    0.4: {"gamma": 5, "micro": 27.30, "macro": 11.24}},
+    "pos": {0.2: {"gamma": 10, "micro": 43.23, "macro": 5.47},
+            0.4: {"gamma": 10, "micro": 42.12, "macro": 5.16}},
+    "ppi": {0.2: {"gamma": 10, "micro": 16.63, "macro": 11.55},
+            0.4: {"gamma": 10, "micro": 14.87, "macro": 10.38}},
+    "cora": {"gamma": 5, "accuracy": 73.09},
+    "citeseer": {"gamma": 5, "accuracy": 68.61},
+    "pubmed": {"gamma": 1, "accuracy": 79.94},
 }
 MULTI_LABEL = ["blogcatalog", "ppi", "pos"]
 ATTRIBUTED = ["cora", "citeseer", "pubmed"]
@@ -180,10 +202,10 @@ def load(name, data):
 # EP-B
 
 
-def load_graph(ds, tmp):
+def load_graph(ds, edges, tmp):
     path = os.path.join(tmp, f"{ds.name}.edges")
     with open(path, "w") as f:
-        for a, b in ds.edges:
+        for a, b in edges:
             f.write(f"n\t{a}\tn\t{b}\t1\n")
     return cl.Graph.load(path, cl.EdgeType.Undirected)
 
@@ -196,11 +218,27 @@ def node_labels(ds, label_type, v):
     return labels or [("dummy", str(v))]
 
 
-def train_label_type(ds, graph, label_type, gamma, seed, args):
-    """Runs EP on one label type and returns h(v), the mean label embedding, for every node."""
+def neighbours(ds):
+    """Each node's neighbours in the full graph."""
+    adj = [[] for _ in range(ds.num_nodes)]
+    for a, b in ds.edges:
+        adj[a].append(b)
+        adj[b].append(a)
+    return adj
+
+
+def train_label_type(ds, graph, edges, label_type, gamma, seed, args, removed=None):
+    """Runs EP on one label type over `edges` and returns an embedding for every node.
+
+    A node in the training graph gets h(v), the mean of its label embeddings.  A node in
+    `removed`, left out of training, gets h~(v), EP-B's reconstruction from its neighbours: the
+    mean over all its neighbours' labels that have an embedding.  Removed neighbours' ids don't,
+    so only nodes seen in training contribute their ids; their words do wherever the word was
+    seen in training.
+    """
     features = cl.FeatureSet.new_from_graph(graph)
     in_graph = np.zeros(ds.num_nodes, bool)
-    in_graph[ds.edges.ravel()] = True
+    in_graph[edges.ravel()] = True
     for v in np.flatnonzero(in_graph):
         features.set_features(("n", str(v)), node_labels(ds, label_type, v))
     ep = cl.EmbeddingPropagator(
@@ -218,6 +256,17 @@ def train_label_type(ds, graph, label_type, gamma, seed, args):
         vecs = [lookup[l] for l in node_labels(ds, label_type, v) if l in lookup]
         if vecs:
             H[v] = np.mean(vecs, axis=0)
+    if removed is not None:
+        adj = neighbours(ds)
+        unreachable = 0
+        for v in removed:
+            vecs = [lookup[l] for u in adj[v] for l in node_labels(ds, label_type, u)
+                    if l in lookup]
+            H[v] = np.mean(vecs, axis=0) if vecs else 0.0
+            unreachable += not vecs
+        if unreachable:
+            log(f"    {unreachable} of {len(removed)} removed nodes have no trained neighbour "
+                f"labels of type {label_type}; they get a zero embedding")
     return H
 
 
@@ -230,8 +279,12 @@ def optimizer(args):
 EP_SETTINGS = ["dims", "passes", "batch_size", "lr", "lr_schedule", "init", "max_nodes", "seed"]
 
 
-def embed(ds, graph, gamma, seed, args):
-    """EP-B embeddings for every node, read from --cache when an identical run is there."""
+def embed(ds, graph, edges, gamma, seed, args, removed=None, split_tag=None):
+    """EP-B embeddings for every node, read from --cache when an identical run is there.
+
+    With `removed`, EP trains on `edges` without those nodes and they are embedded inductively;
+    `split_tag` names the split for the cache.
+    """
     path = None
     if args.cache:
         tag = "-".join(f"{k}={getattr(args, k)}" for k in EP_SETTINGS)
@@ -240,15 +293,37 @@ def embed(ds, graph, gamma, seed, args):
             tag += f"-update_frequency={args.update_frequency}"
         if args.weight_decay is not None:
             tag += f"-adamw={args.weight_decay}"
+        if split_tag is not None:
+            tag += f"-inductive-{split_tag}"
         path = os.path.join(args.cache, f"{ds.name}-gamma={gamma:g}-{tag}.npy")
         if os.path.exists(path):
             return np.load(path), 0.0
     types = ["id"] + (["word"] if ds.words is not None else [])
     start = time.time()
-    H = np.concatenate([train_label_type(ds, graph, t, gamma, seed, args) for t in types], axis=1)
+    H = np.concatenate([train_label_type(ds, graph, edges, t, gamma, seed, args, removed)
+                        for t in types], axis=1)
     if path:
         np.save(path, H)
     return H, time.time() - start
+
+
+def kept_edges(ds, removed):
+    """The edges between nodes not in `removed`."""
+    gone = np.zeros(ds.num_nodes, bool)
+    gone[removed] = True
+    return ds.edges[~(gone[ds.edges[:, 0]] | gone[ds.edges[:, 1]])]
+
+
+def inductive_embeddings(ds, removed, split_tag, args, tmp):
+    """Trains EP without the `removed` nodes for every gamma, and embeds them inductively."""
+    edges = kept_edges(ds, removed)
+    graph = load_graph(ds, edges, tmp)
+    embeddings = {}
+    for gamma in args.gammas:
+        embeddings[gamma], seconds = embed(ds, graph, edges, gamma, args.seed, args, removed,
+                                           split_tag)
+        log(f"  {split_tag}: trained gamma={gamma:g} in {seconds:.0f}s")
+    return embeddings
 
 
 # Multi-label evaluation (BlogCatalog, PPI, POS)
@@ -316,6 +391,40 @@ def choose_gamma_multilabel(embeddings, Y, seed):
     return max(scores, key=scores.get), scores
 
 
+def evaluate_multilabel_inductive(ds, fraction, args, tmp):
+    """Table 4: removes `fraction` of the nodes before training, trains the classifier on
+    Tr = 0.1 of all nodes drawn from the rest, and scores it on the removed nodes.
+
+    The regulariser is chosen by 3-fold cross validation on the classifier's training nodes, and
+    so is gamma, per run and separately for micro and macro F1.
+    """
+    Y, n = ds.labels, ds.num_nodes
+    per_gamma = {g: {"micro": [], "macro": []} for g in args.gammas}
+    best, chosen = {"micro": [], "macro": []}, {"micro": [], "macro": []}
+    for run in range(args.runs):
+        rng = np.random.default_rng([args.seed, run, int(round(fraction * 100)), 1])
+        perm = rng.permutation(n)
+        cut = int(round(fraction * n))
+        removed, kept = np.sort(perm[:cut]), perm[cut:]
+        tr = kept[:int(round(0.1 * n))]
+        embeddings = inductive_embeddings(ds, removed, f"removed={fraction:g}-run={run}", args, tmp)
+        for m in ("micro", "macro"):
+            run_best = None
+            for g, H in embeddings.items():
+                cv = cv_scores(H[tr], Y[tr], np.random.default_rng([args.seed, run, 2]))
+                C = max(C_GRID, key=lambda c: cv[c][m])
+                score = multilabel_scores(H[tr], Y[tr], H[removed], Y[removed], C)[m]
+                per_gamma[g][m].append(score)
+                if run_best is None or cv[C][m] > run_best[0]:
+                    run_best = (cv[C][m], score, g)
+            best[m].append(run_best[1])
+            chosen[m].append(run_best[2])
+    mean_std = lambda v: (float(np.mean(v)), float(np.std(v)))
+    return {**{m: mean_std(v) for m, v in best.items()},
+            "chosen_gammas": chosen,
+            "per_gamma": {g: {m: mean_std(v) for m, v in r.items()} for g, r in per_gamma.items()}}
+
+
 # Single-label evaluation (Cora, Citeseer, Pubmed)
 
 
@@ -332,13 +441,18 @@ def accuracy(Xtr, ytr, Xte, yte, C):
     return 100 * float((clf.predict(Xte) == yte).mean())
 
 
-def evaluate_attributed(embeddings, labels, runs, seed):
-    """Picks gamma and the regulariser on validation for every run, then scores test."""
+def evaluate_attributed(embeddings_for, labels, gammas, runs, seed):
+    """Picks gamma and the regulariser on validation for every run, then scores test.
+
+    `embeddings_for(run, test_nodes)` gives the embeddings for each gamma, so the inductive
+    setting can train EP without the run's test nodes.
+    """
     tests, chosen = [], []
-    per_gamma = {g: [] for g in embeddings}
+    per_gamma = {g: [] for g in gammas}
     for run in range(runs):
         rng = np.random.default_rng([seed, run])
         tr, va, te = planetoid_split(labels, rng)
+        embeddings = embeddings_for(run, te)
         best = None
         for gamma, H in embeddings.items():
             C = max(C_GRID, key=lambda c: accuracy(H[tr], labels[tr], H[va], labels[va], c))
@@ -361,12 +475,42 @@ def fmt(mean_std):
     return f"{mean_std[0]:6.2f} ± {mean_std[1]:4.2f}"
 
 
+def run_inductive(ds, args, tmp):
+    paper = PAPER_INDUCTIVE[ds.name]
+    r = {"paper": paper}
+    if ds.name in MULTI_LABEL:
+        r["results"] = {}
+        for fraction in args.removed:
+            res = evaluate_multilabel_inductive(ds, fraction, args, tmp)
+            r["results"][fraction] = res
+            ref = paper.get(fraction)
+            vs = lambda m: f" (paper {ref[m]:.2f}, gamma={ref['gamma']})" if ref else ""
+            log(f"  removed={fraction:g} Tr=0.1: micro {fmt(res['micro'])}{vs('micro')}, "
+                f"macro {fmt(res['macro'])}{vs('macro')}; per gamma: "
+                + ", ".join(f"{g:g}: {v['micro'][0]:.2f}/{v['macro'][0]:.2f}"
+                            for g, v in res["per_gamma"].items()))
+    else:
+        embeddings_for = lambda run, te: inductive_embeddings(ds, np.sort(te),
+                                                              f"planetoid-run={run}", args, tmp)
+        r["results"] = evaluate_attributed(embeddings_for, ds.labels, args.gammas, args.runs,
+                                           args.seed)
+        log(f"  inductive accuracy {fmt(r['results']['accuracy'])} "
+            f"(paper {paper['accuracy']:.2f}, gamma={paper['gamma']}); per gamma: "
+            + ", ".join(f"{g:g}: {fmt(v)}" for g, v in r["results"]["per_gamma"].items()))
+    return r
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--data", required=True, help="Directory with the downloaded datasets.")
     p.add_argument("--datasets", nargs="+", default=MULTI_LABEL + ATTRIBUTED,
                    choices=MULTI_LABEL + ATTRIBUTED)
     p.add_argument("--gammas", type=float, nargs="+", default=GAMMAS)
+    p.add_argument("--setting", default="transductive", choices=["transductive", "inductive"],
+                   help="Inductive leaves the test nodes out of EP's training and embeds them "
+                        "from their neighbours afterwards; EP is retrained for every run.")
+    p.add_argument("--removed", type=float, nargs="+", default=[0.2, 0.4],
+                   help="Inductive, multi-label datasets: fractions of nodes to remove.")
     p.add_argument("--runs", type=int, default=10)
     p.add_argument("--seed", type=int, default=2017)
     # EP-B settings from the paper; override to compare against cloverleaf's defaults.
@@ -393,10 +537,18 @@ def main():
             ds = load(name, args.data)
             log(f"{name}: {ds.num_nodes} nodes, {len(ds.edges)} edges"
                 + (f", {sum(map(len, ds.words))} word labels" if ds.words else ""))
-            graph = load_graph(ds, tmp)
+            if args.setting == "inductive":
+                results["datasets"][name] = run_inductive(ds, args, tmp)
+                if args.out:
+                    with open(args.out, "w") as f:
+                        json.dump(results, f, indent=2, default=str)
+                continue
+
+            graph = load_graph(ds, ds.edges, tmp)
             embeddings, seconds = {}, {}
             for gamma in args.gammas:
-                embeddings[gamma], seconds[gamma] = embed(ds, graph, gamma, args.seed, args)
+                embeddings[gamma], seconds[gamma] = embed(ds, graph, ds.edges, gamma, args.seed,
+                                                          args)
                 log(f"  trained gamma={gamma:g} in {seconds[gamma]:.0f}s")
 
             paper = PAPER[name]
@@ -416,7 +568,8 @@ def main():
                             f"(paper {paper['micro'][fr]:.2f}), macro {fmt(m['macro'])} "
                             f"(paper {paper['macro'][fr]:.2f})")
             else:
-                r["results"] = evaluate_attributed(embeddings, ds.labels, args.runs, args.seed)
+                r["results"] = evaluate_attributed(lambda run, te: embeddings, ds.labels,
+                                                   args.gammas, args.runs, args.seed)
                 log(f"  accuracy {fmt(r['results']['accuracy'])} "
                     f"(paper {paper['accuracy']:.2f}); per gamma: "
                     + ", ".join(f"{g:g}: {fmt(v)}" for g, v in r["results"]["per_gamma"].items()))

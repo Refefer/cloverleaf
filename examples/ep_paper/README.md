@@ -16,6 +16,7 @@ python reproduce.py --data DIR --cache CACHE_DIR --out results.json
 python reproduce.py --data DIR --datasets blogcatalog --max-nodes 5   # sample 5 neighbours
 python reproduce.py --data DIR --update-frequency epoch --lr 0.05     # one update per pass
 python reproduce.py --data DIR --weight-decay 0.001                   # AdamW instead of Adam
+python reproduce.py --data DIR --setting inductive --gammas 5         # test nodes unseen by EP
 ```
 
 ## Results
