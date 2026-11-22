@@ -91,3 +91,23 @@ def test_flat_attention_still_trains(two_cliques):
 def test_unknown_reconstruction_is_rejected(two_cliques):
     with pytest.raises(ValueError):
         train(two_cliques, Config(dims=4, passes=1, reconstruction="sideways", device="cpu"), log=lambda m: None)
+
+
+def test_attention_weights_use_their_own_learning_rate(two_cliques, monkeypatch):
+    seen = []
+    real_adam = torch.optim.Adam
+
+    class Spy(real_adam):
+        def step(self, *a, **k):
+            seen.append(self.param_groups[0]["lr"])
+            return super().step(*a, **k)
+    monkeypatch.setattr(torch.optim, "Adam", Spy)
+    cfg = Config(dims=8, passes=1, batch_size=10, lr=0.5, dense_lr=0.001, lr_schedule="constant",
+                 pooling="attention", heads=2, device="cpu")
+    train(two_cliques, cfg, log=lambda m: None)
+    assert seen and all(abs(r - 0.001) < 1e-12 for r in seen)
+
+
+def test_unknown_precision_is_rejected(two_cliques):
+    with pytest.raises(ValueError):
+        train(two_cliques, Config(dims=4, passes=1, precision="fp8", device="cpu"), log=lambda m: None)

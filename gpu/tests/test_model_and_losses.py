@@ -130,3 +130,13 @@ def test_deduplicated_embedding_gives_the_same_gradients():
         (out ** 2).sum().backward()
         grads.append(m.features.weight.grad.to_dense())
     assert torch.allclose(grads[0], grads[1], atol=1e-6)
+
+
+@pytest.mark.parametrize("dims,heads", [(151, 1), (151, 4), (8, 3), (3, 4)])
+def test_attention_handles_any_dims_and_heads(dims, heads):
+    pool = AttentionPool(dims, heads)
+    assert pool.head_dims % 8 == 0
+    torch.nn.init.normal_(pool.out.weight)
+    x, w = torch.randn(2, 5, dims), torch.ones(2, 5)
+    out = pool(x, w)
+    assert out.shape == (2, dims) and torch.isfinite(out).all()

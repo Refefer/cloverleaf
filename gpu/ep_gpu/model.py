@@ -35,25 +35,35 @@ class MeanPool(nn.Module):
 class AttentionPool(nn.Module):
     def __init__(self, dims, heads):
         super().__init__()
-        if dims % heads:
-            raise ValueError(f"dims ({dims}) must be divisible by heads ({heads})")
         self.heads = heads
-        self.qkv = nn.Linear(dims, 3 * dims, bias=False)
-        self.out = nn.Linear(dims, dims, bias=False)
+        # Each head's width is dims / heads rounded up to a multiple of 8: the fused attention
+        # kernels need that, and otherwise attention falls back to PyTorch's slow math path.
+        self.head_dims = -(-dims // heads // 8) * 8 if dims >= heads else 8
+        inner = heads * self.head_dims
+        self.qkv = nn.Linear(dims, 3 * inner, bias=False)
+        self.out = nn.Linear(inner, dims, bias=False)
         nn.init.zeros_(self.out.weight)
 
     def forward(self, x, w):
-        b, t, d = x.shape
+        return self.attend(self.qkv(x), weighted_mean(x, w), w)
+
+    def attend(self, qkv, x_mean, w):
+        """Attention from already-projected tokens.  qkv: (B, T, 3 * heads * head_dims), the
+        query, key and value projections of the tokens; x_mean: (B, d), the tokens' weighted
+        mean.  The output projection is linear, so it's applied once to each row's weighted
+        mean context rather than to every token: weighted_mean(x + out(ctx)) equals
+        weighted_mean(x) + out(weighted_mean(ctx))."""
+        b, t, _ = qkv.shape
         mask = w > 0
         # A row without tokens would softmax over nothing; give it one masked-in pad token.
         # Its weight is still 0, so the row pools to zeros.
         empty = ~mask.any(dim=1)
         attend = mask.clone()
         attend[empty, 0] = True
-        q, k, v = self.qkv(x).view(b, t, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.view(b, t, 3, self.heads, self.head_dims).permute(2, 0, 3, 1, 4)
         ctx = F.scaled_dot_product_attention(q, k, v, attn_mask=attend[:, None, None, :])
-        ctx = ctx.transpose(1, 2).reshape(b, t, d)
-        return weighted_mean(x + self.out(ctx), w)
+        ctx = ctx.transpose(1, 2).reshape(b, t, self.heads * self.head_dims)
+        return x_mean + self.out(weighted_mean(ctx, w))
 
 
 class EPModel(nn.Module):
@@ -96,21 +106,26 @@ class EPModel(nn.Module):
         ids = torch.cat([f[v] for (f, _), v in zip(groups, valids)])
         unique, inverse = torch.unique(ids, return_inverse=True)
         table = self.features(unique)
+        attention = isinstance(self.pool, AttentionPool)
+        # A token's query, key and value depend only on its feature, so they're projected once
+        # per distinct feature rather than once per (padded) token.
+        projected = self.pool.qkv(table) if attention else None
         out, start = [], 0
         for (f, w), v in zip(groups, valids):
             rows = v.nonzero(as_tuple=True)[0]
             count = len(rows)
-            tokens = table[inverse[start:start + count]]
+            index = inverse[start:start + count]
             start += count
-            if isinstance(self.pool, MeanPool):
-                # A weighted scatter-sum, without padding.
-                summed = torch.zeros(f.shape[0], table.shape[1], device=table.device, dtype=table.dtype)
-                summed.index_add_(0, rows, tokens * w[v][:, None])
-                out.append(summed / w.sum(dim=1, keepdim=True).clamp(min=1e-12))
+            # The weighted mean of the tokens: a scatter-sum, without padding.
+            summed = torch.zeros(f.shape[0], table.shape[1], device=table.device, dtype=table.dtype)
+            summed.index_add_(0, rows, table[index] * w[v][:, None])
+            mean = summed / w.sum(dim=1, keepdim=True).clamp(min=1e-12)
+            if attention:
+                padded = torch.zeros(*f.shape, projected.shape[1], device=table.device, dtype=projected.dtype)
+                padded[v] = projected[index]
+                out.append(self.pool.attend(padded, mean, w))
             else:
-                padded = torch.zeros(*f.shape, table.shape[1], device=table.device, dtype=table.dtype)
-                padded[v] = tokens
-                out.append(self.pool(padded, w))
+                out.append(mean)
         return out
 
     def combine_neighbours(self, neighbour_embeddings, weights):

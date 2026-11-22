@@ -42,6 +42,22 @@ from the exported feature table exactly, and features-only EP on Cora scores the
   starts at zero, so training starts from mean pooling.
 * Nodes with more neighbours than `max_nodes` are sampled with replacement (cloverleaf samples
   without); hard negatives aren't implemented.
+* Attention reconstructs a node in two levels (`reconstruction`, "auto" by default): each
+  sampled neighbour is pooled from its own features, then the neighbours are pooled together.
+  Cloverleaf attends over all the neighbours' features at once, which on a GPU runs out of
+  memory at useful batch sizes.  Mean pooling keeps cloverleaf's flat reconstruction.
+
+## Speed and precision
+
+* Each batch looks up every distinct feature once, and attention projects each distinct
+  feature's query, key and value once, applying the output projection after pooling.
+* Negatives come from a pool of `negative_pool` nodes embedded once per batch.
+* `precision` is "bf16" by default: the forward pass runs under bfloat16 autocast while the
+  feature table, optimiser state and losses stay float32.  Attention heads are widened to a
+  multiple of 8 so the fused attention kernels apply.
+* The attention weights train with their own learning rate, `dense_lr` (1e-3), on the same
+  schedule as `lr`; a rate tuned for sparse feature updates is far too large for dense matrices.
+* `examples/profile_step.py` profiles a few training steps.
 
 ## Tests
 

@@ -23,6 +23,8 @@ class Config:
     passes: int = 100
     batch_size: int = 1024
     lr: float = 0.01
+    dense_lr: float = 1e-3           # the attention weights' rate; they share lr's schedule shape.
+                                     # Dense matrices need far smaller steps than sparse embeddings.
     lr_schedule: str = "cosine"      # "cosine" (20% warmup from lr/100, then cosine to lr/100) or "constant"
     init: str = "unit"               # "unit" or "glorot"
     loss: str = "margin"             # margin, starspace, rank, rankspace
@@ -38,6 +40,10 @@ class Config:
     reconstruction: str = "auto"     # h~(v): "flat" (cloverleaf), "nested", or "auto": flat for
                                      # mean pooling, nested for attention
     heads: int = 4
+    precision: str = "bf16"          # "bf16": the forward pass under bfloat16 autocast (fastest for
+                                     # attention); "tf32": float32 matrix multiplies on tensor
+                                     # cores; "fp32": exact.  The feature table, optimiser state
+                                     # and losses stay float32.
     valid_pct: float = 0.0           # nodes held out of the anchors; their loss is reported
     seed: int = 2017
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -51,6 +57,18 @@ def learning_rate(cfg, step, total):
         return low + (cfg.lr - low) * step / warmup
     ratio = min((step - warmup) / max(total - warmup, 1), 1.0)
     return low + 0.5 * (cfg.lr - low) * (1 + math.cos(math.pi * ratio))
+
+
+def set_precision(cfg, device):
+    if cfg.precision not in ("fp32", "tf32", "bf16"):
+        raise ValueError(f"precision must be fp32, tf32 or bf16, got {cfg.precision!r}")
+    # Process-wide, as PyTorch's matmul precision is.
+    torch.set_float32_matmul_precision("highest" if cfg.precision == "fp32" else "high")
+
+
+def autocast(cfg, device):
+    enabled = cfg.precision == "bf16" and device.type == "cuda"
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=enabled)
 
 
 def nested_reconstruction(cfg):
@@ -79,10 +97,13 @@ def batch_loss(model, graph, nodes, cfg, generator):
     else:
         neg_nodes = sampling.sample_negatives(graph.num_nodes, nodes, cfg.negatives, generator).reshape(-1)
     nidx, nmask = sampling.sample_features(graph, neg_nodes, cfg.max_features, generator)
-    h, t, neg = model.embed_groups([(fidx, fmask.float()), (tidx, tw), (nidx, nmask.float())])
-    if nested:
-        t = model.combine_neighbours(t.view(len(nodes), nw.shape[1], -1), nw)
-        tw = nw
+    with autocast(cfg, nodes.device):
+        h, t, neg = model.embed_groups([(fidx, fmask.float()), (tidx, tw), (nidx, nmask.float())])
+        if nested:
+            t = model.combine_neighbours(t.view(len(nodes), nw.shape[1], -1), nw)
+            tw = nw
+    # Losses in float32: they normalise and take logs.
+    h, t, neg = h.float(), t.float(), neg.float()
     hu = neg[pick] if cfg.negative_pool else neg.view(len(nodes), cfg.negatives, -1)
     per_node = losses.LOSSES[cfg.loss](t, h, hu, cfg.gamma)
     has_neighbours = tw.sum(dim=1) > 0
@@ -91,13 +112,14 @@ def batch_loss(model, graph, nodes, cfg, generator):
 
 def train(graph, cfg, log=print):
     device = torch.device(cfg.device)
+    set_precision(cfg, device)
     g = graph.to(device)
     torch.manual_seed(cfg.seed)
     gen = torch.Generator(device=device).manual_seed(cfg.seed)
     model = EPModel(g.num_features, cfg.dims, cfg.pooling, cfg.heads, cfg.init, cfg.seed).to(device)
     sparse_opt = torch.optim.SparseAdam(list(model.features.parameters()), lr=cfg.lr)
     dense = model.dense_parameters()
-    dense_opt = torch.optim.Adam(dense, lr=cfg.lr) if dense else None
+    dense_opt = torch.optim.Adam(dense, lr=cfg.dense_lr) if dense else None
 
     order = torch.randperm(g.num_nodes, device=device, generator=gen)
     n_valid = int(g.num_nodes * cfg.valid_pct)
@@ -111,10 +133,10 @@ def train(graph, cfg, log=print):
         for b in range(steps_per_pass):
             nodes = perm[b * cfg.batch_size:(b + 1) * cfg.batch_size]
             lr = learning_rate(cfg, step, total)
-            for opt in (sparse_opt, dense_opt):
+            for opt, rate in ((sparse_opt, lr), (dense_opt, lr * cfg.dense_lr / cfg.lr)):
                 if opt is not None:
                     for group in opt.param_groups:
-                        group["lr"] = lr
+                        group["lr"] = rate
                     opt.zero_grad()
             loss = batch_loss(model, g, nodes, cfg, gen)
             loss.backward()
