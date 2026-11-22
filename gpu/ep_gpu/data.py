@@ -148,8 +148,16 @@ def load_cached(cache_path, edges_path, features_path=None, directed=False, name
 
 
 def save_embeddings(path, keys, embeddings):
-    """Writes `type<TAB>name<TAB>[e1,e2,...]` lines, which cloverleaf's NodeEmbeddings.load reads."""
-    embeddings = embeddings.detach().float().cpu().numpy()
+    """Writes `type<TAB>name<TAB>[e1,e2,...]` lines, which cloverleaf's NodeEmbeddings.load reads.
+    Uses cloverleaf's parallel writer when it's installed, and a slow pure-Python one otherwise."""
+    embeddings = np.ascontiguousarray(embeddings.detach().float().cpu().numpy())
+    try:
+        from cloverleaf import write_embeddings
+    except ImportError:
+        write_embeddings = None
+    if write_embeddings is not None:
+        write_embeddings(path, [(str(t), str(n)) for t, n in keys], embeddings)
+        return
     with open(path, "w") as f:
         for (t, n), e in zip(keys, embeddings):
             f.write(f"{t}\t{n}\t[{','.join(repr(float(x)) for x in e)}]\n")

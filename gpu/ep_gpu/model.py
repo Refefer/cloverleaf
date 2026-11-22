@@ -67,7 +67,8 @@ class AttentionPool(nn.Module):
 
 
 class EPModel(nn.Module):
-    def __init__(self, num_features, dims, pooling="mean", heads=4, init="unit", seed=None):
+    def __init__(self, num_features, dims, pooling="mean", heads=4, init="unit", seed=None,
+                 table_dtype=torch.float32):
         super().__init__()
         self.features = nn.Embedding(num_features, dims, sparse=True)
         g = torch.Generator().manual_seed(seed) if seed is not None else None
@@ -81,6 +82,8 @@ class EPModel(nn.Module):
                 self.features.weight.copy_((torch.rand(num_features, dims, generator=g) * 2 - 1) * limit)
             else:
                 raise ValueError(f"init must be 'unit' or 'glorot', got {init!r}")
+        # Initialised in float32, then stored as table_dtype (bfloat16 halves the table).
+        self.features.to(table_dtype)
         if pooling == "mean":
             self.pool, self.neighbour_pool = MeanPool(), MeanPool()
         elif pooling == "attention":
@@ -105,7 +108,8 @@ class EPModel(nn.Module):
         valids = [w > 0 for _, w in groups]
         ids = torch.cat([f[v] for (f, _), v in zip(groups, valids)])
         unique, inverse = torch.unique(ids, return_inverse=True)
-        table = self.features(unique)
+        # Computed in float32 whatever the table's storage type.
+        table = self.features(unique).float()
         attention = isinstance(self.pool, AttentionPool)
         # A token's query, key and value depend only on its feature, so they're projected once
         # per distinct feature rather than once per (padded) token.

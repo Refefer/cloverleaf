@@ -15,6 +15,7 @@ import torch
 
 from . import data, losses, sampling
 from .model import EPModel
+from .optim import SparseTableOptimizer
 
 
 @dataclass
@@ -44,6 +45,9 @@ class Config:
                                      # attention); "tf32": float32 matrix multiplies on tensor
                                      # cores; "fp32": exact.  The feature table, optimiser state
                                      # and losses stay float32.
+    optimizer: str = "adam"          # the feature table's: adam, rowwise_adam or rowwise_adagrad
+                                     # (see optim.py for the memory each needs)
+    table_dtype: str = "float32"     # "float32" or "bfloat16" (updates stochastically rounded)
     valid_pct: float = 0.0           # nodes held out of the anchors; their loss is reported
     seed: int = 2017
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -69,6 +73,21 @@ def set_precision(cfg, device):
 def autocast(cfg, device):
     enabled = cfg.precision == "bf16" and device.type == "cuda"
     return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=enabled)
+
+
+TABLE_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
+
+
+def build(cfg, num_features, device, generator=None):
+    """The model, the feature table's optimiser and, with attention, an Adam for its weights."""
+    if cfg.table_dtype not in TABLE_DTYPES:
+        raise ValueError(f"table_dtype must be float32 or bfloat16, got {cfg.table_dtype!r}")
+    model = EPModel(num_features, cfg.dims, cfg.pooling, cfg.heads, cfg.init, cfg.seed,
+                    TABLE_DTYPES[cfg.table_dtype]).to(device)
+    table_opt = SparseTableOptimizer(model.features.weight, cfg.optimizer, cfg.lr, generator=generator)
+    dense = model.dense_parameters()
+    dense_opt = torch.optim.Adam(dense, lr=cfg.dense_lr) if dense else None
+    return model, table_opt, dense_opt
 
 
 def nested_reconstruction(cfg):
@@ -116,10 +135,7 @@ def train(graph, cfg, log=print):
     g = graph.to(device)
     torch.manual_seed(cfg.seed)
     gen = torch.Generator(device=device).manual_seed(cfg.seed)
-    model = EPModel(g.num_features, cfg.dims, cfg.pooling, cfg.heads, cfg.init, cfg.seed).to(device)
-    sparse_opt = torch.optim.SparseAdam(list(model.features.parameters()), lr=cfg.lr)
-    dense = model.dense_parameters()
-    dense_opt = torch.optim.Adam(dense, lr=cfg.dense_lr) if dense else None
+    model, table_opt, dense_opt = build(cfg, g.num_features, device, gen)
 
     order = torch.randperm(g.num_nodes, device=device, generator=gen)
     n_valid = int(g.num_nodes * cfg.valid_pct)
@@ -133,14 +149,15 @@ def train(graph, cfg, log=print):
         for b in range(steps_per_pass):
             nodes = perm[b * cfg.batch_size:(b + 1) * cfg.batch_size]
             lr = learning_rate(cfg, step, total)
-            for opt, rate in ((sparse_opt, lr), (dense_opt, lr * cfg.dense_lr / cfg.lr)):
-                if opt is not None:
-                    for group in opt.param_groups:
-                        group["lr"] = rate
-                    opt.zero_grad()
+            table_opt.lr = lr
+            table_opt.zero_grad()
+            if dense_opt is not None:
+                for group in dense_opt.param_groups:
+                    group["lr"] = lr * cfg.dense_lr / cfg.lr
+                dense_opt.zero_grad()
             loss = batch_loss(model, g, nodes, cfg, gen)
             loss.backward()
-            sparse_opt.step()
+            table_opt.step()
             if dense_opt is not None:
                 dense_opt.step()
             running = running + loss.detach() * len(nodes)
@@ -194,7 +211,7 @@ def embed_feature_sets(model, feature_index, feature_sets):
 def export(model, graph, cfg, prefix):
     keys = list(zip(graph.node_types, graph.node_names))
     data.save_embeddings(prefix + ".node-embeddings", keys, node_embeddings(model, graph))
-    data.save_embeddings(prefix + ".feature-embeddings", graph.feature_keys, model.features.weight)
+    data.save_embeddings(prefix + ".feature-embeddings", graph.feature_keys, model.features.weight.float())
     torch.save({"config": asdict(cfg), "state": model.state_dict(),
                 "feature_keys": graph.feature_keys}, prefix + ".pt")
 
@@ -235,7 +252,9 @@ def main():
           f"{graph.num_features} features; {cfg}", flush=True)
     start = time.time()
     model = train(graph, cfg, log=lambda m: print(m, flush=True))
-    print(f"trained in {time.time() - start:.0f}s", flush=True)
+    peak = (f", peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB"
+            if torch.device(cfg.device).type == "cuda" else "")
+    print(f"trained in {time.time() - start:.0f}s{peak}", flush=True)
     if not args.no_export:
         export(model, graph, cfg, args.out)
 

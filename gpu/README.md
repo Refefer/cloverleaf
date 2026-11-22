@@ -59,6 +59,27 @@ from the exported feature table exactly, and features-only EP on Cora scores the
   schedule as `lr`; a rate tuned for sparse feature updates is far too large for dense matrices.
 * `examples/profile_step.py` profiles a few training steps.
 
+## Memory
+
+The feature table and its optimiser state dominate GPU memory.  Per feature, with d dims:
+
+| `optimizer` | state | with a float32 table | with `table_dtype bfloat16` |
+|---|---|---|---|
+| `adam` (default; cloverleaf's optimiser) | two full moments | 12d bytes | 10d |
+| `rowwise_adam` | full first moment, one second moment per row | 8d + 4 | 6d + 4 |
+| `rowwise_adagrad` | one accumulated squared gradient per row | 4d + 4 | 2d + 4 |
+
+`rowwise_adagrad` is the usual choice for large embedding tables (FBGEMM's and TorchRec's
+default).  A bfloat16 table's updates are computed in float32 and written back with stochastic
+rounding, so steps smaller than bfloat16's spacing still move the weights on average.  The peak
+GPU memory of a run is printed when it finishes.
+
+## Export
+
+Embeddings are written with `cloverleaf.write_embeddings` when the installed cloverleaf has it:
+rows are formatted in parallel with the GIL released, tens of times faster than the pure-Python
+fallback.
+
 ## Tests
 
 `pytest tests` (CPU, a few seconds).  `tests/test_cloverleaf_parity.py` runs when cloverleaf is

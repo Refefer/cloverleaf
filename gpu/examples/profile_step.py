@@ -13,8 +13,7 @@ from torch.profiler import ProfilerActivity, profile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from ep_gpu import data  # noqa: E402
-from ep_gpu.model import EPModel  # noqa: E402
-from ep_gpu.train import Config, batch_loss, set_precision  # noqa: E402
+from ep_gpu.train import Config, batch_loss, build, set_precision  # noqa: E402
 
 
 def main():
@@ -43,11 +42,8 @@ def main():
     device = torch.device(cfg.device)
     set_precision(cfg, device)
     g = graph.to(device)
-    model = EPModel(g.num_features, cfg.dims, cfg.pooling, cfg.heads, cfg.init, cfg.seed).to(device)
-    sparse_opt = torch.optim.SparseAdam(list(model.features.parameters()), lr=cfg.lr)
-    dense = model.dense_parameters()
-    dense_opt = torch.optim.Adam(dense, lr=cfg.dense_lr) if dense else None
     gen = torch.Generator(device=device).manual_seed(cfg.seed)
+    model, sparse_opt, dense_opt = build(cfg, g.num_features, device, gen)
 
     def step():
         nodes = torch.randint(0, g.num_nodes, (cfg.batch_size,), device=device, generator=gen)

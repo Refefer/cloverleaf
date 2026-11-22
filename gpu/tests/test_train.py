@@ -111,3 +111,13 @@ def test_attention_weights_use_their_own_learning_rate(two_cliques, monkeypatch)
 def test_unknown_precision_is_rejected(two_cliques):
     with pytest.raises(ValueError):
         train(two_cliques, Config(dims=4, passes=1, precision="fp8", device="cpu"), log=lambda m: None)
+
+
+@pytest.mark.parametrize("optimizer,table_dtype", [("rowwise_adam", "float32"), ("rowwise_adagrad", "float32"),
+                                                   ("rowwise_adagrad", "bfloat16"), ("adam", "bfloat16")])
+def test_memory_saving_options_learn(two_cliques, optimizer, table_dtype):
+    cfg = Config(dims=16, passes=60, batch_size=8, lr=0.05, negatives=3, optimizer=optimizer,
+                 table_dtype=table_dtype, device="cpu", seed=3)
+    model = train(two_cliques, cfg, log=lambda m: None)
+    assert model.features.weight.dtype == (torch.bfloat16 if table_dtype == "bfloat16" else torch.float32)
+    assert separation(node_embeddings(model, two_cliques).float()) > 0.3
