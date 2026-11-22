@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use rayon::prelude::*;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError,PyTypeError,PyRuntimeError};
+use pyo3::buffer::PyBuffer;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 
@@ -4535,6 +4536,51 @@ fn convert_filter_type(
 
 // Training shares embedding stores across rayon threads without locks, so keep the GIL on
 // free-threaded interpreters rather than letting Python threads race on the same objects.
+///    Writes embeddings in the format NodeEmbeddings.load reads, quickly: rows are formatted in
+///    parallel with the GIL released.  For embeddings made outside cloverleaf, e.g. by numpy or
+///    PyTorch, without building a NodeEmbeddings first.
+///    
+///    Parameters
+///    ----------
+///    path : str
+///        Output path; a path ending in .gz is gzipped.
+///    
+///    keys : List[Tuple[str, str]]
+///        (node type, name) of each row.
+///    
+///    embeddings : 2-D float32 array
+///        One row per key, as any object supporting the buffer protocol: a numpy array, or a
+///        PyTorch tensor through tensor.cpu().numpy().
+///    
+///    comp_level : Int - Optional
+///        Gzip compression level, for .gz paths.
+///    
+///    Returns
+///    -------
+///    () - Can throw exception
+///    
+#[pyfunction]
+#[pyo3(signature = (path, keys, embeddings, comp_level=None))]
+fn write_embeddings(
+    py: Python<'_>,
+    path: String,
+    keys: Vec<(String, String)>,
+    embeddings: PyBuffer<f32>,
+    comp_level: Option<u32>
+) -> PyResult<()> {
+    if embeddings.dimensions() != 2 {
+        return Err(PyValueError::new_err(format!(
+            "embeddings must be 2-D, got {} dimensions", embeddings.dimensions())))
+    }
+    let (rows, dims) = (embeddings.shape()[0], embeddings.shape()[1]);
+    if rows != keys.len() {
+        return Err(PyValueError::new_err(format!(
+            "{} keys for {} rows of embeddings", keys.len(), rows)))
+    }
+    let values = embeddings.to_vec(py)?;
+    py.detach(move || Ok(crate::io::write_embedding_matrix(&path, &keys, &values, dims, comp_level)?))
+}
+
 #[pymodule(gil_used = true)]
 fn cloverleaf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Graph>()?;
@@ -4579,6 +4625,7 @@ fn cloverleaf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NodeEmbeddingsBuilder>()?;
     m.add_class::<NodeEmbedder>()?;
     m.add_class::<PolicyEvaluation>()?;
+    m.add_function(wrap_pyfunction!(write_embeddings, m)?)?;
     Ok(())
 }
 

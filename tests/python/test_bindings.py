@@ -234,3 +234,28 @@ def test_embedding_propagator_update_frequency(graph, update_frequency):
 def test_embedding_propagator_rejects_unknown_update_frequency():
     with pytest.raises(ValueError, match="update_frequency"):
         cl.EmbeddingPropagator(update_frequency="step")
+
+
+# Fast embedding export
+
+
+def test_write_embeddings_round_trips(tmp_path):
+    np = pytest.importorskip("numpy")
+    keys = [("q", "a"), ("p", "b b"), ("q", "c")]
+    values = np.array([[1.5, -2.25], [1e-8, 3.0e7], [0.1, 2.0 / 3.0]], dtype=np.float32)
+    for name in ("out.emb", "out.emb.gz"):
+        path = str(tmp_path / name)
+        cl.write_embeddings(path, keys, values)
+        loaded = cl.NodeEmbeddings.load(path, cl.Distance.Cosine)
+        assert len(loaded) == 3
+        for key, row in zip(keys, values):
+            assert loaded.get_embedding(key) == [float(x) for x in row]
+
+
+def test_write_embeddings_rejects_bad_shapes(tmp_path):
+    np = pytest.importorskip("numpy")
+    path = str(tmp_path / "bad.emb")
+    with pytest.raises(ValueError):
+        cl.write_embeddings(path, [("q", "a")], np.zeros(3, dtype=np.float32))
+    with pytest.raises(ValueError):
+        cl.write_embeddings(path, [("q", "a")], np.zeros((2, 3), dtype=np.float32))
