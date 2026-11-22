@@ -1,0 +1,49 @@
+# EP on the GPU
+
+A PyTorch implementation of cloverleaf's Embedding Propagation, for experiments that are too slow
+on the CPU, attention pooling in particular.  It reads cloverleaf's graph and feature files and
+writes embeddings cloverleaf loads, so alignment, ANN search and evaluation still use cloverleaf.
+
+```
+pip install -r requirements.txt
+python -m ep_gpu.train --edges GRAPH --features FEATURES --out PREFIX \
+    --loss margin --gamma 1 --negatives 5 --max-nodes 10 --max-features 0.5 \
+    --pooling attention --heads 4 --batch-size 1024 --passes 100
+```
+
+writes `PREFIX.node-embeddings` (every node, pooled from all its features),
+`PREFIX.feature-embeddings` (the feature table) and `PREFIX.pt` (the model).  New nodes are
+embedded from their features with `ep_gpu.embed_feature_sets`.
+
+## What matches cloverleaf
+
+* Files: nodes numbered in order of first appearance, features namespaced by node type (or one
+  shared namespace), and a node without features gets its own `("node", id)` feature.
+* h(v) pools a node's own features; h~(v) pools all its sampled neighbours' features together,
+  so a feature shared by several neighbours counts once per neighbour.
+* Negatives are uniform random nodes other than the anchor, embedded from their own features.
+* Losses: margin (Euclidean), StarSpace, rank and RankSpace, each averaging only its non-zero
+  terms, as `src/algos/ep/loss.rs` does.
+* `max_features` (a fraction or a count), `max_nodes`, weighted sampling and weighted averaging,
+  where averaging skips the edge weights for neighbours already sampled by weight.
+* Adam on the feature table with sparse updates; "cosine" (20% warmup from lr/100, then cosine
+  decay to lr/100) or "constant" learning rates; "unit" or "glorot" initialisation.
+
+With mean pooling, cloverleaf's averaged `NodeEmbedder` rebuilds the exported node embeddings
+from the exported feature table exactly, and features-only EP on Cora scores the same on both
+(77.32 ± 1.29 GPU, 77.43 ± 1.13 CPU; `examples/parity_cora.py`).
+
+## What differs
+
+* Attention: cloverleaf stores per-head query and key slices in every feature's embedding.  Here
+  the query, key, value and output projections are shared across features, so the table stays
+  one `dims`-wide vector per feature (several times less memory).  Attention is
+  self-attention over a node's tokens followed by their weighted mean; the output projection
+  starts at zero, so training starts from mean pooling.
+* Nodes with more neighbours than `max_nodes` are sampled with replacement (cloverleaf samples
+  without); hard negatives aren't implemented.
+
+## Tests
+
+`pytest tests` (CPU, a few seconds).  `tests/test_cloverleaf_parity.py` runs when cloverleaf is
+installed.

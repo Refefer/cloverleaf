@@ -1,0 +1,222 @@
+"""Trains EP on the GPU and exports the embeddings in cloverleaf's formats.
+
+    python -m ep_gpu.train --edges GRAPH --features FEATURES --out PREFIX [options]
+
+writes PREFIX.node-embeddings (every node, pooled from all its features), PREFIX.feature-embeddings
+(the feature table; with mean pooling, cloverleaf's averaged NodeEmbedder reproduces the node
+embeddings from it) and PREFIX.pt (the model, to embed new nodes with attention pooling).
+"""
+import argparse
+import math
+import time
+from dataclasses import asdict, dataclass
+
+import torch
+
+from . import data, losses, sampling
+from .model import EPModel
+
+
+@dataclass
+class Config:
+    dims: int = 128
+    passes: int = 100
+    batch_size: int = 1024
+    lr: float = 0.01
+    lr_schedule: str = "cosine"      # "cosine" (20% warmup from lr/100, then cosine to lr/100) or "constant"
+    init: str = "unit"               # "unit" or "glorot"
+    loss: str = "margin"             # margin, starspace, rank, rankspace
+    gamma: float = 1.0               # the loss's margin / threshold
+    negatives: int = 1
+    negative_pool: int | None = 2048  # nodes embedded once per batch that every anchor draws its
+                                      # negatives from; 0 or None draws independent ones per anchor
+    max_nodes: int | None = None     # neighbours per reconstruction; None for all
+    max_features: float | int | None = None   # features per node; a fraction, a count or None for all
+    weighted_sampling: bool = False
+    weighted_averaging: bool = False
+    pooling: str = "mean"            # "mean" or "attention"
+    reconstruction: str = "auto"     # h~(v): "flat" (cloverleaf), "nested", or "auto": flat for
+                                     # mean pooling, nested for attention
+    heads: int = 4
+    valid_pct: float = 0.0           # nodes held out of the anchors; their loss is reported
+    seed: int = 2017
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def learning_rate(cfg, step, total):
+    if cfg.lr_schedule == "constant" or total == 0:
+        return cfg.lr
+    low, warmup = cfg.lr / 100, total // 5
+    if step < warmup:
+        return low + (cfg.lr - low) * step / warmup
+    ratio = min((step - warmup) / max(total - warmup, 1), 1.0)
+    return low + 0.5 * (cfg.lr - low) * (1 + math.cos(math.pi * ratio))
+
+
+def nested_reconstruction(cfg):
+    if cfg.reconstruction not in ("auto", "flat", "nested"):
+        raise ValueError(f"reconstruction must be auto, flat or nested, got {cfg.reconstruction!r}")
+    return cfg.reconstruction == "nested" or (cfg.reconstruction == "auto" and cfg.pooling == "attention")
+
+
+def batch_loss(model, graph, nodes, cfg, generator):
+    """Mean EP loss over `nodes` that have neighbours."""
+    fidx, fmask = sampling.sample_features(graph, nodes, cfg.max_features, generator)
+    nested = nested_reconstruction(cfg)
+    neighbours = (sampling.neighbour_features if nested else sampling.neighbourhood_tokens)(
+        graph, nodes, cfg.max_nodes, cfg.max_features, cfg.weighted_sampling,
+        cfg.weighted_averaging, generator)
+    if nested:
+        tidx, tmask, nw = neighbours
+        tw = tmask.float()
+    else:
+        tidx, tw = neighbours
+    if cfg.negative_pool:
+        pool = torch.randint(0, graph.num_nodes, (cfg.negative_pool,), device=nodes.device,
+                             generator=generator)
+        pick = sampling.pick_from_pool(pool, nodes, cfg.negatives, generator)
+        neg_nodes = pool
+    else:
+        neg_nodes = sampling.sample_negatives(graph.num_nodes, nodes, cfg.negatives, generator).reshape(-1)
+    nidx, nmask = sampling.sample_features(graph, neg_nodes, cfg.max_features, generator)
+    h, t, neg = model.embed_groups([(fidx, fmask.float()), (tidx, tw), (nidx, nmask.float())])
+    if nested:
+        t = model.combine_neighbours(t.view(len(nodes), nw.shape[1], -1), nw)
+        tw = nw
+    hu = neg[pick] if cfg.negative_pool else neg.view(len(nodes), cfg.negatives, -1)
+    per_node = losses.LOSSES[cfg.loss](t, h, hu, cfg.gamma)
+    has_neighbours = tw.sum(dim=1) > 0
+    return (per_node * has_neighbours).sum() / has_neighbours.sum().clamp(min=1)
+
+
+def train(graph, cfg, log=print):
+    device = torch.device(cfg.device)
+    g = graph.to(device)
+    torch.manual_seed(cfg.seed)
+    gen = torch.Generator(device=device).manual_seed(cfg.seed)
+    model = EPModel(g.num_features, cfg.dims, cfg.pooling, cfg.heads, cfg.init, cfg.seed).to(device)
+    sparse_opt = torch.optim.SparseAdam(list(model.features.parameters()), lr=cfg.lr)
+    dense = model.dense_parameters()
+    dense_opt = torch.optim.Adam(dense, lr=cfg.lr) if dense else None
+
+    order = torch.randperm(g.num_nodes, device=device, generator=gen)
+    n_valid = int(g.num_nodes * cfg.valid_pct)
+    valid, anchors = order[:n_valid], order[n_valid:]
+    steps_per_pass = math.ceil(len(anchors) / cfg.batch_size)
+    total, step = steps_per_pass * cfg.passes, 0
+    for p in range(cfg.passes):
+        start, running, lr = time.time(), 0.0, learning_rate(cfg, step, total)
+        perm = anchors[torch.randperm(len(anchors), device=device, generator=gen)]
+        model.train()
+        for b in range(steps_per_pass):
+            nodes = perm[b * cfg.batch_size:(b + 1) * cfg.batch_size]
+            lr = learning_rate(cfg, step, total)
+            for opt in (sparse_opt, dense_opt):
+                if opt is not None:
+                    for group in opt.param_groups:
+                        group["lr"] = lr
+                    opt.zero_grad()
+            loss = batch_loss(model, g, nodes, cfg, gen)
+            loss.backward()
+            sparse_opt.step()
+            if dense_opt is not None:
+                dense_opt.step()
+            running = running + loss.detach() * len(nodes)
+            step += 1
+        message = f"pass {p + 1}/{cfg.passes}: loss {float(running) / len(anchors):.5f}, lr {lr:.5f}"
+        if len(valid):
+            model.eval()
+            vgen = torch.Generator(device=device).manual_seed(cfg.seed + 1)
+            total_vl = torch.zeros((), device=device)
+            with torch.no_grad():
+                # In training-sized batches: attention pads every row, so all the held-out nodes
+                # at once may not fit.
+                for vs in range(0, len(valid), cfg.batch_size):
+                    chunk = valid[vs:vs + cfg.batch_size]
+                    total_vl += batch_loss(model, g, chunk, cfg, vgen) * len(chunk)
+            message += f", valid {float(total_vl) / len(valid):.5f}"
+        log(f"{message} ({time.time() - start:.1f}s)")
+    return model
+
+
+@torch.no_grad()
+def node_embeddings(model, graph, batch_size=8192):
+    """Every node, pooled from all its features."""
+    model.eval()
+    g = graph.to(next(model.parameters()).device)
+    out = []
+    for s in range(0, g.num_nodes, batch_size):
+        nodes = torch.arange(s, min(s + batch_size, g.num_nodes), device=g.adj_ptr.device)
+        fidx, fmask = sampling.sample_features(g, nodes, None)
+        out.append(model.embed(fidx, fmask.float()))
+    return torch.cat(out)
+
+
+@torch.no_grad()
+def embed_feature_sets(model, feature_index, feature_sets):
+    """Embeds nodes that weren't in the graph from their features, e.g. nodes added after
+    training.  Features missing from the training vocabulary are skipped; a set with none left
+    embeds to zeros."""
+    model.eval()
+    device = next(model.parameters()).device
+    ids = [[feature_index[f] for f in fs if f in feature_index] for fs in feature_sets]
+    width = max((len(x) for x in ids), default=0) or 1
+    idx = torch.zeros(len(ids), width, dtype=torch.long, device=device)
+    w = torch.zeros(len(ids), width, device=device)
+    for i, x in enumerate(ids):
+        idx[i, :len(x)] = torch.tensor(x, dtype=torch.long)
+        w[i, :len(x)] = 1
+    return model.embed(idx, w)
+
+
+def export(model, graph, cfg, prefix):
+    keys = list(zip(graph.node_types, graph.node_names))
+    data.save_embeddings(prefix + ".node-embeddings", keys, node_embeddings(model, graph))
+    data.save_embeddings(prefix + ".feature-embeddings", graph.feature_keys, model.features.weight)
+    torch.save({"config": asdict(cfg), "state": model.state_dict(),
+                "feature_keys": graph.feature_keys}, prefix + ".pt")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Embedding Propagation on the GPU.")
+    p.add_argument("--edges", required=True)
+    p.add_argument("--features", default=None)
+    p.add_argument("--out", default=None, help="Output prefix; required unless --no-export.")
+    p.add_argument("--no-export", action="store_true", help="Train only, e.g. to time it.")
+    p.add_argument("--graph-cache", default=None,
+                   help="Save the parsed graph here and reuse it while the inputs are unchanged.")
+    p.add_argument("--directed", action="store_true")
+    p.add_argument("--namespace", default="node_type",
+                   help="'node_type' namespaces features by node type; anything else is one shared namespace.")
+    defaults = Config()
+    for name, value in asdict(defaults).items():
+        flag = "--" + name.replace("_", "-")
+        if isinstance(value, bool):
+            p.add_argument(flag, action="store_true")
+        elif name == "max_features":
+            p.add_argument(flag, type=lambda s: float(s) if "." in s else int(s), default=None)
+        elif name == "max_nodes":
+            p.add_argument(flag, type=int, default=None)
+        else:
+            p.add_argument(flag, type=type(value), default=value)
+    args = p.parse_args()
+    if args.out is None and not args.no_export:
+        p.error("--out is required unless --no-export")
+    cfg = Config(**{k: getattr(args, k) for k in asdict(defaults)})
+    start = time.time()
+    if args.graph_cache:
+        graph = data.load_cached(args.graph_cache, args.edges, args.features, args.directed, args.namespace)
+    else:
+        graph = data.load(args.edges, args.features, args.directed, args.namespace)
+    print(f"loaded in {time.time() - start:.0f}s", flush=True)
+    print(f"{graph.num_nodes} nodes, {len(graph.adj_idx)} directed edges, "
+          f"{graph.num_features} features; {cfg}", flush=True)
+    start = time.time()
+    model = train(graph, cfg, log=lambda m: print(m, flush=True))
+    print(f"trained in {time.time() - start:.0f}s", flush=True)
+    if not args.no_export:
+        export(model, graph, cfg, args.out)
+
+
+if __name__ == "__main__":
+    main()
