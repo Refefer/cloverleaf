@@ -10,8 +10,7 @@ use crate::embeddings::NodeEmbeddings;
 
 /// Maps an embedding from one embedding space into another, using nodes embedded in both as
 /// anchors: the query's nearest neighbours in the original space, found with `Ann`, plus
-/// `random_nodes` random ones.  The mapped embedding is placed in the translated space so its
-/// distances to the anchors there match the query's distances to them in the original space.
+/// `random_nodes` random ones.  `method` says how the anchors place it in the translated space.
 ///
 /// The typical use is neighbourhood alignment for a node that has no edges yet: embed it from its
 /// features in the original (pre-alignment) space, and map it into the aligned space.
@@ -21,22 +20,47 @@ pub struct EmbeddingAligner {
     pub num_nodes: usize,
     /// Random nodes added as extra anchors.
     pub random_nodes: usize,
-    /// Learning rate.
-    pub alpha: f32,
-    /// Stop once the error changes by less than this.
-    pub error: f32,
-    /// Maximum optimisation steps.
-    pub max_iters: usize
+    pub method: AlignMethod
+}
+
+/// How the anchors place a mapped embedding.
+#[derive(Clone,Copy,Debug,PartialEq)]
+pub enum AlignMethod {
+    /// Place it so its distances to the anchors in the translated space match its distances to
+    /// them in the original space, by gradient descent from where it started.
+    Distances {
+        /// Learning rate.
+        alpha: f32,
+        /// Stop once the error changes by less than this fraction.
+        error: f32,
+        /// Maximum optimisation steps.
+        max_iters: usize
+    },
+
+    /// Move it by the anchors' mean displacement, query + mean(translated - original): it moves
+    /// as its neighbours did.  After neighbourhood alignment, where each node moved to
+    /// w * itself + (1 - w) * its neighbours' mean, this is the alignment the query would have
+    /// had if its anchors' neighbourhoods were its own, without needing it to have edges.
+    MeanShift
+}
+
+impl AlignMethod {
+    /// `Distances` with the defaults the Python bindings use.
+    pub fn distances() -> Self {
+        AlignMethod::Distances { alpha: 1e-1, error: 1e-2, max_iters: 10 }
+    }
 }
 
 impl EmbeddingAligner {
-    /// An aligner anchoring on `num_nodes` neighbours, with the defaults the Python bindings use.
+    /// An aligner anchoring on `num_nodes` neighbours with the `Distances` method, with the
+    /// defaults the Python bindings use.
     pub fn new(num_nodes: usize) -> Self {
-        EmbeddingAligner { num_nodes, random_nodes: 0, alpha: 1e-1, error: 1e-2, max_iters: 10 }
+        EmbeddingAligner { num_nodes, random_nodes: 0, method: AlignMethod::distances() }
     }
 
     /// Maps `query`, an embedding in `orig`'s space, into `translated`'s space.  `orig_ann` must
-    /// index `orig`.  Anchors missing from `translated` are skipped.
+    /// index `orig`.  Anchors missing from `translated` are skipped; with none left the query is
+    /// returned unchanged.
     pub fn align(
         &self,
         orig: &NodeEmbeddings,
@@ -56,14 +80,32 @@ impl EmbeddingAligner {
             }
         }
 
+        // (original id, translated embedding, distance in the original space)
         let anchors: Vec<_> = neighbors.iter().filter_map(|nd| {
             let (orig_id, dist) = nd.to_tup();
             orig.vocab.get_name(*orig_id)
                 .and_then(|(node_type, name)| translated.vocab.get_node_id(node_type.as_str(), name))
-                .map(|t_id| (translated.embeddings.get_embedding(t_id), dist))
+                .map(|t_id| (*orig_id, translated.embeddings.get_embedding(t_id), dist))
         }).collect();
+        if anchors.is_empty() {
+            return query.to_vec()
+        }
 
-        align_embedding(query, &anchors, self.alpha, self.error, self.max_iters)
+        match self.method {
+            AlignMethod::Distances { alpha, error, max_iters } => {
+                let targets: Vec<_> = anchors.iter().map(|(_, t, d)| (*t, *d)).collect();
+                align_embedding(query, &targets, alpha, error, max_iters)
+            },
+            AlignMethod::MeanShift => {
+                let mut out = query.to_vec();
+                let share = 1f32 / anchors.len() as f32;
+                for (orig_id, t, _) in anchors.iter() {
+                    let o = orig.embeddings.get_embedding(*orig_id);
+                    out.iter_mut().zip(t.iter().zip(o.iter())).for_each(|(v, (ti, oi))| *v += share * (ti - oi));
+                }
+                out
+            }
+        }
     }
 }
 
@@ -148,7 +190,9 @@ mod emb_aligner_tests {
         let orig = embeddings(&[("a", [0., 0.]), ("b", [1., 0.]), ("c", [0., 1.])]);
         let translated = embeddings(&[("a", [0., 0.]), ("b", [2., 0.]), ("c", [0., 2.])]);
         let ann = fitted_ann(&orig);
-        let aligner = EmbeddingAligner { max_iters: 50, error: 0., ..EmbeddingAligner::new(3) };
+        let aligner = EmbeddingAligner {
+            method: AlignMethod::Distances { alpha: 1e-1, error: 0., max_iters: 50 }, ..EmbeddingAligner::new(3)
+        };
         let out = aligner.align(&orig, &ann, &translated, &[0.5, 0.5], 1);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|v| v.is_finite()), "{:?}", out);
@@ -172,5 +216,29 @@ mod emb_aligner_tests {
         let second = aligner.align(&orig, &ann, &translated, &[0.2, 0.3], 7);
         assert!(first.iter().all(|v| v.is_finite()), "{:?}", first);
         assert_eq!(first, second);
+    }
+
+    /// Mean shift moves the query by its anchors' mean displacement.
+    #[test]
+    fn test_mean_shift_moves_by_the_anchors_mean_displacement() {
+        let orig = embeddings(&[("a", [0., 0.]), ("b", [1., 0.]), ("far", [10., 10.])]);
+        let translated = embeddings(&[("a", [1., 1.]), ("b", [3., 1.]), ("far", [-50., -50.])]);
+        let ann = fitted_ann(&orig);
+        let aligner = EmbeddingAligner { method: AlignMethod::MeanShift, ..EmbeddingAligner::new(2) };
+        // Anchors a and b moved by (1, 1) and (2, 1); "far" isn't among the 2 nearest.
+        let out = aligner.align(&orig, &ann, &translated, &[0.5, 0.], 1);
+        assert_eq!(out, vec![2.0, 1.0]);
+    }
+
+    /// With no anchor in the translated space, both methods leave the query where it is.
+    #[test]
+    fn test_no_anchors_leaves_the_query_unchanged() {
+        let orig = embeddings(&[("a", [0., 0.]), ("b", [1., 0.])]);
+        let translated = embeddings(&[("other", [5., 5.])]);
+        let ann = fitted_ann(&orig);
+        for method in [AlignMethod::distances(), AlignMethod::MeanShift] {
+            let aligner = EmbeddingAligner { method, ..EmbeddingAligner::new(2) };
+            assert_eq!(aligner.align(&orig, &ann, &translated, &[0.3, 0.4], 1), vec![0.3, 0.4]);
+        }
     }
 }
