@@ -1,8 +1,8 @@
 # Embedding Propagation — Product Requirements Document
 
-**Version:** 5
+**Version:** 6
 **Status:** Draft
-**Date:** 2026-11-12
+**Date:** 2026-11-20
 
 ---
 
@@ -345,6 +345,18 @@ All nodes are randomly shuffled and partitioned into a **training set** and a **
 
 Training nodes are shuffled each pass and chunked into mini-batches. Nodes within a batch are processed in parallel, and so are the batches themselves: they update the shared feature embeddings and optimizer state lock-free (Hogwild). Gradients for shared features are accumulated (summed) across the batch before the optimizer step.
 
+`UpdateFrequency` sets when the optimizer steps:
+
+```
+UpdateFrequency::Batch   // default: one step per mini-batch, as above
+UpdateFrequency::Epoch   // one step per pass
+```
+
+With `Epoch`, nodes are still processed in mini-batches (which still drive negative sampling and parallelism), but no batch updates the embeddings. Every batch computes its gradients against the embeddings as they were at the start of the pass and adds them to a pass-wide sum, and one optimizer step applies the sum when the pass ends. Features no node touched during the pass aren't updated, as with per-batch updates. Gradient noise (§9.5), if any, is added once to each summed gradient.
+
+- The sum is a dense `num_features × dims` table, as large as the feature embeddings, allocated only in `Epoch` mode. Batches add to it lock-free with compare-and-swap on each f32, so no contribution is lost.
+- Training makes `passes` optimizer steps in total instead of `passes × ⌈train_nodes / batch_size⌉`. The LRScheduler's warmup and decay (§11.4) are measured in these steps. Since each Adam step moves a coordinate by about `alpha`, `Epoch` generally needs a larger `alpha` or more passes than `Batch`.
+
 ### 11.3 Optimizer
 
 The **Optimizer** is a first-class configuration choice.
@@ -374,19 +386,29 @@ v̂_t = v_t / (1 - β₂^t)
 
 Default hyperparameters: `β₁ = 0.9`, `β₂ = 0.999`, `ε = 1e-8`. Updates applied with lock-free (Hogwild-style) parallelism across features.
 
-**Time step:** `t` is the 1-based count of optimizer updates (mini-batches) applied so far, counted globally across passes. It is the same step counter that drives the LRScheduler (§11.4).
+**Time step:** `t` is the 1-based count of optimizer updates (mini-batches, or passes with `UpdateFrequency::Epoch`) applied so far, counted globally across passes. It is the same step counter that drives the LRScheduler (§11.4).
 
 #### AdamW
 
-Adam with decoupled weight decay (Loshchilov & Hutter, 2019). The decay is applied directly to the weights instead of being added to the gradient, so it is not rescaled by Adam's per-parameter step sizes:
+Adam with decoupled weight decay (Loshchilov & Hutter, 2019). The decay is applied directly to the weights instead of being added to the gradient, so it is not rescaled by Adam's per-parameter step sizes. Updates are exactly Adam's; the decay happens once at the end of every pass, to every feature embedding:
 
 ```
-θ ← θ · (1 - α · λ) - α · m̂_t / (√v̂_t + ε)
+update:          θ ← θ - α_t · m̂_t / (√v̂_t + ε)
+end of each pass: θ ← θ · exp(-η · λ)
 ```
 
-where `λ` is `weight_decay` and `α` is the scheduled learning rate for the step. Moments and bias correction are identical to Adam, and AdamW needs no memory beyond Adam's two moment buffers. With `λ = 0` it is exactly Adam.
+where `λ` is `weight_decay`, `α_t` the scheduled learning rate, and `η = α_t / α` the schedule multiplier after the pass's last update (1 for a constant schedule). As in the paper, the decay follows the schedule's shape but not the base learning rate.
 
-Default `weight_decay` when AdamW is selected without one: `0.01`.
+Why per pass rather than per update:
+
+* **Frequency.** Updates are sparse. Decaying only the features in an update decays a feature once per batch it appears in, which is roughly 1 + its degree per pass, so hubs and common words were regularised hardest and rare features barely at all.
+* **Update frequency.** With `UpdateFrequency::Epoch` there are `passes` updates instead of `passes × batches`, so a per-update decay differed by orders of magnitude between the two modes at the same `λ`.
+* **Learning rate.** Scaling by `α` made `λ` mean something different at every learning rate.
+* **Sign.** `1 - α · λ` goes negative once `α · λ > 1`. `exp` keeps the factor in (0, 1].
+
+Decaying lazily, catching up on the decay a feature missed when it is next updated, would also fix the frequency problem but needs a step counter per feature. The per-pass sweep needs no memory beyond Adam's two moment buffers. Features with no gradient in a pass still decay, as in dense AdamW; with every node visited each pass, that is rare. With `λ = 0` it is exactly Adam.
+
+Default `weight_decay` when AdamW is selected without one: `0.001` per pass.
 
 **Sparse decay:** Updates are sparse: only features with a gradient in the current mini-batch are updated, so only those features are decayed. Rare features are therefore decayed less often than common ones. This is intentional; decaying every feature on every step would touch the whole table per batch.
 
@@ -521,9 +543,10 @@ Inference is stateless and trivially parallelizable across nodes.
 | `reconstruction_aggregator` | `ReconstructionAggregator` enum | `Averaged` | How neighbor features are combined. See §6. |
 | `negative_sampler` | `NegativeSampler` enum | `UniformWithHardNegatives { 0 }` | How negatives are selected. See §7. |
 | `feature_dropout` | `FeatureDropout` enum | `All` | Feature subsampling per forward pass. See §9. |
-| `optimizer` | `Optimizer` enum | `Adam { 0.9, 0.999, 1e-8 }` | Gradient optimizer: `Adam` or `AdamW` (default `weight_decay` 0.01). See §11.3. |
+| `optimizer` | `Optimizer` enum | `Adam { 0.9, 0.999, 1e-8 }` | Gradient optimizer: `Adam` or `AdamW` (default `weight_decay` 0.001 per pass). See §11.3. |
 | `lr_scheduler` | `LRScheduler` enum | `CosineDecayWithWarmup { 0.2 }` | Learning rate schedule (`lr_schedule="cosine"` or `"constant"` in Python). See §11.4. |
 | `init` | `EmbeddingInit` enum | `UnitNorm` | Feature embedding initialization (`init="unit"` or `"glorot"` in Python). See §11.7. |
+| `update_frequency` | `UpdateFrequency` enum | `Batch` | Optimizer step after every mini-batch, or once per pass on the summed gradients (`update_frequency="batch"` or `"epoch"` in Python). See §11.2. |
 | `batch_size` | int | `50` | Mini-batch size. |
 | `dims` | int | `100` | Embedding dimensionality. |
 | `passes` | int | `100` | Number of full training passes. |
@@ -601,3 +624,4 @@ Mining-based negative selection (e.g., online hard negative mining using current
 | v3 | 2026-03-10 | Introduced first-class enums: `PositiveSampler` (LocalNeighborhood, RandomWalk), `NegativeSampler` (UniformWithHardNegatives), `ReconstructionAggregator` (Averaged, Weighted), `FeatureDropout` (All, Fixed, Probability), `Optimizer` (Adam), `LRScheduler` (CosineDecayWithWarmup, ExponentialDecay, Constant), and `Model` (Averaged; Parameterized as future work). `max_nodes` and `weighted_*` parameters moved into `PositiveSampler::LocalNeighborhood`. PPR loss deprecated in favor of `MarginLoss` + `PositiveSampler::RandomWalk`. Model established as a serializable component to support future parameterized variants. |
 | v4 | 2026-11-09 | Added `Optimizer::AdamW` with a validated `WeightDecay` (§11.3). Specified how `weighted_sampling` and `weighted_averaging` combine so edge weight is counted once (§5.2). Corrected the Adam time step: `t` counts mini-batch updates, not passes. |
 | v5 | 2026-11-12 | Exposed the `Constant` learning rate schedule (§11.4) and added `EmbeddingInit` with Glorot uniform (§11.7). Uniform negatives exclude the anchor (§7.2). Corrected the cosine decay formula and noted Hogwild batch parallelism (§11.2). Added the EP-B reproduction settings and results (§14). |
+| v6 | 2026-11-20 | Added `UpdateFrequency::Epoch`, which sums gradients over a pass and applies one update at its end (§11.2). AdamW's weight decay is now applied once per pass to every feature, as `exp(-η · λ)`, instead of on every update to the updated features; the default `weight_decay` is now 0.001 (§11.3). |

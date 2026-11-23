@@ -241,7 +241,7 @@ This is a great baseline for both Search and Recommendation applications, with U
 Embedding Propagation is a node embedding method which uses both the graph structure and node features to learn node embeddings.  As with the original paper, EP-B is implemented as a baseline.  In addition, Cloverleaf offers a variety of useful extensions:
 
 1. Multiple losses - EP, Starspace, Rankspace, Contrastive, PPR, and more
-2. Average or Attention-based node feature aggregation with Full, Random, and sliding window approaches (useful for textual node features).
+2. Average or attention-based node feature aggregation.  Attention is multi-head self-attention over a node's features with query, key, value and output projections shared by every feature; it's the same model as the GPU trainer's (`gpu/`), so weights trained by either load into `FeatureAggregator` and embed new nodes identically.
 3. Neighborhood Alignment - Uses graph topology to influence node feature-based embeddings.
 
 The paper's results reproduce: `examples/ep_paper/reproduce.py` trains EP-B with the paper's settings (`loss=EPLoss.margin(gamma, 1)`, `alpha=0.001`, `lr_schedule="constant"`, `init="glorot"`, `batch_size=64`, `passes=200`) and matches its node classification results on Cora, Citeseer, Pubmed, PPI and POS, and on BlogCatalog with 5 sampled neighbors (`max_nodes=5`).  See `examples/ep_paper/README.md` for the numbers.
@@ -258,15 +258,16 @@ The result of the optimization phase is feature embeddings, which can be used to
 5. `passes` - Number of epochs to train the feature embeddings.
 6. `max_nodes` - Maximum number of neighbor nodes, randomly sampled, used to reconstruct the node embedding.  Higher numbers of nodes potentially increase fidelity at the expense of compute time.
 7. `max_features` - Maximum number of features per node, randomly sampled, to use for aggregation.  Higher numbers of features increase fidelity at the cost of run time.
-8. `attention` - Number of dimensions to use for the attention vector for each feature.  The higher the dimension, the more memory is needed.  Warning: attention is extremely computational expensive and reason needs to be used on the size of a graph to optimize for.
-9. `attention_heads` - Number of different heads to use for attention.  The higher the heads, the greater the fidelity.
-10. `context_window` - Number of features to consider on each side of the pivot; useful for reducing the complexity of attention computation while preserving locality.
+8. `attention_heads` - If set, pools each node's features with this many heads of self-attention instead of averaging them.  The projections are learned alongside the feature embeddings, at `dense_alpha` (default 1e-3), and a reconstruction pools each sampled neighbor on its own before averaging them.  After `learn_features`, `feature_aggregator()` returns the learned weights as a `FeatureAggregator`; `learn_features(..., aggregator=...)` continues from saved ones, such as a GPU export's `PREFIX.aggregator`.  Warning: far more expensive than averaging on CPU.
+9. `dense_alpha` - Learning rate of the attention projections, on the same schedule as `alpha`.
+10. `update_frequency` - "batch" (an update after every batch) or "epoch" (gradients summed over a pass, one update at its end).
 11. `noise` - Adds gradient noise to the updates; likely to be removed in the future.
 12. `hard_negatives` - Computes hard negatives through a fixed random walk from the anchor node, providing a similar but non-neighbor to the node.
 13. `valid_pct` - Percentage of nodes in the graph to use for validation.
-14. `optimizer` - `cloverleaf.Optimizer.adam()` (default) or `cloverleaf.Optimizer.adamw(weight_decay)`.
+14. `optimizer` - `cloverleaf.Optimizer.adam()` (default) or `cloverleaf.Optimizer.adamw(weight_decay)`.  AdamW's decay is per pass: at the end of each pass every feature embedding is multiplied by `exp(-weight_decay)` (scaled down along with the learning rate schedule), however many updates the pass had.  Default `weight_decay` 0.001.
 15. `lr_schedule` - `"cosine"` (default) warms the learning rate up over the first 20% of updates, then decays it along a cosine; `"constant"` keeps it at `alpha`, as in the paper.
 16. `init` - `"unit"` (default) starts each feature embedding as a random unit vector; `"glorot"` uses Glorot uniform, as in the paper.
+17. `update_frequency` - `"batch"` (default) updates the embeddings after every batch; `"epoch"` still processes batches, but sums their gradients over the pass and applies one update at the end.  That gives `passes` updates in total, so it usually wants a larger `alpha` or more passes, and it keeps an extra gradient table the size of the feature embeddings.  It works best on dense graphs: with an average degree in the tens, a node's features get a gradient in dozens of batches a pass, and summing them removes the noise of that many small steps.  On the EP paper's benchmarks (see `examples/ep_paper`) it gained 1–8 points of F1 on BlogCatalog, PPI and POS (average degree 19–65) at `alpha` 0.01–0.05, and lost 1–2 points of accuracy on Cora, Citeseer and Pubmed (average degree under 5), where `"batch"` is the better choice.  On nodes unseen during training the gains held on BlogCatalog and PPI but not POS, and epoch updates peaked after about 100 passes, so choose `passes` on a held-out split.
 
 #### Example
 
@@ -474,6 +475,12 @@ PprRankLearner(
 )
 ```
 
+`loss` is `"listnet"` (default): cross entropy between each node's PPR list, as a distribution,
+and a softmax over its dot products with the listed nodes and the negatives.  Positives already
+predicted at least as likely as their PPR weight are skipped.  `"listmle"` is top-k ListMLE: the
+Plackett–Luce likelihood of the listed nodes coming first, in PPR order, ahead of the negatives.
+The order among the negatives isn't scored.  `ppr_lists` (below) returns the lists themselves.
+
 ### Feature handling
 | Class | Constructor (Python) | Key Methods |
 |-------|----------------------|-------------|
@@ -481,17 +488,19 @@ PprRankLearner(
 | `FeatureSet` | • `FeatureSet.new_from_graph(graph: Graph)`<br>• `FeatureSet.new_from_file(path: str, namespace: FeatureNamespace \| None = None)` | `set_features(node: tuple[str,str], features: list[tuple[str,str]])`<br>`get_features(node: tuple[str,str]) -> list[tuple[str,str]]`<br>`load_into(path: str, f_ns: FeatureNamespace \| None = None)`<br>`nodes() -> int`<br>`num_features() -> int` |
 | `FeaturePropagator` | `FeaturePropagator(k: int, threshold: float = 0.0, max_iters: int = 20)` | `propagate(graph: Graph, features: FeatureSet) -> None` |
 | `FeatureWeight` | enum values `FeatureWeight.Uniform`, `FeatureWeight.IDF` | *(used in VPCG)* |
-| `FeatureAggregator` | • `FeatureAggregator.Averaged()`<br>• `FeatureAggregator.Attention(num_heads: int, d_k: int, window: int \| None = None)`<br>• `FeatureAggregator.Weighted(alpha: float, fs: FeatureSet)` | `save(path: str) -> None`<br>`load(path: str) -> FeatureAggregator` |
+| `FeatureAggregator` | • `FeatureAggregator.Averaged()`<br>• `FeatureAggregator.Attention(dims: int, heads: int, head_dims: int, qkv: list[float], out: list[float])` (trained attention weights; usually loaded from a file written by EP or the GPU trainer)<br>• `FeatureAggregator.Weighted(alpha: float, fs: FeatureSet)` | `save(path: str) -> None`<br>`load(path: str) -> FeatureAggregator` |
 
 ### Embedding Core
 | Class | Constructor (Python) | Key Methods |
 |-------|----------------------|-------------|
 | `NodeEmbeddings` | • `NodeEmbeddings.new(graph: Graph, dims: int, distance: Distance)`<br>• `NodeEmbeddings.new_from_list(list: list[tuple[tuple[str,str], list[float]]], distance: Distance)` | `contains(node: tuple[str,str]) -> bool`<br>`get_embedding(node: tuple[str,str]) -> list[float]`<br>`set_embedding(node: tuple[str,str], embedding: list[float])`<br>`nearest_neighbor(emb: list[float], k: int, filter_type: str \| list[str] \| None = None) -> list[tuple[tuple[str,str], float]]`<br>`compute_distance(e1: Query, e2: Query) -> float`<br>`l2norm()`<br>`save(path: str, comp_level: int \| None = None)`<br>`load(path: str, distance: Distance \| None = None, filter_type: ... ) -> NodeEmbeddings` |
+| `write_embeddings` (function) | `write_embeddings(path: str, keys: list[tuple[str,str]], embeddings: 2-D float32 array, comp_level: int \| None = None)` | Writes embeddings made outside cloverleaf (e.g. a numpy array, or a PyTorch tensor via `.cpu().numpy()`) in the format `NodeEmbeddings.load` reads, formatting rows in parallel. |
+| `ppr_lists` (function) | `ppr_lists(graph: Graph, k: int, walks: int, steps: float, beta: float = 0.8, compression: float = 1.0, other_type_only: bool = False, seed: int \| None = None, indicator: bool = True) -> tuple[bytes, bytes]` | Every node's top-k personalised PageRank list, as `PprRankLearner` trains on: little-endian int64 node ids and float32 weights, `graph.nodes() * k` of each, for `numpy.frombuffer(...).reshape(-1, k)`. `other_type_only` keeps only nodes of a different type from the start node. |
 | `EmbeddingPropagator` | See full signature below* (many optional arguments) | `learn_features(graph: Graph, features: FeatureSet, feature_embeddings: NodeEmbeddings \| None = None) -> NodeEmbeddings` |
 | `NodeEmbedder` | `NodeEmbedder(feat_agg: FeatureAggregator)` | `embed_feature_set(feat_set: FeatureSet, feature_embeddings: NodeEmbeddings) -> NodeEmbeddings`<br>`embed_adhoc(features: list[tuple[str,str]], feature_embeddings: NodeEmbeddings, strict: bool = True) -> list[float]` |
 | `EmbeddingAligner` | `EmbeddingAligner(num_nodes: int, random_nodes: int, alpha: float, error: float, max_iters: int)` | (see methods above) |
 
-*Full signature for `EmbeddingPropagator.__new__` includes optional arguments such as `alpha`, `loss`, `batch_size`, `dims`, `passes`, `seed`, `max_nodes`, `weighted_neighbor_sampling`, `weighted_neighbor_averaging`, `max_features`, `loss_weighting`, `valid_pct`, `hard_negatives`, `indicator`, `attention`, `attention_heads`, `context_window`, `noise` (all default to sensible values).*
+*Full signature for `EmbeddingPropagator.__new__` includes optional arguments such as `alpha`, `loss`, `batch_size`, `dims`, `passes`, `seed`, `max_nodes`, `weighted_neighbor_sampling`, `weighted_neighbor_averaging`, `max_features`, `loss_weighting`, `valid_pct`, `hard_negatives`, `indicator`, `attention_heads`, `dense_alpha`, `noise`, `optimizer`, `lr_schedule`, `init`, `update_frequency` (all default to sensible values).*
 
 ### ANN utilities
 | Class | Constructor (Python) | Key Methods |

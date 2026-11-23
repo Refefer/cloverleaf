@@ -292,6 +292,44 @@ pub fn open_file_for_reading(path: &str) -> IOResult<Box<dyn BufRead>> {
     Ok(result)
 }
 
+/// Writes a row-major matrix of embeddings, `dims` floats per row, as `type<TAB>name<TAB>[e1,...]`
+/// lines, the format `NodeEmbeddings::load` reads, one per key in order.  Rows are formatted in
+/// parallel, a chunk at a time, so large exports are bounded by the disk rather than formatting.
+/// A path ending in `.gz` is gzipped, at `comp_level` when given.
+pub fn write_embedding_matrix<K: AsRef<str> + Sync>(
+    path: &str,
+    keys: &[(K, K)],
+    values: &[f32],
+    dims: usize,
+    comp_level: Option<u32>
+) -> Result<(), Error> {
+    if values.len() != keys.len() * dims {
+        return Err(Error::InvalidArgument(format!(
+            "{} values can't be {} rows of {} dims", values.len(), keys.len(), dims)))
+    }
+    const CHUNK: usize = 16_384;
+    let mut output = open_file_for_writing(path, comp_level)?;
+    for (chunk_idx, chunk) in keys.chunks(CHUNK).enumerate() {
+        let first = chunk_idx * CHUNK;
+        let lines: Vec<String> = chunk.par_iter().enumerate().map(|(i, (node_type, name))| {
+            let row = &values[(first + i) * dims..(first + i + 1) * dims];
+            let mut line = String::with_capacity(dims * 12 + 32);
+            line.push_str(node_type.as_ref());
+            line.push('\t');
+            line.push_str(name.as_ref());
+            line.push_str("\t[");
+            EmbeddingWriter::format_embedding(&mut Buffer::new(), &mut line, row);
+            line.push_str("]\n");
+            line
+        }).collect();
+        for line in lines {
+            output.write_all(line.as_bytes())?;
+        }
+    }
+    output.flush()?;
+    Ok(())
+}
+
 pub fn open_file_for_writing(path: &str, compression: Option<u32>) -> IOResult<Box<dyn Write>> {
     let comp_level = compression.map(|l| Compression::new(l));
     let f = File::create(path)?;
@@ -469,6 +507,38 @@ mod io_tests {
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("cloverleaf-{}-{}", std::process::id(), name))
+    }
+
+    /// A written matrix reads back exactly: the same nodes in order and bit-identical values,
+    /// plain or gzipped, across more rows than one formatting chunk.
+    #[test]
+    fn test_write_embedding_matrix_round_trips() {
+        let rows = 20_000;
+        let dims = 3;
+        let keys: Vec<(String, String)> = (0..rows)
+            .map(|i| (if i % 2 == 0 { "q" } else { "p" }.to_string(), format!("n{}", i)))
+            .collect();
+        let values: Vec<f32> = (0..rows * dims).map(|i| (i as f32).sin() * 1e3 / 7.0).collect();
+        for name in ["matrix.emb", "matrix.emb.gz"] {
+            let path = temp_path(name);
+            write_embedding_matrix(path.to_str().unwrap(), &keys, &values, dims, None).unwrap();
+            let (vocab, es) = EmbeddingReader::load(
+                path.to_str().unwrap(), Distance::Euclidean, &None, None, None).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(vocab.len(), rows);
+            for (i, (t, n)) in keys.iter().enumerate() {
+                let id = vocab.get_node_id(t, n).expect("node missing");
+                assert_eq!(es.get_embedding(id), &values[i * dims..(i + 1) * dims], "row {}", i);
+            }
+        }
+    }
+
+    #[test]
+    fn test_write_embedding_matrix_rejects_a_shape_mismatch() {
+        let keys = vec![("n".to_string(), "a".to_string())];
+        let err = write_embedding_matrix(
+            temp_path("bad.emb").to_str().unwrap(), &keys, &[1., 2., 3.], 2, None);
+        assert!(matches!(err, Err(Error::InvalidArgument(_))));
     }
 
     /// Feature files may be gzipped, as `load_into` already supports.

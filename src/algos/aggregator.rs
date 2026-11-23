@@ -1,10 +1,6 @@
 //! Aggregators take models, feature embeddings, and a feature set and convert them into
 //! embeddings.  They are constructed adhoc so can be used in parallel as well as within the python
 //! interface
-use crate::autograd::*;
-use rand::prelude::*;
-use rand_xorshift::XorShiftRng;
-
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::sync::Arc;
@@ -16,7 +12,7 @@ use crate::embeddings::{EmbeddingStore, NodeEmbeddings};
 use crate::distance::Distance;
 use crate::error::Error;
 use crate::vocab::Vocab;
-use crate::algos::ep::attention::{attention_mean,AttentionType,MultiHeadedAttention};
+use crate::algos::ep::attention::AttentionWeights;
 
 pub trait EmbeddingBuilder {
     fn construct( &self, features: &[usize], out: &mut [f32]) -> ();
@@ -128,37 +124,22 @@ impl <'a> EmbeddingBuilder for WeightedAggregator<'a> {
     }
 }
 
-/// Constructs an embedding from a sequenced feature set using attention.  Expensive but relatively
-/// effective for text features
+/// Attention pooling with trained weights (see [`AttentionWeights`]); every feature has weight 1.
 pub struct AttentionAggregator<'a> {
     embs: &'a EmbeddingStore,
-    mha: MultiHeadedAttention
+    weights: &'a AttentionWeights
 }
 
 impl <'a> AttentionAggregator<'a> {
-    pub fn new(embs: &'a EmbeddingStore, mha: MultiHeadedAttention) -> Self {
-        AttentionAggregator { embs, mha }
+    pub fn new(embs: &'a EmbeddingStore, weights: &'a AttentionWeights) -> Self {
+        AttentionAggregator { embs, weights }
     }
 }
 
 impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {
-    fn construct(
-        &self, 
-        features: &[usize],
-        out: &mut [f32]
-    ) {
-        out.fill(0f32);
-        let it = features.iter().map(|feat_id| {
-            let e = self.embs.get_embedding(*feat_id); 
-            (Constant::new(e.to_vec()), 1f32)
-        }).collect::<Vec<_>>();
-
-        // No-op RNG
-        let mut rng = XorShiftRng::seed_from_u64(0);
-        let v = attention_mean(it.iter(), &self.mha, &mut rng);
-        v.value().iter().zip(out.iter_mut()).for_each(|(vi, outi)| {
-            *outi = *vi;
-        });
+    fn construct(&self, features: &[usize], out: &mut [f32]) {
+        let x: Vec<&[f32]> = features.iter().map(|feat_id| self.embs.get_embedding(*feat_id)).collect();
+        self.weights.pool(&x, &vec![1f32; x.len()], out);
     }
 }
 
@@ -173,7 +154,7 @@ enum AggregatorKind {
     /// The unigram probabilities are indexed by the ids of `vocab`, the feature vocab they were
     /// counted over; it's kept so they can be saved by name.
     Weighted { alpha: f32, vocab: Arc<Vocab>, unigrams: Arc<UnigramProbability> },
-    Attention { num_heads: usize, d_k: usize, window: Option<usize> }
+    Attention(Arc<AttentionWeights>)
 }
 
 impl FeatureAggregator {
@@ -182,10 +163,17 @@ impl FeatureAggregator {
         FeatureAggregator(AggregatorKind::Averaged)
     }
 
-    /// Attention over the features, for embeddings trained with an attention model.  `window`
-    /// limits attention to a sliding window of features.
-    pub fn attention(num_heads: usize, d_k: usize, window: Option<usize>) -> Self {
-        FeatureAggregator(AggregatorKind::Attention { num_heads, d_k, window })
+    /// Attention pooling with trained weights, from EP's attention model or the GPU trainer.
+    pub fn attention(weights: AttentionWeights) -> Self {
+        FeatureAggregator(AggregatorKind::Attention(Arc::new(weights)))
+    }
+
+    /// The attention weights, for an attention aggregator.
+    pub fn attention_weights(&self) -> Option<&AttentionWeights> {
+        match &self.0 {
+            AggregatorKind::Attention(weights) => Some(weights),
+            _ => None
+        }
     }
 
     /// A weighted mean that favours rare features (SIF weighting), with feature frequencies
@@ -201,11 +189,23 @@ impl FeatureAggregator {
         let mut bw = BufWriter::new(File::create(path)?);
         match &self.0 {
             AggregatorKind::Averaged => writeln!(bw, "Averaged")?,
-            AggregatorKind::Attention { num_heads, d_k, window } => {
+            AggregatorKind::Attention(w) => {
+                // Each row of a projection on one line; ryu writes the shortest text that reads
+                // back as the same f32.
                 writeln!(bw, "Attention")?;
-                writeln!(bw, "{}", num_heads)?;
-                writeln!(bw, "{}", d_k)?;
-                writeln!(bw, "{}", window.unwrap_or(0))?;
+                writeln!(bw, "{}\t{}\t{}", w.dims(), w.heads(), w.head_dims())?;
+                let mut buf = ryu::Buffer::new();
+                for (rows, width) in [(w.qkv(), w.dims()), (w.out(), w.heads() * w.head_dims())] {
+                    for row in rows.chunks_exact(width) {
+                        let mut first = true;
+                        for v in row {
+                            if !first { bw.write_all(b" ")?; }
+                            bw.write_all(buf.format_finite(*v).as_bytes())?;
+                            first = false;
+                        }
+                        bw.write_all(b"\n")?;
+                    }
+                }
             },
             AggregatorKind::Weighted { alpha, vocab, unigrams } => {
                 writeln!(bw, "Weighted")?;
@@ -239,13 +239,39 @@ impl FeatureAggregator {
         match kind.trim_end() {
             "Averaged" => Ok(FeatureAggregator::averaged()),
             "Attention" => {
-                let (i, l) = next_line("num_heads")?;
-                let num_heads = parse(i, &l, "num_heads")?;
-                let (i, l) = next_line("d_k")?;
-                let d_k = parse(i, &l, "d_k")?;
-                let (i, l) = next_line("window")?;
-                let window: usize = parse(i, &l, "window")?;
-                Ok(FeatureAggregator::attention(num_heads, d_k, if window == 0 { None } else { Some(window) }))
+                let (i, l) = next_line("dims, heads and head_dims")?;
+                let shape: Vec<&str> = l.split('\t').collect();
+                if shape.len() != 3 {
+                    return Err(Error::Malformed { line: i, message: if shape.len() == 1 {
+                        "this attention aggregator is from Cloverleaf's earlier attention, which \
+                         stored projections inside each feature embedding; it can't be loaded, \
+                         retrain the model".into()
+                    } else {
+                        "expected dims<TAB>heads<TAB>head_dims".into()
+                    }})
+                }
+                let dims: usize = parse(i, shape[0], "dims")?;
+                let heads: usize = parse(i, shape[1], "heads")?;
+                let head_dims: usize = parse(i, shape[2], "head_dims")?;
+                let inner = heads * head_dims;
+                let mut read_rows = |rows: usize, width: usize, what: &str| -> Result<Vec<f32>, Error> {
+                    let mut values = Vec::with_capacity(rows * width);
+                    for _ in 0..rows {
+                        let (i, l) = next_line(what)?;
+                        let before = values.len();
+                        for v in l.split_ascii_whitespace() {
+                            values.push(parse::<f32>(i, v, what)?);
+                        }
+                        if values.len() - before != width {
+                            return Err(Error::Malformed { line: i, message: format!(
+                                "{} row has {} values, expected {}", what, values.len() - before, width) })
+                        }
+                    }
+                    Ok(values)
+                };
+                let qkv = read_rows(3 * inner, dims, "qkv")?;
+                let out = read_rows(dims, inner, "out")?;
+                Ok(FeatureAggregator::attention(AttentionWeights::new(dims, heads, head_dims, qkv, out)?))
             },
             "Weighted" => {
                 let (i, l) = next_line("alpha")?;
@@ -279,29 +305,19 @@ impl FeatureAggregator {
             AggregatorKind::Weighted { alpha, unigrams, .. } =>
                 Box::new(WeightedAggregator::new(es, unigrams, *alpha)),
             AggregatorKind::Averaged => Box::new(AvgAggregator::new(es)),
-            AggregatorKind::Attention { num_heads, d_k, window } => {
-                let at = match window {
-                    Some(window_size) => AttentionType::Sliding { window_size: *window_size },
-                    None => AttentionType::Full
-                };
-                Box::new(AttentionAggregator::new(es, MultiHeadedAttention::new(*num_heads, *d_k, at)))
-            }
+            AggregatorKind::Attention(weights) => Box::new(AttentionAggregator::new(es, weights))
         }
     }
 
     /// Dimensions of the node embeddings built from `feature_dims`-dimensional feature
-    /// embeddings.  Attention feature embeddings also hold the query and key projections.
+    /// embeddings: the same, and for attention they must be the width its weights were trained
+    /// for.
     pub fn node_dims(&self, feature_dims: usize) -> Result<usize, Error> {
-        match self.0 {
-            AggregatorKind::Attention { num_heads, d_k, .. } => {
-                let attention_dims = 2 * num_heads * d_k;
-                if num_heads == 0 || feature_dims <= attention_dims {
-                    return Err(Error::InvalidArgument(format!(
-                        "{}-dimensional feature embeddings are too small for {} heads with d_k={}",
-                        feature_dims, num_heads, d_k)))
-                }
-                Ok((feature_dims - attention_dims) / num_heads)
-            },
+        match &self.0 {
+            AggregatorKind::Attention(w) if w.dims() != feature_dims =>
+                Err(Error::InvalidArgument(format!(
+                    "attention weights are for {}-dimensional feature embeddings, got {}",
+                    w.dims(), feature_dims))),
             _ => Ok(feature_dims)
         }
     }
@@ -312,8 +328,8 @@ impl std::fmt::Display for FeatureAggregator {
         match &self.0 {
             AggregatorKind::Averaged => write!(f, "Averaged"),
             AggregatorKind::Weighted { alpha, .. } => write!(f, "Weighted<alpha={}>", alpha),
-            AggregatorKind::Attention { num_heads, d_k, window } =>
-                write!(f, "Attention<num_heads={},d_k={},window={:?}>", num_heads, d_k, window)
+            AggregatorKind::Attention(w) =>
+                write!(f, "Attention<dims={},heads={},head_dims={}>", w.dims(), w.heads(), w.head_dims())
         }
     }
 }
@@ -398,6 +414,8 @@ mod aggregator_tests {
     use super::*;
 
     use std::sync::Arc;
+    use rand::SeedableRng;
+    use rand_xorshift::XorShiftRng;
 
     fn feature_set() -> FeatureSet {
         let mut node_vocab = Vocab::new();
@@ -435,13 +453,14 @@ mod aggregator_tests {
     #[test]
     fn test_save_load_round_trip() {
         let fs = feature_set();
-        for agg in [FeatureAggregator::averaged(), FeatureAggregator::attention(2, 3, Some(4)),
-                    FeatureAggregator::attention(1, 2, None), FeatureAggregator::weighted(0.25, &fs)] {
+        for agg in [FeatureAggregator::averaged(), attention(), FeatureAggregator::weighted(0.25, &fs)] {
             let path = temp_path("rt");
             agg.save(&path).unwrap();
             let loaded = FeatureAggregator::load(&path).unwrap();
             std::fs::remove_file(&path).unwrap();
             assert_eq!(loaded.to_string(), agg.to_string());
+            // Attention weights read back bit-exactly.
+            assert_eq!(agg.attention_weights(), loaded.attention_weights());
             if let (AggregatorKind::Weighted { vocab: v1, unigrams: u1, .. },
                     AggregatorKind::Weighted { vocab: v2, unigrams: u2, .. }) = (&agg.0, &loaded.0) {
                 assert_eq!(v1.len(), v2.len());
@@ -459,14 +478,52 @@ mod aggregator_tests {
         assert!(matches!(res, Err(Error::Malformed { .. })));
     }
 
-    /// Attention feature embeddings too small for the projections are an error, not an
-    /// underflow.
+    /// Attention weights for 3-dimensional embeddings, 2 heads of width 8, with values that
+    /// need all of f32's digits to round trip.
+    fn attention() -> FeatureAggregator {
+        let mut rng = XorShiftRng::seed_from_u64(7);
+        let w = AttentionWeights::init(3, 2, &mut rng).unwrap();
+        let out = (0..3 * 16).map(|i| (i as f32 * 0.1234567).sin() / 3.0).collect();
+        FeatureAggregator::attention(AttentionWeights::new(3, 2, 8, w.qkv().to_vec(), out).unwrap())
+    }
+
+    /// Attention embeddings are as wide as the feature embeddings its weights were trained on.
     #[test]
     fn test_attention_node_dims() {
-        let agg = FeatureAggregator::attention(2, 3, None);
-        assert_eq!(agg.node_dims(2 * 2 * 3 + 2 * 5).unwrap(), 5);
-        assert!(agg.node_dims(12).is_err());
+        let agg = attention();
+        assert_eq!(agg.node_dims(3).unwrap(), 3);
         assert!(agg.node_dims(4).is_err());
+    }
+
+    /// Files from the earlier attention (num_heads, d_k and window on their own lines) are
+    /// rejected with a message saying why, as are truncated files.
+    #[test]
+    fn test_load_rejects_old_and_truncated_attention() {
+        let path = temp_path("old-att");
+        std::fs::write(&path, "Attention\n2\n3\n0\n").unwrap();
+        let res = FeatureAggregator::load(&path);
+        assert!(matches!(&res, Err(Error::Malformed { message, .. }) if message.contains("retrain")));
+        attention().save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let truncated: Vec<&str> = text.lines().take(10).collect();
+        std::fs::write(&path, truncated.join("\n")).unwrap();
+        assert!(FeatureAggregator::load(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The aggregator embeds with its weights: adhoc and per-node agree with `pool`.
+    #[test]
+    fn test_attention_embed_adhoc_uses_the_weights() {
+        let mut b = crate::embeddings::NodeEmbeddingsBuilder::new(Distance::Cosine);
+        b.add_embedding("f", "a", &[1., 0., 2.]).unwrap();
+        b.add_embedding("f", "b", &[0., 1., -1.]).unwrap();
+        let fe = b.build().unwrap();
+        let agg = attention();
+        let mut expected = vec![0f32; 3];
+        agg.attention_weights().unwrap().pool(&[&[1., 0., 2.], &[0., 1., -1.]], &[1., 1.], &mut expected);
+        let embedder = NodeEmbedder::new(agg);
+        assert_eq!(embedder.embed_adhoc(&[("f", "a"), ("f", "b")], &fe, true).unwrap(), expected);
+        assert_ne!(expected, vec![0.5, 0.5, 0.5]);   // not just the mean
     }
 
     /// Averaging two features gives their mean; unknown features are skipped unless strict.

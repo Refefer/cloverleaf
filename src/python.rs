@@ -10,6 +10,8 @@ use std::collections::HashSet;
 use rayon::prelude::*;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError,PyTypeError,PyRuntimeError};
+use pyo3::buffer::PyBuffer;
+use pyo3::types::PyBytes;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 
@@ -30,8 +32,8 @@ use crate::io::{read_node_values,EmbeddingLoadError,FeatureFileError,GraphLoadEr
 use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::ann::Ann;
 use crate::algos::connected::find_connected_components;
-use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
-use crate::algos::ep::{EmbeddingPropagation,EmbeddingInit,LearningRateSchedule,LossWeighting as EPLW};
+use crate::algos::ep::attention::AttentionWeights;
+use crate::algos::ep::{EmbeddingPropagation,EmbeddingInit,LearningRateSchedule,UpdateFrequency,LossWeighting as EPLW};
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
 use crate::algos::feat_propagation::propagate_features;
@@ -960,14 +962,17 @@ impl OptimizerSpec {
         OptimizerSpec { kind: OptimizerKind::Adam }
     }
 
-    ///    AdamW: Adam with decoupled weight decay.  Each update also shrinks the weights by
-    ///    learning_rate * weight_decay, independently of the gradient.  Weight decay only applies
-    ///    to features updated in a batch, so rare features are decayed less often.
+    ///    AdamW: Adam with decoupled weight decay.  At the end of every pass, every feature
+    ///    embedding is multiplied by exp(-m * weight_decay), independently of the gradient, where
+    ///    m is the learning rate schedule's current value relative to its peak (1 for a constant
+    ///    schedule).  The decay per pass is the same for every feature, for batch and epoch
+    ///    updates, and at any learning rate.
     ///    
     ///    Parameters
     ///    ----------
     ///    weight_decay : Float - Optional
-    ///        Decay rate; must be finite and non-negative.  Default is 0.01.
+    ///        Decay rate per pass; must be finite and non-negative.  Default is 0.001, which
+    ///        shrinks weights by about 0.1% a pass.
     ///    
     ///    Returns
     ///    -------
@@ -976,7 +981,7 @@ impl OptimizerSpec {
     #[staticmethod]
     #[pyo3(signature = (weight_decay=None))]
     pub fn adamw(weight_decay: Option<f32>) -> PyResult<Self> {
-        let rate = weight_decay.unwrap_or(0.01);
+        let rate = weight_decay.unwrap_or(0.001);
         let wd = WeightDecay::new(rate).ok_or_else(|| PyValueError::new_err(
             format!("weight_decay must be finite and non-negative, got {}", rate)))?;
         Ok(OptimizerSpec { kind: OptimizerKind::AdamW(wd) })
@@ -1194,7 +1199,7 @@ impl EmbeddingPropagator {
     ///
     ///    weighted_neighbor_averaging : Bool - Optional
     ///        Reconstructs the node from the edge-weighted mean of its neighbors rather than the
-    ///        plain mean.  Ignored by attention models.  Default is False.
+    ///        plain mean.  Default is False.
     ///
     ///    max_features : Int/Float - Optional
     ///        Maximum number of features to use to construct a node embedding.  These features
@@ -1212,26 +1217,23 @@ impl EmbeddingPropagator {
     ///    indicator : Bool - Optional
     ///        Shows a progress bar.  Default is True
     ///    
-    ///    attention : Int - Optional
-    ///        If provided, uses softmax attention to construct node embeddings.  If provided, this
-    ///        adds to the `dim` space into query, key, and value functions.  This specifies the
-    ///        size used for Query and Value, resulting in an embedding that is "2*`attention` +
-    ///        dim".
-    ///
-    ///        Note: while this functionality is here, it is _incredibly_ computationally expensive
-    ///        to do on CPU.  Useful only for small graphs or extreme patience.
-    ///
-    ///        Default is 0.
-    ///    
     ///    attention_heads : Int - Optional
-    ///        Number of heads to use.  This expands the model size even more.
+    ///        If provided, pools each node's features with multi-head self-attention instead of
+    ///        averaging them: query, key, value and output projections shared by every feature,
+    ///        learned alongside the feature embeddings (at `dense_alpha`), the node embedding
+    ///        being the features' mean plus the projected mean attention context.  The same
+    ///        model as the GPU trainer's attention pooling.  Reconstructions pool each sampled
+    ///        neighbor on its own, then average the neighbors.  Each head is dims / heads
+    ///        rounded up to a multiple of 8 wide.  After learning, `feature_aggregator()` gives
+    ///        the aggregator that embeds nodes the same way.
     ///
-    ///        Default is 1.
+    ///        Note: far more expensive than averaging on CPU.
+    ///
+    ///        Default is None (averaging).
     ///    
-    ///    context_window : Int - Optional
-    ///        If provided, uses sliding attention which can be helpful for NLP node features
-    ///
-    ///        Default is None
+    ///    dense_alpha : Float - Optional
+    ///        Learning rate of the attention projections, on the same schedule as alpha.
+    ///        Default is 1e-3.
     ///    
     ///    noise : Float - Optional
     ///        If added, injects gaussian noise into the gradients to help with generalization.  
@@ -1258,13 +1260,23 @@ impl EmbeddingPropagator {
     ///
     ///        Default is "unit".
     ///
+    ///    update_frequency : String - Optional
+    ///        "batch" updates the feature embeddings after every batch.  "epoch" still processes
+    ///        nodes in batches, but every batch computes its gradients against the same
+    ///        embeddings; the gradients are summed over the pass and applied in one update at its
+    ///        end.  That lowers the variance of each update but leaves only `passes` updates, so
+    ///        it usually wants a larger alpha or more passes.  It also keeps an extra gradient
+    ///        table as large as the feature embeddings.
+    ///
+    ///        Default is "batch".
+    ///
     ///    Returns
     ///    -------
     ///    Self
     ///        
     ///    
     #[new]
-    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention=None, attention_heads=None, context_window=None, noise=None, optimizer=None, lr_schedule=None, init=None))]
+    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention_heads=None, dense_alpha=None, noise=None, optimizer=None, lr_schedule=None, init=None, update_frequency=None))]
     pub fn new(
         // Learning rate
         alpha: Option<f32>, 
@@ -1309,14 +1321,11 @@ impl EmbeddingPropagator {
         // Whether to have a pretty indicator.
         indicator: Option<bool>,
 
-        // Number of dims to use for attention.  If missing, uses the Averaged model
-        attention: Option<usize>,
-
-        // Number of heads to use.  Defaults to one, but only used if attention dims are set
+        // Attention heads; None for the averaged model
         attention_heads: Option<usize>,
 
-        // Use sliding window context.
-        context_window: Option<usize>,
+        // Learning rate of attention's projections
+        dense_alpha: Option<f32>,
 
         // Use gradient noise where we sample from the normal distribution and blend with `noise`
         noise: Option<f32>,
@@ -1328,7 +1337,10 @@ impl EmbeddingPropagator {
         lr_schedule: Option<String>,
 
         // Feature embedding initialisation: "unit" or "glorot"
-        init: Option<String>
+        init: Option<String>,
+
+        // When to update the feature embeddings: "batch" or "epoch"
+        update_frequency: Option<String>
     ) -> PyResult<Self> {
         let lr_schedule = match lr_schedule.as_deref().unwrap_or("cosine") {
             "cosine" => LearningRateSchedule::CosineWarmup,
@@ -1341,6 +1353,12 @@ impl EmbeddingPropagator {
             "glorot" => EmbeddingInit::GlorotUniform,
             other => return Err(PyValueError::new_err(
                 format!("init must be \"unit\" or \"glorot\", got {:?}", other)))
+        };
+        let update_frequency = match update_frequency.as_deref().unwrap_or("batch") {
+            "batch" => UpdateFrequency::Batch,
+            "epoch" => UpdateFrequency::Epoch,
+            other => return Err(PyValueError::new_err(
+                format!("update_frequency must be \"batch\" or \"epoch\", got {:?}", other)))
         };
         let loss_weighting = loss_weighting.map(|lw| lw.loss).unwrap_or(EPLW::None);
         let d = EmbeddingPropagation::default();
@@ -1358,8 +1376,13 @@ impl EmbeddingPropagator {
             noise: noise.unwrap_or(d.noise),
             optimizer: optimizer.map(|o| o.kind).unwrap_or(d.optimizer),
             lr_schedule,
-            init
+            init,
+            update_frequency,
+            dense_alpha: dense_alpha.unwrap_or(d.dense_alpha)
         };
+        if !(ep.dense_alpha.is_finite() && ep.dense_alpha >= 0.) {
+            return Err(PyValueError::new_err("dense_alpha must be finite and >= 0"))
+        }
 
         let wns = weighted_neighbor_sampling.unwrap_or(false);
         let wna = weighted_neighbor_averaging.unwrap_or(false);
@@ -1373,18 +1396,9 @@ impl EmbeddingPropagator {
             .unwrap_or(Ok(Sample::All))
             .map_err(|_err| PyValueError::new_err("max_nodes must be either None, or (0, N)"))?;
 
-        let model = if let Some(d_k) = attention {
-            let num_heads = attention_heads.unwrap_or(1);
-            let at = if let Some(size) = context_window {
-                AttentionType::Sliding{window_size: size}
-            } else {
-                match max_features {
-                    Sample::All => AttentionType::Full,
-                    _ => AttentionType::Random { num_features: max_features }
-                }
-            };
-            let mha = MultiHeadedAttention::new(num_heads, d_k, at);
-            ModelType::Attention(AttentionFeatureModel::new(mha, Sample::All, max_nodes, wns))
+        let model = if let Some(heads) = attention_heads {
+            ModelType::Attention(AttentionFeatureModel::new(heads, max_features, max_nodes, wns, wna)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?)
         } else {
             ModelType::Averaged(AveragedFeatureModel::new(
                 max_features, max_nodes, wns, wna
@@ -1407,19 +1421,39 @@ impl EmbeddingPropagator {
     ///    feature_embeddings : mut NodeEmbeddings - Optional
     ///        If not provided, creates a new randomized feature_embedding set.
     ///    
+    ///    aggregator : FeatureAggregator - Optional
+    ///        Attention models only: continue from these attention weights (for example a GPU
+    ///        trained model's) rather than fresh ones, or the ones the last call learned.  Must
+    ///        have the model's heads and dims.
+    ///    
     ///    Returns
     ///    -------
     ///    NodeEmbeddings
-    ///        A mapping from features -> embedding
+    ///        A mapping from features -> embedding.  With attention, `feature_aggregator()`
+    ///        then gives the learned weights.
     ///    
-    #[pyo3(signature = (graph, features, feature_embeddings=None))]
+    #[pyo3(signature = (graph, features, feature_embeddings=None, aggregator=None))]
     pub fn learn_features(
         &mut self, 
         graph: &Graph, 
         features: &mut FeatureSet,
-        feature_embeddings: Option<&mut NodeEmbeddings>
+        feature_embeddings: Option<&mut NodeEmbeddings>,
+        aggregator: Option<&FeatureAggregator>
     ) -> PyResult<NodeEmbeddings> {
 
+        if let Some(agg) = aggregator {
+            let ModelType::Attention(model) = &self.model else {
+                return Err(PyValueError::new_err("aggregator warm-starts attention models only"))
+            };
+            let weights = agg.agg.attention_weights().ok_or_else(||
+                PyValueError::new_err("aggregator must be an attention aggregator"))?;
+            if weights.dims() != self.ep.d_model {
+                return Err(PyValueError::new_err(format!(
+                    "the aggregator is for {}-dimensional embeddings, the model trains {}",
+                    weights.dims(), self.ep.d_model)))
+            }
+            model.warm_start(weights.clone()).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
         let warm_start = take_warm_start(&graph.inner, &mut features.inner, feature_embeddings)?;
         let learned = match &self.model {
             ModelType::Averaged(model) =>
@@ -1429,6 +1463,18 @@ impl EmbeddingPropagator {
         }?;
         Ok(NodeEmbeddings::from(learned))
 
+    }
+
+    ///    The aggregator that embeds nodes as the model does: `Averaged` for the averaged model,
+    ///    and for attention its learned weights, which it has once learn_features has run (or
+    ///    been warm-started).  Save it to embed new nodes later with a NodeEmbedder.
+    pub fn feature_aggregator(&self) -> PyResult<FeatureAggregator> {
+        let agg = match &self.model {
+            ModelType::Averaged(_) => Some(CoreFeatureAggregator::averaged()),
+            ModelType::Attention(model) => model.aggregator()
+        };
+        agg.map(|agg| FeatureAggregator { agg })
+            .ok_or_else(|| PyValueError::new_err("the attention model has no weights until learn_features runs"))
     }
     
     /// Simple Python representation 
@@ -1781,18 +1827,30 @@ impl FeatureAggregator {
         format!("FeatureAggregator<{}>", self.agg)
     }
 
-    ///    Uses attention across features to construct the node embeddings.
+    ///    Attention pooling with trained weights: multi-head self-attention over a node's
+    ///    feature embeddings, with query/key/value and output projections shared by every
+    ///    feature.  A node's embedding is the mean of its feature embeddings plus the output
+    ///    projection of the mean attention context.  Usually loaded from a file written by EP's
+    ///    attention model or the GPU trainer (`FeatureAggregator.load`); this builds one from
+    ///    the raw weights.
     ///    
     ///    Parameters
     ///    ----------
-    ///    num_heads : Int
+    ///    dims : Int
+    ///        Width of the feature (and node) embeddings.
+    ///    
+    ///    heads : Int
     ///        Number of attention heads.
     ///    
-    ///    d_k : Int
-    ///        Dimension of the Query and Key fields.
+    ///    head_dims : Int
+    ///        Width of each head.
     ///    
-    ///    window : Int - Optional
-    ///        If provided, uses sliding window attention.
+    ///    qkv : List[Float]
+    ///        The query, key and value projections, (3 * heads * head_dims) x dims row-major:
+    ///        rows are the query heads, then the key heads, then the value heads.
+    ///    
+    ///    out : List[Float]
+    ///        The output projection, dims x (heads * head_dims) row-major.
     ///    
     ///    Returns
     ///    -------
@@ -1801,9 +1859,10 @@ impl FeatureAggregator {
     ///    
     #[allow(non_snake_case)]
     #[staticmethod]
-    #[pyo3(signature = (num_heads, d_k, window=None))]
-    pub fn Attention(num_heads: usize, d_k: usize, window: Option<usize>) -> Self {
-        FeatureAggregator { agg: CoreFeatureAggregator::attention(num_heads, d_k, window) }
+    pub fn Attention(dims: usize, heads: usize, head_dims: usize, qkv: Vec<f32>, out: Vec<f32>) -> PyResult<Self> {
+        let weights = AttentionWeights::new(dims, heads, head_dims, qkv, out)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(FeatureAggregator { agg: CoreFeatureAggregator::attention(weights) })
     }
 
     ///    Uses weights derived from feature frequency to bias node embeddings to rarer features.
@@ -2894,16 +2953,16 @@ impl EmbeddingAligner {
     ///    Parameters
     ///    ----------
     ///    orig_embeddings : NodeEmbeddings
-    ///        Original embeddings.
+    ///        Embeddings before alignment, in the query's space.  The anchors are searched for here.
     ///    
     ///    orig_ann : EmbAnn
-    ///        Approximate Nearest Neighbor instance to find nearest neighbors.
+    ///        Approximate Nearest Neighbor index over orig_embeddings.
     ///    
     ///    translated_embeddings : NodeEmbeddings
-    ///        Translated NodeEmbeddings.
+    ///        The same nodes' embeddings after alignment: the space to map into.
     ///    
     ///    emb : Query
-    ///        Embedding to use
+    ///        An embedding in orig_embeddings' space, or a node looked up in orig_embeddings.
     ///    
     ///    seed : Int - Optional
     ///        If provided, uses the random seed.  Default is global seed
@@ -2921,7 +2980,8 @@ impl EmbeddingAligner {
         emb: &Query,
         seed: Option<u64>
     ) -> PyResult<Vec<f32>> {
-        let query_embedding = lookup_embedding(emb, translated_embeddings)?;
+        // The query lives in the original space: that's where its anchors are searched for.
+        let query_embedding = lookup_embedding(emb, orig_embeddings)?;
         Ok(self.aligner.align(&orig_embeddings.inner, &orig_ann.ann, &translated_embeddings.inner,
                               query_embedding, seed.unwrap_or(SEED + 123123)))
     }
@@ -2931,16 +2991,16 @@ impl EmbeddingAligner {
     ///    Parameters
     ///    ----------
     ///    orig_embeddings : NodeEmbeddings
-    ///        Original embeddings.
+    ///        Embeddings before alignment, in the query's space.  The anchors are searched for here.
     ///    
     ///    orig_ann : EmbAnn
-    ///        Approximate Nearest Neighbor instance to find nearest neighbors.
+    ///        Approximate Nearest Neighbor index over orig_embeddings.
     ///    
     ///    translated_embeddings : NodeEmbeddings
-    ///        Translated NodeEmbeddings.
+    ///        The same nodes' embeddings after alignment: the space to map into.
     ///    
-    ///    emb : List[Query]
-    ///        Set of embeddings to use
+    ///    queries : List[Query]
+    ///        Embeddings in orig_embeddings' space, or nodes looked up in orig_embeddings.
     ///    
     ///    seed : Int - Optional
     ///        If provided, uses the random seed.  Default is global seed
@@ -4511,9 +4571,122 @@ fn convert_filter_type(
 
 // Training shares embedding stores across rayon threads without locks, so keep the GIL on
 // free-threaded interpreters rather than letting Python threads race on the same objects.
+///    Writes embeddings in the format NodeEmbeddings.load reads, quickly: rows are formatted in
+///    parallel with the GIL released.  For embeddings made outside cloverleaf, e.g. by numpy or
+///    PyTorch, without building a NodeEmbeddings first.
+///    
+///    Parameters
+///    ----------
+///    path : str
+///        Output path; a path ending in .gz is gzipped.
+///    
+///    keys : List[Tuple[str, str]]
+///        (node type, name) of each row.
+///    
+///    embeddings : 2-D float32 array
+///        One row per key, as any object supporting the buffer protocol: a numpy array, or a
+///        PyTorch tensor through tensor.cpu().numpy().
+///    
+///    comp_level : Int - Optional
+///        Gzip compression level, for .gz paths.
+///    
+///    Returns
+///    -------
+///    () - Can throw exception
+///    
+#[pyfunction]
+#[pyo3(signature = (path, keys, embeddings, comp_level=None))]
+fn write_embeddings(
+    py: Python<'_>,
+    path: String,
+    keys: Vec<(String, String)>,
+    embeddings: PyBuffer<f32>,
+    comp_level: Option<u32>
+) -> PyResult<()> {
+    if embeddings.dimensions() != 2 {
+        return Err(PyValueError::new_err(format!(
+            "embeddings must be 2-D, got {} dimensions", embeddings.dimensions())))
+    }
+    let (rows, dims) = (embeddings.shape()[0], embeddings.shape()[1]);
+    if rows != keys.len() {
+        return Err(PyValueError::new_err(format!(
+            "{} keys for {} rows of embeddings", keys.len(), rows)))
+    }
+    let values = embeddings.to_vec(py)?;
+    py.detach(move || Ok(crate::io::write_embedding_matrix(&path, &keys, &values, dims, comp_level)?))
+}
+
+///    Each node's top-k personalised PageRank list, as PprRankLearner builds them: random walks
+///    with restart from every node, following edges in proportion to their weight, score each
+///    node reached count / (walks * degree^beta); a node's list is its top k other nodes,
+///    weighted score^compression and normalised to sum to 1.
+///    
+///    Parameters
+///    ----------
+///    graph : Graph
+///    k : Int
+///        Length of each list.
+///    walks : Int
+///        Walks per node.
+///    steps : Float
+///        When steps ~ [0,1), the probability of stopping after each step.  When steps ~ [1,inf],
+///        a fixed walk length.
+///    beta : Float - Optional
+///        Popularity discount.  Default is 0.8, as PprRankLearner.
+///    compression : Float - Optional
+///        Default is 1.
+///    other_type_only : Bool - Optional
+///        Only list nodes whose type differs from the start node's.  Default is False.
+///    seed : Int - Optional
+///    indicator : Bool - Optional
+///        Whether to show a progress bar.  Default is True.
+///    
+///    Returns
+///    -------
+///    (Bytes, Bytes)
+///        Node ids as little-endian int64 and weights as little-endian float32, each
+///        graph.nodes() * k long: node v's list is entries v * k to (v + 1) * k, padded with
+///        node 0 at weight 0.  Node ids are the graph's, in the order of graph.vocab().
+///
+#[pyfunction]
+#[pyo3(signature = (graph, k, walks, steps, beta=None, compression=None, other_type_only=None, seed=None, indicator=None))]
+fn ppr_lists<'py>(
+    py: Python<'py>,
+    graph: &Graph,
+    k: usize,
+    walks: usize,
+    steps: f32,
+    beta: Option<f32>,
+    compression: Option<f32>,
+    other_type_only: Option<bool>,
+    seed: Option<u64>,
+    indicator: Option<bool>
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let steps = Sample::steps(steps)
+        .map_err(|_err| PyValueError::new_err("steps must be in (0, 1) or [1, inf)"))?;
+    if walks == 0 || k == 0 {
+        return Err(PyValueError::new_err("walks and k must be positive"))
+    }
+    let named = &graph.inner;
+    let (nodes, weights) = py.detach(|| {
+        let vocab = &named.vocab;
+        let other_type = other_type_only.unwrap_or(false);
+        let keep = |node: NodeID, other: NodeID| {
+            !other_type || vocab.get_node_type(node) != vocab.get_node_type(other)
+        };
+        crate::algos::pprrank::ppr_lists(named.graph(), steps, walks, beta.unwrap_or(0.8), k,
+            compression.unwrap_or(1f32), seed.unwrap_or(SEED), keep, indicator.unwrap_or(true))
+            .into_parts()
+    });
+    let node_bytes: Vec<u8> = nodes.iter().flat_map(|n| (*n as i64).to_le_bytes()).collect();
+    let weight_bytes: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
+    Ok((PyBytes::new(py, &node_bytes), PyBytes::new(py, &weight_bytes)))
+}
+
 #[pymodule(gil_used = true)]
 fn cloverleaf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Graph>()?;
+    m.add_function(wrap_pyfunction!(ppr_lists, m)?)?;
     m.add_class::<Distance>()?;
     m.add_class::<GraphBuilder>()?;
     m.add_class::<EdgeType>()?;
@@ -4555,6 +4728,7 @@ fn cloverleaf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NodeEmbeddingsBuilder>()?;
     m.add_class::<NodeEmbedder>()?;
     m.add_class::<PolicyEvaluation>()?;
+    m.add_function(wrap_pyfunction!(write_embeddings, m)?)?;
     Ok(())
 }
 

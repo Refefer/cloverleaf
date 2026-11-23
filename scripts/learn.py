@@ -118,23 +118,12 @@ def build_arg_parser():
         default=None,
         help="If provided, uses weighted embeddings.")
 
-    parser.add_argument("--attention",
-        dest="attention",
-        type=int,
-        default=None,
-        help="If provided, uses self attention with D dims.")
-
     parser.add_argument("--attention-heads",
         dest="attention_heads",
         type=int,
-        default=1,
-        help="If attention is used, number of heads.  Default is 1")
-
-    parser.add_argument("--context-window",
-        dest="context_window",
-        type=int,
         default=None,
-        help="If provided, uses self attention with local window size of CONTEXT_WINDOW * 2.")
+        help="If provided, pools each node's features with this many heads of self attention "
+             "instead of averaging them.")
 
     parser.add_argument("--neighborhood-alignment",
         dest="neighborhood_alignment",
@@ -270,8 +259,7 @@ def main(args):
         max_features=args.max_features, loss_weighting=loss_weight,
         weighted_neighbor_averaging=args.weighted_neighbor_averaging,
         weighted_neighbor_sampling=args.weighted_neighbor_sampling,
-        attention=args.attention, 
-        attention_heads=args.attention_heads, context_window=args.context_window, 
+        attention_heads=args.attention_heads,
         noise=args.gradient_noise, hard_negatives=args.hard_negatives, valid_pct=args.valid_pct)
 
     if args.warm_start is not None:
@@ -299,8 +287,9 @@ def main(args):
     feature_embeddings.save(args.output + feature_suffix)
 
     print("Constructing nodes...")
-    if args.attention is not None:
-        aggregator = cloverleaf.FeatureAggregator.Attention(args.attention_heads, args.attention, args.context_window)
+    if args.attention_heads is not None:
+        # The learned attention weights (saved with the embeddings below).
+        aggregator = ep.feature_aggregator()
     elif args.alpha is not None:
         aggregator = cloverleaf.FeatureAggregator.Weighted(args.alpha, features)
     else:

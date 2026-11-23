@@ -9,7 +9,7 @@ use crate::EmbeddingStore;
 use crate::FeatureStore;
 use crate::graph::{Graph as CGraph,NodeID};
 use super::model::*;
-use super::attention::softmax;
+use float_ord::FloatOrd;
 
 #[derive(Copy,Clone,Debug)]
 pub enum Loss {
@@ -159,6 +159,7 @@ impl Loss {
 
     pub fn construct_positive<G: CGraph, R: Rng, M: Model>(
         &self,
+        params: &M::Params,
         graph: &G,
         node: NodeID,
         feature_store: &FeatureStore,
@@ -177,12 +178,12 @@ impl Loss {
                 if nodes.len() == 0 {
                     nodes.push((node, 1f32));
                 }
-                model.construct_from_multiple_nodes(nodes.into_iter(),
+                model.construct_from_multiple_nodes(params, nodes.into_iter(),
                         feature_store, feature_embeddings, rng)
             },
             _ => {
                 model.reconstruct_node_embedding(
-                    graph, node, feature_store, feature_embeddings, rng)
+                    params, graph, node, feature_store, feature_embeddings, rng)
             }
         }
 
@@ -240,6 +241,23 @@ fn cosine(x1: ANode, x2: ANode) -> ANode {
 
 fn euclidean_distance(e1: &ANode, e2: &ANode) -> ANode {
     (e1 - e2).pow(2f32).sum().pow(0.5)
+}
+
+// Simple softmax.
+pub fn softmax(numers: ANode, exact: bool) -> ANode {
+    // Doesn't need to be part of the graph
+    let numer_values = numers.value();
+    let max_value = numer_values.iter()
+        .max_by_key(|v| FloatOrd(**v))
+        .expect("Shouldn't be non-zero!");
+
+    let mv = Constant::scalar(*max_value);
+    let n = if exact {
+        (numers - &mv).exp()
+    } else {
+        (numers - &mv).exp_approx()
+    };
+    &n / n.sum()
 }
 
 #[cfg(test)]

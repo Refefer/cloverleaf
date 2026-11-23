@@ -1,22 +1,39 @@
 //! The Embedding Propagation framework parameterizes over the feature aggregator - that is, given
 //! a node with a set of features, how do we combine them to product a node embedding?
 //! This module defines them
+use std::sync::{Arc, Mutex, RwLock};
+
 use crate::autograd::*;
 use hashbrown::HashMap;
 use rand::prelude::*;
 
 use crate::FeatureStore;
 use crate::EmbeddingStore;
+use crate::error::Error;
 use crate::graph::{Graph as CGraph,NodeID, CDFtoP};
+use crate::algos::aggregator::FeatureAggregator;
+use crate::algos::grad_utils::optimizer::DenseAdam;
 use crate::algos::utils::{Sample,weighted_reservoir_sample,reservoir_sample};
-use super::attention::{attention_mean,MultiHeadedAttention};
+use super::attention::{attention_pool,AttentionVars,AttentionWeights};
 
 /// Main interface for model.  Needs to be threadsafe
 pub trait Model: Send + Sync {
 
+    /// What a forward pass reads besides the feature embeddings: nothing for the averaged model,
+    /// the attention weights as autograd variables for attention.  Made once per forward pass
+    /// (`params`), so all of one node's embeddings use the same weights.
+    type Params;
+
+    /// Gets the model ready to train `dims`-wide feature embeddings: attention initialises its
+    /// weights, or checks the ones it was warm-started with fit.
+    fn prepare(&self, dims: usize, rng: &mut impl Rng) -> Result<(), Error>;
+
+    fn params(&self) -> Self::Params;
+
     /// Given a node, construct a node embedding from its features.
     fn construct_node_embedding<R: Rng>(
         &self,
+        params: &Self::Params,
         node: NodeID,
         weight: f32,
         feature_store: &FeatureStore,
@@ -27,6 +44,7 @@ pub trait Model: Send + Sync {
     /// Given a node, reconstruct a node from its neighborhood
     fn reconstruct_node_embedding<G: CGraph, R: Rng>(
         &self,
+        params: &Self::Params,
         graph: &G,
         node: NodeID,
         feature_store: &FeatureStore,
@@ -37,21 +55,20 @@ pub trait Model: Send + Sync {
     /// Construct multiple node embeddings - we use this for negatives, typically.
     fn construct_from_multiple_nodes<I: Iterator<Item=(NodeID, f32)>, R: Rng>(
         &self,
+        params: &Self::Params,
         nodes: I,
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
-    ) -> (NodeCounts, ANode); 
+    ) -> (NodeCounts, ANode);
 
-    /// Indicates whether it uses attention
-    fn uses_attention(&self) -> bool;
+    /// The gradients of the model's own weights after a backward pass through a forward pass
+    /// that used `params`, flattened; None for a model without weights or a loss that didn't
+    /// reach them.
+    fn dense_gradients(&self, params: &Self::Params, graph: &Graph) -> Option<Vec<f32>>;
 
-    /// Size of the node embedding.  
-    fn feature_dims(&self, d_model: usize) -> usize;
-
-    /// Currently unused and should be axed (YAGNI).  If models have parmeters they can learn, we
-    /// can expose them here.  Not wired up currently
-    fn parameters(&self) -> Vec<ANode>;
+    /// Applies summed `dense_gradients` with learning rate `alpha`.
+    fn update_dense(&self, gradients: &[f32], alpha: f32);
 }
 
 /// Creates node embeddings by averaging features together
@@ -87,8 +104,17 @@ impl AveragedFeatureModel {
 }
 
 impl Model for AveragedFeatureModel {
+    type Params = ();
+
+    fn prepare(&self, _dims: usize, _rng: &mut impl Rng) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn params(&self) {}
+
     fn construct_node_embedding<R: Rng>(
         &self,
+        _params: &(),
         node: NodeID,
         weight: f32,
         feature_store: &FeatureStore,
@@ -106,6 +132,7 @@ impl Model for AveragedFeatureModel {
 
     fn reconstruct_node_embedding<G: CGraph, R: Rng>(
         &self,
+        _params: &(),
         graph: &G,
         node: NodeID,
         feature_store: &FeatureStore,
@@ -127,6 +154,7 @@ impl Model for AveragedFeatureModel {
 
     fn construct_from_multiple_nodes<I: Iterator<Item=(NodeID, f32)>, R: Rng>(
         &self,
+        _params: &(),
         nodes: I,
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
@@ -139,68 +167,117 @@ impl Model for AveragedFeatureModel {
             None, rng)
     }
 
-    fn feature_dims(&self, d_model: usize) -> usize {
-        d_model
+    fn dense_gradients(&self, _params: &(), _graph: &Graph) -> Option<Vec<f32>> {
+        None
     }
 
-    fn uses_attention(&self) -> bool {
-        false
-    }
-
-    fn parameters(&self) -> Vec<ANode> {
-        Vec::with_capacity(0)
-    }
- 
+    fn update_dense(&self, _gradients: &[f32], _alpha: f32) {}
 }
 
-/// Attention model. Uses attention to combine features into node embeddings.  Slow, but pretty
-/// powerful when used on the right feature set. 
+/// Attention pooling (see [`AttentionWeights`]): each node's embedding is multi-head
+/// self-attention over its feature embeddings, with query, key, value and output projections
+/// shared by every feature and learned alongside them.  A reconstruction pools each sampled
+/// neighbour from its own features, then takes the neighbours' weighted mean, as the GPU
+/// trainer's nested reconstruction does.  Slower than averaging, but it learns which features
+/// matter together.
 pub struct AttentionFeatureModel {
-    /// Defines the attention type and number of heads
-    mha: MultiHeadedAttention,
+    heads: usize,
 
-    /// Max features to consider
+    /// Randomly sample max_features of each node's features if provided
     max_features: Sample,
-    
-    /// Max neighbors to consider for reconstruction
+
+    /// Neighbors to consider for a reconstruction
     max_neighbor_nodes: Sample,
-    
+
     /// If true, samples neighborhoods proportionally to their edge weights
-    weighted_neighbor_sampling: bool
-       
+    weighted_neighbor_sampling: bool,
+
+    /// If true, a reconstruction weights its neighbours by their edge weights
+    weighted_neighbor_averaging: bool,
+
+    /// The current weights: None until `prepare` initialises them, unless warm-started.
+    /// Readers clone the Arc; an update swaps in a new one.
+    weights: RwLock<Option<Arc<AttentionWeights>>>,
+
+    /// The weights' optimiser state, made by `prepare`.  Updates hold it while they run, so
+    /// they apply one at a time.
+    optimizer: Mutex<Option<DenseAdam>>
 }
 
 impl AttentionFeatureModel {
     pub fn new(
-        mha: MultiHeadedAttention,
+        heads: usize,
         max_features: Sample,
         max_neighbor_nodes: Sample,
-        weighted_neighbor_sampling: bool
-    ) -> Self {
-        AttentionFeatureModel { mha, max_features, max_neighbor_nodes, weighted_neighbor_sampling }
+        weighted_neighbor_sampling: bool,
+        weighted_neighbor_averaging: bool
+    ) -> Result<Self, Error> {
+        if heads == 0 {
+            return Err(Error::InvalidArgument("attention needs at least one head".into()))
+        }
+        Ok(AttentionFeatureModel {
+            heads, max_features, max_neighbor_nodes, weighted_neighbor_sampling,
+            weighted_neighbor_averaging, weights: RwLock::new(None), optimizer: Mutex::new(None)
+        })
+    }
+
+    /// Starts training from `weights` (e.g. a GPU-trained model's) rather than fresh ones.
+    pub fn warm_start(&self, weights: AttentionWeights) -> Result<(), Error> {
+        if weights.heads() != self.heads {
+            return Err(Error::InvalidArgument(format!(
+                "the weights have {} heads, the model {}", weights.heads(), self.heads)))
+        }
+        *self.weights.write().expect("attention weights lock") = Some(Arc::new(weights));
+        Ok(())
+    }
+
+    /// The current weights, once there are some.
+    pub fn weights(&self) -> Option<Arc<AttentionWeights>> {
+        self.weights.read().expect("attention weights lock").clone()
+    }
+
+    /// The aggregator that embeds nodes as this model does, once it has weights.
+    pub fn aggregator(&self) -> Option<FeatureAggregator> {
+        self.weights().map(|w| FeatureAggregator::attention((*w).clone()))
     }
 }
 
 impl Model for AttentionFeatureModel {
+    type Params = AttentionVars;
+
+    fn prepare(&self, dims: usize, rng: &mut impl Rng) -> Result<(), Error> {
+        let mut weights = self.weights.write().expect("attention weights lock");
+        match weights.as_ref() {
+            Some(w) if w.dims() != dims => return Err(Error::InvalidArgument(format!(
+                "the attention weights are for {}-dimensional embeddings, training {}", w.dims(), dims))),
+            Some(_) => {},
+            None => *weights = Some(Arc::new(AttentionWeights::init(dims, self.heads, rng)?))
+        }
+        let count = weights.as_ref().map(|w| w.parameters().len()).unwrap_or(0);
+        *self.optimizer.lock().expect("attention optimizer lock") = Some(DenseAdam::new(count));
+        Ok(())
+    }
+
+    fn params(&self) -> AttentionVars {
+        AttentionVars::new(&self.weights().expect("prepare runs before training"))
+    }
+
     fn construct_node_embedding<R: Rng>(
         &self,
+        params: &AttentionVars,
         node: NodeID,
-        _weight: f32,
+        weight: f32,
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
     ) -> (NodeCounts, ANode) {
-        attention_construct_node_embedding(
-            node,
-            feature_store,
-            feature_embeddings,
-            self.max_features,
-            self.mha.clone(),
-            rng)
+        construct_from_multiple_nodes(std::iter::once((node, weight)), feature_store,
+            feature_embeddings, self.max_features, Some(params), rng)
     }
 
     fn reconstruct_node_embedding<G: CGraph, R: Rng>(
         &self,
+        params: &AttentionVars,
         graph: &G,
         node: NodeID,
         feature_store: &FeatureStore,
@@ -214,38 +291,40 @@ impl Model for AttentionFeatureModel {
             feature_embeddings,
             self.max_neighbor_nodes,
             self.max_features,
-            Some(self.mha.clone()),
+            Some(params),
             self.weighted_neighbor_sampling,
-            false,
+            self.weighted_neighbor_averaging,
             rng)
     }
 
     fn construct_from_multiple_nodes<I: Iterator<Item=(NodeID, f32)>, R: Rng>(
         &self,
+        params: &AttentionVars,
         nodes: I,
         feature_store: &FeatureStore,
         feature_embeddings: &EmbeddingStore,
         rng: &mut R
     ) -> (NodeCounts, ANode) { 
-        construct_from_multiple_nodes(
-            nodes, feature_store, 
-            feature_embeddings, 
-            self.max_features,
-            Some(self.mha.clone()), rng)
+        construct_from_multiple_nodes(nodes, feature_store, feature_embeddings,
+            self.max_features, Some(params), rng)
     }
 
-    fn uses_attention(&self) -> bool {
-        true
+    fn dense_gradients(&self, params: &AttentionVars, graph: &Graph) -> Option<Vec<f32>> {
+        params.gradients(graph)
     }
 
-    fn feature_dims(&self, d_model: usize) -> usize {
-        self.mha.num_heads * (self.mha.d_k * 2 + d_model)
+    fn update_dense(&self, gradients: &[f32], alpha: f32) {
+        let mut optimizer = self.optimizer.lock().expect("attention optimizer lock");
+        let optimizer = optimizer.as_mut().expect("prepare runs before training");
+        let current = self.weights().expect("prepare runs before training");
+        let mut params = current.parameters();
+        optimizer.step(&mut params, gradients, alpha);
+        // A step that produced non-finite weights is dropped rather than poisoning every
+        // later embedding.
+        if let Ok(updated) = current.with_parameters(params) {
+            *self.weights.write().expect("attention weights lock") = Some(Arc::new(updated));
+        }
     }
-
-    fn parameters(&self) -> Vec<ANode> {
-        Vec::with_capacity(0)
-    }
- 
 }
 
 /// We track the number of times a features has been seen to help reduce the gradient graph we need
@@ -253,7 +332,8 @@ impl Model for AttentionFeatureModel {
 /// probably be abstracted better.
 pub type NodeCounts = HashMap<usize, (ANode, f32)>;
 
-/// Gets the feature embeddings for a node, adding or updating the counts
+/// Gets the feature embeddings for a node, adding or updating the counts, and returns the
+/// features it sampled.
 pub fn collect_embeddings_from_node<R: Rng>(
     node: NodeID,
     mut weight: f32,
@@ -262,12 +342,13 @@ pub fn collect_embeddings_from_node<R: Rng>(
     feat_map: &mut NodeCounts,
     max_features: Sample,
     rng: &mut R
-) {
+) -> Vec<usize> {
     let feats = feature_store.get_features(node);
     // Scale the node weight by the dropout correction so the feature sample stays unbiased.
     let (max_features, scalar) = max_features.sample(feats.len(), true, rng);
     weight *= scalar;
-    for feat in feats.choose_multiple(rng, max_features) {
+    let chosen: Vec<usize> = feats.choose_multiple(rng, max_features).cloned().collect();
+    for feat in chosen.iter() {
         if let Some((_emb, count)) = feat_map.get_mut(feat) {
             *count += weight;
         } else {
@@ -276,6 +357,7 @@ pub fn collect_embeddings_from_node<R: Rng>(
             feat_map.insert(*feat, (v, weight));
         }
     }
+    chosen
 }
 
 // H(n)
@@ -301,41 +383,6 @@ pub fn construct_node_embedding<R: Rng>(
     (feature_map, mean)
 }
 
-// Attention H(n)
-// Use scaled attention between features associated with a node
-// to create the node embedding
-pub fn attention_construct_node_embedding<R: Rng>(
-    node: NodeID,
-    feature_store: &FeatureStore,
-    feature_embeddings: &EmbeddingStore,
-    max_features: Sample,
-    mha: MultiHeadedAttention,
-    rng: &mut R
-) -> (NodeCounts, ANode) {
-    let mut feature_map = HashMap::new();
-    collect_embeddings_from_node(node, 1f32, 
-                                 feature_store, 
-                                 feature_embeddings, 
-                                 &mut feature_map,
-                                 max_features,
-                                 rng);
-
-    let mean = if mha.preserve_feature_order() {
-        // Need to preserve order of features for context windows
-        let feats = feature_store.get_features(node);
-        let it = feats.iter()
-            .filter(|f| feature_map.contains_key(*f))
-            .map(|f| {
-                feature_map.get(f).expect("Some type of error!")
-            });
-        attention_mean(it, &mha, rng)
-    } else {
-        attention_mean(feature_map.values(), &mha, rng)
-    };
-    (feature_map, mean)
-}
-
-
 // ~H(n)
 // The Expensive function.  We grab a node'ss neighbors
 // and use the average of their features to construct
@@ -347,7 +394,7 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
     feature_embeddings: &EmbeddingStore,
     max_nodes: Sample,
     max_features: Sample,
-    mha: Option<MultiHeadedAttention>,
+    attention: Option<&AttentionVars>,
     weighted_neighbor_sampling: bool,
     weighted_neighbor_averaging: bool,
     rng: &mut R
@@ -383,68 +430,45 @@ fn reconstruct_node_embedding<G: CGraph, R: Rng>(
         feature_store,
         feature_embeddings,
         max_features,
-        mha,
+        attention,
         rng)
 }
 
+/// Embeds weighted `nodes` together.  Averaging pools all their features as one set (each
+/// weighted by its nodes' weights); attention pools each node from its own features and takes
+/// the nodes' weighted mean.  Either way every feature is one autograd leaf, in the returned
+/// map, however many nodes share it.
 fn construct_from_multiple_nodes<I: Iterator<Item=(NodeID, f32)>, R: Rng>(
     nodes: I,
     feature_store: &FeatureStore,
     feature_embeddings: &EmbeddingStore,
     max_features: Sample,
-    mha: Option<MultiHeadedAttention>,
+    attention: Option<&AttentionVars>,
     rng: &mut R,
 ) -> (NodeCounts, ANode) {
     let mut feature_map = HashMap::new();
-    let mut new_nodes = Vec::with_capacity(0);
+    let mut pooled = Vec::new();
     for (node, weight) in nodes {
-        if mha.is_some() {
-            new_nodes.push(node.clone());
-        }
-
-        collect_embeddings_from_node(node, weight, feature_store, 
+        let chosen = collect_embeddings_from_node(node, weight, feature_store,
                                      feature_embeddings, 
                                      &mut feature_map,
                                      max_features,
                                      rng);
+        if let Some(vars) = attention {
+            // A node's own features all count equally; its weight applies to its embedding.
+            let tokens: Vec<(ANode, f32)> = chosen.iter()
+                .map(|f| (feature_map[f].0.clone(), 1f32))
+                .collect();
+            pooled.push((attention_pool(&tokens, vars), weight));
+        }
     }
 
-    let mean = if let Some(attention) = mha {
-        attention_multiple(new_nodes, feature_store, &feature_map, attention, rng)
+    let mean = if attention.is_some() {
+        mean_embeddings(pooled.iter())
     } else {
         mean_embeddings(feature_map.values())
     };
     (feature_map, mean)
-}
-
-
-fn attention_multiple(
-    new_nodes: Vec<NodeID>,
-    feature_store: &FeatureStore,
-    feature_map: &NodeCounts,
-    mha: MultiHeadedAttention,
-    rng: &mut impl Rng
-) -> ANode {
-    let mut feats_per_node = HashMap::new();
-    let mut output = Vec::new();
-    for node in new_nodes {
-        feats_per_node.clear();
-        let feats = feature_store.get_features(node);
-        for feat in feats.iter() {
-            if let Some((node, _)) = feature_map.get(feat) {
-                let e = feats_per_node.entry(feat).or_insert_with(|| (node.clone(), 0f32));
-                e.1 += 1f32;
-            }
-        }
-        let it = feats.iter()
-            .filter(|f| feats_per_node.contains_key(*f))
-            .map(|f| {
-                feats_per_node.get(f).expect("Some type of error!")
-            });
-
-        output.push((attention_mean(it, &mha, rng), 1f32))
-    }
-    mean_embeddings(output.iter())
 }
 
 pub fn mean_embeddings<'a>(
@@ -529,7 +553,7 @@ mod model_tests {
         let trials = 2000;
         let heavy_picks = (0..trials).filter(|seed| {
             let mut rng = XorShiftRng::seed_from_u64(*seed);
-            let (counts, _) = model.reconstruct_node_embedding(&graph, 0, &fs, &es, &mut rng);
+            let (counts, _) = model.reconstruct_node_embedding(&(), &graph, 0, &fs, &es, &mut rng);
             assert_eq!(counts.len(), 1);
             counts.contains_key(&heavy)
         }).count();
@@ -548,7 +572,7 @@ mod model_tests {
 
         for seed in 0..50 {
             let mut rng = XorShiftRng::seed_from_u64(seed);
-            let (counts, _) = model.reconstruct_node_embedding(&graph, 0, &fs, &es, &mut rng);
+            let (counts, _) = model.reconstruct_node_embedding(&(), &graph, 0, &fs, &es, &mut rng);
             let weights: Vec<f32> = counts.values().map(|(_, w)| *w).collect();
             assert_eq!(weights.len(), 2);
             assert!((weights[0] - weights[1]).abs() < 1e-6,
@@ -564,7 +588,7 @@ mod model_tests {
         for wns in [false, true] {
             let model = AveragedFeatureModel::new(Sample::All, Sample::All, wns, true);
             let mut rng = XorShiftRng::seed_from_u64(0);
-            let (counts, _) = model.reconstruct_node_embedding(&graph, 0, &fs, &es, &mut rng);
+            let (counts, _) = model.reconstruct_node_embedding(&(), &graph, 0, &fs, &es, &mut rng);
             let w = |node| counts[&feature_of(&fs, node)].1;
             assert!((w(1) / w(2) - 98.).abs() < 1e-3, "wns={}: {} vs {}", wns, w(1), w(2));
             assert!((w(2) - w(3)).abs() < 1e-6);

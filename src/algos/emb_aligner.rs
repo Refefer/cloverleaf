@@ -10,7 +10,11 @@ use crate::embeddings::NodeEmbeddings;
 
 /// Maps an embedding from one embedding space into another, using nodes embedded in both as
 /// anchors: the query's nearest neighbours in the original space, found with `Ann`, plus
-/// `random_nodes` random ones.
+/// `random_nodes` random ones.  The mapped embedding is placed in the translated space so its
+/// distances to the anchors there match the query's distances to them in the original space.
+///
+/// The typical use is neighbourhood alignment for a node that has no edges yet: embed it from its
+/// features in the original (pre-alignment) space, and map it into the aligned space.
 #[derive(Clone,Debug)]
 pub struct EmbeddingAligner {
     /// Nearest neighbours to anchor on.
@@ -31,7 +35,7 @@ impl EmbeddingAligner {
         EmbeddingAligner { num_nodes, random_nodes: 0, alpha: 1e-1, error: 1e-2, max_iters: 10 }
     }
 
-    /// Maps `query`, an embedding in `translated`'s space, into `orig`'s space.  `orig_ann` must
+    /// Maps `query`, an embedding in `orig`'s space, into `translated`'s space.  `orig_ann` must
     /// index `orig`.  Anchors missing from `translated` are skipped.
     pub fn align(
         &self,

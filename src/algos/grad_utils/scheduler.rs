@@ -42,6 +42,19 @@ impl LRScheduler {
         LRScheduler::Noop 
     }
 
+    /// The rate at `cur_step` as a fraction of the schedule's peak, in [0, 1].  Zero if the peak
+    /// is zero.  Scales things tied to the schedule but not to the rate itself, such as AdamW's
+    /// weight decay.
+    pub fn multiplier(&self, cur_step: usize) -> f32 {
+        let peak = match self {
+            LRScheduler::CosDecay { alpha, .. } => *alpha,
+            LRScheduler::ExpDecay { alpha, .. } => *alpha,
+            LRScheduler::Constant { alpha } => *alpha,
+            LRScheduler::Noop => 0.0
+        };
+        if peak > 0.0 { (self.compute(cur_step) / peak).clamp(0.0, 1.0) } else { 0.0 }
+    }
+
     pub fn compute(&self, cur_step: usize) -> f32 {
         match self {
             LRScheduler::CosDecay {min_alpha, alpha, warmup_steps, max_steps} => {
@@ -114,5 +127,18 @@ mod scheduler_tests {
         for step in [0usize, 1, 100, 1_000_000] {
             assert_eq!(s.compute(step), 0.001);
         }
+    }
+
+    /// The multiplier is the rate relative to the peak: 1 for a constant schedule, rising to 1
+    /// through warmup and falling to min/alpha by the end of a cosine.
+    #[test]
+    fn test_multiplier() {
+        assert_eq!(LRScheduler::constant(0.05).multiplier(7), 1.0);
+        let s = LRScheduler::cos_decay(0.01, 1.0, 10, 100);
+        assert!((s.multiplier(5) - 0.505).abs() < 1e-4, "{}", s.multiplier(5));
+        assert!((s.multiplier(10) - 1.0).abs() < 1e-6);
+        assert!((s.multiplier(100) - 0.01).abs() < 1e-6);
+        assert_eq!(LRScheduler::noop().multiplier(3), 0.0);
+        assert_eq!(LRScheduler::constant(0.0).multiplier(3), 0.0);
     }
 }

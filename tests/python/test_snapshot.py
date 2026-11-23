@@ -159,7 +159,9 @@ def collect(tmp):
     frnd = random.Random(2)
     fe = cl.NodeEmbeddings.new_from_list([(f, [frnd.uniform(-1, 1) for _ in range(6)]) for f in feat_names], cl.Distance.Cosine)
     for label, agg in [("avg", cl.FeatureAggregator.Averaged()), ("weighted", cl.FeatureAggregator.Weighted(0.1, fs_full)),
-                       ("attention", cl.FeatureAggregator.Attention(1, 2, None))]:
+                       ("attention", cl.FeatureAggregator.Attention(
+                           6, 2, 8, [math.sin(i * 0.37) / 4 for i in range(48 * 6)],
+                           [math.cos(i * 0.53) / 4 for i in range(6 * 16)]))]:
         agg.save(path(f"agg_{label}"))
         loaded = cl.FeatureAggregator.load(path(f"agg_{label}"))
         emit(f"agg {label}", (repr(agg), repr(loaded), open(path(f"agg_{label}")).read().splitlines()[:4]))

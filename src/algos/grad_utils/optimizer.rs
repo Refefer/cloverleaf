@@ -7,15 +7,36 @@ use std::collections::{HashMap as CHashMap};
 
 /// Optimizer trait.  We provide it the feature set, the gradient maps, and a few other details
 /// (such as alpha==learning rate), and it optimizes.
-pub trait Optimizer {
+pub trait Optimizer: Sync {
+    /// Applies one feature's gradient.  `step` is the 1-based count of updates applied so far,
+    /// including this one.
+    fn update_row(
+        &self,
+        feature_embeddings: &EmbeddingStore,
+        feat_id: usize,
+        grad: &[f32],
+        alpha: f32,
+        step: f32
+    );
+
+    /// Called once at the end of every pass, with the learning rate schedule's multiplier there
+    /// (see [`LRScheduler::multiplier`](super::scheduler::LRScheduler::multiplier)).  For
+    /// regularisation that should happen once per pass whatever the number of updates.  Does
+    /// nothing by default.
+    fn end_pass(&self, _feature_embeddings: &EmbeddingStore, _schedule_multiplier: f32) {}
+
+    /// Applies a batch of per-feature gradients in parallel.
     fn update(
         &self, 
         feature_embeddings: &EmbeddingStore,
         grads: CHashMap<usize, Vec<f32>>,
         alpha: f32,
-        // 1-based count of updates applied so far, including this one
         step: f32
-    );
+    ) {
+        grads.into_par_iter().for_each(|(feat_id, grad)| {
+            self.update_row(feature_embeddings, feat_id, &grad, alpha, step);
+        });
+    }
 
 }
 
@@ -41,7 +62,8 @@ pub enum OptimizerKind {
 
     /// AdamW (Loshchilov & Hutter, 2019): Adam plus weight decay applied directly to the weights
     /// rather than folded into the gradient, so the decay isn't rescaled by Adam's per-parameter
-    /// step sizes.
+    /// step sizes.  The rate is per pass: at the end of each pass every feature embedding is
+    /// multiplied by `exp(-m * rate)`, where `m` is the learning rate schedule's multiplier.
     AdamW(WeightDecay)
 }
 
@@ -50,8 +72,12 @@ pub enum OptimizerKind {
 /// learnable parameters (aka all the feature embeddings): the weights plus the first and second
 /// moments.  Weight decay adds no memory.
 ///
-/// Updates are sparse: only features with a gradient in a batch are touched, so weight decay is
-/// also only applied to those features.  Rare features are decayed less often than common ones.
+/// Gradient updates are sparse: only features with a gradient in a batch are touched.  Weight
+/// decay is not: it is applied to every feature once per pass (see [`Optimizer::end_pass`]), so
+/// how much a feature decays doesn't depend on how often it gets a gradient, on whether updates
+/// are per batch or per pass, or on the base learning rate.  Decaying a feature only when it was
+/// updated would tie its decay to its frequency, and decaying it lazily for the updates it missed
+/// would need a step counter per feature.
 pub struct AdamOptimizer {
     beta_1: f32,
     beta_2: f32,
@@ -75,20 +101,20 @@ impl AdamOptimizer {
 
 impl Optimizer for AdamOptimizer {
 
-    fn update(
-        &self, 
+    fn update_row(
+        &self,
         feature_embeddings: &EmbeddingStore,
-        grads: CHashMap<usize, Vec<f32>>,
+        feat_id: usize,
+        grad: &[f32],
         alpha: f32,
         step: f32
     ) {
         let t = step;
-        grads.into_par_iter().for_each(|(feat_id, grad)| {
-
+        {
             // Can get some nans in weird cases, such as the distance between
             // a node and it's reconstruction when it shares all features.
             // We just skip over those weird ones.
-            if grad.par_iter().all(|gi| !gi.is_nan()) {
+            if grad.iter().all(|gi| !gi.is_nan()) {
 
                 // Update first order mean
                 let mom = self.mom.get_embedding_mut_hogwild(feat_id);
@@ -104,16 +130,58 @@ impl Optimizer for AdamOptimizer {
 
                 // Create the new grad and update
                 let emb = feature_embeddings.get_embedding_mut_hogwild(feat_id);
-                let decay = 1. - alpha * self.weight_decay;
+                let bias_1 = 1. - self.beta_1.powf(t);
+                let bias_2 = 1. - self.beta_2.powf(t);
                 emb.iter_mut().zip(mom.iter().zip(var.iter())).for_each(|(e_i, (m_i, v_i))| {
-                    let m_i = m_i / (1. - self.beta_1.powf(t));
-                    let v_i = v_i / (1. - self.beta_2.powf(t));
+                    let m_i = m_i / bias_1;
+                    let v_i = v_i / bias_2;
                     let g_i = m_i / (v_i.sqrt() + self.eps);
-                    *e_i = *e_i * decay - alpha * g_i;
+                    *e_i -= alpha * g_i;
                 });
 
             }
-        });
+        }
+    }
+
+    /// Weight decay: `exp` keeps the factor in (0, 1], so a large rate can't flip signs.
+    fn end_pass(&self, feature_embeddings: &EmbeddingStore, schedule_multiplier: f32) {
+        if self.weight_decay > 0. && schedule_multiplier > 0. {
+            let factor = (-schedule_multiplier * self.weight_decay).exp();
+            (0..feature_embeddings.len()).into_par_iter().for_each(|feat_id| {
+                feature_embeddings.get_embedding_mut_hogwild(feat_id).iter_mut()
+                    .for_each(|e_i| *e_i *= factor);
+            });
+        }
+    }
+}
+
+/// Adam over a dense parameter vector, such as attention's projection weights, which every
+/// update touches in full.  Counts its own steps for the bias correction.
+pub struct DenseAdam {
+    beta_1: f32,
+    beta_2: f32,
+    eps: f32,
+    steps: i32,
+    mom: Vec<f32>,
+    var: Vec<f32>
+}
+
+impl DenseAdam {
+    pub fn new(len: usize) -> Self {
+        DenseAdam { beta_1: 0.9, beta_2: 0.999, eps: 1e-8, steps: 0, mom: vec![0.; len], var: vec![0.; len] }
+    }
+
+    /// One step on `params` with gradient `grad` and learning rate `alpha`.
+    pub fn step(&mut self, params: &mut [f32], grad: &[f32], alpha: f32) {
+        assert!(params.len() == self.mom.len() && grad.len() == self.mom.len(), "parameter count");
+        self.steps += 1;
+        let bias_1 = 1. - self.beta_1.powi(self.steps);
+        let bias_2 = 1. - self.beta_2.powi(self.steps);
+        for (((p, g), m), v) in params.iter_mut().zip(grad).zip(self.mom.iter_mut()).zip(self.var.iter_mut()) {
+            *m = self.beta_1 * *m + (1. - self.beta_1) * g;
+            *v = self.beta_2 * *v + (1. - self.beta_2) * g * g;
+            *p -= alpha * (*m / bias_1) / ((*v / bias_2).sqrt() + self.eps);
+        }
     }
 }
 
@@ -121,6 +189,19 @@ impl Optimizer for AdamOptimizer {
 #[cfg(test)]
 mod optimizer_tests {
     use super::*;
+
+    /// A constant gradient moves every parameter by alpha per step, in the gradient's
+    /// opposite direction, as sparse Adam does.
+    #[test]
+    fn test_dense_adam_steps_are_alpha_sized() {
+        let mut adam = DenseAdam::new(2);
+        let mut params = vec![0f32, 0f32];
+        for step in 1..4 {
+            adam.step(&mut params, &[2., -3.], 0.1);
+            assert!((params[0] + 0.1 * step as f32).abs() < 1e-4, "{:?}", params);
+            assert!((params[1] - 0.1 * step as f32).abs() < 1e-4, "{:?}", params);
+        }
+    }
 
     /// With bias correction at step t, a constant gradient gives m_hat = g and v_hat = g^2, so
     /// every Adam step moves the weight by exactly alpha (minus eps).
@@ -147,22 +228,9 @@ mod optimizer_tests {
         fe
     }
 
-    /// AdamW decays the weight by alpha * weight_decay * w on top of the Adam step.  A zero
-    /// gradient makes the Adam step zero, isolating the decay.
+    /// Updates don't decay: AdamW's gradient step is exactly Adam's.
     #[test]
-    fn test_adamw_decays_weights_decoupled_from_gradient() {
-        let fe = store_with(&[1.0]);
-        let wd = WeightDecay::new(0.5).unwrap();
-        let adamw = AdamOptimizer::new(OptimizerKind::AdamW(wd), 1, 1);
-        let mut grads = CHashMap::new();
-        grads.insert(0usize, vec![0f32]);
-        adamw.update(&fe, grads, 0.1, 1.0);
-        assert!((fe.get_embedding(0)[0] - 0.95).abs() < 1e-6, "{}", fe.get_embedding(0)[0]);
-    }
-
-    /// Decay is decoupled: the step size from the gradient is the same as Adam's.
-    #[test]
-    fn test_adamw_gradient_step_matches_adam() {
+    fn test_adamw_update_matches_adam() {
         let adam_fe = store_with(&[1.0]);
         let adamw_fe = store_with(&[1.0]);
         let adam = AdamOptimizer::new(OptimizerKind::Adam, 1, 1);
@@ -172,20 +240,39 @@ mod optimizer_tests {
             grads.insert(0usize, vec![2f32]);
             opt.update(fe, grads, 0.1, 1.0);
         }
-        // Adam: 1 - 0.1.  AdamW: 1 - 0.1 * 0.5 * 1 - 0.1.
         assert!((adam_fe.get_embedding(0)[0] - 0.9).abs() < 1e-4);
-        assert!((adamw_fe.get_embedding(0)[0] - 0.85).abs() < 1e-4);
+        assert_eq!(adam_fe.get_embedding(0)[0], adamw_fe.get_embedding(0)[0]);
     }
 
-    /// Only features with a gradient this step are decayed; the rest are left untouched.
+    /// The end of a pass multiplies every feature by exp(-multiplier * rate), whether or not it
+    /// had a gradient.
     #[test]
-    fn test_adamw_only_decays_updated_features() {
-        let fe = store_with(&[1.0, 1.0]);
+    fn test_adamw_end_pass_decays_every_feature() {
+        let fe = store_with(&[1.0, -2.0]);
         let adamw = AdamOptimizer::new(OptimizerKind::AdamW(WeightDecay::new(0.5).unwrap()), 1, 2);
-        let mut grads = CHashMap::new();
-        grads.insert(0usize, vec![0f32]);
-        adamw.update(&fe, grads, 0.1, 1.0);
-        assert_eq!(fe.get_embedding(1)[0], 1.0);
+        adamw.end_pass(&fe, 0.4);
+        let factor = (-0.2f32).exp();
+        assert!((fe.get_embedding(0)[0] - factor).abs() < 1e-6, "{}", fe.get_embedding(0)[0]);
+        assert!((fe.get_embedding(1)[0] + 2. * factor).abs() < 1e-6, "{}", fe.get_embedding(1)[0]);
+    }
+
+    /// A huge rate shrinks weights toward zero but never flips their sign.
+    #[test]
+    fn test_adamw_end_pass_never_flips_sign() {
+        let fe = store_with(&[1.0]);
+        let adamw = AdamOptimizer::new(OptimizerKind::AdamW(WeightDecay::new(50.).unwrap()), 1, 1);
+        adamw.end_pass(&fe, 1.0);
+        let w = fe.get_embedding(0)[0];
+        assert!(w >= 0. && w < 1e-6, "{}", w);
+    }
+
+    /// Adam has no decay, and a zero schedule multiplier means no decay for AdamW.
+    #[test]
+    fn test_end_pass_without_decay_is_a_no_op() {
+        let fe = store_with(&[1.0]);
+        AdamOptimizer::new(OptimizerKind::Adam, 1, 1).end_pass(&fe, 1.0);
+        AdamOptimizer::new(OptimizerKind::AdamW(WeightDecay::new(0.5).unwrap()), 1, 1).end_pass(&fe, 0.0);
+        assert_eq!(fe.get_embedding(0)[0], 1.0);
     }
 
     #[test]
