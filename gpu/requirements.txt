@@ -1,3 +1,4 @@
+# and cloverleaf itself: `make gpu` at the repository root builds it and installs these
 torch>=2.2
 numpy
 pytest

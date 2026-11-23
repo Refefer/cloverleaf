@@ -1,10 +1,11 @@
 """Checks against cloverleaf itself: the same nodes in the same order, the same features, and, with
 mean pooling, node embeddings that cloverleaf's averaged embedder rebuilds from the exported
-feature table.  Skipped when cloverleaf isn't installed."""
+feature table.  ep_gpu loads through cloverleaf, so these check the pieces around loading:
+export, the aggregator, and pruning against cloverleaf's own."""
 import numpy as np
 import pytest
 
-cl = pytest.importorskip("cloverleaf")
+import cloverleaf as cl
 
 from ep_gpu import data
 from ep_gpu.train import Config, export, train
@@ -27,13 +28,12 @@ def files(tmp_path):
 
 
 def cloverleaf_features(edges, feats):
-    """Loaded as cloverleaf's EP pipeline loads them.  Cloverleaf gives featureless nodes their
-    own ("node", id) feature when training starts, so a 1-pass training run fills them in, as
-    in a real pipeline, which embeds after learn_features."""
+    """Loaded as cloverleaf's EP pipeline loads them, featureless nodes filled in as learning
+    does."""
     graph = cl.Graph.load(edges, cl.EdgeType.Undirected)
     features = cl.FeatureSet.new_from_graph(graph)
     features.load_into(feats, cl.FeatureNamespace.node_type())
-    cl.EmbeddingPropagator(dims=4, passes=1, indicator=False).learn_features(graph, features)
+    features.fill_missing_nodes()
     return graph, features
 
 
@@ -65,7 +65,7 @@ def test_pruning_matches_cloverleafs_prune_min_count(files, min_count):
     features = cl.FeatureSet.new_from_graph(graph)
     features.load_into(files[1], cl.FeatureNamespace.node_type())
     pruned = features.prune_min_count(min_count)
-    cl.EmbeddingPropagator(dims=4, passes=1, indicator=False).learn_features(graph, pruned)
+    pruned.fill_missing_nodes()
     for v, node in enumerate(graph.vocab()):
         start, end = int(ours.feat_ptr[v]), int(ours.feat_ptr[v + 1])
         mine = {ours.feature_keys[f] for f in ours.feat_idx[start:end].tolist()}

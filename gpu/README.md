@@ -64,11 +64,15 @@ a node in the aligned space by how its nearest nodes moved.
 
 ## What matches cloverleaf
 
-* Files: nodes numbered in order of first appearance, features namespaced by node type (or one
-  shared namespace), and a node without features gets its own `("node", id)` feature.
-  `--shared-namespace NAME` (GPU only) gives each token a feature in NAME as well as its node
-  type's, and starts the node-type features at zero: each is an offset from the shared one, so
-  the same word on two node types starts out identical and diverges only as training needs.
+* Files are read by cloverleaf itself (`Graph.load`, `FeatureSet.load_into`), so nodes, features
+  and their ids are exactly cloverleaf's: nodes numbered in order of first appearance, features
+  namespaced by node type (or one shared namespace), and a node without features gets its own
+  `("node", id)` feature.  A token repeated on a line counts once (`dedup=True`), and edge
+  weights are each node's transition probabilities.  `--shared-namespace NAME` loads with
+  `FeatureNamespace.node_type_and_shared(NAME)`, each token getting a feature in NAME as well as
+  its node type's, and starts the node-type features at zero: each is an offset from the shared
+  one, so the same word on two node types starts out identical and diverges only as training
+  needs.  `--prune-min-count` is cloverleaf's `prune_min_count`.
 * h(v) pools a node's own features; h~(v) pools all its sampled neighbours' features together,
   so a feature shared by several neighbours counts once per neighbour.
 * Negatives are uniform random nodes other than the anchor, embedded from their own features.
@@ -106,8 +110,7 @@ GPU model.
   rather than their weighted mean) and flat attention reconstructions are GPU only.
 * GPU only: the "sawtooth" learning rate (`lr_cycles` equal cycles, each a linear decay from `lr`
   to `lr`/100, the first after the warmup), row-wise optimisers and a bfloat16 table, InfoNCE and
-  the listwise losses, feature pruning on load (`--prune-min-count`), shared feature namespaces
-  (`--shared-namespace`) and `epoch_after`.
+  the listwise losses, zero-initialised offsets with `--shared-namespace`, and `epoch_after`.
 
 ## Speed and precision
 
@@ -168,11 +171,9 @@ size.
 
 ## Export
 
-Embeddings are written with `cloverleaf.write_embeddings` when the installed cloverleaf has it:
-rows are formatted in parallel with the GIL released, tens of times faster than the pure-Python
-fallback.
+Embeddings are written with `cloverleaf.write_embeddings` (rows formatted in parallel with the
+GIL released), and the aggregator with `cloverleaf.FeatureAggregator.save`.
 
 ## Tests
 
-`pytest tests` (CPU, a few seconds).  `tests/test_cloverleaf_parity.py` runs when cloverleaf is
-installed.
+`pytest tests` (CPU, a few seconds; needs cloverleaf).

@@ -25,11 +25,13 @@ def ppr_lists(edges_path, graph, k, walks, steps, beta=0.8, compression=1.0,
               other_type_only=False, directed=False, seed=2017):
     """The top-k PPR list of every node of `graph`, which was loaded from edges_path.
     other_type_only keeps only nodes of a different type from the start node, e.g. a query's
-    products."""
+    products.  Uses the cloverleaf graph `graph` was loaded from, or reloads it (a cached graph)."""
     import cloverleaf
 
-    edge_type = cloverleaf.EdgeType.Directed if directed else cloverleaf.EdgeType.Undirected
-    cl_graph = cloverleaf.Graph.load(edges_path, edge_type)
+    cl_graph = graph.cloverleaf
+    if cl_graph is None:
+        edge_type = cloverleaf.EdgeType.Directed if directed else cloverleaf.EdgeType.Undirected
+        cl_graph = cloverleaf.Graph.load(edges_path, edge_type, chunk_size=100_000)
     if cl_graph.nodes() != graph.num_nodes:
         raise ValueError(f"cloverleaf loaded {cl_graph.nodes()} nodes, but the graph has {graph.num_nodes}")
     nodes, weights = cloverleaf.ppr_lists(cl_graph, k, walks, float(steps), beta=beta,
