@@ -32,7 +32,7 @@ use crate::io::{read_node_values,EmbeddingLoadError,FeatureFileError,GraphLoadEr
 use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::ann::Ann;
 use crate::algos::connected::find_connected_components;
-use crate::algos::ep::attention::{AttentionType,MultiHeadedAttention};
+use crate::algos::ep::attention::{AttentionType,AttentionWeights,MultiHeadedAttention};
 use crate::algos::ep::{EmbeddingPropagation,EmbeddingInit,LearningRateSchedule,UpdateFrequency,LossWeighting as EPLW};
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
@@ -1806,18 +1806,30 @@ impl FeatureAggregator {
         format!("FeatureAggregator<{}>", self.agg)
     }
 
-    ///    Uses attention across features to construct the node embeddings.
+    ///    Attention pooling with trained weights: multi-head self-attention over a node's
+    ///    feature embeddings, with query/key/value and output projections shared by every
+    ///    feature.  A node's embedding is the mean of its feature embeddings plus the output
+    ///    projection of the mean attention context.  Usually loaded from a file written by EP's
+    ///    attention model or the GPU trainer (`FeatureAggregator.load`); this builds one from
+    ///    the raw weights.
     ///    
     ///    Parameters
     ///    ----------
-    ///    num_heads : Int
+    ///    dims : Int
+    ///        Width of the feature (and node) embeddings.
+    ///    
+    ///    heads : Int
     ///        Number of attention heads.
     ///    
-    ///    d_k : Int
-    ///        Dimension of the Query and Key fields.
+    ///    head_dims : Int
+    ///        Width of each head.
     ///    
-    ///    window : Int - Optional
-    ///        If provided, uses sliding window attention.
+    ///    qkv : List[Float]
+    ///        The query, key and value projections, (3 * heads * head_dims) x dims row-major:
+    ///        rows are the query heads, then the key heads, then the value heads.
+    ///    
+    ///    out : List[Float]
+    ///        The output projection, dims x (heads * head_dims) row-major.
     ///    
     ///    Returns
     ///    -------
@@ -1826,9 +1838,10 @@ impl FeatureAggregator {
     ///    
     #[allow(non_snake_case)]
     #[staticmethod]
-    #[pyo3(signature = (num_heads, d_k, window=None))]
-    pub fn Attention(num_heads: usize, d_k: usize, window: Option<usize>) -> Self {
-        FeatureAggregator { agg: CoreFeatureAggregator::attention(num_heads, d_k, window) }
+    pub fn Attention(dims: usize, heads: usize, head_dims: usize, qkv: Vec<f32>, out: Vec<f32>) -> PyResult<Self> {
+        let weights = AttentionWeights::new(dims, heads, head_dims, qkv, out)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(FeatureAggregator { agg: CoreFeatureAggregator::attention(weights) })
     }
 
     ///    Uses weights derived from feature frequency to bias node embeddings to rarer features.

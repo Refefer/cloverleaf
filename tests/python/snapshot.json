@@ -805,47 +805,71 @@
   ]
  ],
  "agg attention": [
-  "FeatureAggregator<Attention<num_heads=1,d_k=2,window=None>>",
-  "FeatureAggregator<Attention<num_heads=1,d_k=2,window=None>>",
+  "FeatureAggregator<Attention<dims=6,heads=2,head_dims=8>>",
+  "FeatureAggregator<Attention<dims=6,heads=2,head_dims=8>>",
   [
    "Attention",
-   "1",
-   "2",
-   "0"
+   "6\t2\t8",
+   "0.0 0.090403855 0.16857198 0.22392467 0.24897021 0.2403188",
+   "0.19914137 0.13101108 0.045149066 -0.046823665 -0.13245903 -0.2001667"
   ]
  ],
- "embedder attention repr": "NodeEmbedder<aggregator=FeatureAggregator<Attention<num_heads=1,d_k=2,window=None>>>",
+ "embedder attention repr": "NodeEmbedder<aggregator=FeatureAggregator<Attention<dims=6,heads=2,head_dims=8>>>",
  "embed set attention": [
-  "NodeEmbeddings<Nodes=62, Dims=2, Distance=Cosine>",
+  "NodeEmbeddings<Nodes=62, Dims=6, Distance=Cosine>",
   [
-   0.303604,
-   -0.66439
+   0.151571,
+   -0.388791,
+   -0.102392,
+   0.289933,
+   0.294173,
+   -0.6547
   ],
   [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
    0.0,
    0.0
   ]
  ],
  "embed adhoc attention": [
-  0.149105,
-  0.0676298
+  0.0316876,
+  0.211058,
+  0.474093,
+  0.084718,
+  0.160652,
+  0.048048
  ],
  "embed adhoc strict attention": [
   "raised",
   "KeyError"
  ],
  "embed adhoc lax attention": [
-  0.162408,
-  -0.683234
+  0.35731,
+  -0.39609,
+  0.208527,
+  0.229906,
+  0.146666,
+  -0.681089
  ],
  "bulk attention": [
   [
-   0.162408,
-   -0.683234
+   0.35731,
+   -0.39609,
+   0.208527,
+   0.229906,
+   0.146666,
+   -0.681089
   ],
   [
-   0.399143,
-   -0.667861
+   0.464001,
+   -0.0586669,
+   -0.53547,
+   -0.343283,
+   0.369584,
+   -0.640604
   ]
  ],
  "agg bad": [

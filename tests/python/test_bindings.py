@@ -299,3 +299,28 @@ def test_write_embeddings_rejects_bad_shapes(tmp_path):
         cl.write_embeddings(path, [("q", "a")], np.zeros(3, dtype=np.float32))
     with pytest.raises(ValueError):
         cl.write_embeddings(path, [("q", "a")], np.zeros((2, 3), dtype=np.float32))
+
+
+def test_attention_aggregator_from_weights(tmp_path):
+    # dims 2, 2 heads of width 1; with a zero output projection it pools to the mean.
+    agg = cl.FeatureAggregator.Attention(2, 2, 1, [0.5] * 12, [0.0] * 4)
+    assert repr(agg) == "FeatureAggregator<Attention<dims=2,heads=2,head_dims=1>>"
+    fe = cl.NodeEmbeddings.new_from_list([(("f", "a"), [1.0, 0.0]), (("f", "b"), [0.0, 3.0])], cl.Distance.Cosine)
+    assert cl.NodeEmbedder(agg).embed_adhoc([("f", "a"), ("f", "b")], fe) == [0.5, 1.5]
+    path = str(tmp_path / "agg")
+    agg.save(path)
+    assert repr(cl.FeatureAggregator.load(path)) == repr(agg)
+
+
+@pytest.mark.parametrize("args", [(2, 2, 1, [0.0] * 11, [0.0] * 4), (2, 2, 1, [0.0] * 12, [0.0] * 3),
+                                  (2, 0, 1, [], []), (2, 2, 1, [float("nan")] * 12, [0.0] * 4)])
+def test_attention_aggregator_rejects_bad_weights(args):
+    with pytest.raises(ValueError):
+        cl.FeatureAggregator.Attention(*args)
+
+
+def test_attention_aggregator_needs_matching_feature_width():
+    agg = cl.FeatureAggregator.Attention(2, 2, 1, [0.5] * 12, [0.0] * 4)
+    fe = cl.NodeEmbeddings.new_from_list([(("f", "a"), [1.0, 0.0, 0.0])], cl.Distance.Cosine)
+    with pytest.raises(ValueError):
+        cl.NodeEmbedder(agg).embed_adhoc([("f", "a")], fe)

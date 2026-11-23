@@ -488,7 +488,7 @@ The order among the negatives isn't scored.  `ppr_lists` (below) returns the lis
 | `FeatureSet` | • `FeatureSet.new_from_graph(graph: Graph)`<br>• `FeatureSet.new_from_file(path: str, namespace: FeatureNamespace \| None = None)` | `set_features(node: tuple[str,str], features: list[tuple[str,str]])`<br>`get_features(node: tuple[str,str]) -> list[tuple[str,str]]`<br>`load_into(path: str, f_ns: FeatureNamespace \| None = None)`<br>`nodes() -> int`<br>`num_features() -> int` |
 | `FeaturePropagator` | `FeaturePropagator(k: int, threshold: float = 0.0, max_iters: int = 20)` | `propagate(graph: Graph, features: FeatureSet) -> None` |
 | `FeatureWeight` | enum values `FeatureWeight.Uniform`, `FeatureWeight.IDF` | *(used in VPCG)* |
-| `FeatureAggregator` | • `FeatureAggregator.Averaged()`<br>• `FeatureAggregator.Attention(num_heads: int, d_k: int, window: int \| None = None)`<br>• `FeatureAggregator.Weighted(alpha: float, fs: FeatureSet)` | `save(path: str) -> None`<br>`load(path: str) -> FeatureAggregator` |
+| `FeatureAggregator` | • `FeatureAggregator.Averaged()`<br>• `FeatureAggregator.Attention(dims: int, heads: int, head_dims: int, qkv: list[float], out: list[float])` (trained attention weights; usually loaded from a file written by EP or the GPU trainer)<br>• `FeatureAggregator.Weighted(alpha: float, fs: FeatureSet)` | `save(path: str) -> None`<br>`load(path: str) -> FeatureAggregator` |
 
 ### Embedding Core
 | Class | Constructor (Python) | Key Methods |

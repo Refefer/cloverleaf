@@ -191,6 +191,27 @@ def load_cached(cache_path, edges_path, features_path=None, directed=False, name
     return graph
 
 
+def save_aggregator(path, model):
+    """Writes the model's pooling as a cloverleaf FeatureAggregator file, which
+    `cloverleaf.FeatureAggregator.load` reads: "Averaged" for mean pooling; for attention
+    pooling, "Attention", then dims, heads and head_dims, then the qkv projection's rows and the
+    output projection's rows (PyTorch Linear weights), one row per line.  Every float32 is
+    written as the shortest decimal of its value, so it reads back exactly.  A nested
+    reconstruction's neighbour pooling is only used in training and isn't written."""
+    from .model import AttentionPool
+    pool = model.pool
+    with open(path, "w") as f:
+        if not isinstance(pool, AttentionPool):
+            f.write("Averaged\n")
+            return
+        qkv = pool.qkv.weight.detach().float().cpu()
+        out = pool.out.weight.detach().float().cpu()
+        f.write(f"Attention\n{out.shape[0]}\t{pool.heads}\t{pool.head_dims}\n")
+        for weight in (qkv, out):
+            for row in weight.tolist():
+                f.write(" ".join(map(repr, row)) + "\n")
+
+
 def save_embeddings(path, keys, embeddings):
     """Writes `type<TAB>name<TAB>[e1,e2,...]` lines, which cloverleaf's NodeEmbeddings.load reads.
     Uses cloverleaf's parallel writer when it's installed, and a slow pure-Python one otherwise."""

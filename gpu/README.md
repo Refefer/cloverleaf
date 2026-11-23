@@ -12,8 +12,10 @@ python -m ep_gpu.train --edges GRAPH --features FEATURES --out PREFIX \
 ```
 
 writes `PREFIX.node-embeddings` (every node, pooled from all its features),
-`PREFIX.feature-embeddings` (the feature table) and `PREFIX.pt` (the model).  New nodes are
-embedded from their features with `ep_gpu.embed_feature_sets`.
+`PREFIX.feature-embeddings` (the feature table), `PREFIX.aggregator` (the pooling, as a cloverleaf
+`FeatureAggregator` file) and `PREFIX.pt` (the model).  New nodes are embedded from their features
+by cloverleaf, `NodeEmbedder(FeatureAggregator.load(PREFIX.aggregator))` over the feature table,
+with mean or attention pooling, or in PyTorch with `ep_gpu.embed_feature_sets`; the two agree.
 
 ## What matches cloverleaf
 

@@ -4,7 +4,9 @@
 
 writes PREFIX.node-embeddings (every node, pooled from all its features), PREFIX.feature-embeddings
 (the feature table; with mean pooling, cloverleaf's averaged NodeEmbedder reproduces the node
-embeddings from it) and PREFIX.pt (the model, to embed new nodes with attention pooling).
+embeddings from it), PREFIX.aggregator (the pooling, for cloverleaf's FeatureAggregator.load, so
+cloverleaf's NodeEmbedder embeds new nodes as the model does, attention included) and PREFIX.pt
+(the model).
 """
 import argparse
 import math
@@ -380,6 +382,7 @@ def export(model, graph, cfg, prefix):
     keys = list(zip(graph.node_types, graph.node_names))
     data.save_embeddings(prefix + ".node-embeddings", keys, node_embeddings(model, graph))
     data.save_embeddings(prefix + ".feature-embeddings", graph.feature_keys, model.features.weight.float())
+    data.save_aggregator(prefix + ".aggregator", model)
     torch.save({"config": asdict(cfg), "state": model.state_dict(),
                 "feature_keys": graph.feature_keys}, prefix + ".pt")
 

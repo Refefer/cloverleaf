@@ -70,3 +70,42 @@ def test_pruning_matches_cloverleafs_prune_min_count(files, min_count):
         start, end = int(ours.feat_ptr[v]), int(ours.feat_ptr[v + 1])
         mine = {ours.feature_keys[f] for f in ours.feat_idx[start:end].tolist()}
         assert mine == {tuple(f) for f in pruned.get_features(node)}, node
+
+
+def test_mean_pooling_exports_an_averaged_aggregator(files, tmp_path):
+    ours = data.load(*files)
+    cfg = Config(dims=6, passes=1, batch_size=2, device="cpu", seed=5)
+    prefix = str(tmp_path / "ep")
+    export(train(ours, cfg, log=lambda m: None), ours, cfg, prefix)
+    assert open(prefix + ".aggregator").read() == "Averaged\n"
+    assert repr(cl.FeatureAggregator.load(prefix + ".aggregator")) == "FeatureAggregator<Averaged>"
+
+
+def test_attention_pooled_embeddings_match_cloverleafs_attention_embedder(files, tmp_path):
+    """Cloverleaf, given the exported feature table and aggregator, embeds every node, and a set
+    of features no node has, exactly as the GPU model does.  dims 13 with 2 heads pads each head
+    to width 8, so the padding is exercised too."""
+    from ep_gpu.train import embed_feature_sets
+    ours = data.load(*files)
+    cfg = Config(dims=13, passes=20, batch_size=2, lr=0.1, dense_lr=0.05, pooling="attention", heads=2,
+                 precision="fp32", device="cpu", seed=5)
+    model = train(ours, cfg, log=lambda m: None)
+    assert model.pool.out.weight.abs().max() > 1e-3, "the output projection should have trained"
+    prefix = str(tmp_path / "ep")
+    export(model, ours, cfg, prefix)
+
+    aggregator = cl.FeatureAggregator.load(prefix + ".aggregator")
+    assert repr(aggregator) == "FeatureAggregator<Attention<dims=13,heads=2,head_dims=8>>"
+    graph, features = cloverleaf_features(*files)
+    feature_embs = cl.NodeEmbeddings.load(prefix + ".feature-embeddings", cl.Distance.Cosine)
+    embedder = cl.NodeEmbedder(aggregator)
+    rebuilt = embedder.embed_feature_set(features, feature_embs)
+    exported = cl.NodeEmbeddings.load(prefix + ".node-embeddings", cl.Distance.Cosine)
+    mean_pooled = cl.NodeEmbedder(cl.FeatureAggregator.Averaged()).embed_feature_set(features, feature_embs)
+    for node in graph.vocab():
+        assert np.allclose(rebuilt.get_embedding(node), exported.get_embedding(node), atol=1e-5), node
+    assert not np.allclose(rebuilt.get_embedding(("n", "b")), mean_pooled.get_embedding(("n", "b")), atol=1e-3)
+
+    new_node = [("n", "x"), ("n", "z"), ("n", "q")]
+    ours_new = embed_feature_sets(model, ours.feature_index(), [new_node])[0].numpy()
+    assert np.allclose(embedder.embed_adhoc(new_node, feature_embs), ours_new, atol=1e-5)
