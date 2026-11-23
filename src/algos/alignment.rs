@@ -23,6 +23,9 @@ pub struct NeighborhoodAligner {
 }
 
 impl NeighborhoodAligner {
+    /// Nodes [`align_to_disk`](Self::align_to_disk) aligns per parallel chunk when the Python
+    /// bindings aren't told.
+    pub const DEFAULT_CHUNK_SIZE: usize = 10_000;
 
     pub fn new(alpha: Option<f32>, max_neighbors: Option<usize>) -> Self {
         NeighborhoodAligner { alpha, max_neighbors }

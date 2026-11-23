@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::io::BufRead;
 
 use crate::NodeID;
+use crate::algos::feat_propagation::propagate_features;
 use crate::embeddings::NodeEmbeddings;
 use crate::error::{Error, ensure_aligned};
 use crate::io::{FeatureFileError, open_file_for_reading, read_feature_vocab};
@@ -377,6 +378,30 @@ impl FeatureSet {
                            "FeatureSet features and warm-start feature embeddings")?;
         }
         Ok(())
+    }
+
+    /// Gives each node without features the top `k` features of its neighbours in `graph`,
+    /// weighted by edge, dropping those whose normalised weight isn't over `threshold`.  Runs up
+    /// to `max_iters` passes, so features spread further each pass; nodes that started with
+    /// features keep them.  `graph` must index the same nodes, else an [`Error::VocabMismatch`]
+    /// and nothing changes.  The Python
+    /// defaults are [`DEFAULT_THRESHOLD`](crate::algos::feat_propagation::DEFAULT_THRESHOLD) and
+    /// [`DEFAULT_MAX_ITERS`](crate::algos::feat_propagation::DEFAULT_MAX_ITERS).
+    pub fn propagate(
+        &mut self,
+        graph: &NamedGraph,
+        k: usize,
+        threshold: f32,
+        max_iters: usize
+    ) -> Result<(), Error> {
+        ensure_aligned(&graph.vocab, &self.vocab, "Graph and FeatureSet")?;
+        propagate_features(graph.graph(), &mut self.features, max_iters, k, threshold);
+        Ok(())
+    }
+
+    /// The `(feature type, feature name)` of the feature with id `feature_id`, if there is one.
+    pub fn feature_name(&self, feature_id: usize) -> Option<(String, String)> {
+        self.features.get_vocab().get_name_owned(feature_id)
     }
 
     pub fn vocab(&self) -> &Arc<Vocab> {

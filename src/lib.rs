@@ -15,7 +15,10 @@
 //! | `EmbeddingPropagator`, `PprRankLearner` | [`algos::ep::EmbeddingPropagation::learn_features`], [`algos::pprrank::PprRank::learn_features`] |
 //! | `NeighborhoodAligner`, `EmbeddingAligner` | [`algos::alignment::NeighborhoodAligner`], [`algos::emb_aligner::EmbeddingAligner`] |
 //! | `TournamentBuilder`, `LSR` | [`algos::lsr::TournamentBuilder`], [`algos::lsr::LSR::learn`] |
-//! | `PageRank`, `PolicyEvaluation` | [`algos::pagerank::PageRank::learn`], [`algos::policy_evaluation::PolicyEvaluation::optimize`] |
+//! | `PageRank`, `PolicyEvaluation` | [`algos::pagerank::PageRank::learn`], [`algos::policy_evaluation::PolicyEvaluation::optimize_rewards`] with [`algos::policy_evaluation::NodeRewards`] |
+//! | `Smci` | [`algos::smci::SupervisedMCIteration::learn_rewards`] with [`algos::smci::PairRewards`] |
+//! | `VpcgEmbedder`, `VpcgFeatureMappings` | [`algos::vpcg::VPCG::learn_named`], [`algos::vpcg::VpcgFeatureMappings`] |
+//! | `FeaturePropagator` | [`FeatureSet::propagate`] |
 //! | `Query` | [`Query`], looked up with [`NodeEmbeddings::resolve`] |
 //! | `RandomWalker`, `SparsePPR`, `RandomPath` | [`algos::rwr::RWR::walk_scores`], [`algos::rwr::SparsePpr`], [`algos::rwr::seeded_rollouts`] |
 //! | `BiasedRandomWalker` | [`algos::grwr::GuidedRWR::walk_named`] |

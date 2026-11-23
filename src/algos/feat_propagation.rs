@@ -9,6 +9,13 @@ use crate::graph::Graph;
 use crate::feature_store::FeatureStore;
 use crate::bitset::BitSet;
 
+/// Normalised weight a feature must exceed to propagate, when the Python bindings aren't told:
+/// any feature does.
+pub const DEFAULT_THRESHOLD: f32 = 0.;
+
+/// Passes the Python bindings run when not told otherwise.
+pub const DEFAULT_MAX_ITERS: usize = 20;
+
 /// Propagates features into a feature store.
 pub fn propagate_features(
     // Graph to guide propagation with
