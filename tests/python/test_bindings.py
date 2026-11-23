@@ -461,3 +461,23 @@ def test_write_embeddings_takes_keys_from_a_graph_or_feature_set(tmp_path, graph
     path = str(tmp_path / "f.emb")
     cl.write_embeddings(path, fs, rows)
     assert cl.NodeEmbeddings.load(path, cl.Distance.Cosine).get_embedding(fs.feature_keys()[1]) == [2.0, 3.0]
+
+
+# Settings the core now checks
+
+
+def test_margin_loss_uses_at_least_one_negative():
+    assert repr(cl.EPLoss.margin(1.0, 0)) == "EPLoss<MarginLoss(1.0, 1)>"
+
+
+@pytest.mark.parametrize("loss", ["ListNet", "list_mle", "mle"])
+def test_ppr_rank_rejects_unknown_losses(loss):
+    with pytest.raises(ValueError, match="listnet"):
+        cl.PprRankLearner(0.1, 2, 4, 2, 3.0, 2, 2, 1, loss=loss)
+
+
+@pytest.mark.parametrize("kwargs", [dict(alpha=0.0), dict(batch_size=0), dict(dims=0), dict(valid_pct=1.0),
+                                    dict(noise=-1.0), dict(dense_alpha=float("nan"))])
+def test_embedding_propagator_rejects_untrainable_settings(kwargs):
+    with pytest.raises(ValueError):
+        cl.EmbeddingPropagator(**kwargs)
