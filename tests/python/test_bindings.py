@@ -407,3 +407,57 @@ def test_attention_ep_has_no_packed_attention_options():
         cl.EmbeddingPropagator(attention=4)
     with pytest.raises(TypeError):
         cl.EmbeddingPropagator(context_window=2)
+
+
+# Bulk access for numpy (used by the GPU trainer)
+
+
+def test_graph_csr_and_names(graph):
+    import numpy as np
+    offsets, targets, probs = (np.frombuffer(b, t) for b, t in zip(graph.csr(), (np.int64, np.int64, np.float32)))
+    assert len(offsets) == graph.nodes() + 1 and offsets[-1] == len(targets) == len(probs)
+    names = list(graph.vocab())
+    for v in range(graph.nodes()):
+        row = slice(offsets[v], offsets[v + 1])
+        assert abs(probs[row].sum() - 1) < 1e-5
+        nbrs, weights = graph.get_edges(names[v], normalized=True)
+        assert sorted(names[int(u)] for u in targets[row]) == sorted(nbrs)
+    assert graph.node_names() == [n for _, n in names]
+    types, ids = graph.node_type_ids()
+    assert [types[i] for i in np.frombuffer(ids, np.int64)] == [t for t, _ in names]
+
+
+def test_feature_set_csr_dedup_shared_and_fill(tmp_path, graph):
+    import numpy as np
+    path = tmp_path / "f.txt"
+    path.write_text("n\t0\tred red shoe\nn\t1\tshoe\n")
+    plain = cl.FeatureSet.new_from_graph(graph)
+    plain.load_into(str(path), cl.FeatureNamespace.node_type())
+    assert plain.get_features(n(0)) == [("n", "red"), ("n", "red"), ("n", "shoe")]
+    fs = cl.FeatureSet.new_from_graph(graph)
+    fs.load_into(str(path), cl.FeatureNamespace.node_type_and_shared("w"), dedup=True)
+    assert fs.get_features(n(0)) == [("n", "red"), ("w", "red"), ("n", "shoe"), ("w", "shoe")]
+    fs.fill_missing_nodes()
+    offsets, ids = (np.frombuffer(b, np.int64) for b in fs.csr())
+    keys = fs.feature_keys()
+    assert [keys[i] for i in ids[offsets[1]:offsets[2]]] == [("n", "shoe"), ("w", "shoe")]
+    assert [keys[i] for i in ids[offsets[2]:offsets[3]]] == [("node", "2")]
+    with pytest.raises(ValueError):
+        cl.FeatureNamespace.node_type_and_shared("node")
+    clash = cl.FeatureSet.new_from_graph(graph)
+    with pytest.raises(ValueError, match="node type"):
+        clash.load_into(str(path), cl.FeatureNamespace.node_type_and_shared("n"))
+
+
+def test_write_embeddings_takes_keys_from_a_graph_or_feature_set(tmp_path, graph):
+    import numpy as np
+    rows = np.arange(graph.nodes() * 2, dtype=np.float32).reshape(-1, 2)
+    path = str(tmp_path / "g.emb")
+    cl.write_embeddings(path, graph, rows)
+    loaded = cl.NodeEmbeddings.load(path, cl.Distance.Cosine)
+    assert loaded.get_embedding(n(3)) == [6.0, 7.0]
+    fs = cl.FeatureSet.new_from_graph(graph)
+    fs.fill_missing_nodes()
+    path = str(tmp_path / "f.emb")
+    cl.write_embeddings(path, fs, rows)
+    assert cl.NodeEmbeddings.load(path, cl.Distance.Cosine).get_embedding(fs.feature_keys()[1]) == [2.0, 3.0]

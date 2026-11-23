@@ -86,8 +86,8 @@ def test_sample_all_neighbours(tiny):
     assert set(nbrs[1][mask[1]].tolist()) == {0, 1, 3}
     assert set(nbrs[2][mask[2]].tolist()) == {2}
     assert not sampled.any()
-    # c - a has weight 3
-    assert dict(zip(nbrs[0][mask[0]].tolist(), w[0][mask[0]].tolist())) == {1: 1.0, 2: 3.0}
+    # Weights are each node's transition probabilities: a's edges have weights 1 (b) and 3 (c).
+    assert dict(zip(nbrs[0][mask[0]].tolist(), w[0][mask[0]].tolist())) == {1: 0.25, 2: 0.75}
 
 
 def test_sampled_neighbours_are_real_neighbours(tiny):
@@ -137,12 +137,12 @@ def test_neighbourhood_tokens_count_each_neighbours_features(tiny):
 def test_weighted_averaging_uses_edge_weights(tiny):
     g = data.load(*tiny)
     idx, w = sampling.neighbourhood_tokens(g, torch.tensor([0]), weighted_averaging=True)
-    # a's neighbours: b (weight 1), c (weight 3).
+    # a's neighbours: b (weight 1), c (weight 3), so b's features weigh a third of c's.
     per_feature = {}
     for f, wt in zip(idx[0].tolist(), w[0].tolist()):
         if wt > 0:
             per_feature[g.feature_keys[f]] = per_feature.get(g.feature_keys[f], 0) + wt
-    assert per_feature == {("n", "y"): 1, ("n", "z"): 1, ("n", "w"): 1, ("n", "x"): 3}
+    assert per_feature == pytest.approx({("n", "y"): 0.25, ("n", "z"): 0.25, ("n", "w"): 0.25, ("n", "x"): 0.75})
 
 
 def test_negatives_from_a_pool_are_never_the_anchor():
@@ -241,8 +241,10 @@ def test_shared_namespace_prunes_shared_and_offset_features_separately(tmp_path)
 def test_shared_namespace_rejects_conflicting_settings(tmp_path, namespace, shared):
     edges = tmp_path / "g.edges"
     edges.write_text("q\ta\tp\tb\t1\n")
+    feats = tmp_path / "g.features"
+    feats.write_text("q\ta\tx\n")
     with pytest.raises(ValueError):
-        data.load(str(edges), namespace=namespace, shared_namespace=shared)
+        data.load(str(edges), str(feats), namespace=namespace, shared_namespace=shared)
 
 
 def test_graph_cache_rebuilds_when_shared_namespace_changes(tmp_path):

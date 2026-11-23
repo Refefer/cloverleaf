@@ -163,7 +163,9 @@ impl std::error::Error for EmbeddingLoadError {}
 pub enum FeatureFileError {
     Io(std::io::Error),
     /// 1-based line number
-    Malformed(usize)
+    Malformed(usize),
+    /// A shared feature namespace with the same name as a node type, whose features would merge
+    SharedNamespaceClash(String)
 }
 
 
@@ -172,7 +174,9 @@ impl std::fmt::Display for FeatureFileError {
         match self {
             FeatureFileError::Io(e) => write!(f, "{:?}", e),
             FeatureFileError::Malformed(line) => write!(f,
-                "Line {}: Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ...", line)
+                "Line {}: Malformed feature line! Need node_type<TAB>name<TAB>f1 f2 ...", line),
+            FeatureFileError::SharedNamespaceClash(ns) => write!(f,
+                "The shared feature namespace {:?} is also a node type; their features would merge", ns)
         }
     }
 }

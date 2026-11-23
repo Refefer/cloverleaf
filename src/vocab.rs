@@ -102,6 +102,26 @@ impl Vocab {
         })
     }
 
+    /// Each node's type as an index into [`node_types`](Self::node_types), in node id order.
+    pub fn node_type_ids(&self) -> Vec<u32> {
+        self.node_id_to_node.iter().map(|(nt_id, _)| *nt_id as u32).collect()
+    }
+
+    /// The node types, in the order [`node_type_ids`](Self::node_type_ids) indexes them.
+    pub fn node_types(&self) -> Vec<&str> {
+        self.id_to_node_type.iter().map(|t| t.as_str()).collect()
+    }
+
+    /// Whether any node has type `node_type`.
+    pub fn has_node_type_named(&self, node_type: &str) -> bool {
+        self.node_type_to_id.contains_key(&node_type.to_string())
+    }
+
+    /// Every node's name, in node id order.
+    pub fn names(&self) -> Vec<&str> {
+        self.node_id_to_node.iter().map(|(_, name)| self.interner.resolve(name)).collect()
+    }
+
     pub fn len(&self) -> usize {
         self.node_id_to_node.len()
     }
@@ -158,6 +178,19 @@ impl Vocab {
 #[cfg(test)]
 mod vocab_tests {
     use super::*;
+
+    /// Bulk accessors agree with the per-node ones, in node id order.
+    #[test]
+    fn test_bulk_accessors() {
+        let mut vocab = Vocab::new();
+        vocab.get_or_insert("q", "a");
+        vocab.get_or_insert("p", "b");
+        vocab.get_or_insert("q", "c");
+        assert_eq!(vocab.node_types(), vec!["q", "p"]);
+        assert_eq!(vocab.node_type_ids(), vec![0, 1, 0]);
+        assert_eq!(vocab.names(), vec!["a", "b", "c"]);
+        assert!(vocab.has_node_type_named("p") && !vocab.has_node_type_named("x"));
+    }
 
     #[test]
     fn test_get_set() {

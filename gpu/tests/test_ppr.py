@@ -1,13 +1,10 @@
-"""PPR lists from cloverleaf, and the listwise losses trained on them.  Skipped when cloverleaf
-isn't installed."""
+"""PPR lists from cloverleaf, and the listwise losses trained on them."""
 import pytest
 import torch
 
 from ep_gpu import data
 from ep_gpu.ppr import ppr_lists
 from ep_gpu.train import Config, build_lists, node_embeddings, train
-
-pytest.importorskip("cloverleaf")
 
 
 @pytest.fixture

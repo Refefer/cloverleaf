@@ -433,6 +433,19 @@ impl CumCSR {
         CumCSR(csr)
     }
 
+    /// The graph as flat arrays: row offsets (`len() + 1` of them; node v's edges are
+    /// `offsets[v]..offsets[v + 1]`), each edge's target, and each edge's transition
+    /// probability.  The stored weights are cumulative per row, so these are their differences:
+    /// a row's probabilities sum to 1.
+    pub fn csr_arrays(&self) -> (Vec<usize>, Vec<NodeID>, Vec<f32>) {
+        let csr = &self.0;
+        let mut probabilities = Vec::with_capacity(csr.weights.len());
+        for start_stop in csr.rows.windows(2) {
+            probabilities.extend(CDFtoP::new(&csr.weights[start_stop[0]..start_stop[1]]));
+        }
+        (csr.rows.clone(), csr.columns.clone(), probabilities)
+    }
+
     /// Swaps out the underlying edge weghts with new edge weights and confirm invariants
     pub fn clone_with_edges(&self, weights: Vec<f32>) -> Result<CumCSR,&'static str> {
         if weights.len() != self.0.weights.len() {
@@ -708,6 +721,18 @@ pub fn convert_edges_to_cdf(weights: &mut [f32], sum: Option<f32>) {
 #[cfg(test)]
 mod csr_tests {
     use super::*;
+
+    /// csr_arrays gives each edge's probability back from the stored CDF.
+    #[test]
+    fn test_csr_arrays_are_probabilities() {
+        let csr = CSR::construct_from_edges(vec![(0, 1, 1.), (0, 2, 3.), (1, 0, 2.), (2, 0, 0.)], false);
+        let (offsets, columns, probs) = CumCSR::convert(csr).csr_arrays();
+        assert_eq!(offsets, vec![0, 2, 3, 4]);
+        assert_eq!(columns, vec![1, 2, 0, 0]);
+        assert!((probs[0] - 0.25).abs() < 1e-6 && (probs[1] - 0.75).abs() < 1e-6);
+        assert!((probs[2] - 1.).abs() < 1e-6);
+        assert!((probs[3] - 1.).abs() < 1e-6, "an all-zero row becomes uniform: {:?}", probs);
+    }
 
     /// The CDF check has to validate the new weights, not the existing ones.
     #[test]

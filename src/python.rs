@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError,PyTypeError,PyRuntimeError};
 use pyo3::buffer::PyBuffer;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyByteArray, PyBytes};
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 
@@ -93,7 +93,8 @@ impl From<FeatureFileError> for PyErr {
     fn from(e: FeatureFileError) -> PyErr {
         match e {
             FeatureFileError::Io(_) => PyIOError::new_err(e.to_string()),
-            FeatureFileError::Malformed(_) => PyValueError::new_err(e.to_string())
+            FeatureFileError::Malformed(_) | FeatureFileError::SharedNamespaceClash(_) =>
+                PyValueError::new_err(e.to_string())
         }
     }
 }
@@ -328,6 +329,18 @@ pub struct Graph {
     inner: NamedGraph
 }
 
+/// Little-endian int64s in a writable bytearray, so numpy wraps them without a copy.
+fn i64_bytes<'py>(py: Python<'py>, values: &[usize]) -> Bound<'py, PyByteArray> {
+    let bytes: Vec<u8> = values.iter().flat_map(|v| (*v as i64).to_le_bytes()).collect();
+    PyByteArray::new(py, &bytes)
+}
+
+/// Little-endian float32s in a writable bytearray.
+fn f32_bytes<'py>(py: Python<'py>, values: &[f32]) -> Bound<'py, PyByteArray> {
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    PyByteArray::new(py, &bytes)
+}
+
 impl From<NamedGraph> for Graph {
     fn from(inner: NamedGraph) -> Self {
         Graph { inner }
@@ -427,6 +440,39 @@ impl Graph {
     ///     
     pub fn vocab(&self) -> VocabIterator {
         VocabIterator::new(self.vocab.clone())
+    }
+
+    ///    The graph as flat arrays, for numpy (`np.frombuffer(offsets, np.int64)` etc.).
+    ///    
+    ///    Returns
+    ///    -------
+    ///    (bytearray, bytearray, bytearray)
+    ///        Row offsets (nodes + 1 int64s; node v's edges are offsets[v]:offsets[v + 1]), each
+    ///        edge's target node id (int64), and each edge's transition probability (float32;
+    ///        each node's sum to 1).  Undirected graphs hold every edge in both directions.
+    ///    
+    pub fn csr<'py>(&self, py: Python<'py>) -> (Bound<'py, PyByteArray>, Bound<'py, PyByteArray>, Bound<'py, PyByteArray>) {
+        let (offsets, columns, probabilities) = py.detach(|| self.inner.graph().csr_arrays());
+        (i64_bytes(py, &offsets), i64_bytes(py, &columns), f32_bytes(py, &probabilities))
+    }
+
+    ///    Every node's name, in node id order (`vocab()` gives types and names together).
+    pub fn node_names(&self) -> Vec<String> {
+        self.vocab.names().into_iter().map(|n| n.to_string()).collect()
+    }
+
+    ///    Every node's type, compactly.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    (List[str], bytearray)
+    ///        The node types, and each node's type as an index into them (int64), in node id
+    ///        order.
+    ///    
+    pub fn node_type_ids<'py>(&self, py: Python<'py>) -> (Vec<String>, Bound<'py, PyByteArray>) {
+        let types = self.vocab.node_types().into_iter().map(|t| t.to_string()).collect();
+        let ids: Vec<usize> = self.vocab.node_type_ids().into_iter().map(|t| t as usize).collect();
+        (types, i64_bytes(py, &ids))
     }
 
     ///    Saves a graph to disk at the provided path.
@@ -1505,6 +1551,14 @@ impl FeatureNamespace {
         Ok(FeatureNamespace(CoreFeatureNamespace::prefix(delim)?))
     }
 
+    ///    Each token becomes two features: one of its node's type and one of type `shared`, the
+    ///    same for every node type, so a word in a query and in a product title share a feature
+    ///    as well as having their own.  `shared` can't be "node", empty, or a node type.
+    #[staticmethod]
+    pub fn node_type_and_shared(shared: String) -> PyResult<Self> {
+        Ok(FeatureNamespace(CoreFeatureNamespace::node_type_and_shared(shared)?))
+    }
+
 }
 
 /// Defines the FeatureSet class, which allows setting discrete features for a node
@@ -1630,18 +1684,51 @@ impl FeatureSet {
     ///    f_ns : FeatureNamespace - optional
     ///        How to construct a feature namespace from a given token.  Default is Static("feat")
     ///    
+    ///    dedup : Bool - optional
+    ///        Keep only the first occurrence of each feature on a node, so a word repeated on a
+    ///        line counts once.  Default False: repeats count every time.
+    ///    
     ///    Returns
     ///    -------
     ///    () - Can throw exception
     ///        
     ///    
-    #[pyo3(signature = (path, f_ns=None))]
+    #[pyo3(signature = (path, f_ns=None, dedup=false))]
     pub fn load_into(
         &mut self,
+        py: Python<'_>,
         path: String,
-        f_ns: Option<FeatureNamespace>
+        f_ns: Option<FeatureNamespace>,
+        dedup: bool
     ) -> PyResult<()> {
-        Ok(self.inner.load_into(&path, &f_ns.unwrap_or_default().0)?)
+        let ns = f_ns.unwrap_or_default().0;
+        let options = crate::feature_store::LoadOptions { dedup };
+        let inner = &mut self.inner;
+        Ok(py.detach(|| inner.load_into_with(&path, &ns, &options))?)
+    }
+
+    ///    Gives every node without features a feature of its own, ("node", "<node id>"), as
+    ///    embedding requires.  Learning does this itself.
+    pub fn fill_missing_nodes(&mut self) {
+        self.inner.fill_missing_nodes()
+    }
+
+    ///    Every node's features as flat arrays, for numpy.
+    ///    
+    ///    Returns
+    ///    -------
+    ///    (bytearray, bytearray)
+    ///        Offsets (nodes + 1 int64s; node v's features are ids[offsets[v]:offsets[v + 1]])
+    ///        and feature ids (int64), indexing `feature_keys()`.
+    ///    
+    pub fn csr<'py>(&self, py: Python<'py>) -> (Bound<'py, PyByteArray>, Bound<'py, PyByteArray>) {
+        let (offsets, ids) = self.inner.store().csr();
+        (i64_bytes(py, &offsets), i64_bytes(py, &ids))
+    }
+
+    ///    Every feature's (type, name), in feature id order.
+    pub fn feature_keys(&self) -> Vec<(String, String)> {
+        self.inner.store().get_vocab().iter().map(|(t, n)| (t.to_string(), n.to_string())).collect()
     }
 
     ///    Returns the number of nodes in the feature set.
@@ -4613,8 +4700,9 @@ fn convert_filter_type(
 ///    path : str
 ///        Output path; a path ending in .gz is gzipped.
 ///    
-///    keys : List[Tuple[str, str]]
-///        (node type, name) of each row.
+///    keys : List[Tuple[str, str]] | Graph | FeatureSet
+///        (node type, name) of each row; or a Graph for its nodes, or a FeatureSet for its
+///        features, in id order (without building the list in Python).
 ///    
 ///    embeddings : 2-D float32 array
 ///        One row per key, as any object supporting the buffer protocol: a numpy array, or a
@@ -4632,10 +4720,19 @@ fn convert_filter_type(
 fn write_embeddings(
     py: Python<'_>,
     path: String,
-    keys: Vec<(String, String)>,
+    keys: &Bound<'_, PyAny>,
     embeddings: PyBuffer<f32>,
     comp_level: Option<u32>
 ) -> PyResult<()> {
+    // Keys: a list of (type, name), or a Graph (its nodes) or FeatureSet (its features), whose
+    // keys are taken in id order without building the list in Python.
+    let keys: Vec<(String, String)> = if let Ok(graph) = keys.cast::<Graph>() {
+        graph.borrow().vocab.iter().map(|(t, n)| (t.to_string(), n.to_string())).collect()
+    } else if let Ok(features) = keys.cast::<FeatureSet>() {
+        features.borrow().inner.store().get_vocab().iter().map(|(t, n)| (t.to_string(), n.to_string())).collect()
+    } else {
+        keys.extract()?
+    };
     if embeddings.dimensions() != 2 {
         return Err(PyValueError::new_err(format!(
             "embeddings must be 2-D, got {} dimensions", embeddings.dimensions())))

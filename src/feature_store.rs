@@ -53,6 +53,39 @@ impl FeatureStore {
             .collect()
     }
 
+    /// [`set_features`](Self::set_features), keeping only the first occurrence of each feature.
+    pub fn set_features_unique<A,B>(
+        &mut self,
+        node: NodeID,
+        node_features: impl Iterator<Item=(A, B)>
+    )
+        where
+            A: AsRef<str>,
+            B: AsRef<str>
+    {
+        let mut ids: Vec<usize> = Vec::new();
+        for (ft, fname) in node_features {
+            let id = self.feature_vocab.get_or_insert(ft.as_ref(), fname.as_ref());
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        self.features[node] = ids;
+    }
+
+    /// Every node's features as flat arrays: offsets (`num_nodes() + 1` of them; node v's
+    /// features are `ids[offsets[v]..offsets[v + 1]]`) and feature ids, in stored order.
+    pub fn csr(&self) -> (Vec<usize>, Vec<usize>) {
+        let mut offsets = Vec::with_capacity(self.features.len() + 1);
+        offsets.push(0);
+        let mut ids = Vec::with_capacity(self.features.iter().map(|f| f.len()).sum());
+        for fs in self.features.iter() {
+            ids.extend_from_slice(fs);
+            offsets.push(ids.len());
+        }
+        (offsets, ids)
+    }
+
     pub fn set_features_raw(
         &mut self, 
         node: NodeID, 
@@ -152,7 +185,8 @@ pub struct FeatureNamespace(Namespace);
 enum Namespace {
     Static(String),
     NodeType,
-    Prefix(String)
+    Prefix(String),
+    NodeTypeAndShared(String)
 }
 
 impl FeatureNamespace {
@@ -175,15 +209,61 @@ impl FeatureNamespace {
         Ok(FeatureNamespace(Namespace::Prefix(delim)))
     }
 
-    /// Splits a token into (feature type, feature name), or None when a prefix is missing.
+    /// Each token becomes two features: one of its node's type, as with
+    /// [`node_type`](Self::node_type), and one of type `shared`, the same for every node type.
+    /// So a word in a query and the same word in a product title share a feature as well as
+    /// having their own.  `shared` can't be "node" (the type of the features
+    /// [`FeatureSet::fill_missing_nodes`] adds) or empty, and loading rejects it if it's also
+    /// a node type.
+    pub fn node_type_and_shared(shared: impl Into<String>) -> Result<Self, Error> {
+        let shared = shared.into();
+        if shared.is_empty() || shared == "node" {
+            return Err(Error::InvalidArgument(format!(
+                "the shared namespace can't be empty or \"node\", got {:?}", shared)))
+        }
+        Ok(FeatureNamespace(Namespace::NodeTypeAndShared(shared)))
+    }
+
+    /// Splits a token into (feature type, feature name), or None when a prefix is missing.  With
+    /// [`node_type_and_shared`](Self::node_type_and_shared) this is the node type's feature;
+    /// [`keys`](Self::keys) gives both.
     pub fn parse<'a>(&'a self, node_type: &'a str, token: &'a str) -> Option<(&'a str, &'a str)> {
         match &self.0 {
             Namespace::Static(s) => Some((s, token)),
-            Namespace::NodeType => Some((node_type, token)),
+            Namespace::NodeType | Namespace::NodeTypeAndShared(_) => Some((node_type, token)),
             Namespace::Prefix(delim) => token.find(delim.as_str())
                 .map(|idx| (&token[..idx], &token[(idx + delim.len())..]))
         }
     }
+
+    /// Every feature a token becomes: one, or two with
+    /// [`node_type_and_shared`](Self::node_type_and_shared).  A token missing its prefix gets
+    /// the type "feat".
+    pub fn keys<'a>(&'a self, node_type: &'a str, token: &'a str) -> impl Iterator<Item=(&'a str, &'a str)> {
+        let first = self.parse(node_type, token).unwrap_or(("feat", token));
+        let second = match &self.0 {
+            Namespace::NodeTypeAndShared(shared) => Some((shared.as_str(), token)),
+            _ => None
+        };
+        std::iter::once(first).chain(second)
+    }
+
+    /// The shared namespace's name, for [`node_type_and_shared`](Self::node_type_and_shared).
+    pub fn shared(&self) -> Option<&str> {
+        match &self.0 {
+            Namespace::NodeTypeAndShared(shared) => Some(shared),
+            _ => None
+        }
+    }
+}
+
+/// How [`FeatureSet::load_into_with`] reads a feature file.
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
+pub struct LoadOptions {
+    /// Keep only the first occurrence of each feature on a node, so a word repeated on a line
+    /// counts once (in means and in [`FeatureSet::prune_min_count`]'s counts).  Off by default:
+    /// repeats count every time.
+    pub dedup: bool
 }
 
 /// Features type "feat".
@@ -221,6 +301,21 @@ impl FeatureSet {
     /// Sets features from a `node_type<TAB>name<TAB>f1 f2 ...` file.  Nodes not in the vocab are
     /// skipped.
     pub fn load_into(&mut self, path: &str, namespace: &FeatureNamespace) -> Result<(), FeatureFileError> {
+        self.load_into_with(path, namespace, &LoadOptions::default())
+    }
+
+    /// [`load_into`](Self::load_into) with options.
+    pub fn load_into_with(
+        &mut self,
+        path: &str,
+        namespace: &FeatureNamespace,
+        options: &LoadOptions
+    ) -> Result<(), FeatureFileError> {
+        if let Some(shared) = namespace.shared() {
+            if self.vocab.has_node_type_named(shared) {
+                return Err(FeatureFileError::SharedNamespaceClash(shared.to_string()))
+            }
+        }
         let reader = open_file_for_reading(path).map_err(FeatureFileError::Io)?;
         for (i, line) in reader.lines().enumerate() {
             let line = line.map_err(FeatureFileError::Io)?;
@@ -229,9 +324,12 @@ impl FeatureSet {
                 return Err(FeatureFileError::Malformed(i + 1))
             }
             if let Some(node_id) = self.vocab.get_node_id(pieces[0], pieces[1]) {
-                let bow = pieces[2].split_whitespace()
-                    .map(|s| namespace.parse(pieces[0], s).unwrap_or(("feat", s)));
-                self.features.set_features(node_id, bow);
+                let bow = pieces[2].split_whitespace().flat_map(|s| namespace.keys(pieces[0], s));
+                if options.dedup {
+                    self.features.set_features_unique(node_id, bow);
+                } else {
+                    self.features.set_features(node_id, bow);
+                }
             }
         }
         Ok(())
@@ -331,5 +429,69 @@ mod feature_set_tests {
         assert_eq!(fs.get_features("n", "a").unwrap(),
                    vec![("color".to_string(), "red".to_string()), ("feat".to_string(), "big".to_string())]);
         assert!(matches!(fs.get_features("n", "zzz"), Err(Error::UnknownNode { .. })));
+    }
+
+    fn two_type_set(lines: &str, ns: &FeatureNamespace, dedup: bool, tag: &str) -> Result<FeatureSet, FeatureFileError> {
+        let mut vocab = Vocab::new();
+        vocab.get_or_insert("q", "a");
+        vocab.get_or_insert("p", "b");
+        vocab.get_or_insert("p", "c");
+        let mut fs = FeatureSet::new(Arc::new(vocab));
+        let path = std::env::temp_dir().join(format!("cloverleaf-fs-{}-{}", std::process::id(), tag));
+        std::fs::write(&path, lines).unwrap();
+        let res = fs.load_into_with(path.to_str().unwrap(), ns, &LoadOptions { dedup });
+        std::fs::remove_file(&path).unwrap();
+        res.map(|_| fs)
+    }
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    /// Repeats count every time by default, once with dedup, in first-seen order.
+    #[test]
+    fn test_load_dedup() {
+        let ns = FeatureNamespace::node_type();
+        let kept = two_type_set("q\ta\tx y x\n", &ns, false, "keep").unwrap();
+        assert_eq!(kept.get_features("q", "a").unwrap(), pairs(&[("q", "x"), ("q", "y"), ("q", "x")]));
+        let deduped = two_type_set("q\ta\tx y x\n", &ns, true, "dedup").unwrap();
+        assert_eq!(deduped.get_features("q", "a").unwrap(), pairs(&[("q", "x"), ("q", "y")]));
+        // Pruning counts what was kept: x on one node counts once with dedup.
+        assert_eq!(deduped.prune_min_count(2).num_features(), 0);
+        assert_eq!(kept.prune_min_count(2).num_features(), 1);
+    }
+
+    /// Each token gets its node type's feature and the shared one, so the same word on two node
+    /// types shares a feature.
+    #[test]
+    fn test_node_type_and_shared_namespace() {
+        let ns = FeatureNamespace::node_type_and_shared("w").unwrap();
+        assert_eq!(ns.keys("q", "red").collect::<Vec<_>>(), vec![("q", "red"), ("w", "red")]);
+        let fs = two_type_set("q\ta\tred\np\tb\tred shoe\n", &ns, true, "shared").unwrap();
+        assert_eq!(fs.get_features("q", "a").unwrap(), pairs(&[("q", "red"), ("w", "red")]));
+        assert_eq!(fs.get_features("p", "b").unwrap(), pairs(&[("p", "red"), ("w", "red"), ("p", "shoe"), ("w", "shoe")]));
+        assert_eq!(fs.num_features(), 5);
+        // Only "w red" is on two nodes.
+        assert_eq!(fs.prune_min_count(2).num_features(), 1);
+    }
+
+    #[test]
+    fn test_shared_namespace_rejects_clashes() {
+        assert!(FeatureNamespace::node_type_and_shared("node").is_err());
+        assert!(FeatureNamespace::node_type_and_shared("").is_err());
+        let clash = FeatureNamespace::node_type_and_shared("p").unwrap();
+        assert!(matches!(two_type_set("q\ta\tred\n", &clash, false, "clash"),
+                         Err(FeatureFileError::SharedNamespaceClash(ns)) if ns == "p"));
+    }
+
+    /// Flat arrays: offsets per node and feature ids in stored order; filled-in nodes included.
+    #[test]
+    fn test_csr_and_fill_missing_nodes() {
+        let mut fs = two_type_set("q\ta\tx y\np\tc\ty\n", &FeatureNamespace::single("f"), false, "csr").unwrap();
+        assert_eq!(fs.store().csr(), (vec![0, 2, 2, 3], vec![0, 1, 1]));
+        fs.fill_missing_nodes();
+        let (offsets, ids) = fs.store().csr();
+        assert_eq!(offsets, vec![0, 2, 3, 4]);
+        assert_eq!(fs.store().get_pretty_feature(ids[2]), ("node".to_string(), "1".to_string()));
     }
 }
