@@ -12,7 +12,12 @@ use rand_distr::{Distribution,Uniform};
 use float_ord::FloatOrd;
 
 use crate::graph::{Graph as CGraph,NodeID};
-use crate::embeddings::{EmbeddingStore,Entity};
+use crate::embeddings::{EmbeddingStore,Entity,NodeEmbeddings,Query};
+use crate::error::{Error,ensure_aligned};
+use crate::named_graph::NamedGraph;
+
+/// Seed for [`GraphAnn::find`]'s random starting nodes when none is given.
+pub const GRAPH_ANN_SEED: u64 = crate::DEFAULT_SEED + 10;
 
 /// Defines a distance metric which we can use with heaps.  Lower == better
 
@@ -135,6 +140,48 @@ impl Ann {
     
 }
 
+/// [`Ann`] over a named graph: finds nodes close to a query by hill climbing through the graph,
+/// by the distances of embeddings that index the graph's nodes.
+#[derive(Clone)]
+pub struct GraphAnn {
+    graph: NamedGraph,
+    max_steps: usize
+}
+
+impl GraphAnn {
+    /// Steps the Python bindings explore when not told otherwise.
+    pub const DEFAULT_MAX_STEPS: usize = 1000;
+
+    /// Searches `graph` for `max_steps` steps, plus one per neighbour asked for.
+    pub fn new(graph: &NamedGraph, max_steps: usize) -> Self {
+        GraphAnn { graph: graph.clone(), max_steps }
+    }
+
+    pub fn graph(&self) -> &NamedGraph {
+        &self.graph
+    }
+
+    pub fn max_steps(&self) -> usize {
+        self.max_steps
+    }
+
+    /// The `k` nodes found closest to `query`, closest first, by `embeddings`' distance.  The
+    /// query is looked up in `embeddings`, which must index the graph's nodes, else an
+    /// [`Error::VocabMismatch`].
+    pub fn find(
+        &self,
+        query: &Query,
+        embeddings: &NodeEmbeddings,
+        k: usize,
+        seed: u64
+    ) -> Result<Vec<NodeDistance>, Error> {
+        ensure_aligned(self.graph.vocab(), embeddings.vocab(), "Graph and NodeEmbeddings")?;
+        let query = embeddings.resolve(query)?;
+        let ann = Ann::new(k, self.max_steps + k, seed);
+        Ok(ann.find(query, self.graph.graph(), embeddings.store()))
+    }
+}
+
 // This hill climbs.  We start with a node and compute the embeddings for each node.  We greedily
 // explore the edges where the distance is minmized.  We return the best nodes after performing the
 // search `max_steps` times.
@@ -203,6 +250,49 @@ mod ann_tests {
             }
         }
         edges
+    }
+
+    fn named_clique() -> (NamedGraph, NodeEmbeddings) {
+        let mut gb = crate::named_graph::GraphBuilder::new();
+        for (a, b, _) in build_star_edges().into_iter().filter(|(a, b, _)| a < b && *b < 10) {
+            gb.add_edge(("n", &a.to_string()), ("n", &b.to_string()), 1., crate::graph::EdgeType::Undirected);
+        }
+        let g = gb.build(true).unwrap();
+        let mut emb = crate::embeddings::NodeEmbeddingsBuilder::new(crate::distance::Distance::Euclidean);
+        for (_, name) in g.vocab().iter() {
+            emb.add_embedding("n", name, &[name.parse::<f32>().unwrap()]).unwrap();
+        }
+        (g, emb.build().unwrap())
+    }
+
+    #[test]
+    fn test_graph_ann_matches_ann() {
+        let (g, emb) = named_clique();
+        let gann = GraphAnn::new(&g, 20);
+        let query = Query::Embedding(vec![3.2]);
+        let found = gann.find(&query, &emb, 3, GRAPH_ANN_SEED).unwrap();
+        let expected = Ann::new(3, 23, GRAPH_ANN_SEED).find(&[3.2], g.graph(), emb.store());
+        assert_eq!(found, expected);
+        assert_eq!(found.len(), 3);
+
+        let by_node = gann.find(&Query::Node("n".into(), "3".into()), &emb, 3, GRAPH_ANN_SEED).unwrap();
+        assert_eq!(by_node, Ann::new(3, 23, GRAPH_ANN_SEED).find(&[3.], g.graph(), emb.store()));
+        assert!(matches!(gann.find(&Query::NodeId(100), &emb, 3, 1), Err(Error::NodeIdOutOfRange { .. })));
+    }
+
+    /// Embeddings must index the graph's nodes: these list them in another order.
+    #[test]
+    fn test_graph_ann_rejects_misaligned_embeddings() {
+        let (g, _) = named_clique();
+        let mut names: Vec<_> = g.vocab().iter().map(|(_, n)| n.to_string()).collect();
+        names.reverse();
+        let mut emb = crate::embeddings::NodeEmbeddingsBuilder::new(crate::distance::Distance::Euclidean);
+        for name in names.iter() {
+            emb.add_embedding("n", name, &[0.]).unwrap();
+        }
+        let reordered = emb.build().unwrap();
+        let query = Query::Embedding(vec![0.]);
+        assert!(matches!(GraphAnn::new(&g, 10).find(&query, &reordered, 2, 1), Err(Error::VocabMismatch(_))));
     }
 
     #[test]

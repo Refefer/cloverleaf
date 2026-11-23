@@ -5,8 +5,16 @@ use std::collections::{BinaryHeap,HashSet};
 use crate::NodeID;
 use crate::graph::{Graph,CDFtoP};
 
-use crate::embeddings::EmbeddingStore;
+use crate::embeddings::{EmbeddingStore, NodeEmbeddings};
 use crate::distance::Distance;
+use crate::error::Error;
+use crate::named_graph::NamedGraph;
+
+/// Each node's connected component, as the one-dimensional embeddings
+/// [`find_connected_components`] makes, named by `graph`'s nodes.
+pub fn connected_components(graph: &NamedGraph) -> Result<NodeEmbeddings, Error> {
+    NodeEmbeddings::new(graph.vocab().clone(), find_connected_components(graph.graph()))
+}
 
 /// Find the connected components of a graph.  Labels are stored as f32, which is exact only up
 /// to 2^24 components; use `component_labels` when exact labels matter.

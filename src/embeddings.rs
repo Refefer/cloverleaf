@@ -24,6 +24,20 @@ pub enum Entity<'a> {
     Embedding(&'a [f32])
 }
 
+/// What to look an embedding up by in a [`NodeEmbeddings`]: a node by name or by id, or an
+/// embedding given directly.  [`NodeEmbeddings::resolve`] turns it into the embedding.
+#[derive(Clone,Debug,PartialEq)]
+pub enum Query {
+    /// A node by (node type, name).
+    Node(String, String),
+
+    /// A node by id.
+    NodeId(NodeID),
+
+    /// An embedding, used as given.
+    Embedding(Vec<f32>)
+}
+
 /// The core Embedding Store used everywhere.
 #[derive(Clone)]
 pub struct EmbeddingStore {
@@ -344,6 +358,22 @@ impl NodeEmbeddings {
         Ok(self.embeddings.set_embedding(node_id, embedding)?)
     }
 
+    /// The embedding `query` refers to: a node's here, or the query's own embedding, which isn't
+    /// checked against these embeddings' dimensions.  Errors with [`Error::UnknownNode`] or
+    /// [`Error::NodeIdOutOfRange`] when the node isn't here.
+    pub fn resolve<'a>(&'a self, query: &'a Query) -> Result<&'a [f32], Error> {
+        match query {
+            Query::Node(node_type, name) => self.get_embedding(node_type, name),
+            Query::NodeId(node_id) => self.get_embedding_by_id(*node_id),
+            Query::Embedding(embedding) => Ok(embedding)
+        }
+    }
+
+    /// The distance between what two queries refer to, by these embeddings' distance.
+    pub fn compute_distance(&self, a: &Query, b: &Query) -> Result<f32, Error> {
+        Ok(self.distance().compute(self.resolve(a)?, self.resolve(b)?))
+    }
+
     /// The `k` nodes closest to `embedding`, closest first, optionally only those whose type is
     /// in `node_types`.
     pub fn nearest_neighbor(
@@ -530,6 +560,25 @@ mod embedding_tests {
         assert_eq!((es.len(), es.dims()), (2, 3));
         assert_eq!(es.get_embedding(0), &[7., 8., 9.]);
         assert_eq!(es.get_embedding(1), &[4., 5., 6.]);
+    }
+
+    #[test]
+    fn test_queries_resolve_by_name_id_or_embedding() {
+        let mut b = NodeEmbeddingsBuilder::new(Distance::Euclidean);
+        b.add_embedding("n", "a", &[0., 0.]).unwrap();
+        b.add_embedding("n", "b", &[3., 4.]).unwrap();
+        let ne = b.build().unwrap();
+
+        let by_name = Query::Node("n".into(), "b".into());
+        assert_eq!(ne.resolve(&by_name).unwrap(), &[3., 4.]);
+        assert_eq!(ne.resolve(&Query::NodeId(0)).unwrap(), &[0., 0.]);
+        assert_eq!(ne.resolve(&Query::Embedding(vec![1.])).unwrap(), &[1.]);
+        assert!(matches!(ne.resolve(&Query::Node("n".into(), "zzz".into())), Err(Error::UnknownNode { .. })));
+        assert!(matches!(ne.resolve(&Query::NodeId(2)), Err(Error::NodeIdOutOfRange { node_id: 2, len: 2 })));
+
+        assert_eq!(ne.compute_distance(&Query::NodeId(0), &by_name).unwrap(), 5.);
+        assert_eq!(ne.compute_distance(&Query::Embedding(vec![3., 0.]), &by_name).unwrap(), 4.);
+        assert!(ne.compute_distance(&by_name, &Query::NodeId(7)).is_err());
     }
 
     #[test]

@@ -9,14 +9,43 @@ use rayon::prelude::*;
 
 use crate::graph::Graph;
 use crate::progress::CLProgressBar;
-use crate::embeddings::EmbeddingStore;
+use crate::embeddings::{EmbeddingStore, NodeEmbeddings};
 use crate::distance::Distance;
+use crate::error::Error;
+use crate::named_graph::NamedGraph;
 use crate::algos::utils::{get_best_count,Counter};
 
-#[derive(Clone,Copy)]
+#[derive(Clone,Copy,Debug)]
 pub enum ListenerRule {
     Best,
     Probabilistic
+}
+
+/// Embeds each node by the clusters it remembers hearing at least `threshold` times in `t`
+/// passes of SLPA, for [`Distance::Jaccard`].  See [`construct_slpa_embedding`].
+#[derive(Clone,Copy,Debug)]
+pub struct Slpa {
+    pub t: usize,
+    pub threshold: usize,
+    pub rule: ListenerRule,
+    pub memory_size: usize,
+    pub seed: u64
+}
+
+impl Slpa {
+    /// SLPA with the defaults the Python bindings use: at least one pass, the best rule, a
+    /// memory as long as the passes and the default seed.
+    pub fn new(t: usize, threshold: usize) -> Self {
+        let t = t.max(1);
+        Slpa { t, threshold, rule: ListenerRule::Best, memory_size: t, seed: crate::DEFAULT_SEED }
+    }
+
+    /// Embeds every node of `graph`.
+    pub fn learn(&self, graph: &NamedGraph) -> Result<NodeEmbeddings, Error> {
+        let es = construct_slpa_embedding(graph.graph(), self.rule, self.t, self.threshold,
+                                          self.memory_size, self.seed);
+        NodeEmbeddings::new(graph.vocab().clone(), es)
+    }
 }
 
 /// Learns the SLPA algorithm
@@ -41,7 +70,6 @@ pub fn construct_slpa_embedding(
 
 
 ) -> EmbeddingStore {
-    println!("t: {}, threshold:{}, seed:{}", t, threshold, seed);
 
     let dims = (memory_size as f32 / threshold as f32).ceil() as usize + 1;
     let mut es = EmbeddingStore::new(graph.len(), dims, Distance::Jaccard);
@@ -157,6 +185,26 @@ mod slpa_tests {
             println!("{}: {:?}", node_id, es.get_embedding(node_id));
         }
         //panic!();
+    }
+
+    #[test]
+    fn test_slpa_defaults_and_learns_named() {
+        let d = Slpa::new(0, 2);
+        assert_eq!((d.t, d.memory_size, d.seed), (1, 1, crate::DEFAULT_SEED));
+        assert!(matches!(d.rule, ListenerRule::Best));
+
+        let mut gb = crate::named_graph::GraphBuilder::new();
+        for (a, b) in [("a", "b"), ("b", "c"), ("c", "a")] {
+            gb.add_edge(("n", a), ("n", b), 1., crate::graph::EdgeType::Undirected);
+        }
+        let g = gb.build(true).unwrap();
+        let slpa = Slpa { seed: 3, ..Slpa::new(5, 2) };
+        let ne = slpa.learn(&g).unwrap();
+        assert!(std::sync::Arc::ptr_eq(ne.vocab(), g.vocab()));
+        let es = construct_slpa_embedding(g.graph(), ListenerRule::Best, 5, 2, 5, 3);
+        assert_eq!((ne.len(), ne.dims()), (3, es.dims()));
+        assert!(matches!(ne.distance(), Distance::Jaccard));
+        assert_eq!(ne.store().get_embedding(0), es.get_embedding(0));
     }
 
     /// Node 2 has an inbound edge but no outbound edges.

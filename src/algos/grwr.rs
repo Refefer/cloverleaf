@@ -8,9 +8,10 @@ use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
 
 use crate::graph::{Graph,NodeID};
-use crate::error::Error;
-use crate::sampler::Sampler;
-use crate::embeddings::EmbeddingStore;
+use crate::error::{Error, ensure_aligned};
+use crate::named_graph::NamedGraph;
+use crate::sampler::{Sampler, Weighted};
+use crate::embeddings::{EmbeddingStore, NodeEmbeddings, Query};
 use crate::algos::reweighter::Reweighter;
 use crate::algos::utils::node_seed;
 use rand_distr::{Binomial,Distribution};
@@ -72,6 +73,29 @@ impl GuidedRWR {
     /// default seed.
     pub fn new(steps: Steps, walks: usize) -> Self {
         GuidedRWR { steps, walks, alpha: 0.5, beta: 0.5, seed: crate::DEFAULT_SEED }
+    }
+
+    /// A weighted walk from `start_node` biased toward `context`, then, when `rerank` is given,
+    /// reweighted by distance to it with the same blend, `alpha`.  The queries are looked up in
+    /// `embeddings`, which must index the graph's nodes, else an [`Error::VocabMismatch`].
+    pub fn walk_named(
+        &self,
+        graph: &NamedGraph,
+        embeddings: &NodeEmbeddings,
+        start_node: NodeID,
+        context: &Query,
+        rerank: Option<&Query>
+    ) -> Result<HashMap<NodeID, f32>, Error> {
+        ensure_aligned(graph.vocab(), embeddings.vocab(), "Graph and NodeEmbeddings")?;
+        let context = embeddings.resolve(context)?;
+        let rerank = rerank.map(|q| embeddings.resolve(q)).transpose()?;
+
+        let store = embeddings.store();
+        let mut results = self.sample(graph.graph(), &Weighted, store, start_node, context);
+        if let Some(rerank) = rerank {
+            Reweighter::new(self.alpha).reweight(&mut results, store, rerank);
+        }
+        Ok(results)
     }
 
     /// This uses a diffusion type method to shift counts at each step.  The advantage of this is
@@ -247,6 +271,64 @@ mod grwr_tests {
         let scores = rwr.sample(&ccsr, &Unweighted, &es, 0, &[0f32]);
         let on_children: f32 = scores.iter().filter(|(k, _)| **k > 0).map(|(_, v)| *v).sum();
         assert!((on_children - 0.9).abs() < 0.1, "fraction on children: {}", on_children);
+    }
+
+    fn named(edges: &[(&str, &str)]) -> NamedGraph {
+        let mut gb = crate::named_graph::GraphBuilder::new();
+        for (a, b) in edges {
+            gb.add_edge(("n", a), ("n", b), 1., crate::graph::EdgeType::Undirected);
+        }
+        gb.build(true).unwrap()
+    }
+
+    fn embeddings_for(graph: &NamedGraph, names: &[&str]) -> NodeEmbeddings {
+        let mut b = crate::embeddings::NodeEmbeddingsBuilder::new(Distance::Euclidean);
+        for name in names {
+            let id = graph.node_id("n", name).unwrap_or(names.len()) as f32;
+            b.add_embedding("n", name, &[id]).unwrap();
+        }
+        b.build().unwrap()
+    }
+
+    /// Parallel float sums may differ in the last bit between runs.
+    fn assert_close(a: &HashMap<NodeID, f32>, b: &HashMap<NodeID, f32>) {
+        assert_eq!(a.len(), b.len(), "{:?} vs {:?}", a, b);
+        for (k, v) in a {
+            assert!((v - b[k]).abs() <= 1e-6 * v.abs().max(1.), "{:?} vs {:?}", a, b);
+        }
+    }
+
+    #[test]
+    fn test_walk_named_matches_sample_and_reranks() {
+        let g = named(&[("a", "b"), ("b", "c"), ("c", "d"), ("d", "a"), ("a", "c")]);
+        let emb = embeddings_for(&g, &["a", "b", "c", "d"]);
+        let grwr = GuidedRWR { seed: 1234, ..GuidedRWR::new(Steps::Fixed(2), 200) };
+        let start = g.node_id("n", "a").unwrap();
+        let context = Query::Node("n".into(), "c".into());
+
+        let walked = grwr.walk_named(&g, &emb, start, &context, None).unwrap();
+        let c = emb.get_embedding("n", "c").unwrap();
+        assert_close(&walked, &grwr.sample(g.graph(), &Weighted, emb.store(), start, c));
+
+        let rerank = Query::Embedding(vec![0.]);
+        let reranked = grwr.walk_named(&g, &emb, start, &context, Some(&rerank)).unwrap();
+        let mut expected = walked.clone();
+        Reweighter::new(grwr.alpha).reweight(&mut expected, emb.store(), &[0.]);
+        assert_close(&reranked, &expected);
+
+        let unknown = Query::Node("n".into(), "zzz".into());
+        assert!(matches!(grwr.walk_named(&g, &emb, start, &unknown, None), Err(Error::UnknownNode { .. })));
+        assert!(matches!(grwr.walk_named(&g, &emb, start, &context, Some(&unknown)),
+                         Err(Error::UnknownNode { .. })));
+    }
+
+    #[test]
+    fn test_walk_named_rejects_misaligned_embeddings() {
+        let g = named(&[("a", "b"), ("b", "c")]);
+        let reordered = embeddings_for(&g, &["c", "b", "a"]);
+        let grwr = GuidedRWR::new(Steps::Fixed(1), 10);
+        let context = Query::Embedding(vec![0.]);
+        assert!(matches!(grwr.walk_named(&g, &reordered, 0, &context, None), Err(Error::VocabMismatch(_))));
     }
 
     #[test]

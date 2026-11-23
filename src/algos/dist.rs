@@ -10,15 +10,48 @@ use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 
 use crate::bitset::BitSet;
-use crate::embeddings::EmbeddingStore;
+use crate::embeddings::{EmbeddingStore, NodeEmbeddings};
 use crate::distance::Distance;
+use crate::error::Error;
 use crate::graph::{Graph,NodeID};
+use crate::named_graph::NamedGraph;
 use crate::progress::CLProgressBar;
 
 #[derive(Copy,Clone,Debug)]
 pub enum LandmarkSelection {
     Random(u64),
     Degree
+}
+
+impl LandmarkSelection {
+    /// Random landmarks with `seed` when given, else the highest degree nodes.
+    pub fn from_seed(seed: Option<u64>) -> Self {
+        match seed {
+            Some(seed) => LandmarkSelection::Random(seed),
+            None => LandmarkSelection::Degree
+        }
+    }
+}
+
+/// Embeds each node by its distance in hops to each of `n_landmarks` landmarks, for
+/// [`Distance::ALT`].
+#[derive(Copy,Clone,Debug)]
+pub struct DistanceEmbedder {
+    pub n_landmarks: usize,
+    pub landmarks: LandmarkSelection
+}
+
+impl DistanceEmbedder {
+    /// Landmarks chosen at random with `seed` when given, else the highest degree nodes.
+    pub fn new(n_landmarks: usize, seed: Option<u64>) -> Self {
+        DistanceEmbedder { n_landmarks, landmarks: LandmarkSelection::from_seed(seed) }
+    }
+
+    /// Embeds every node of `graph`.
+    pub fn learn(&self, graph: &NamedGraph) -> Result<NodeEmbeddings, Error> {
+        let es = construct_walk_distances(graph.graph(), self.n_landmarks, self.landmarks);
+        NodeEmbeddings::new(graph.vocab().clone(), es)
+    }
 }
 
 /// Ignores edge weights and computes it assuming each edge has the same weight.  This radically
@@ -156,6 +189,24 @@ mod dist_tests {
         assert_eq!(es.get_embedding(3), vec![2f32, 1f32]);
     }
 
+
+    #[test]
+    fn test_distance_embedder_learns_named() {
+        assert!(matches!(LandmarkSelection::from_seed(Some(3)), LandmarkSelection::Random(3)));
+        assert!(matches!(LandmarkSelection::from_seed(None), LandmarkSelection::Degree));
+
+        let mut gb = crate::named_graph::GraphBuilder::new();
+        for (a, b) in [("a", "b"), ("b", "c")] {
+            gb.add_edge(("n", a), ("n", b), 1., crate::graph::EdgeType::Undirected);
+        }
+        let g = gb.build(true).unwrap();
+        let ne = DistanceEmbedder::new(1, None).learn(&g).unwrap();
+        assert_eq!((ne.len(), ne.dims()), (3, 1));
+        assert!(matches!(ne.distance(), Distance::ALT));
+        // "b" has the highest degree, so it is the landmark.
+        assert_eq!(ne.get_embedding("n", "a").unwrap(), &[1.]);
+        assert_eq!(ne.get_embedding("n", "b").unwrap(), &[0.]);
+    }
 
     /// Distances past 255 hops must saturate at 255, not wrap back toward 0.
     #[test]

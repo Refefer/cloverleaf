@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::collections::HashSet;
 
 use crate::error::Error;
+use crate::algos::graph_ann::NodeDistance;
+use crate::algos::utils::top_k_scores;
 use std::sync::atomic::{AtomicUsize,Ordering};
 
 static VOCAB_ID: AtomicUsize = AtomicUsize::new(0);
@@ -151,6 +153,37 @@ impl Vocab {
         (0..self.len()).map(move |id| self.get_name(id).expect("ids below len are in the vocab"))
     }
 
+    /// The `k` highest scores (all of them when `k` is None) by node name, highest first, keeping
+    /// only nodes whose type is in `node_types` when given.  Ties keep the order of `scores`.
+    /// The scores' node ids must be from this vocab.
+    pub fn top_k_named(
+        &self,
+        scores: impl IntoIterator<Item=(NodeID, f32)>,
+        k: Option<usize>,
+        node_types: Option<&HashSet<String>>
+    ) -> Vec<((String, String), f32)> {
+        let top = match node_types {
+            Some(nts) => top_k_scores(scores, k, |id| self.has_node_type(id, nts)),
+            None => top_k_scores(scores, k, |_id| true)
+        };
+        top.into_iter().map(|(node_id, score)| (self.name_of(node_id), score)).collect()
+    }
+
+    /// Distances by node name, in the order given.  The node ids must be from this vocab.
+    pub fn name_distances(
+        &self,
+        distances: impl IntoIterator<Item=NodeDistance>
+    ) -> Vec<((String, String), f32)> {
+        distances.into_iter().map(|nd| {
+            let (node_id, distance) = nd.to_tup_cloned();
+            (self.name_of(node_id), distance)
+        }).collect()
+    }
+
+    fn name_of(&self, node: NodeID) -> (String, String) {
+        self.get_name_owned(node).expect("node ids come from this vocab")
+    }
+
     pub fn translate_node(&self, other: &Vocab, other_node_id: NodeID) -> Option<NodeID> {
         if self.is_identical(other) {
             Some(other_node_id)
@@ -237,6 +270,28 @@ mod vocab_tests {
         let mut v = Vocab::new();
         names.iter().for_each(|n| { v.get_or_insert("n", *n); });
         v
+    }
+
+    #[test]
+    fn test_top_k_named() {
+        let mut v = Vocab::new();
+        v.get_or_insert("q", "a");
+        v.get_or_insert("p", "b");
+        v.get_or_insert("q", "c");
+        let name = |t: &str, n: &str| (t.to_string(), n.to_string());
+        let scores = vec![(0, 0.1), (1, 0.9), (2, 0.5)];
+
+        assert_eq!(v.top_k_named(scores.clone(), Some(2), None),
+                   vec![(name("p", "b"), 0.9), (name("q", "c"), 0.5)]);
+        let only_q = HashSet::from(["q".to_string()]);
+        assert_eq!(v.top_k_named(scores.clone(), None, Some(&only_q)),
+                   vec![(name("q", "c"), 0.5), (name("q", "a"), 0.1)]);
+        // Ties keep their input order.
+        assert_eq!(v.top_k_named(vec![(2, 1.), (0, 1.)], None, None),
+                   vec![(name("q", "c"), 1.), (name("q", "a"), 1.)]);
+
+        let distances = vec![NodeDistance::new(0.2, 2), NodeDistance::new(0.1, 1)];
+        assert_eq!(v.name_distances(distances), vec![(name("q", "c"), 0.2), (name("p", "b"), 0.1)]);
     }
 
     #[test]
