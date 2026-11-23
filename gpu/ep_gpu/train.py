@@ -357,6 +357,8 @@ def main():
     p.add_argument("--graph-cache", default=None,
                    help="Save the parsed graph here and reuse it while the inputs are unchanged.")
     p.add_argument("--directed", action="store_true")
+    p.add_argument("--prune-min-count", type=int, default=0,
+                   help="Drop features fewer than this many nodes have (cloverleaf's prune_min_count).")
     p.add_argument("--namespace", default="node_type",
                    help="'node_type' namespaces features by node type; anything else is one shared namespace.")
     defaults = Config()
@@ -376,9 +378,10 @@ def main():
     cfg = Config(**{k: getattr(args, k) for k in asdict(defaults)})
     start = time.time()
     if args.graph_cache:
-        graph = data.load_cached(args.graph_cache, args.edges, args.features, args.directed, args.namespace)
+        graph = data.load_cached(args.graph_cache, args.edges, args.features, args.directed,
+                                 args.namespace, args.prune_min_count)
     else:
-        graph = data.load(args.edges, args.features, args.directed, args.namespace)
+        graph = data.load(args.edges, args.features, args.directed, args.namespace, args.prune_min_count)
     print(f"loaded in {time.time() - start:.0f}s", flush=True)
     print(f"{graph.num_nodes} nodes, {len(graph.adj_idx)} directed edges, "
           f"{graph.num_features} features; {cfg}", flush=True)

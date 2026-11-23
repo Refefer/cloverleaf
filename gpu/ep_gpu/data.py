@@ -63,13 +63,17 @@ def _csr(n, rows, cols, vals):
     return np.cumsum(ptr), cols, vals
 
 
-def load(edges_path, features_path=None, directed=False, namespace="node_type"):
+def load(edges_path, features_path=None, directed=False, namespace="node_type", prune_min_count=0):
     """Reads a cloverleaf graph file and, optionally, a feature file.
 
     namespace: "node_type" puts each feature in its node's type namespace (cloverleaf's
     FeatureNamespace.node_type()); any other string is a single namespace for every feature
     (FeatureNamespace.single(namespace)).
+    prune_min_count: drops features that fewer than this many of the graph's nodes have, as
+    cloverleaf's FeatureSet.prune_min_count does; a node left with none gets its own feature.
     """
+    if isinstance(prune_min_count, bool) or not isinstance(prune_min_count, int) or prune_min_count < 0:
+        raise ValueError(f"prune_min_count must be an int >= 0, got {prune_min_count!r}")
     index, types, names = {}, [], []
 
     def node(t, n):
@@ -118,6 +122,15 @@ def load(edges_path, features_path=None, directed=False, namespace="node_type"):
                     continue
                 ns = pieces[0] if namespace == "node_type" else namespace
                 node_feats[v] = sorted({feature((ns, tok)) for tok in pieces[2].split()})
+    if prune_min_count > 1 and feature_keys:
+        counts = np.bincount(np.fromiter((f for fs in node_feats for f in fs), np.int64),
+                             minlength=len(feature_keys))
+        kept = np.flatnonzero(counts >= prune_min_count)
+        remap = np.full(len(feature_keys), -1, np.int64)
+        remap[kept] = np.arange(len(kept))
+        node_feats = [[int(remap[f]) for f in fs if remap[f] >= 0] for fs in node_feats]
+        feature_keys = [feature_keys[i] for i in kept]
+        feature_ids = {k: i for i, k in enumerate(feature_keys)}
     for v in range(n):
         if not node_feats[v]:
             node_feats[v] = [feature(("node", str(v)))]
@@ -135,19 +148,21 @@ def load(edges_path, features_path=None, directed=False, namespace="node_type"):
                  feature_keys)
 
 
-def load_cached(cache_path, edges_path, features_path=None, directed=False, namespace="node_type"):
+def load_cached(cache_path, edges_path, features_path=None, directed=False, namespace="node_type",
+                prune_min_count=0):
     """`load`, saving the parsed graph to `cache_path` the first time and reading it back after.
     The cache records its inputs and settings, and is rebuilt if they change."""
     import os
     key = {"edges": os.path.abspath(edges_path), "edges_mtime": os.path.getmtime(edges_path),
            "features": features_path and os.path.abspath(features_path),
            "features_mtime": features_path and os.path.getmtime(features_path),
-           "directed": directed, "namespace": namespace, "format": 2}
+           "directed": directed, "namespace": namespace, "prune_min_count": prune_min_count,
+           "format": 2}
     if os.path.exists(cache_path):
         saved = torch.load(cache_path, weights_only=False)
         if saved["key"] == key:
             return saved["graph"]
-    graph = load(edges_path, features_path, directed, namespace)
+    graph = load(edges_path, features_path, directed, namespace, prune_min_count)
     torch.save({"key": key, "graph": graph}, cache_path)
     return graph
 

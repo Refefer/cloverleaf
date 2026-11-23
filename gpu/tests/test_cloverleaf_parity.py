@@ -56,3 +56,17 @@ def test_mean_pooled_embeddings_match_cloverleafs_averaged_embedder(files, tmp_p
     exported = cl.NodeEmbeddings.load(prefix + ".node-embeddings", cl.Distance.Cosine)
     for node in graph.vocab():
         assert np.allclose(rebuilt.get_embedding(node), exported.get_embedding(node), atol=1e-5), node
+
+
+@pytest.mark.parametrize("min_count", [2, 3])
+def test_pruning_matches_cloverleafs_prune_min_count(files, min_count):
+    ours = data.load(*files, prune_min_count=min_count)
+    graph = cl.Graph.load(files[0], cl.EdgeType.Undirected)
+    features = cl.FeatureSet.new_from_graph(graph)
+    features.load_into(files[1], cl.FeatureNamespace.node_type())
+    pruned = features.prune_min_count(min_count)
+    cl.EmbeddingPropagator(dims=4, passes=1, indicator=False).learn_features(graph, pruned)
+    for v, node in enumerate(graph.vocab()):
+        start, end = int(ours.feat_ptr[v]), int(ours.feat_ptr[v + 1])
+        mine = {ours.feature_keys[f] for f in ours.feat_idx[start:end].tolist()}
+        assert mine == {tuple(f) for f in pruned.get_features(node)}, node

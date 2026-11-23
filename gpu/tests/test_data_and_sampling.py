@@ -179,3 +179,36 @@ def test_ids_are_int32_and_offsets_int64(tiny):
     g = data.load(*tiny)
     assert g.adj_idx.dtype == torch.int32 and g.feat_idx.dtype == torch.int32
     assert g.adj_ptr.dtype == torch.int64 and g.feat_ptr.dtype == torch.int64
+
+
+def test_prune_min_count_drops_rare_features_and_fills_emptied_nodes(tmp_path):
+    edges = tmp_path / "g.edges"
+    edges.write_text("n\ta\tn\tb\t1\nn\tb\tn\tc\t1\nn\tc\tn\td\t1\n")
+    feats = tmp_path / "g.features"
+    feats.write_text("n\ta\tx y\nn\tb\ty z\nn\tc\tx w\nn\td\tq\n")
+    g = data.load(str(edges), str(feats), prune_min_count=2)
+    by_node = {g.node_names[v]: {g.feature_keys[f] for f in
+                                 g.feat_idx[int(g.feat_ptr[v]):int(g.feat_ptr[v + 1])].tolist()}
+               for v in range(g.num_nodes)}
+    assert by_node == {"a": {("n", "x"), ("n", "y")}, "b": {("n", "y")}, "c": {("n", "x")},
+                       "d": {("node", "3")}}
+    assert len(g.feature_keys) == 3
+    assert data.load(str(edges), str(feats), prune_min_count=1).num_features == 5   # 0 and 1 keep all
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, True])
+def test_prune_min_count_rejects_bad_values(tmp_path, bad):
+    edges = tmp_path / "g.edges"
+    edges.write_text("n\ta\tn\tb\t1\n")
+    with pytest.raises(ValueError):
+        data.load(str(edges), prune_min_count=bad)
+
+
+def test_graph_cache_rebuilds_when_pruning_changes(tmp_path):
+    edges = tmp_path / "g.edges"
+    edges.write_text("n\ta\tn\tb\t1\n")
+    feats = tmp_path / "g.features"
+    feats.write_text("n\ta\tx\nn\tb\tx y\n")
+    cache = str(tmp_path / "g.pt")
+    assert data.load_cached(cache, str(edges), str(feats)).num_features == 2
+    assert data.load_cached(cache, str(edges), str(feats), prune_min_count=2).num_features == 1
