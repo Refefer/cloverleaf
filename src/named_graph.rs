@@ -146,6 +146,10 @@ pub struct GraphBuilder {
 }
 
 impl GraphBuilder {
+    /// Whether the Python bindings' `build_graph` merges repeated edges when not told.  Loading a
+    /// graph file doesn't by default ([`GraphLoadOptions::default`]).
+    pub const DEFAULT_DEDUPLICATE: bool = true;
+
     pub fn new() -> Self {
         GraphBuilder { vocab: Vocab::new(), edges: Vec::new() }
     }

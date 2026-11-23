@@ -29,6 +29,10 @@ pub enum Error {
     /// An argument outside its allowed range.
     InvalidArgument(String),
 
+    /// Changing a graph in place was asked for without copying, but the graph is shared with
+    /// other owners, so it would have to be copied first.
+    WouldCopyGraph,
+
     GraphLoad(GraphLoadError),
     EmbeddingLoad(EmbeddingLoadError),
     FeatureFile(FeatureFileError)
@@ -54,6 +58,9 @@ impl fmt::Display for Error {
                 write!(f, "Embedding has {} dimensions, expected {}", e.actual, e.expected),
             Error::Malformed { line, message } => write!(f, "Line {}: {}", line, message),
             Error::InvalidArgument(message) => write!(f, "{}", message),
+            Error::WouldCopyGraph => write!(f,
+                "Cannot change the graph in place: it is shared with other owners, so it would be \
+                 copied first.  Release the other references or allow the copy."),
             Error::GraphLoad(e) => write!(f, "{}", e),
             Error::EmbeddingLoad(e) => write!(f, "{}", e),
             Error::FeatureFile(e) => write!(f, "{}", e)

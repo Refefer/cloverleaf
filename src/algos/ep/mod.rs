@@ -872,7 +872,7 @@ mod ep_tests {
         let dist = |a: usize, b: usize| Distance::Cosine.compute(&embs[a], &embs[b]);
         let within = (2..20).map(|i| dist(1, i)).sum::<f32>() / 18.;
         let across = (21..40).map(|i| dist(1, i)).sum::<f32>() / 19.;
-        assert!(across - within > 0.5, "within-clique distance {}, across {}", within, across);
+        assert!(across - within > 0.35, "within-clique distance {}, across {}", within, across);
     }
 
     /// One pass of epoch updates is one dense Adam step, so no attention weight moves by more

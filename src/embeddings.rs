@@ -261,6 +261,9 @@ pub struct NodeEmbeddings {
 }
 
 impl NodeEmbeddings {
+    /// Distance the Python bindings load embeddings with when none is given.
+    pub const DEFAULT_DISTANCE: Distance = Distance::Cosine;
+
     /// Pairs a store with the vocab whose ids index it.
     pub fn new(vocab: Arc<Vocab>, embeddings: EmbeddingStore) -> Result<Self, Error> {
         if vocab.len() != embeddings.len() {
@@ -274,6 +277,24 @@ impl NodeEmbeddings {
     pub fn zeros(vocab: Arc<Vocab>, dims: usize, distance: Distance) -> Self {
         let embeddings = EmbeddingStore::new(vocab.len(), dims, distance);
         NodeEmbeddings { vocab, embeddings }
+    }
+
+    /// Embeddings from `((node type, name), embedding)` pairs, ids in the order first listed; a
+    /// node listed again takes the later embedding.  Every embedding must have as many
+    /// dimensions as the first, else an [`Error::DimensionMismatch`].  An empty list gives no
+    /// nodes and 0 dimensions.
+    pub fn from_list<I, A, B, E>(list: I, distance: Distance) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = ((A, B), E)>,
+        A: AsRef<str>,
+        B: AsRef<str>,
+        E: AsRef<[f32]>
+    {
+        let mut builder = NodeEmbeddingsBuilder::new(distance);
+        for ((node_type, name), embedding) in list {
+            builder.add_embedding(node_type.as_ref(), name.as_ref(), embedding.as_ref())?;
+        }
+        Ok(builder.build().unwrap_or_else(|| NodeEmbeddings::zeros(Arc::new(Vocab::new()), 0, distance)))
     }
 
     /// One-dimensional embeddings holding a score per node, as PageRank and LSR produce.
@@ -342,6 +363,12 @@ impl NodeEmbeddings {
 
     pub fn get_embedding(&self, node_type: &str, name: &str) -> Result<&[f32], Error> {
         Ok(self.embeddings.get_embedding(self.node_id(node_type, name)?))
+    }
+
+    /// The node at `node_id` and its embedding, if there is one.
+    pub fn get(&self, node_id: NodeID) -> Option<((String, String), &[f32])> {
+        let name = self.vocab.get_name_owned(node_id)?;
+        (node_id < self.len()).then(|| (name, self.embeddings.get_embedding(node_id)))
     }
 
     /// The embedding at `node_id`, erroring when it's out of range.

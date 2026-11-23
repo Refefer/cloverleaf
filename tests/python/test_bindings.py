@@ -543,3 +543,92 @@ def test_embedding_propagator_rejects_untrainable_settings(kwargs):
 def test_sparse_ppr_rejects_nan_restarts(make):
     with pytest.raises(ValueError):
         make()
+
+
+# VPCG
+
+
+@pytest.fixture
+def user_items():
+    """Users u1, u2 and items i1..i3; only the items have features."""
+    gb = cl.GraphBuilder()
+    for u, i in [("u1", "i1"), ("u1", "i2"), ("u2", "i2"), ("u2", "i3")]:
+        gb.add_edge(("user", u), ("item", i), 1.0, cl.EdgeType.Undirected)
+    g = gb.build_graph()
+    fs = cl.FeatureSet.new_from_graph(g)
+    for i in ["i1", "i2", "i3"]:
+        fs.set_features(("item", i), [("w", i), ("w", "shared")])
+    return g, fs
+
+
+def test_vpcg_feature_mappings(user_items):
+    g, fs = user_items
+    maps = cl.VpcgEmbedder(10, 2, 8).learn_feature_mapping(g, fs, "user")
+    # Users were given a feature of their own first.
+    assert fs.num_features() == 6
+    u1 = maps.get_feature_map(("user", "u1"))
+    assert sorted(fs[f][1] for f, _ in u1) == ["i1", "i2", "shared"]
+    assert math.isclose(sum(w * w for _, w in u1), 1.0, rel_tol=1e-5)
+    assert maps[list(g.vocab()).index(("user", "u1"))] == u1
+    with pytest.raises(KeyError):
+        maps.get_feature_map(("user", "zzz"))
+    with pytest.raises(IndexError):
+        maps[len(g)]
+
+
+@pytest.mark.parametrize("start", ["user", ["user"]])
+def test_vpcg_learn_embeddings(user_items, start):
+    g, fs = user_items
+    ne = cl.VpcgEmbedder(10, 3, 8, feature_weight=cl.FeatureWeight.IDF).learn(g, fs, start)
+    assert (ne.len(), ne.dims()) == (len(g), 8)
+    assert list(ne.vocab()) == list(g.vocab())
+    assert ne.get_distance() == cl.Distance.Cosine
+
+
+def test_vpcg_rejects_misaligned_features(user_items, tmp_path):
+    g, _ = user_items
+    # The feature file lists the graph's nodes in a different order.
+    path = tmp_path / "feats_reordered"
+    path.write_text("".join(f"{t}\t{name}\tf{name}\n" for t, name in reversed(list(g.vocab()))))
+    fs = cl.FeatureSet.new_from_file(str(path))
+    before = fs.num_features()
+    vpcg = cl.VpcgEmbedder(10, 2, 8)
+    with pytest.raises(ValueError):
+        vpcg.learn_feature_mapping(g, fs, "user")
+    with pytest.raises(ValueError):
+        vpcg.learn(g, fs, "user")
+    assert fs.num_features() == before
+
+
+@pytest.mark.parametrize("args", [(0, 2, 8), (10, 2, 0)])
+def test_vpcg_unembeddable_settings_raise(user_items, args):
+    # Keeping no terms leaves nodes without features; 0 dims has nowhere to hash them.
+    g, fs = user_items
+    with pytest.raises(ValueError):
+        cl.VpcgEmbedder(*args).learn(g, fs, "user")
+
+
+# PolicyEvaluation's optimize checks
+
+
+def test_policy_evaluation_needs_its_own_graph(graph):
+    gb = cl.GraphBuilder()
+    for a, b in [(0, 1), (1, 2), (2, 0), (2, 3)]:
+        gb.add_edge(n(a), n(b), 1.0, cl.EdgeType.Undirected)
+    twin = gb.build_graph()
+    pe = cl.PolicyEvaluation(graph)
+    with pytest.raises(ValueError, match="different graph"):
+        pe.optimize(twin, indicator=False)
+
+
+def test_policy_evaluation_copies_shared_graphs_only_when_told(graph):
+    pe = cl.PolicyEvaluation(graph)
+    pe.set_reward(n(3), 1.0)
+    before = graph.get_edges(n(2), normalized=True)
+    smci = cl.Smci(graph)  # holds a reference to the graph
+    with pytest.raises(RuntimeError, match="no_copy=False"):
+        pe.optimize(graph, indicator=False)
+    assert graph.get_edges(n(2), normalized=True) == before
+    pe.optimize(graph, no_copy=False, indicator=False)
+    assert graph.get_edges(n(2), normalized=True) != before
+    del smci

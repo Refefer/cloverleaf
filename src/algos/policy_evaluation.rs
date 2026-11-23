@@ -10,13 +10,62 @@
 //! original weights.
 
 use crate::error::Error;
+use crate::io::read_node_values;
 use crate::named_graph::NamedGraph;
+use crate::vocab::Vocab;
 use rayon::prelude::*;
 use std::fmt::Write;
+use std::sync::Arc;
 
 use crate::graph::{Graph, NodeID, ParallelModifiableGraph, convert_edges_to_cdf};
 use crate::progress::CLProgressBar;
 
+/// A reward for every node of a graph, for [`PolicyEvaluation::optimize_rewards`].  Every node
+/// starts at 0.
+#[derive(Clone,Debug)]
+pub struct NodeRewards {
+    vocab: Arc<Vocab>,
+    values: Vec<f32>
+}
+
+impl NodeRewards {
+    /// A reward of 0 for each of the graph's nodes.
+    pub fn new(graph: &NamedGraph) -> Self {
+        NodeRewards { vocab: graph.vocab().clone(), values: vec![0f32; graph.nodes()] }
+    }
+
+    /// Sets a node's reward, or errors with [`Error::UnknownNode`].
+    pub fn set(&mut self, node_type: &str, name: &str, value: f32) -> Result<(), Error> {
+        let node_id = self.vocab.node_id(node_type, name)?;
+        self.values[node_id] = value;
+        Ok(())
+    }
+
+    /// A node's reward, or [`Error::UnknownNode`].
+    pub fn get(&self, node_type: &str, name: &str) -> Result<f32, Error> {
+        Ok(self.values[self.vocab.node_id(node_type, name)?])
+    }
+
+    /// Sets rewards from a `node_type<TAB>name<TAB>reward` file; nodes not in it keep theirs.
+    /// The whole file is read first, so a malformed line or unknown node changes nothing.
+    pub fn load(&mut self, path: &str) -> Result<(), Error> {
+        for (node_id, value) in read_node_values(path, &self.vocab)? {
+            self.values[node_id] = value;
+        }
+        Ok(())
+    }
+
+    pub fn vocab(&self) -> &Arc<Vocab> {
+        &self.vocab
+    }
+
+    /// Every node's reward, indexed by node id.
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
+}
+
+#[derive(Clone,Copy,Debug)]
 pub struct PolicyEvaluation {
     pub gamma: f32,
     pub iterations: usize,
@@ -38,6 +87,25 @@ impl PolicyEvaluation {
         let values = self.compute(csr, rewards);
         self.update_policy_weights_in_place(csr, &values);
         Ok(())
+    }
+
+    /// [`optimize`](Self::optimize) with named rewards, which must have been built from this
+    /// graph or a clone of it (the same vocab, not merely an equal one), else an
+    /// [`Error::VocabMismatch`].  Unless `allow_copy`, a graph shared with other owners is an
+    /// [`Error::WouldCopyGraph`] rather than copied.  Either error leaves the graph unchanged.
+    pub fn optimize_rewards(
+        &self,
+        graph: &mut NamedGraph,
+        rewards: &NodeRewards,
+        allow_copy: bool
+    ) -> Result<(), Error> {
+        if !Arc::ptr_eq(graph.vocab(), rewards.vocab()) {
+            return Err(Error::VocabMismatch("NodeRewards and Graph"))
+        }
+        if !allow_copy && graph.graph_mut().is_none() {
+            return Err(Error::WouldCopyGraph)
+        }
+        self.optimize(graph, rewards.values())
     }
 }
 
@@ -197,4 +265,94 @@ pub fn update_one_node(
 
     // Back to CDF.
     convert_edges_to_cdf(weights, Some(sum));
+}
+
+#[cfg(test)]
+mod policy_evaluation_tests {
+    use super::*;
+    use crate::graph::EdgeType;
+    use crate::named_graph::GraphBuilder;
+
+    /// a -> b, a -> c, b -> c, c -> a.
+    fn graph() -> NamedGraph {
+        let mut gb = GraphBuilder::new();
+        for (f, t) in [("a", "b"), ("a", "c"), ("b", "c"), ("c", "a")] {
+            gb.add_edge(("n", f), ("n", t), 1., EdgeType::Directed);
+        }
+        gb.build(true).unwrap()
+    }
+
+    fn quiet() -> PolicyEvaluation {
+        PolicyEvaluation { indicator: false, ..PolicyEvaluation::default() }
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("cloverleaf-pe-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn test_node_rewards_set_and_load() {
+        let g = graph();
+        let mut rewards = NodeRewards::new(&g);
+        assert!(Arc::ptr_eq(rewards.vocab(), g.vocab()));
+        assert_eq!(rewards.values(), &[0., 0., 0.]);
+        rewards.set("n", "b", 2.).unwrap();
+        assert!(matches!(rewards.set("n", "zzz", 1.), Err(Error::UnknownNode { .. })));
+        assert_eq!(rewards.get("n", "b").unwrap(), 2.);
+
+        let path = temp_path("rewards");
+        std::fs::write(&path, "n\tc\t-1.5\n").unwrap();
+        rewards.load(path.to_str().unwrap()).unwrap();
+        // A bad line anywhere changes nothing.
+        std::fs::write(&path, "n\ta\t3\nn\tzzz\t1\n").unwrap();
+        let unknown = rewards.load(path.to_str().unwrap());
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(unknown, Err(Error::UnknownNode { .. })));
+        assert_eq!((rewards.get("n", "a").unwrap(), rewards.get("n", "b").unwrap(), rewards.get("n", "c").unwrap()),
+                   (0., 2., -1.5));
+    }
+
+    #[test]
+    fn test_optimize_rewards_matches_optimize() {
+        let mut g = graph();
+        let mut rewards = NodeRewards::new(&g);
+        rewards.set("n", "b", 1.).unwrap();
+        let mut expected = NamedGraph::new(g.vocab().clone(), Arc::new(g.graph().clone())).unwrap();
+        quiet().optimize(&mut expected, rewards.values()).unwrap();
+        quiet().optimize_rewards(&mut g, &rewards, false).unwrap();
+        assert_eq!(g.get_edges("n", "a", true).unwrap(), expected.get_edges("n", "a", true).unwrap());
+        // a now prefers b, the rewarded node.
+        let (edges, probs) = g.get_edges("n", "a", true).unwrap();
+        let to_b = edges.iter().position(|e| *e == g.node_id("n", "b").unwrap()).unwrap();
+        assert!(probs[to_b] > 0.5);
+    }
+
+    /// Rewards from an equal but separately built graph are rejected: only the same vocab counts.
+    #[test]
+    fn test_optimize_rewards_needs_the_same_vocab() {
+        let mut g = graph();
+        let rewards = NodeRewards::new(&graph());
+        assert!(g.vocab().is_aligned_with(rewards.vocab()));
+        let before = g.get_edges("n", "a", false).unwrap().1;
+        assert!(matches!(quiet().optimize_rewards(&mut g, &rewards, true), Err(Error::VocabMismatch(_))));
+        assert_eq!(g.get_edges("n", "a", false).unwrap().1, before);
+    }
+
+    /// A shared graph is an error unless copying is allowed, and then the other owner keeps the
+    /// original.
+    #[test]
+    fn test_optimize_rewards_copies_only_when_allowed() {
+        let mut g = graph();
+        let shared = g.clone();
+        let mut rewards = NodeRewards::new(&g);
+        rewards.set("n", "b", 1.).unwrap();
+        assert!(matches!(quiet().optimize_rewards(&mut g, &rewards, false), Err(Error::WouldCopyGraph)));
+        assert!(Arc::ptr_eq(g.shared_graph(), shared.shared_graph()));
+
+        quiet().optimize_rewards(&mut g, &rewards, true).unwrap();
+        assert!(!Arc::ptr_eq(g.shared_graph(), shared.shared_graph()));
+        assert_ne!(g.get_edges("n", "a", true).unwrap().1, shared.get_edges("n", "a", true).unwrap().1);
+        // No longer shared, so in place is fine.
+        quiet().optimize_rewards(&mut g, &rewards, false).unwrap();
+    }
 }

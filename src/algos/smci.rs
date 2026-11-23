@@ -9,6 +9,7 @@ use hashbrown::HashSet;
 use float_ord::FloatOrd;
 
 use std::ops::Deref;
+use std::sync::Arc;
 
 use crate::algos::rwr::rollout;
 use crate::algos::utils::Sample;
@@ -18,12 +19,58 @@ use crate::hogwild::{Hogwild};
 use crate::sampler::{GreedySampler};
 use crate::vocab::{TranslationTable, Vocab};
 use crate::embeddings::NodeEmbeddings;
+use crate::error::{Error, ensure_aligned};
 use crate::named_graph::NamedGraph;
+
+/// Seed the Python bindings use when none is given.
+pub const SMCI_SEED: u64 = crate::DEFAULT_SEED;
 
 /// Maps graph node ids to embedding ids, so SMCI can index the embeddings with graph nodes.
 fn graph_to_embedding_table(graph_vocab: &Vocab, embedding_vocab: &Vocab) -> TranslationTable {
     // create_translation_table is indexed by the receiver's ids and yields ids in `to_vocab`.
     graph_vocab.create_translation_table(embedding_vocab)
+}
+
+/// `(from node, to node, reward)` rewards over a graph's nodes, for
+/// [`SupervisedMCIteration::learn_rewards`]: walks from the first node are rewarded for ending
+/// at, or by embedding near, the second.
+#[derive(Clone,Debug)]
+pub struct PairRewards {
+    vocab: Arc<Vocab>,
+    rewards: Vec<(NodeID, NodeID, f32)>
+}
+
+impl PairRewards {
+    /// No rewards yet, over the graph's nodes.
+    pub fn new(graph: &NamedGraph) -> Self {
+        PairRewards { vocab: graph.vocab().clone(), rewards: Vec::new() }
+    }
+
+    /// Rewards walks from `from` that reach `to`.  Errors with [`Error::UnknownNode`], adding
+    /// nothing, unless both are in the vocab.
+    pub fn add(&mut self, from: (&str, &str), to: (&str, &str), reward: f32) -> Result<(), Error> {
+        let from = self.vocab.node_id(from.0, from.1)?;
+        let to = self.vocab.node_id(to.0, to.1)?;
+        self.rewards.push((from, to, reward));
+        Ok(())
+    }
+
+    pub fn vocab(&self) -> &Arc<Vocab> {
+        &self.vocab
+    }
+
+    /// The rewards by node id, in the order added.
+    pub fn rewards(&self) -> &[(NodeID, NodeID, f32)] {
+        &self.rewards
+    }
+
+    pub fn len(&self) -> usize {
+        self.rewards.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rewards.is_empty()
+    }
 }
 
 pub struct SupervisedMCIteration {
@@ -58,6 +105,45 @@ pub struct SupervisedMCIteration {
 }
 
 impl SupervisedMCIteration {
+    /// Contrast the Python bindings use when none is given: the learned distribution as is.
+    pub const DEFAULT_COMPRESSION: f32 = 1.0;
+
+    /// Settings for every parameter without a Python default, with
+    /// [`DEFAULT_COMPRESSION`](Self::DEFAULT_COMPRESSION) and [`SMCI_SEED`].
+    pub fn new(
+        iterations: usize,
+        num_walks: usize,
+        alpha: f32,
+        discount: f32,
+        step_penalty: f32,
+        explore_pct: f32,
+        restart_prob: f32
+    ) -> Self {
+        SupervisedMCIteration {
+            iterations,
+            num_walks,
+            alpha,
+            discount,
+            step_penalty,
+            explore_pct,
+            compression: SupervisedMCIteration::DEFAULT_COMPRESSION,
+            restart_prob,
+            seed: SMCI_SEED
+        }
+    }
+
+    /// [`learn_graph`](Self::learn_graph) with named rewards, which must index the graph's
+    /// nodes, else an [`Error::VocabMismatch`].
+    pub fn learn_rewards(
+        &self,
+        graph: &NamedGraph,
+        rewards: &PairRewards,
+        embeddings: Option<&NodeEmbeddings>
+    ) -> Result<NamedGraph, Error> {
+        ensure_aligned(graph.vocab(), rewards.vocab(), "Graph and PairRewards")?;
+        Ok(self.learn_graph(graph, rewards.rewards(), embeddings))
+    }
+
     /// Learns new edge weights for a named graph from `(from, to, reward)` rewards, returning a
     /// copy of the graph with them.  `embeddings`, when given, are matched to the graph's nodes
     /// by name.
@@ -291,5 +377,41 @@ mod test_supervised_mc_iteration {
         assert_eq!(learned.edges(), g.edges());
         let total: f32 = learned.get_edges("n", "a", true).unwrap().1.iter().sum();
         assert!((total - 1.).abs() < 1e-5 && total.is_finite());
+    }
+
+    #[test]
+    fn test_new_uses_binding_defaults() {
+        let s = SupervisedMCIteration::new(10, 20, 0., 0.9, 0., 0., 0.1);
+        assert_eq!((s.compression, s.seed), (SupervisedMCIteration::DEFAULT_COMPRESSION, SMCI_SEED));
+        assert_eq!((s.iterations, s.num_walks, s.restart_prob), (10, 20, 0.1));
+    }
+
+    /// Named rewards learn what the same rewards by id do.
+    #[test]
+    fn test_learn_rewards_matches_learn_graph() {
+        let g = diamond();
+        let mut rewards = PairRewards::new(&g);
+        assert!(rewards.is_empty());
+        rewards.add(("n", "a"), ("n", "b"), 1.).unwrap();
+        assert!(matches!(rewards.add(("n", "a"), ("n", "zzz"), 1.), Err(Error::UnknownNode { .. })));
+        assert!(matches!(rewards.add(("n", "zzz"), ("n", "a"), 1.), Err(Error::UnknownNode { .. })));
+        assert_eq!(rewards.len(), 1);
+        let (a, b) = (g.node_id("n", "a").unwrap(), g.node_id("n", "b").unwrap());
+        assert_eq!(rewards.rewards(), &[(a, b, 1.)]);
+
+        let named = smci().learn_rewards(&g, &rewards, None).unwrap();
+        let by_id = smci().learn_graph(&g, &[(a, b, 1.)], None);
+        for n in ["a", "b", "c", "d"] {
+            assert_eq!(named.get_edges("n", n, false).unwrap(), by_id.get_edges("n", n, false).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_learn_rewards_rejects_misaligned_rewards() {
+        let g = diamond();
+        let mut gb = crate::named_graph::GraphBuilder::new();
+        gb.add_edge(("n", "d"), ("n", "a"), 1., crate::graph::EdgeType::Directed);
+        let other = PairRewards::new(&gb.build(false).unwrap());
+        assert!(matches!(smci().learn_rewards(&g, &other, None), Err(Error::VocabMismatch(_))));
     }
 }

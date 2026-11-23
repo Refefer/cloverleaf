@@ -341,6 +341,9 @@ pub struct NodeEmbedder {
 }
 
 impl NodeEmbedder {
+    /// Whether the Python bindings' adhoc embedding rejects unknown features when not told.
+    pub const DEFAULT_STRICT: bool = true;
+
     pub fn new(aggregator: FeatureAggregator) -> Self {
         NodeEmbedder { aggregator }
     }

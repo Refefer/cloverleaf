@@ -14,7 +14,7 @@ use pyo3::types::{PyByteArray, PyBytes};
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 
-use crate::graph::{CumCSR,Graph as CGraph,NodeID};
+use crate::graph::{Graph as CGraph,NodeID};
 use crate::vocab::Vocab;
 use crate::distance::{Distance as EDist};
 use crate::embeddings::{EmbeddingStore,DimensionMismatch,Query as CoreQuery};
@@ -25,7 +25,7 @@ use crate::embeddings::NodeEmbeddingsBuilder as CoreNodeEmbeddingsBuilder;
 use crate::algos::aggregator::{FeatureAggregator as CoreFeatureAggregator, NodeEmbedder as CoreNodeEmbedder};
 use crate::algos::emb_aligner::{AlignMethod, EmbeddingAligner as CoreEmbeddingAligner, ALIGN_SEED};
 use crate::embeddings::NodeEmbeddings as CoreNodeEmbeddings;
-use crate::io::{read_node_values,EmbeddingLoadError,FeatureFileError,GraphLoadError};
+use crate::io::{EmbeddingLoadError,FeatureFileError,GraphLoadError};
 
 use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::ann::{Ann, ANN_SEED};
@@ -35,7 +35,7 @@ use crate::algos::ep::attention::AttentionWeights;
 use crate::algos::ep::{EmbeddingPropagation,LossWeighting as EPLW};
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::FeatureModel;
-use crate::algos::feat_propagation::propagate_features;
+use crate::algos::feat_propagation::{DEFAULT_THRESHOLD as PROPAGATION_THRESHOLD, DEFAULT_MAX_ITERS as PROPAGATION_MAX_ITERS};
 use crate::algos::graph_ann::{GraphAnn as CoreGraphAnn, GRAPH_ANN_SEED};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
@@ -44,14 +44,14 @@ use crate::algos::lsr::{LSR as ALSR, TournamentBuilder as CoreTournamentBuilder,
 use crate::algos::pprembed::PPREmbed;
 use crate::algos::pprrank::{PprRank, Loss as PprLoss};
 use crate::algos::grad_utils::optimizer::{OptimizerKind, WeightDecay};
-use crate::algos::policy_evaluation::{PolicyEvaluation as PEA};
+use crate::algos::policy_evaluation::{PolicyEvaluation as PEA, NodeRewards};
 use crate::algos::rwr::{RWR,SparsePpr,ROLLOUT_SEED,seeded_rollouts};
 use crate::algos::slpa::Slpa;
-use crate::algos::smci::SupervisedMCIteration;
+use crate::algos::smci::{SupervisedMCIteration, PairRewards};
 use crate::algos::utils::Sample;
 use crate::error::Error;
 use crate::named_graph::{GraphBuilder as CoreGraphBuilder, GraphLoadOptions};
-use crate::algos::vpcg::{VPCG, FeatureWeight as VFeatureWeight};
+use crate::algos::vpcg::{VPCG, FeatureWeight as VFeatureWeight, VpcgFeatureMappings as CoreVpcgFeatureMappings};
 
 
 impl From<Error> for PyErr {
@@ -64,7 +64,8 @@ impl From<Error> for PyErr {
             Error::EmbeddingLoad(e) => e.into(),
             Error::FeatureFile(e) => e.into(),
             Error::VocabMismatch(_) | Error::DimensionMismatch(_) | Error::Malformed { .. }
-                | Error::InvalidArgument(_) => PyValueError::new_err(e.to_string())
+                | Error::InvalidArgument(_) => PyValueError::new_err(e.to_string()),
+            Error::WouldCopyGraph => PyRuntimeError::new_err(e.to_string())
         }
     }
 }
@@ -130,12 +131,6 @@ fn convert_node_id_to_fqn(
 }
 
 
-/// Convenience method for getting an internal node id from pretty name
-/// Errors unless node ids from `a` index the same nodes in `b`.
-fn ensure_aligned(a: &Vocab, b: &Vocab, what: &'static str) -> PyResult<()> {
-    Ok(crate::error::ensure_aligned(a, b, what)?)
-}
-
 fn dimension_error(e: DimensionMismatch) -> PyErr {
     Error::from(e).into()
 }
@@ -153,6 +148,7 @@ fn resolve_index(mut idx: isize, len: usize) -> Option<usize> {
     }
 }
 
+/// Convenience method for getting an internal node id from pretty name
 fn get_node_id<A: AsRef<str>, B: AsRef<str>>(
     vocab: &Vocab, 
     node_type: A,
@@ -913,7 +909,7 @@ impl GraphBuilder {
     ///    
     #[pyo3(signature = (deduplicate=None))]
     pub fn build_graph(&mut self, deduplicate: Option<bool>) -> Option<Graph> {
-        self.gb.build(deduplicate.unwrap_or(true)).map(Graph::from)
+        self.gb.build(deduplicate.unwrap_or(CoreGraphBuilder::DEFAULT_DEDUPLICATE)).map(Graph::from)
     }
 
 }
@@ -1697,11 +1693,9 @@ impl FeatureSet {
     ///        
     ///    
     pub fn __getitem__(&self, idx: isize) -> PyResult<FQNode> {
-        let idx = resolve_index(idx, self.features.num_features())
-            .ok_or_else(|| PyIndexError::new_err("Feature index out of range for FeatureSet!"))?;
-
-        let fqn = self.features.get_pretty_feature(idx);
-        Ok(fqn)
+        resolve_index(idx, self.inner.num_features())
+            .and_then(|idx| self.inner.feature_name(idx))
+            .ok_or_else(|| PyIndexError::new_err("Feature index out of range for FeatureSet!"))
     }
 
     
@@ -1752,8 +1746,8 @@ impl FeaturePropagator {
     pub fn new(k: usize, threshold: Option<f32>, max_iters: Option<usize>) -> Self {
         FeaturePropagator { 
             k: k, 
-            threshold: threshold.unwrap_or(0.),
-            max_iters: max_iters.unwrap_or(20)
+            threshold: threshold.unwrap_or(PROPAGATION_THRESHOLD),
+            max_iters: max_iters.unwrap_or(PROPAGATION_MAX_ITERS)
         }
     }
     
@@ -1776,14 +1770,7 @@ impl FeaturePropagator {
         graph: &Graph,
         features: &mut FeatureSet
     ) -> PyResult<()> {
-        ensure_aligned(&graph.vocab, &features.vocab, "Graph and FeatureSet")?;
-        propagate_features(
-            graph.graph.deref(), 
-            &mut features.features, 
-            self.max_iters,
-            self.k,
-            self.threshold);
-        Ok(())
+        Ok(features.inner.propagate(&graph.inner, self.k, self.threshold, self.max_iters)?)
     }
 
 }
@@ -2000,7 +1987,8 @@ impl NodeEmbedder {
         feature_embeddings: &NodeEmbeddings,
         strict: Option<bool>
     ) -> PyResult<Vec<f32>> {
-        Ok(self.embedder.embed_adhoc(&features, &feature_embeddings.inner, strict.unwrap_or(true))?)
+        Ok(self.embedder.embed_adhoc(&features, &feature_embeddings.inner,
+                                     strict.unwrap_or(CoreNodeEmbedder::DEFAULT_STRICT))?)
     }
 
     ///    Same as embed_adhoc but with multiple feature sets.
@@ -2032,7 +2020,8 @@ impl NodeEmbedder {
         feature_embeddings: &NodeEmbeddings,
         strict: Option<bool>
     ) -> PyResult<Vec<Vec<f32>>> {
-        Ok(self.embedder.bulk_embed_adhoc(&features_set, &feature_embeddings.inner, strict.unwrap_or(true))?)
+        Ok(self.embedder.bulk_embed_adhoc(&features_set, &feature_embeddings.inner,
+                                          strict.unwrap_or(CoreNodeEmbedder::DEFAULT_STRICT))?)
     }
 
 }
@@ -2377,13 +2366,7 @@ impl NodeEmbeddings {
         list: Vec<((String, String), Vec<f32>)>, 
         distance: Distance
     ) -> PyResult<Self> {
-        let mut builder = CoreNodeEmbeddingsBuilder::new(distance.to_edist());
-        for ((node_type, node_name), emb) in list.iter() {
-            builder.add_embedding(node_type, node_name, emb).map_err(dimension_error)?;
-        }
-        let inner = builder.build().unwrap_or_else(||
-            CoreNodeEmbeddings::zeros(Arc::new(Vocab::new()), 0, distance.to_edist()));
-        Ok(NodeEmbeddings::from(inner))
+        Ok(NodeEmbeddings::from(CoreNodeEmbeddings::from_list(list, distance.to_edist())?))
     }
 
     /// Simple Python representation 
@@ -2560,12 +2543,10 @@ impl NodeEmbeddings {
     ///        
     ///    
     pub fn __getitem__(&self, idx: isize) -> PyResult<(FQNode, Vec<f32>)> {
-        let idx = resolve_index(idx, self.embeddings.len())
-            .ok_or_else(|| PyIndexError::new_err("Index out of range for embedding store!"))?;
-
-        let emb = self.embeddings.get_embedding(idx).to_vec();
-        let (nt, nn) = self.vocab.get_name(idx).expect("Already validated bounds, something borked");
-        Ok((((*nt).clone(), nn.to_string()), emb))
+        resolve_index(idx, self.inner.len())
+            .and_then(|idx| self.inner.get(idx))
+            .map(|(node, emb)| (node, emb.to_vec()))
+            .ok_or_else(|| PyIndexError::new_err("Index out of range for embedding store!"))
     }
 
     ///    L2Norms the embeddings, useful for cosine similarity.
@@ -2628,7 +2609,7 @@ impl NodeEmbeddings {
         skip_rows: Option<usize>
     ) -> PyResult<Self> {
         let fts = convert_filter_type(filter_type)?;
-        let distance = distance.unwrap_or(Distance::Cosine).to_edist();
+        let distance = distance.map(|d| d.to_edist()).unwrap_or(CoreNodeEmbeddings::DEFAULT_DISTANCE);
         py.detach(move || {
             let inner = CoreNodeEmbeddings::load(path, distance, fts.as_ref(), chunk_size, skip_rows)?;
             Ok(NodeEmbeddings::from(inner))
@@ -2834,7 +2815,7 @@ impl NeighborhoodAligner {
         comp_level: Option<u32>
     ) -> PyResult<()> {
         Ok(self.aligner.align_to_disk(path, &embeddings.inner, &graph.inner,
-                                      chunk_size.unwrap_or(10_000), comp_level)?)
+                                      chunk_size.unwrap_or(NA::DEFAULT_CHUNK_SIZE), comp_level)?)
     }
 
 
@@ -3182,10 +3163,9 @@ impl EmbAnn {
 /// Wrapper for the Supervised Monte-Carlo Iteration.  It stores the reward maps on the struct.
 #[pyclass]
 struct Smci {
-    graph: Arc<CumCSR>,
-    vocab: Arc<Vocab>,
+    graph: NamedGraph,
     /// Maps Node 1 -> Node 2 = Reward
-    rewards: Vec<(NodeID,NodeID,f32)>
+    rewards: PairRewards
 }
 
 /// Builds a table indexed by graph node id which yields the matching embedding id, if any.
@@ -3195,9 +3175,8 @@ impl Smci {
     #[new]
     pub fn new(graph: &Graph) -> Self {
         Smci {
-            graph: graph.graph.clone(),
-            vocab: graph.vocab.clone(),
-            rewards: Vec::new()
+            graph: graph.inner.clone(),
+            rewards: PairRewards::new(&graph.inner)
         }
     }
 
@@ -3207,10 +3186,7 @@ impl Smci {
         to_node: FQNode, 
         reward: f32
     ) -> PyResult<()> {
-        let f_n = get_node_id(self.vocab.deref(), from_node.0, from_node.1)?;
-        let t_n = get_node_id(self.vocab.deref(), to_node.0, to_node.1)?;
-        self.rewards.push((f_n, t_n, reward));
-        Ok(())
+        Ok(self.rewards.add((&from_node.0, &from_node.1), (&to_node.0, &to_node.1), reward)?)
     }
 
     #[pyo3(signature = (iterations, num_walks, alpha, discount, step_penalty, explore_pct, restart_prob, compression=None, embeddings=None, seed=None))]
@@ -3227,21 +3203,14 @@ impl Smci {
         embeddings: Option<&NodeEmbeddings>,
         seed: Option<u64>
     ) -> PyResult<Graph> {
+        let d = SupervisedMCIteration::new(
+            iterations, num_walks, alpha, discount, step_penalty, explore_pct, restart_prob);
         let smci = SupervisedMCIteration {
-            iterations,
-            num_walks,
-            alpha,
-            discount,
-            step_penalty,
-            explore_pct,
-            restart_prob,
-            compression: compression.unwrap_or(1.0),
-            seed: seed.unwrap_or(SEED)
+            compression: compression.unwrap_or(d.compression),
+            seed: seed.unwrap_or(d.seed),
+            ..d
         };
-
-        let graph = NamedGraph::new(self.vocab.clone(), self.graph.clone())?;
-        let new_graph = smci.learn_graph(&graph, &self.rewards, embeddings.map(|e| &e.inner));
-
+        let new_graph = smci.learn_rewards(&self.graph, &self.rewards, embeddings.map(|e| &e.inner))?;
         Ok(Graph::from(new_graph))
 
     }
@@ -3253,12 +3222,8 @@ impl Smci {
 /// edges via softmax to bias trajectories toward higher-value states.
 #[pyclass]
 struct PolicyEvaluation {
-    vocab: Arc<Vocab>,
-    gamma: f32,
-    iterations: usize,
-    eps: f32,
-    temperature: f32,
-    rewards: Vec<f32>,
+    pe: PEA,
+    rewards: NodeRewards
 }
 
 #[pymethods]
@@ -3305,20 +3270,20 @@ impl PolicyEvaluation {
         temperature: Option<f32>,
     ) -> Self {
         let d = PEA::default();
-        PolicyEvaluation {
-            vocab: graph.vocab.clone(),
+        let pe = PEA {
             gamma: gamma.unwrap_or(d.gamma),
             iterations: iterations.unwrap_or(d.iterations),
             eps: eps.unwrap_or(d.eps),
             temperature: temperature.unwrap_or(d.temperature),
-            rewards: vec![0f32; graph.nodes()],
-        }
+            ..d
+        };
+        PolicyEvaluation { pe, rewards: NodeRewards::new(&graph.inner) }
     }
 
     pub fn __repr__(&self) -> String {
         format!(
             "PolicyEvaluation<gamma={}, iterations={}, eps={}, temperature={}>",
-            self.gamma, self.iterations, self.eps, self.temperature
+            self.pe.gamma, self.pe.iterations, self.pe.eps, self.pe.temperature
         )
     }
 
@@ -3336,9 +3301,7 @@ impl PolicyEvaluation {
     ///    -------
     ///    () - Can throw exception
     pub fn set_reward(&mut self, node: FQNode, reward: f32) -> PyResult<()> {
-        let node_id = get_node_id(self.vocab.deref(), node.0, node.1)?;
-        self.rewards[node_id] = reward;
-        Ok(())
+        Ok(self.rewards.set(&node.0, &node.1, reward)?)
     }
 
     ///    Loads rewards from a tab-separated file.  Format per line:
@@ -3355,10 +3318,7 @@ impl PolicyEvaluation {
     ///    -------
     ///    () - Can throw exception
     pub fn load_rewards(&mut self, path: &str) -> PyResult<()> {
-        for (node_id, reward) in read_node_values(path, &self.vocab)? {
-            self.rewards[node_id] = reward;
-        }
-        Ok(())
+        Ok(self.rewards.load(path)?)
     }
 
     ///    Runs policy evaluation and rewrites the passed graph's edge weights
@@ -3391,28 +3351,20 @@ impl PolicyEvaluation {
         no_copy: Option<bool>,
         indicator: Option<bool>,
     ) -> PyResult<()> {
-        // Identity check: PE's vocab must be the vocab the graph was built with,
-        // otherwise `rewards[node_id]` is meaningless against this graph.
-        if !Arc::ptr_eq(&self.vocab, &graph.vocab) {
-            return Err(PyValueError::new_err(
+        let pe = PEA { indicator: indicator.unwrap_or(self.pe.indicator), ..self.pe };
+        pe.optimize_rewards(&mut graph.inner, &self.rewards, !no_copy.unwrap_or(true)).map_err(|e| match e {
+            Error::VocabMismatch(_) => PyValueError::new_err(
                 "PolicyEvaluation was built from a different graph's vocabulary; \
-                 construct a new PolicyEvaluation from this graph before optimizing."
-            ));
-        }
-
-        if no_copy.unwrap_or(true) && graph.inner.graph_mut().is_none() {
-            return Err(PyRuntimeError::new_err(
+                 construct a new PolicyEvaluation from this graph before optimizing."),
+            Error::WouldCopyGraph => PyRuntimeError::new_err(
                 "Cannot optimize in place: this graph has other live \
                  references, so running the optimizer would require \
                  making a full copy of it.  Release the other references \
                  (for example, drop any other Python variables pointing \
                  at the same graph) or pass no_copy=False to allow the \
-                 copy."
-            ));
-        }
-
-        let vi = PEA::new(self.gamma, self.iterations, self.eps, self.temperature, indicator.unwrap_or(true));
-        Ok(vi.optimize(&mut graph.inner, &self.rewards)?)
+                 copy."),
+            e => e.into()
+        })
     }
 }
 
@@ -3636,11 +3588,7 @@ impl PprRankLearner {
 #[pyclass]
 /// Method holding sparse embeddings
 struct VpcgFeatureMappings {
-    /// Vocab used for NodeID
-    vocab: Arc<Vocab>,
-
-    /// Mapping from NodeID to a list of (feature_idx, weight)
-    feature_mappings: Vec<Vec<(usize, f32)>>
+    inner: CoreVpcgFeatureMappings
 }
 
 #[pymethods]
@@ -3656,8 +3604,7 @@ impl VpcgFeatureMappings {
         &self, 
         node: FQNode
     ) -> PyResult<Vec<(usize, f32)>> {
-        let node_id = get_node_id(&self.vocab, node.0, node.1)?;
-        Ok(self.feature_mappings[node_id].clone())
+        Ok(self.inner.get(&node.0, &node.1)?.to_vec())
     }
 
     ///    Retrieves the feature mappings and weights for a given NodeID.
@@ -3665,8 +3612,7 @@ impl VpcgFeatureMappings {
         &self, 
         node_id: NodeID 
     ) -> PyResult<Vec<(usize, f32)>> {
-        self.feature_mappings.get(node_id).cloned()
-            .ok_or_else(|| PyIndexError::new_err("Node index larger than embedding size!"))
+        Ok(self.inner.get_by_id(node_id)?.to_vec())
     }
 
 }
@@ -3682,24 +3628,20 @@ pub enum FeatureWeight {
     IDF
 }
 
+impl From<FeatureWeight> for VFeatureWeight {
+    fn from(w: FeatureWeight) -> Self {
+        match w {
+            FeatureWeight::Uniform => VFeatureWeight::Uniform,
+            FeatureWeight::IDF => VFeatureWeight::IDF
+        }
+    }
+}
+
 /// Learns VPCG vectors on a graph.
 #[pyclass]
 struct VpcgEmbedder {
-    max_terms: usize, 
-    passes: usize,
-    dims: usize,
-    alpha: f32,
-    err: f32,
-    feature_weight: FeatureWeight
-}
-
-impl VpcgEmbedder {
-    fn split_graph(
-        graph: &Graph, 
-        start_node_types: HashSet<String>
-    ) -> (Vec<NodeID>, Vec<NodeID>) {
-        graph.split_by_node_types(&start_node_types)
-    }
+    vpcg: VPCG,
+    dims: usize
 }
 
 #[pymethods]
@@ -3750,20 +3692,20 @@ impl VpcgEmbedder {
         err: Option<f32>,
         feature_weight: Option<FeatureWeight>
     ) -> Self {
-        VpcgEmbedder { 
-            max_terms, 
-            passes, 
-            dims,
-            alpha: alpha.unwrap_or(1f32),
-            err: err.unwrap_or(1e-5),
-            feature_weight: feature_weight.unwrap_or(FeatureWeight::Uniform) 
-        }
+        let d = VPCG::new(max_terms, passes);
+        let vpcg = VPCG {
+            alpha: alpha.unwrap_or(d.alpha),
+            err: err.unwrap_or(d.err),
+            feature_weight: feature_weight.map(VFeatureWeight::from).unwrap_or(d.feature_weight),
+            ..d
+        };
+        VpcgEmbedder { vpcg, dims }
     }
 
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
         format!("VPCGEmbedder<MaxTerms={}, Passes={}, Dims={}, Alpha={}, Err={}>",
-                self.max_terms, self.passes, self.dims, self.alpha, self.err)
+                self.vpcg.max_terms, self.vpcg.iterations, self.dims, self.vpcg.alpha, self.vpcg.err)
     }
 
     ///    Learns VPCG embeddings on the graph.
@@ -3789,14 +3731,8 @@ impl VpcgEmbedder {
         features: &mut FeatureSet,
         start_node_type: &Bound<'_, PyAny>
     ) -> PyResult<NodeEmbeddings> {
-        let feature_maps = self.learn_feature_mapping(graph, features, start_node_type)?;
-        let embs = VPCG::convert_to_es(features.num_features(), self.dims, feature_maps.feature_mappings);
-        let node_embeddings = NodeEmbeddings::from(CoreNodeEmbeddings {
-            vocab: graph.vocab.clone(),
-            embeddings: embs 
-        });
-
-        Ok(node_embeddings)
+        let mappings = self.learn_feature_mapping(graph, features, start_node_type)?;
+        Ok(NodeEmbeddings::from(mappings.inner.into_embeddings(self.dims)?))
     }
 
     ///    Learns VPCG feature maps on the graph.
@@ -3823,37 +3759,8 @@ impl VpcgEmbedder {
         start_node_type: &Bound<'_, PyAny>
     ) -> PyResult<VpcgFeatureMappings> {
         let start_node_types = single_or_multistring(start_node_type)?;
-
-        // Bisect the graph
-        let (left, right) = VpcgEmbedder::split_graph(graph, start_node_types);
-
-        let feature_weight = match self.feature_weight{
-            FeatureWeight::Uniform => VFeatureWeight::Uniform,
-            FeatureWeight::IDF => VFeatureWeight::IDF,
-        };
-
-        // Every node must have at least one feature
-        features.features.fill_missing_nodes();
-        let vpcg = VPCG {
-            max_terms: self.max_terms, 
-            iterations: self.passes,
-            alpha: self.alpha,
-            err: self.err,
-            feature_weight: feature_weight 
-        };
-
-        let sparse_embeddings = vpcg.learn(
-            graph.graph.as_ref(), 
-            &features.features, 
-            (&left, &right)
-        );
-
-        let vfm = VpcgFeatureMappings {
-            vocab: graph.vocab.clone(),
-            feature_mappings: sparse_embeddings
-        };
-
-        Ok(vfm)
+        let inner = self.vpcg.learn_named(&graph.inner, &mut features.inner, &start_node_types)?;
+        Ok(VpcgFeatureMappings { inner })
 
     }
 
