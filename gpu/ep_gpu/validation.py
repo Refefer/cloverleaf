@@ -10,11 +10,19 @@ features as the exported embeddings are.
          high as the neighbour (ties count against it), as the retrieval evaluation's HitRate@10
   auc    the mean fraction of negatives the neighbour outscores
 
-The neighbours and negatives are drawn once, so the numbers compare from pass to pass.
-Validation nodes are left out as anchors but stay in the graph, so their edges still shape
-their neighbours' training: this is a transductive check, like the evaluation's transductive
-queries, not an inductive one.
+The pairs and negatives are drawn once, so the numbers compare from pass to pass.
+
+The pairs come from one of two places:
+
+  held-out edges  (`hold_out_edges`) edges removed from the training graph, in both directions:
+                  link prediction on edges the model never saw, the question the retrieval
+                  evaluation asks of test-period edges.
+  validation nodes (`RankingProbe.from_nodes`) the neighbours of nodes left out as anchors.
+                  Those nodes stay in their neighbours' reconstructions, so the edges were
+                  trained on, and the check mostly measures how well training edges are fit.
 """
+import dataclasses
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -22,15 +30,31 @@ import torch.nn.functional as F
 from . import sampling
 
 
+def hold_out_edges(graph, fraction, generator=None):
+    """(graph without them, sources, targets): `fraction` of the edges, drawn uniformly and
+    removed together with their reverse edges where those exist (an undirected graph stores
+    both), so nothing in training connects the pair."""
+    n, degrees = graph.num_nodes, graph.degrees()
+    device = graph.adj_ptr.device
+    src = torch.repeat_interleave(torch.arange(n, device=device), degrees)
+    dst = graph.adj_idx.long()
+    count = int(len(dst) * fraction)
+    pick = torch.randperm(len(dst), device=device, generator=generator)[:count]
+    keys = src * n + dst
+    dropped = torch.cat([keys[pick], dst[pick] * n + src[pick]])
+    keep = ~torch.isin(keys, dropped)
+    ptr = torch.zeros(n + 1, dtype=graph.adj_ptr.dtype, device=device)
+    ptr[1:] = torch.cumsum(torch.bincount(src[keep], minlength=n), 0)
+    held = dataclasses.replace(graph, adj_ptr=ptr, adj_idx=graph.adj_idx[keep], adj_w=graph.adj_w[keep])
+    return held, src[pick], dst[pick]
+
+
 class RankingProbe:
-    def __init__(self, graph, valid, positives=5, negatives=1000, seed=0):
-        """graph: on the device validation runs on; valid: validation node ids."""
+    def __init__(self, graph, anchor, positive, negatives=1000, seed=0):
+        """graph: on the device validation runs on; (anchor, positive): the pairs to score."""
         device = graph.adj_ptr.device
         gen = torch.Generator(device=device).manual_seed(seed)
-        nbrs, _, mask, _ = sampling.sample_neighbours(graph, valid, positives, generator=gen)
-        rows, cols = mask.nonzero(as_tuple=True)
-        self.anchor = valid[rows]                   # (P,) each pair's validation node
-        self.positive = nbrs[rows, cols]            # (P,) and its neighbour
+        self.anchor, self.positive = anchor, positive
         _, types = np.unique(np.asarray(graph.node_types), return_inverse=True)
         node_type = torch.from_numpy(types).to(device)
         self.positive_type = node_type[self.positive]
@@ -41,6 +65,14 @@ class RankingProbe:
             pick = torch.randint(0, len(members), (negatives,), device=device, generator=gen)
             self.negatives[t] = members[pick]
         self.count = negatives
+
+    @classmethod
+    def from_nodes(cls, graph, valid, positives=5, negatives=1000, seed=0):
+        """Up to `positives` neighbours of each validation node."""
+        gen = torch.Generator(device=graph.adj_ptr.device).manual_seed(seed)
+        nbrs, _, mask, _ = sampling.sample_neighbours(graph, valid, positives, generator=gen)
+        rows, cols = mask.nonzero(as_tuple=True)
+        return cls(graph, valid[rows], nbrs[rows, cols], negatives, seed + 1)
 
     def __len__(self):
         return len(self.anchor)

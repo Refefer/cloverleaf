@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 import torch
 
 from . import data, losses, ppr, sampling
-from .validation import RankingProbe
+from .validation import RankingProbe, hold_out_edges
 from .model import EPModel
 from .optim import EpochGradients, SparseTableOptimizer
 
@@ -89,6 +89,9 @@ class Config:
     valid_positives: int = 5         # neighbours per validation node that ranking check scores,
     valid_negatives: int = 1000      # against this many random nodes of each neighbour's type
                                      # (0 turns the ranking check off; see validation.py)
+    valid_edges: float = 0.0         # this fraction of edges is removed from training (with their
+                                     # reverses) and the ranking check scores them instead: link
+                                     # prediction on unseen edges rather than on trained ones
     seed: int = 2017
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -308,6 +311,12 @@ def train(graph, cfg, log=print, lists=None):
     set_precision(cfg, device)
     graph_device = placement(cfg, "graph_device")
     g = graph.to(graph_device)
+    if not 0 <= cfg.valid_edges < 1:
+        raise ValueError(f"valid_edges must be in [0, 1), got {cfg.valid_edges}")
+    held_out = None
+    if cfg.valid_edges > 0:
+        edge_gen = torch.Generator(device=graph_device).manual_seed(cfg.seed + 4)
+        g, *held_out = hold_out_edges(g, cfg.valid_edges, edge_gen)
     torch.manual_seed(cfg.seed)
     gen = torch.Generator(device=graph_device).manual_seed(cfg.seed)
     model, table_opt, dense_opt = build(cfg, g.num_features, device,
@@ -319,8 +328,12 @@ def train(graph, cfg, log=print, lists=None):
     order = torch.randperm(g.num_nodes, device=graph_device, generator=gen)
     n_valid = int(g.num_nodes * cfg.valid_pct)
     valid, anchors = order[:n_valid], order[n_valid:]
-    probe = (RankingProbe(g, valid, cfg.valid_positives, cfg.valid_negatives, cfg.seed + 3)
-             if len(valid) and cfg.valid_negatives > 0 and cfg.valid_positives > 0 else None)
+    probe = None
+    if cfg.valid_negatives > 0:
+        if held_out is not None:
+            probe = RankingProbe(g, *held_out, cfg.valid_negatives, cfg.seed + 3)
+        elif len(valid) and cfg.valid_positives > 0:
+            probe = RankingProbe.from_nodes(g, valid, cfg.valid_positives, cfg.valid_negatives, cfg.seed + 3)
     steps_per_pass = math.ceil(len(anchors) / cfg.batch_size)
     # Epoch updates: the table's gradients are summed here; the attention weights' accumulate in
     # their .grad, which is cleared only once a pass.  They start after `epoch_after` passes of
@@ -379,9 +392,9 @@ def train(graph, cfg, log=print, lists=None):
                     chunk = valid[vs:vs + cfg.batch_size]
                     total_vl += batch_loss(model, g, chunk, cfg, vgen, lists) * len(chunk)
             message += f", valid {float(total_vl) / len(valid):.5f}"
-            if probe is not None:
-                hr, auc = probe.evaluate(model, g)
-                message += f", valid hr@10 {hr:.4f} auc {auc:.4f}"
+        if probe is not None:
+            hr, auc = probe.evaluate(model, g)
+            message += f", {'held-out edges' if held_out is not None else 'valid'} hr@10 {hr:.4f} auc {auc:.4f}"
         log(f"{message} ({time.time() - start:.1f}s)")
     return model
 
