@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass
 
 import torch
 
-from . import data, losses, sampling
+from . import data, losses, ppr, sampling
 from .model import EPModel
 from .optim import SparseTableOptimizer
 
@@ -28,13 +28,25 @@ class Config:
                                      # Dense matrices need far smaller steps than sparse embeddings.
     lr_schedule: str = "cosine"      # "cosine" (20% warmup from lr/100, then cosine to lr/100) or "constant"
     init: str = "unit"               # "unit" or "glorot"
-    loss: str = "margin"             # margin, starspace, rank, rankspace
+    loss: str = "margin"             # margin, starspace, rank, rankspace, infonce; or listnet or
+                                     # listmle over each node's PPR list rather than reconstructing
     gamma: float = 1.0               # the loss's margin / threshold
     negatives: int = 1
     negative_pool: int | None = 2048  # nodes embedded once per batch that every anchor draws its
                                       # negatives from; 0 or None draws independent ones per anchor
     pool_negatives: bool = False     # infonce only: use the whole pool as each node's negatives
                                      # (one matrix multiply) instead of `negatives` drawn from it
+    ppr_k: int = 10                  # listwise losses: the PPR list's length,
+    ppr_sample: int | None = None    # entries drawn from it per node each time it's used (None: all),
+    ppr_sample_by: str = "weight"    # drawn in proportion to their PPR weight, or "uniform",
+    ppr_walks: int = 1000            # walks per node estimating it,
+    ppr_steps: float = 0.5           # < 1: each walk's restart probability after each step, so walks
+                                     # average 1/p steps; a whole number >= 1: a fixed walk length
+                                     # (odd lengths on a bipartite graph always end on the other side),
+    ppr_beta: float = 0.8            # the popularity discount: scores / degree^beta,
+    ppr_compression: float = 1.0     # weights are score^compression, normalised,
+    ppr_other_type: bool = False     # only nodes of another type, e.g. a query's products,
+    ppr_passive: bool = False        # listnet: skip positives already as likely as their weight
     max_nodes: int | None = None     # neighbours per reconstruction; None for all
     max_features: float | int | None = None   # features per node; a fraction, a count or None for all
     weighted_sampling: bool = False
@@ -86,11 +98,26 @@ def autocast(cfg, device):
 TABLE_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 
 
+def listwise(cfg):
+    return cfg.loss in losses.LISTWISE
+
+
 def check_loss(cfg):
-    if cfg.loss not in losses.LOSSES:
-        raise ValueError(f"loss must be one of {', '.join(losses.LOSSES)}, got {cfg.loss!r}")
-    if cfg.pool_negatives and (cfg.loss != "infonce" or not cfg.negative_pool):
-        raise ValueError("pool_negatives needs loss infonce and a negative_pool")
+    names = {**losses.LOSSES, **losses.LISTWISE}
+    if cfg.loss not in names:
+        raise ValueError(f"loss must be one of {', '.join(names)}, got {cfg.loss!r}")
+    if cfg.pool_negatives and (cfg.loss != "infonce" and not listwise(cfg) or not cfg.negative_pool):
+        raise ValueError("pool_negatives needs loss infonce, listnet or listmle, and a negative_pool")
+    if listwise(cfg) and not cfg.negative_pool:
+        raise ValueError(f"{cfg.loss} draws its negatives from a negative_pool")
+    if cfg.ppr_passive and cfg.loss != "listnet":
+        raise ValueError("ppr_passive applies only to listnet")
+    if not (0 < cfg.ppr_steps < 1 or (cfg.ppr_steps >= 1 and float(cfg.ppr_steps).is_integer())):
+        raise ValueError(f"ppr_steps must be in (0, 1) or a whole number >= 1, got {cfg.ppr_steps}")
+    if cfg.ppr_sample is not None and not 0 < cfg.ppr_sample <= cfg.ppr_k:
+        raise ValueError(f"ppr_sample must be in 1..ppr_k ({cfg.ppr_k}), got {cfg.ppr_sample}")
+    if cfg.ppr_sample_by not in ppr.SAMPLE_BY:
+        raise ValueError(f"ppr_sample_by must be one of {', '.join(ppr.SAMPLE_BY)}, got {cfg.ppr_sample_by!r}")
 
 
 def placement(cfg, setting):
@@ -127,9 +154,63 @@ def nested_reconstruction(cfg):
     return cfg.reconstruction == "nested" or (cfg.reconstruction == "auto" and cfg.pooling == "attention")
 
 
-def batch_loss(model, graph, nodes, cfg, generator):
-    """Mean EP loss over `nodes` that have neighbours.  Sampling runs where the graph is (nodes and
-    generator are on its device); the embedding and loss run on model.device."""
+def listwise_loss(model, graph, lists, nodes, cfg, generator):
+    """Mean listwise loss over `nodes` whose PPR list isn't empty."""
+    pos, pos_w = lists.nodes[nodes], lists.weights[nodes]
+    if cfg.ppr_sample is not None and cfg.ppr_sample < cfg.ppr_k:
+        pos, pos_w = ppr.subsample(pos, pos_w, cfg.ppr_sample, cfg.ppr_sample_by, generator)
+    fidx, fmask = sampling.sample_features(graph, nodes, cfg.max_features, generator)
+    pidx, pmask = sampling.sample_features(graph, pos.reshape(-1), cfg.max_features, generator)
+    pmask &= (pos_w.reshape(-1) > 0)[:, None]
+    pool = torch.randint(0, graph.num_nodes, (cfg.negative_pool,), device=nodes.device,
+                         generator=generator)
+    nidx, nmask = sampling.sample_features(graph, pool, cfg.max_features, generator)
+    valid = pos_w > 0
+    if cfg.pool_negatives:
+        # Every pool node but the anchor and its own positives.
+        clash = (pool[None, :] == nodes[:, None]) | (
+            (pool[None, None, :] == pos[:, :, None]) & valid[:, :, None]).any(1)
+    else:
+        pick = sampling.pick_from_pool(pool, nodes, cfg.negatives, generator)
+        clash = ((pool[pick][:, :, None] == pos[:, None, :]) & valid[:, None, :]).any(2)
+    device = model.device
+    move = lambda x: x.to(device, non_blocking=True)
+    fidx, fmask, pidx, pmask, nidx, nmask, pos_w, clash = map(
+        move, (fidx, fmask, pidx, pmask, nidx, nmask, pos_w, clash))
+    with autocast(cfg, device):
+        h, hp, neg = model.embed_groups([(fidx, fmask.float()), (pidx, pmask.float()),
+                                         (nidx, nmask.float())])
+    h, hp, neg = h.float(), hp.float(), neg.float()
+    pos_logits = losses.cosine_logits(h, hp.view(len(nodes), pos_w.shape[1], -1), cfg.gamma)
+    if cfg.pool_negatives:
+        neg_logits = losses.pool_logits(h, neg, cfg.gamma)
+    else:
+        neg_logits = losses.cosine_logits(h, neg[move(pick)], cfg.gamma)
+    neg_logits = neg_logits.masked_fill(clash, losses.MASKED)
+    if cfg.loss == "listnet":
+        per_node = losses.listnet(pos_logits, pos_w, neg_logits, cfg.ppr_passive)
+    else:
+        per_node = losses.listmle(pos_logits, pos_w, neg_logits)
+    has_list = pos_w.sum(1) > 0
+    return (per_node * has_list).sum() / has_list.sum().clamp(min=1)
+
+
+def build_lists(edges_path, graph, cfg, directed=False, log=print):
+    """The PPR lists a listwise loss trains on, built by cloverleaf from the graph's edge file."""
+    start = time.time()
+    lists = ppr.ppr_lists(edges_path, graph, cfg.ppr_k, cfg.ppr_walks, cfg.ppr_steps, cfg.ppr_beta,
+                          cfg.ppr_compression, cfg.ppr_other_type, directed, cfg.seed)
+    empty = int((lists.weights.sum(1) == 0).sum())
+    log(f"ppr lists in {time.time() - start:.1f}s; {empty} of {graph.num_nodes} nodes reach nothing")
+    return lists
+
+
+def batch_loss(model, graph, nodes, cfg, generator, lists=None):
+    """Mean loss over `nodes` that have neighbours (or, for a listwise loss, a PPR list).  Sampling
+    runs where the graph is (nodes and generator are on its device); the embedding and loss run
+    on model.device."""
+    if listwise(cfg):
+        return listwise_loss(model, graph, lists, nodes, cfg, generator)
     fidx, fmask = sampling.sample_features(graph, nodes, cfg.max_features, generator)
     nested = nested_reconstruction(cfg)
     neighbours = (sampling.neighbour_features if nested else sampling.neighbourhood_tokens)(
@@ -172,9 +253,12 @@ def batch_loss(model, graph, nodes, cfg, generator):
     return (per_node * has_neighbours).sum() / has_neighbours.sum().clamp(min=1)
 
 
-def train(graph, cfg, log=print):
+def train(graph, cfg, log=print, lists=None):
+    """lists: the PPR lists (build_lists) a listwise loss needs."""
     device = torch.device(cfg.device)
     check_loss(cfg)
+    if listwise(cfg) and lists is None:
+        raise ValueError(f"{cfg.loss} needs PPR lists; see build_lists")
     set_precision(cfg, device)
     graph_device = placement(cfg, "graph_device")
     g = graph.to(graph_device)
@@ -183,6 +267,8 @@ def train(graph, cfg, log=print):
     model, table_opt, dense_opt = build(cfg, g.num_features, device,
                                         torch.Generator(device=device).manual_seed(cfg.seed + 2))
 
+    if lists is not None:
+        lists = lists.to(graph_device)
     order = torch.randperm(g.num_nodes, device=graph_device, generator=gen)
     n_valid = int(g.num_nodes * cfg.valid_pct)
     valid, anchors = order[:n_valid], order[n_valid:]
@@ -201,7 +287,7 @@ def train(graph, cfg, log=print):
                 for group in dense_opt.param_groups:
                     group["lr"] = lr * cfg.dense_lr / cfg.lr
                 dense_opt.zero_grad()
-            loss = batch_loss(model, g, nodes, cfg, gen)
+            loss = batch_loss(model, g, nodes, cfg, gen, lists)
             loss.backward()
             table_opt.step()
             if dense_opt is not None:
@@ -218,7 +304,7 @@ def train(graph, cfg, log=print):
                 # at once may not fit.
                 for vs in range(0, len(valid), cfg.batch_size):
                     chunk = valid[vs:vs + cfg.batch_size]
-                    total_vl += batch_loss(model, g, chunk, cfg, vgen) * len(chunk)
+                    total_vl += batch_loss(model, g, chunk, cfg, vgen, lists) * len(chunk)
             message += f", valid {float(total_vl) / len(valid):.5f}"
         log(f"{message} ({time.time() - start:.1f}s)")
     return model
@@ -280,7 +366,7 @@ def main():
             p.add_argument(flag, action="store_true")
         elif name == "max_features":
             p.add_argument(flag, type=lambda s: float(s) if "." in s else int(s), default=None)
-        elif name == "max_nodes":
+        elif name in ("max_nodes", "ppr_sample"):
             p.add_argument(flag, type=int, default=None)
         else:
             p.add_argument(flag, type=type(value), default=value)
@@ -296,8 +382,11 @@ def main():
     print(f"loaded in {time.time() - start:.0f}s", flush=True)
     print(f"{graph.num_nodes} nodes, {len(graph.adj_idx)} directed edges, "
           f"{graph.num_features} features; {cfg}", flush=True)
+    log = lambda m: print(m, flush=True)
+    check_loss(cfg)
+    lists = build_lists(args.edges, graph, cfg, args.directed, log) if listwise(cfg) else None
     start = time.time()
-    model = train(graph, cfg, log=lambda m: print(m, flush=True))
+    model = train(graph, cfg, log=log, lists=lists)
     peak = (f", peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB"
             if torch.device(cfg.device).type == "cuda" else "")
     print(f"trained in {time.time() - start:.0f}s{peak}", flush=True)

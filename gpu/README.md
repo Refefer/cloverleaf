@@ -88,6 +88,17 @@ size.
 * `loss`: margin, starspace, rank, rankspace (as cloverleaf) or `infonce`: cross entropy over
   cosine similarities divided by a temperature (`gamma`).  With `pool_negatives`, each node's
   softmax runs over the whole negative pool with one matrix multiply.
+* `listnet` / `listmle`: no reconstruction.  Each node is scored against its own personalised
+  PageRank list, which cloverleaf builds (`cloverleaf.ppr_lists`, as `PprRankLearner` uses, with
+  `ppr_k`, `ppr_walks`, `ppr_steps`, `ppr_beta`, `ppr_compression` and `ppr_other_type`), and
+  against negatives from the pool.  `ppr_steps` below 1 is the restart probability; a whole
+  number is a fixed walk length, and on a bipartite graph an odd one always ends on the other
+  side, so no walks are wasted.  `ppr_sample` draws that many of each list's `ppr_k` entries every
+  time the node is used (`ppr_sample_by` weight or uniform), so a long list doesn't become a
+  fixed set of targets to memorise.  Logits are cosine similarities over the temperature
+  (`gamma`).  ListNet is cross entropy against the list's weights; top-k ListMLE is the
+  likelihood of the listed nodes coming first, in order.  This trains embeddings the way
+  retrieval uses them, node against node, and needs cloverleaf installed.
 * `neighbour_pooling` ("mean" by default) combines a nested reconstruction's neighbours.  A
   weighted mean keeps h~(v) in the same space as the node embeddings it's compared with;
   attention there learns its own transform, which lowers the training loss but makes nodes

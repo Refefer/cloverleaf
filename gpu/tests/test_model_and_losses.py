@@ -161,3 +161,53 @@ def test_infonce_pool_matches_gathering_every_pool_node():
         keep = ~exclude[i]
         ref = losses.infonce(t[i:i + 1], h[i:i + 1], pool[keep][None], 0.1)
         assert torch.allclose(got[i], ref[0], atol=1e-5)
+
+
+def _listwise_case():
+    torch.manual_seed(0)
+    pos_logits = torch.randn(3, 4, dtype=torch.float64)
+    neg_logits = torch.randn(3, 5, dtype=torch.float64)
+    pos_w = torch.tensor([[0.5, 0.3, 0.2, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+                         dtype=torch.float64)
+    return pos_logits, pos_w, neg_logits
+
+
+def test_listnet_is_cross_entropy_against_the_list_weights():
+    pos_logits, pos_w, neg_logits = _listwise_case()
+    got = losses.listnet(pos_logits, pos_w, neg_logits)
+    for b in range(3):
+        k = int((pos_w[b] > 0).sum())
+        log_p = torch.log_softmax(torch.cat([pos_logits[b, :k], neg_logits[b]]), 0)
+        assert torch.allclose(got[b], -(pos_w[b, :k] * log_p[:k]).sum())
+
+
+def test_passive_listnet_skips_positives_already_as_likely_as_their_weight():
+    pos_logits = torch.tensor([[5.0, -5.0]])
+    pos_w = torch.tensor([[0.5, 0.5]])
+    neg_logits = torch.tensor([[-5.0]])
+    log_p = torch.log_softmax(torch.tensor([5.0, -5.0, -5.0]), 0)
+    assert torch.allclose(losses.listnet(pos_logits, pos_w, neg_logits, passive=True), -0.5 * log_p[1])
+    assert torch.allclose(losses.listnet(pos_logits, pos_w, neg_logits), -0.5 * log_p[:2].sum())
+
+
+def test_listmle_scores_only_the_positives_positions():
+    pos_logits, pos_w, neg_logits = _listwise_case()
+    got = losses.listmle(pos_logits, pos_w, neg_logits)
+    for b in range(3):
+        k = int((pos_w[b] > 0).sum())
+        logits = torch.cat([pos_logits[b, :k], neg_logits[b]])
+        want = sum(torch.logsumexp(logits[i:], 0) - logits[i] for i in range(k))
+        assert torch.allclose(got[b], torch.as_tensor(want, dtype=got.dtype))
+    shuffled = losses.listmle(pos_logits, pos_w, neg_logits.flip(1))
+    assert torch.allclose(got, shuffled)
+
+
+def test_masked_negatives_drop_out_and_keep_gradients_finite():
+    pos_logits, pos_w, neg_logits = _listwise_case()
+    pos_logits.requires_grad_(True)
+    masked = torch.cat([neg_logits, torch.full((3, 2), losses.MASKED, dtype=torch.float64)], 1)
+    for loss in (losses.listnet, losses.listmle):
+        assert torch.allclose(loss(pos_logits, pos_w, masked), loss(pos_logits, pos_w, neg_logits))
+        loss(pos_logits, pos_w, masked).sum().backward()
+        assert torch.isfinite(pos_logits.grad).all()
+        pos_logits.grad = None

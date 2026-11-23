@@ -62,3 +62,47 @@ def infonce_pool(t, h, pool, exclude, temperature):
 
 LOSSES = {"margin": margin, "starspace": starspace, "rank": rank, "rankspace": rankspace,
           "infonce": infonce}
+
+
+# Listwise losses over each node's PPR list (ppr.py).  Unlike the losses above there's no
+# reconstruction: h(v) is scored against its listed nodes' own embeddings, as retrieval scores
+# them, with logits cos(h(v), h(u)) / temperature.  pos_w (B, k) are the list's weights, 0 for
+# padding; the negatives' logits (B, n) have MASKED where a negative must not count.
+
+MASKED = -1e4   # finite, so logcumsumexp's backward pass stays finite
+
+
+def cosine_logits(h, others, temperature):
+    """(B, d) against (B, n, d) -> (B, n)."""
+    return (F.normalize(others, dim=-1) * F.normalize(h, dim=-1)[:, None, :]).sum(-1) / temperature
+
+
+def pool_logits(h, pool, temperature):
+    """(B, d) against a shared (P, d) pool -> (B, P)."""
+    return F.normalize(h, dim=-1) @ F.normalize(pool, dim=-1).T / temperature
+
+
+def listnet(pos_logits, pos_w, neg_logits, passive=False):
+    """Cross entropy between the list's weights (0 for every negative) and one softmax over the
+    positives and negatives.  passive skips positives already predicted at least as likely as
+    their weight, as cloverleaf's Python bindings do."""
+    valid = pos_w > 0
+    k = pos_logits.shape[1]
+    log_p = torch.log_softmax(torch.cat([pos_logits.masked_fill(~valid, MASKED), neg_logits], 1), 1)[:, :k]
+    if passive:
+        valid = valid & (log_p.detach().exp() <= pos_w)
+    return -torch.where(valid, pos_w * log_p, torch.zeros_like(log_p)).sum(1)
+
+
+def listmle(pos_logits, pos_w, neg_logits):
+    """Top-k ListMLE: the Plackett-Luce likelihood of the positives coming first, in list order,
+    each chosen from itself, the positives after it and every negative.  The negatives' own order
+    is arbitrary, so it isn't scored."""
+    valid = pos_w > 0
+    pos = pos_logits.masked_fill(~valid, MASKED)
+    after = torch.logcumsumexp(pos.flip(1), 1).flip(1)           # log sum over positives j >= i
+    denom = torch.logaddexp(after, torch.logsumexp(neg_logits, 1, keepdim=True))
+    return torch.where(valid, denom - pos, torch.zeros_like(pos)).sum(1)
+
+
+LISTWISE = {"listnet": listnet, "listmle": listmle}
