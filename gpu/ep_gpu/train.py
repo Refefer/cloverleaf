@@ -43,6 +43,10 @@ class Config:
                                       # negatives from; 0 or None draws independent ones per anchor
     pool_negatives: bool = False     # infonce only: use the whole pool as each node's negatives
                                      # (one matrix multiply) instead of `negatives` drawn from it
+    mask_neighbours: bool = False    # infonce only: a negative that is one of the anchor's own
+                                     # neighbours doesn't count (a false negative)
+    starspace_weight: float = 0.0    # infonce only: the loss is (1 - w) infonce + w StarSpace over
+    starspace_margin: float = 0.1    # the same negatives, with this margin
     ppr_k: int = 10                  # listwise losses: the PPR list's length,
     ppr_sample: int | None = None    # entries drawn from it per node each time it's used (None: all),
     ppr_sample_by: str = "weight"    # drawn in proportion to their PPR weight, or "uniform",
@@ -89,6 +93,8 @@ class Config:
     valid_positives: int = 5         # neighbours per validation node that ranking check scores,
     valid_negatives: int = 1000      # against this many random nodes of each neighbour's type
                                      # (0 turns the ranking check off; see validation.py)
+    keep_best_probe: bool = False    # export the pass whose ranking check had the best hr@10
+                                     # rather than the last (early stopping; needs the check)
     valid_edges: float = 0.0         # this fraction of edges is removed from training (with their
                                      # reverses) and the ranking check scores them instead: link
                                      # prediction on unseen edges rather than on trained ones
@@ -146,6 +152,10 @@ def check_loss(cfg):
         raise ValueError("pool_negatives needs loss infonce, listnet or listmle, and a negative_pool")
     if listwise(cfg) and not cfg.negative_pool:
         raise ValueError(f"{cfg.loss} draws its negatives from a negative_pool")
+    if (cfg.mask_neighbours or cfg.starspace_weight) and cfg.loss != "infonce":
+        raise ValueError("mask_neighbours and starspace_weight apply only to infonce")
+    if not 0 <= cfg.starspace_weight <= 1:
+        raise ValueError(f"starspace_weight must be in [0, 1], got {cfg.starspace_weight}")
     if cfg.ppr_passive and cfg.loss != "listnet":
         raise ValueError("ppr_passive applies only to listnet")
     if not (0 < cfg.ppr_steps < 1 or (cfg.ppr_steps >= 1 and float(cfg.ppr_steps).is_integer())):
@@ -245,10 +255,10 @@ def build_lists(edges_path, graph, cfg, directed=False, log=print):
     return lists
 
 
-def batch_loss(model, graph, nodes, cfg, generator, lists=None):
+def batch_loss(model, graph, nodes, cfg, generator, lists=None, keys=None):
     """Mean loss over `nodes` that have neighbours (or, for a listwise loss, a PPR list).  Sampling
     runs where the graph is (nodes and generator are on its device); the embedding and loss run
-    on model.device."""
+    on model.device.  keys: sampling.edge_keys(graph), for mask_neighbours."""
     if listwise(cfg):
         return listwise_loss(model, graph, lists, nodes, cfg, generator)
     fidx, fmask = sampling.sample_features(graph, nodes, cfg.max_features, generator)
@@ -283,9 +293,24 @@ def batch_loss(model, graph, nodes, cfg, generator, lists=None):
             tw = nw
     # Losses in float32: they normalise and take logs.
     h, t, neg = h.float(), t.float(), neg.float()
-    if cfg.pool_negatives:
-        exclude = pool.to(device)[None, :] == nodes.to(device)[:, None]
-        per_node = losses.infonce_pool(t, h, neg, exclude, cfg.gamma)
+    if cfg.loss == "infonce" and (cfg.pool_negatives or cfg.mask_neighbours or cfg.starspace_weight):
+        # Against the whole pool, or `negatives` picked from it, leaving out the anchor itself
+        # and, with mask_neighbours, its own neighbours.
+        if cfg.pool_negatives:
+            neg_ids = pool[None, :].expand(len(nodes), -1)
+            pos, neg_cos = losses.cosines(t, h, pool=neg)
+        else:
+            neg_ids = pool[pick.to(pool.device)] if cfg.negative_pool else neg_nodes.view(len(nodes), -1)
+            hu = neg[pick] if cfg.negative_pool else neg.view(len(nodes), cfg.negatives, -1)
+            pos, neg_cos = losses.cosines(t, h, hu=hu)
+        exclude = neg_ids == nodes[:, None]
+        if cfg.mask_neighbours:
+            exclude = exclude | sampling.are_neighbours(keys, graph.num_nodes, nodes, neg_ids)
+        exclude = move(exclude)
+        per_node = losses.infonce_from_cosines(pos, neg_cos, cfg.gamma, exclude)
+        if cfg.starspace_weight:
+            w = cfg.starspace_weight
+            per_node = (1 - w) * per_node + w * losses.starspace_from_cosines(pos, neg_cos, cfg.starspace_margin, exclude)
     else:
         hu = neg[pick] if cfg.negative_pool else neg.view(len(nodes), cfg.negatives, -1)
         per_node = losses.LOSSES[cfg.loss](t, h, hu, cfg.gamma)
@@ -328,6 +353,7 @@ def train(graph, cfg, log=print, lists=None):
     order = torch.randperm(g.num_nodes, device=graph_device, generator=gen)
     n_valid = int(g.num_nodes * cfg.valid_pct)
     valid, anchors = order[:n_valid], order[n_valid:]
+    keys = sampling.edge_keys(g) if cfg.mask_neighbours else None
     probe = None
     if cfg.valid_negatives > 0:
         if held_out is not None:
@@ -350,6 +376,9 @@ def train(graph, cfg, log=print, lists=None):
             for group in dense_opt.param_groups:
                 group["lr"] = lr * cfg.dense_lr / cfg.lr
 
+    if cfg.keep_best_probe and probe is None:
+        raise ValueError("keep_best_probe needs the ranking check: valid_edges or valid_pct, and valid_negatives")
+    best = (-1.0, 0, None)   # (hr@10, pass, model state) with keep_best_probe
     for p in range(cfg.passes):
         per_pass = p >= epoch_from
         start, running, lr = time.time(), 0.0, learning_rate(cfg, p * steps_per_pass, total)
@@ -365,7 +394,7 @@ def train(graph, cfg, log=print, lists=None):
                 set_lr(lr)
                 if dense_opt is not None:
                     dense_opt.zero_grad()
-            loss = batch_loss(model, g, nodes, cfg, gen, lists)
+            loss = batch_loss(model, g, nodes, cfg, gen, lists, keys)
             loss.backward()
             if per_pass:
                 epoch.add(model.features.weight.grad)
@@ -390,12 +419,17 @@ def train(graph, cfg, log=print, lists=None):
                 # at once may not fit.
                 for vs in range(0, len(valid), cfg.batch_size):
                     chunk = valid[vs:vs + cfg.batch_size]
-                    total_vl += batch_loss(model, g, chunk, cfg, vgen, lists) * len(chunk)
+                    total_vl += batch_loss(model, g, chunk, cfg, vgen, lists, keys) * len(chunk)
             message += f", valid {float(total_vl) / len(valid):.5f}"
         if probe is not None:
             hr, auc = probe.evaluate(model, g)
             message += f", {'held-out edges' if held_out is not None else 'valid'} hr@10 {hr:.4f} auc {auc:.4f}"
+            if cfg.keep_best_probe and hr > best[0]:
+                best = (hr, p + 1, {k: v.detach().clone() for k, v in model.state_dict().items()})
         log(f"{message} ({time.time() - start:.1f}s)")
+    if best[2] is not None:
+        model.load_state_dict(best[2])
+        log(f"kept pass {best[1]}, held-out hr@10 {best[0]:.4f}")
     return model
 
 

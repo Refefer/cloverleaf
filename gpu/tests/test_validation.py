@@ -78,3 +78,51 @@ def test_training_with_held_out_edges_reports_their_ranking(two_cliques):
     assert all("held-out edges hr@10" in m and "valid " not in m.split("held-out")[0][-8:] for m in lines)
     with pytest.raises(ValueError, match="valid_edges"):
         train(two_cliques, Config(dims=4, passes=1, valid_edges=1.0, device="cpu"), log=lambda m: None)
+
+
+def test_are_neighbours(two_cliques):
+    from ep_gpu import sampling
+    keys = sampling.edge_keys(two_cliques)
+    a = torch.tensor([0, 0, 15])
+    b = torch.tensor([[1, 10, 15], [11, 0, 9], [10, 0, 19]])
+    assert sampling.are_neighbours(keys, two_cliques.num_nodes, a, b).tolist() == \
+        [[True, True, False], [False, False, True], [True, False, True]]
+
+
+def test_infonce_and_starspace_ignore_excluded_negatives():
+    from ep_gpu import losses
+    pos = torch.tensor([0.5, 0.5])
+    neg = torch.tensor([[0.9, 0.0], [0.9, 0.0]])
+    keep_all = losses.infonce_from_cosines(pos, neg, 0.1)
+    drop_close = losses.infonce_from_cosines(pos, neg, 0.1, torch.tensor([[True, False], [False, False]]))
+    assert drop_close[0] < keep_all[0] and drop_close[1] == keep_all[1]
+    hinge = losses.starspace_from_cosines(pos, neg, 0.2, torch.tensor([[True, False], [False, False]]))
+    assert hinge[0] == 0 and hinge[1] > 0      # only the close negative violated the margin
+
+
+@pytest.mark.parametrize("kwargs", [dict(pool_negatives=True), dict(negatives=4), dict(negatives=4, negative_pool=0)])
+def test_masked_and_mixed_infonce_trains(two_cliques, kwargs):
+    cfg = Config(dims=16, passes=40, batch_size=4, lr=0.1, loss="infonce", gamma=0.2, mask_neighbours=True,
+                 starspace_weight=0.5, device="cpu", seed=3, **kwargs)
+    from ep_gpu.train import node_embeddings
+    emb = torch.nn.functional.normalize(node_embeddings(train(two_cliques, cfg, log=lambda m: None), two_cliques), dim=1)
+    d = 1 - emb @ emb.T
+    assert float(d[:10, 10:].mean() - (d[:10, :10].sum() + d[10:, 10:].sum()) / 180) > 0.3
+
+
+def test_keep_best_probe_restores_the_best_pass(two_cliques):
+    lines = []
+    cfg = Config(dims=8, passes=6, batch_size=4, lr=0.05, valid_edges=0.1, keep_best_probe=True, device="cpu", seed=2)
+    model = train(two_cliques, cfg, log=lines.append)
+    hrs = [float(m.split("hr@10 ")[1].split()[0]) for m in lines if m.startswith("pass")]
+    kept = [m for m in lines if m.startswith("kept pass")]
+    assert len(kept) == 1
+    best_pass = int(kept[0].split()[2].rstrip(","))
+    assert hrs[best_pass - 1] == max(hrs)
+
+
+@pytest.mark.parametrize("kwargs", [dict(loss="starspace", mask_neighbours=True), dict(loss="infonce", starspace_weight=1.5),
+                                    dict(keep_best_probe=True, valid_negatives=0)])
+def test_infonce_options_are_checked(two_cliques, kwargs):
+    with pytest.raises(ValueError):
+        train(two_cliques, Config(dims=4, passes=1, device="cpu", **kwargs), log=lambda m: None)

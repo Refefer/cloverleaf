@@ -135,3 +135,17 @@ def neighbourhood_tokens(graph, nodes, max_nodes=None, max_features=None, weight
     l = fidx.shape[1]
     tok_w = (w.reshape(-1, 1) * fmask).reshape(b, k * l)
     return fidx.reshape(b, k * l), tok_w
+
+
+def edge_keys(graph):
+    """Every edge as one sorted int64 key, source * N + target, for `are_neighbours`."""
+    n = graph.num_nodes
+    src = torch.repeat_interleave(torch.arange(n, device=graph.adj_ptr.device), graph.degrees())
+    return torch.sort(src * n + graph.adj_idx.long()).values
+
+
+def are_neighbours(keys, num_nodes, a, b):
+    """Whether each b[i, j] is a neighbour of a[i] (a (B,), b (B, K)), from `edge_keys`."""
+    query = (a.long()[:, None] * num_nodes + b.long()).reshape(-1)
+    pos = torch.searchsorted(keys, query).clamp(max=max(len(keys) - 1, 0))
+    return (keys[pos] == query).reshape(b.shape) if len(keys) else torch.zeros(b.shape, dtype=torch.bool, device=b.device)

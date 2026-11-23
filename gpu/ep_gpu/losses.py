@@ -41,23 +41,44 @@ def rankspace(t, h, hu, gamma):
     return starspace(t, h, hu, gamma) + rank(t, h, hu, gamma)
 
 
+def cosines(t, h, hu=None, pool=None):
+    """(cos(h, t) (B,), cos(h, negatives) (B, K)), the negatives given per node (hu, (B, n, d))
+    or as a pool shared by every node (pool, (P, d)), scored with one matrix multiply."""
+    hn = F.normalize(h, dim=-1)
+    pos = (hn * F.normalize(t, dim=-1)).sum(-1)
+    if pool is not None:
+        return pos, hn @ F.normalize(pool, dim=-1).T
+    return pos, (F.normalize(hu, dim=-1) * hn[:, None, :]).sum(-1)
+
+
+def infonce_from_cosines(pos, neg, temperature, exclude=None):
+    """-log p(positive) under a softmax over [pos, neg_1, ..., neg_K] / temperature; negatives
+    where `exclude` (B, K) is True don't count."""
+    if exclude is not None:
+        neg = neg.masked_fill(exclude, float("-inf"))
+    return -torch.log_softmax(torch.cat([pos[:, None], neg], dim=1) / temperature, dim=1)[:, 0]
+
+
+def starspace_from_cosines(pos, neg, gamma, exclude=None):
+    """StarSpace's hinge, mean of the non-zero max(0, gamma - (pos - neg_i)), over negatives not
+    in `exclude`."""
+    terms = torch.relu(gamma - (pos[:, None] - neg))
+    if exclude is not None:
+        terms = terms.masked_fill(exclude, 0.0)
+    return _mean_of_positive(terms)
+
+
 def infonce(t, h, hu, temperature):
     """-log p(positive) under a softmax over cosine similarities divided by the temperature:
     [cos(h, t), cos(h, hu_1), ..., cos(h, hu_n)] / temperature.  Always on, unlike rank."""
-    hn = F.normalize(h, dim=-1)
-    pos = (hn * F.normalize(t, dim=-1)).sum(-1, keepdim=True)
-    neg = (F.normalize(hu, dim=-1) * hn[:, None, :]).sum(-1)
-    return -torch.log_softmax(torch.cat([pos, neg], dim=1) / temperature, dim=1)[:, 0]
+    return infonce_from_cosines(*cosines(t, h, hu=hu), temperature)
 
 
 def infonce_pool(t, h, pool, exclude, temperature):
     """infonce against every node of a shared negative pool at once: one (B, P) matrix multiply
     rather than gathering P negatives per node.  exclude: (B, P), True where the pool node is the
-    anchor itself."""
-    hn = F.normalize(h, dim=-1)
-    pos = (hn * F.normalize(t, dim=-1)).sum(-1, keepdim=True)
-    neg = (hn @ F.normalize(pool, dim=-1).T).masked_fill(exclude, float("-inf"))
-    return -torch.log_softmax(torch.cat([pos, neg], dim=1) / temperature, dim=1)[:, 0]
+    anchor itself (or must otherwise not count)."""
+    return infonce_from_cosines(*cosines(t, h, pool=pool), temperature, exclude)
 
 
 LOSSES = {"margin": margin, "starspace": starspace, "rank": rank, "rankspace": rankspace,
