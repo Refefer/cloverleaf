@@ -447,7 +447,7 @@ A simple random projection based ANN method which can be consumed directly or in
 | Class | Constructor (Python) | Key Methods |
 |-------|----------------------|-------------|
 | `NeighborhoodAligner` | `NeighborhoodAligner(alpha: float \| None = None, max_neighbors: int \| None = None)` | `align(embeddings: NodeEmbeddings, graph: Graph) -> NodeEmbeddings` |
-| `EmbeddingAligner` | `EmbeddingAligner(num_nodes: int, random_nodes: int, alpha: float, error: float, max_iters: int)` | `align(orig_embeddings: NodeEmbeddings, orig_ann: EmbAnn, translated_embeddings: NodeEmbeddings, query: Query, seed: int \| None = None) -> list[float]`<br>`bulk_align(... ) -> list[list[float]]` |
+| `EmbeddingAligner` | `EmbeddingAligner(num_nodes: int, random_nodes: int = 0, alpha: float = 0.1, error: float = 0.01, max_iters: int = 10, method: str = "distances")`; `method="mean_shift"` moves the embedding by its anchors' mean displacement instead of matching distances (alpha, error and max_iters apply to "distances" only) | `align(orig_embeddings: NodeEmbeddings, orig_ann: EmbAnn, translated_embeddings: NodeEmbeddings, query: Query, seed: int \| None = None) -> list[float]`<br>`bulk_align(... ) -> list[list[float]]` |
 
 ### Ranking & PageRank
 | Class | Constructor (Python) | Key Methods |
@@ -498,7 +498,7 @@ The order among the negatives isn't scored.  `ppr_lists` (below) returns the lis
 | `ppr_lists` (function) | `ppr_lists(graph: Graph, k: int, walks: int, steps: float, beta: float = 0.8, compression: float = 1.0, other_type_only: bool = False, seed: int \| None = None, indicator: bool = True) -> tuple[bytes, bytes]` | Every node's top-k personalised PageRank list, as `PprRankLearner` trains on: little-endian int64 node ids and float32 weights, `graph.nodes() * k` of each, for `numpy.frombuffer(...).reshape(-1, k)`. `other_type_only` keeps only nodes of a different type from the start node. |
 | `EmbeddingPropagator` | See full signature below* (many optional arguments) | `learn_features(graph: Graph, features: FeatureSet, feature_embeddings: NodeEmbeddings \| None = None) -> NodeEmbeddings` |
 | `NodeEmbedder` | `NodeEmbedder(feat_agg: FeatureAggregator)` | `embed_feature_set(feat_set: FeatureSet, feature_embeddings: NodeEmbeddings) -> NodeEmbeddings`<br>`embed_adhoc(features: list[tuple[str,str]], feature_embeddings: NodeEmbeddings, strict: bool = True) -> list[float]` |
-| `EmbeddingAligner` | `EmbeddingAligner(num_nodes: int, random_nodes: int, alpha: float, error: float, max_iters: int)` | (see methods above) |
+| `EmbeddingAligner` | `EmbeddingAligner(num_nodes: int, random_nodes: int = 0, alpha: float = 0.1, error: float = 0.01, max_iters: int = 10, method: str = "distances")` | (see methods above) |
 
 *Full signature for `EmbeddingPropagator.__new__` includes optional arguments such as `alpha`, `loss`, `batch_size`, `dims`, `passes`, `seed`, `max_nodes`, `weighted_neighbor_sampling`, `weighted_neighbor_averaging`, `max_features`, `loss_weighting`, `valid_pct`, `hard_negatives`, `indicator`, `attention_heads`, `dense_alpha`, `noise`, `optimizer`, `lr_schedule`, `init`, `update_frequency` (all default to sensible values).*
 

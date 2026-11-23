@@ -231,3 +231,29 @@ def test_batch_then_epoch_updates_learn_the_cliques(two_cliques):
 def test_epoch_after_needs_epoch_updates_and_a_positive_count(two_cliques, kwargs):
     with pytest.raises(ValueError, match="epoch_after"):
         train(two_cliques, Config(dims=4, passes=1, device="cpu", **kwargs), log=lambda m: None)
+
+
+def test_sawtooth_schedule_restarts_each_cycle():
+    from ep_gpu.train import learning_rate
+    cfg = Config(lr=1.0, lr_schedule="sawtooth", lr_cycles=4)
+    rates = [learning_rate(cfg, s, 400) for s in range(400)]
+    assert rates[0] == pytest.approx(0.01) and rates[20] == pytest.approx(1.0)   # first cycle warms up
+    for start in (100, 200, 300):
+        assert rates[start] == pytest.approx(1.0)                               # restarts at the peak
+        assert rates[start - 1] < 0.03                                          # after decaying to near lr/100
+        assert all(a >= b for a, b in zip(rates[start:start + 99], rates[start + 1:start + 100]))
+    assert learning_rate(Config(lr=1.0, lr_schedule="sawtooth"), 50, 100) == \
+        pytest.approx(1.0 - 0.99 * 30 / 80)                                      # one cycle: warmup, linear decay
+
+
+@pytest.mark.parametrize("kwargs", [dict(lr_schedule="step"), dict(lr_cycles=0),
+                                    dict(lr_cycles=3), dict(lr_schedule="sawtooth", lr_cycles=0)])
+def test_bad_schedules_are_rejected(two_cliques, kwargs):
+    with pytest.raises(ValueError, match="lr_"):
+        train(two_cliques, Config(dims=4, passes=1, device="cpu", **kwargs), log=lambda m: None)
+
+
+def test_sawtooth_trains(two_cliques):
+    cfg = Config(dims=16, passes=60, batch_size=4, lr=0.2, loss="starspace", gamma=0.5, negatives=3,
+                 optimizer="rowwise_adagrad", lr_schedule="sawtooth", lr_cycles=3, device="cpu", seed=3)
+    assert separation(node_embeddings(train(two_cliques, cfg, log=lambda m: None), two_cliques)) > 0.3

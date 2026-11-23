@@ -165,6 +165,26 @@ def test_embedding_aligner_node_query_uses_original_embedding():
     assert by_node == by_embedding
 
 
+def test_embedding_aligner_mean_shift_moves_by_the_anchors_mean_displacement():
+    orig = cl.NodeEmbeddings.new_from_list(
+        [(n(0), [0., 0.]), (n(1), [1., 0.]), (n(2), [10., 10.])], cl.Distance.Euclidean)
+    translated = cl.NodeEmbeddings.new_from_list(
+        [(n(0), [1., 1.]), (n(1), [3., 1.]), (n(2), [-50., -50.])], cl.Distance.Euclidean)
+    ann = cl.EmbAnn(orig, 2, 2, seed=1)
+    aligner = cl.EmbeddingAligner(2, method="mean_shift")
+    assert repr(aligner) == "EmbeddingAligner<NumNodes=2, RandomNodes=0, Method=mean_shift>"
+    # Its two nearest anchors moved by (1, 1) and (2, 1).
+    assert aligner.align(orig, ann, translated, cl.Query.embedding([0.5, 0.]), seed=1) == [2.0, 1.0]
+    assert aligner.bulk_align(orig, ann, translated, [cl.Query.embedding([0.5, 0.])], seed=1) == [[2.0, 1.0]]
+
+
+@pytest.mark.parametrize("kwargs", [dict(method="median"), dict(method="mean_shift", alpha=0.1),
+                                    dict(method="mean_shift", max_iters=5)])
+def test_embedding_aligner_rejects_bad_methods(kwargs):
+    with pytest.raises(ValueError):
+        cl.EmbeddingAligner(3, **kwargs)
+
+
 # Graph IO
 
 

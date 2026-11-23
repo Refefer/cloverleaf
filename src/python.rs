@@ -25,7 +25,7 @@ use crate::named_graph::NamedGraph;
 use crate::feature_store::FeatureNamespace as CoreFeatureNamespace;
 use crate::embeddings::NodeEmbeddingsBuilder as CoreNodeEmbeddingsBuilder;
 use crate::algos::aggregator::{FeatureAggregator as CoreFeatureAggregator, NodeEmbedder as CoreNodeEmbedder};
-use crate::algos::emb_aligner::EmbeddingAligner as CoreEmbeddingAligner;
+use crate::algos::emb_aligner::{AlignMethod, EmbeddingAligner as CoreEmbeddingAligner};
 use crate::embeddings::NodeEmbeddings as CoreNodeEmbeddings;
 use crate::io::{read_node_values,EmbeddingLoadError,FeatureFileError,GraphLoadError};
 
@@ -2915,9 +2915,19 @@ impl EmbeddingAligner {
     ///        Closest K nodes to consider to learn mapping.
     ///    
     ///    random_nodes : Int - Optional
-    ///        If provided, also samples random nodes for distances.
+    ///        If provided, also samples random nodes as anchors.
     ///
     ///        Default is 0.
+    ///    
+    ///    alpha, error, max_iters : Optional
+    ///        The "distances" method's learning rate, relative error change to stop at, and
+    ///        maximum steps.  Defaults 0.1, 0.01 and 10.
+    ///    
+    ///    method : Str - Optional
+    ///        How the anchors place the embedding.  "distances" (default) optimises it so its
+    ///        distances to the anchors after alignment match those before.  "mean_shift" moves
+    ///        it by the anchors' mean displacement, emb + mean(translated - original): it moves
+    ///        as its nearest neighbours did, no optimisation involved.
     ///    
     ///    Returns
     ///    -------
@@ -2925,27 +2935,50 @@ impl EmbeddingAligner {
     ///        
     ///    
     #[new]
-    #[pyo3(signature = (num_nodes, random_nodes=None, alpha=None, error=None, max_iters=None))]
+    #[pyo3(signature = (num_nodes, random_nodes=None, alpha=None, error=None, max_iters=None, method=None))]
     pub fn new(
         num_nodes: usize, 
         random_nodes: Option<usize>,
         alpha: Option<f32>,
         error: Option<f32>,
-        max_iters: Option<usize>
-    ) -> Self {
+        max_iters: Option<usize>,
+        method: Option<String>
+    ) -> PyResult<Self> {
         let d = CoreEmbeddingAligner::new(num_nodes);
-        EmbeddingAligner { aligner: CoreEmbeddingAligner {
+        let method = match method.as_deref().unwrap_or("distances") {
+            "distances" => {
+                let AlignMethod::Distances { alpha: a, error: e, max_iters: m } = AlignMethod::distances() else {
+                    unreachable!("distances() is a Distances")
+                };
+                AlignMethod::Distances {
+                    alpha: alpha.unwrap_or(a), error: error.unwrap_or(e), max_iters: max_iters.unwrap_or(m)
+                }
+            },
+            "mean_shift" => {
+                if alpha.is_some() || error.is_some() || max_iters.is_some() {
+                    return Err(PyValueError::new_err(
+                        "alpha, error and max_iters apply only to method \"distances\""))
+                }
+                AlignMethod::MeanShift
+            },
+            other => return Err(PyValueError::new_err(format!(
+                "method must be \"distances\" or \"mean_shift\", got {:?}", other)))
+        };
+        Ok(EmbeddingAligner { aligner: CoreEmbeddingAligner {
             num_nodes,
             random_nodes: random_nodes.unwrap_or(d.random_nodes),
-            alpha: alpha.unwrap_or(d.alpha),
-            error: error.unwrap_or(d.error),
-            max_iters: max_iters.unwrap_or(d.max_iters)
-        } }
+            method
+        } })
     }
 
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
-        format!("EmbeddingAligner<NumNodes={}, RandomNodes={}>", self.aligner.num_nodes, self.aligner.random_nodes)
+        let method = match self.aligner.method {
+            AlignMethod::Distances { .. } => "distances",
+            AlignMethod::MeanShift => "mean_shift"
+        };
+        format!("EmbeddingAligner<NumNodes={}, RandomNodes={}, Method={}>",
+                self.aligner.num_nodes, self.aligner.random_nodes, method)
     }
 
     ///    Transforms an embedding to the post neighborhood aligned space.

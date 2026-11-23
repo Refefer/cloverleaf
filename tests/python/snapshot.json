@@ -941,7 +941,7 @@
   ]
  ],
  "emb aligner": [
-  "EmbeddingAligner<NumNodes=5, RandomNodes=3>",
+  "EmbeddingAligner<NumNodes=5, RandomNodes=3, Method=distances>",
   [
    -0.492897,
    -0.00563818,

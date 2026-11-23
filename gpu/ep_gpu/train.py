@@ -28,7 +28,11 @@ class Config:
     lr: float = 0.01
     dense_lr: float = 1e-3           # the attention weights' rate; they share lr's schedule shape.
                                      # Dense matrices need far smaller steps than sparse embeddings.
-    lr_schedule: str = "cosine"      # "cosine" (20% warmup from lr/100, then cosine to lr/100) or "constant"
+    lr_schedule: str = "cosine"      # "cosine" (20% warmup from lr/100, then cosine to lr/100),
+                                     # "constant", or "sawtooth": lr_cycles equal cycles, each a
+                                     # linear decay from lr to lr/100 (the first after the warmup),
+                                     # so the rate jumps back to lr at every restart
+    lr_cycles: int = 1               # sawtooth only: the number of cycles
     init: str = "unit"               # "unit" or "glorot"
     loss: str = "margin"             # margin, starspace, rank, rankspace, infonce; or listnet or
                                      # listmle over each node's PPR list rather than reconstructing
@@ -84,10 +88,22 @@ class Config:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+LR_SCHEDULES = ("cosine", "constant", "sawtooth")
+
+
 def learning_rate(cfg, step, total):
     if cfg.lr_schedule == "constant" or total == 0:
         return cfg.lr
-    low, warmup = cfg.lr / 100, total // 5
+    low = cfg.lr / 100
+    if cfg.lr_schedule == "sawtooth":
+        cycle = total / cfg.lr_cycles
+        k = min(int(step // cycle), cfg.lr_cycles - 1)
+        start, warmup = k * cycle, (cycle // 5 if k == 0 else 0)
+        if step - start < warmup:
+            return low + (cfg.lr - low) * (step - start) / warmup
+        ratio = min((step - start - warmup) / max(cycle - warmup, 1), 1.0)
+        return cfg.lr - (cfg.lr - low) * ratio
+    warmup = total // 5
     if step < warmup:
         return low + (cfg.lr - low) * step / warmup
     ratio = min((step - warmup) / max(total - warmup, 1), 1.0)
@@ -278,6 +294,10 @@ def train(graph, cfg, log=print, lists=None):
     if cfg.update_frequency not in UPDATE_FREQUENCIES:
         raise ValueError(f"update_frequency must be one of {', '.join(UPDATE_FREQUENCIES)}, "
                          f"got {cfg.update_frequency!r}")
+    if cfg.lr_schedule not in LR_SCHEDULES:
+        raise ValueError(f"lr_schedule must be one of {', '.join(LR_SCHEDULES)}, got {cfg.lr_schedule!r}")
+    if cfg.lr_cycles < 1 or (cfg.lr_cycles > 1 and cfg.lr_schedule != "sawtooth"):
+        raise ValueError(f"lr_cycles must be >= 1, and above 1 only with lr_schedule 'sawtooth', got {cfg.lr_cycles}")
     if cfg.epoch_after is not None and (cfg.update_frequency != "epoch" or cfg.epoch_after < 1):
         raise ValueError(f"epoch_after needs update_frequency 'epoch' and a value >= 1, got {cfg.epoch_after!r}")
     set_precision(cfg, device)
