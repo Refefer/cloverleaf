@@ -155,10 +155,53 @@ impl Optimizer for AdamOptimizer {
     }
 }
 
+/// Adam over a dense parameter vector, such as attention's projection weights, which every
+/// update touches in full.  Counts its own steps for the bias correction.
+pub struct DenseAdam {
+    beta_1: f32,
+    beta_2: f32,
+    eps: f32,
+    steps: i32,
+    mom: Vec<f32>,
+    var: Vec<f32>
+}
+
+impl DenseAdam {
+    pub fn new(len: usize) -> Self {
+        DenseAdam { beta_1: 0.9, beta_2: 0.999, eps: 1e-8, steps: 0, mom: vec![0.; len], var: vec![0.; len] }
+    }
+
+    /// One step on `params` with gradient `grad` and learning rate `alpha`.
+    pub fn step(&mut self, params: &mut [f32], grad: &[f32], alpha: f32) {
+        assert!(params.len() == self.mom.len() && grad.len() == self.mom.len(), "parameter count");
+        self.steps += 1;
+        let bias_1 = 1. - self.beta_1.powi(self.steps);
+        let bias_2 = 1. - self.beta_2.powi(self.steps);
+        for (((p, g), m), v) in params.iter_mut().zip(grad).zip(self.mom.iter_mut()).zip(self.var.iter_mut()) {
+            *m = self.beta_1 * *m + (1. - self.beta_1) * g;
+            *v = self.beta_2 * *v + (1. - self.beta_2) * g * g;
+            *p -= alpha * (*m / bias_1) / ((*v / bias_2).sqrt() + self.eps);
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod optimizer_tests {
     use super::*;
+
+    /// A constant gradient moves every parameter by alpha per step, in the gradient's
+    /// opposite direction, as sparse Adam does.
+    #[test]
+    fn test_dense_adam_steps_are_alpha_sized() {
+        let mut adam = DenseAdam::new(2);
+        let mut params = vec![0f32, 0f32];
+        for step in 1..4 {
+            adam.step(&mut params, &[2., -3.], 0.1);
+            assert!((params[0] + 0.1 * step as f32).abs() < 1e-4, "{:?}", params);
+            assert!((params[1] - 0.1 * step as f32).abs() < 1e-4, "{:?}", params);
+        }
+    }
 
     /// With bias correction at step t, a constant gradient gives m_hat = g and v_hat = g^2, so
     /// every Adam step moves the weight by exactly alpha (minus eps).

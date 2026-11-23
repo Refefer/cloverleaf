@@ -4,6 +4,7 @@ input checks that turn bad inputs into Python exceptions instead of panics.
 Build the module first (`maturin develop --release`), then run `pytest`.
 """
 import gzip
+import math
 
 import pytest
 
@@ -324,3 +325,65 @@ def test_attention_aggregator_needs_matching_feature_width():
     fe = cl.NodeEmbeddings.new_from_list([(("f", "a"), [1.0, 0.0, 0.0])], cl.Distance.Cosine)
     with pytest.raises(ValueError):
         cl.NodeEmbedder(agg).embed_adhoc([("f", "a")], fe)
+
+
+# Attention EP
+
+
+def attention_features(graph):
+    fs = cl.FeatureSet.new_from_graph(graph)
+    for i, feats in enumerate([["a", "b"], ["b", "c"], ["c", "a", "d"], ["d"]]):
+        fs.set_features(n(i), [("f", f) for f in feats])
+    return fs
+
+
+@pytest.mark.parametrize("update_frequency", ["batch", "epoch"])
+def test_attention_ep_learns_an_aggregator(graph, tmp_path, update_frequency):
+    ep = cl.EmbeddingPropagator(dims=6, passes=3, batch_size=2, valid_pct=0.0, indicator=False,
+                                attention_heads=2, dense_alpha=0.01, update_frequency=update_frequency)
+    with pytest.raises(ValueError, match="no weights"):
+        ep.feature_aggregator()
+    fs = attention_features(graph)
+    fe = ep.learn_features(graph, fs)
+    assert fe.dims() == 6
+    agg = ep.feature_aggregator()
+    assert repr(agg) == "FeatureAggregator<Attention<dims=6,heads=2,head_dims=8>>"
+    path = str(tmp_path / "agg")
+    agg.save(path)
+    nodes = cl.NodeEmbedder(cl.FeatureAggregator.load(path)).embed_feature_set(fs, fe)
+    assert nodes.dims() == 6 and all(map(math.isfinite, nodes.get_embedding(n(2))))
+
+
+def test_attention_ep_warm_starts_from_an_aggregator(graph, tmp_path):
+    fs = attention_features(graph)
+    first = cl.EmbeddingPropagator(dims=6, passes=2, valid_pct=0.0, indicator=False, attention_heads=2)
+    first.learn_features(graph, fs)
+    path = str(tmp_path / "agg")
+    first.feature_aggregator().save(path)
+    saved = open(path).read()
+
+    second = cl.EmbeddingPropagator(dims=6, passes=0, valid_pct=0.0, indicator=False, attention_heads=2)
+    second.learn_features(graph, attention_features(graph), aggregator=cl.FeatureAggregator.load(path))
+    second.feature_aggregator().save(path)
+    assert open(path).read() == saved      # no passes: the weights are the warm start's
+
+    wrong_dims = cl.EmbeddingPropagator(dims=4, passes=0, valid_pct=0.0, indicator=False, attention_heads=2)
+    with pytest.raises(ValueError):
+        wrong_dims.learn_features(graph, attention_features(graph), aggregator=cl.FeatureAggregator.load(path))
+    averaged = cl.EmbeddingPropagator(dims=6, passes=0, valid_pct=0.0, indicator=False)
+    with pytest.raises(ValueError):
+        averaged.learn_features(graph, attention_features(graph), aggregator=cl.FeatureAggregator.load(path))
+    assert repr(averaged.feature_aggregator()) == "FeatureAggregator<Averaged>"
+
+
+@pytest.mark.parametrize("kwargs", [dict(attention_heads=0), dict(dense_alpha=-1.0)])
+def test_attention_ep_rejects_bad_settings(kwargs):
+    with pytest.raises(ValueError):
+        cl.EmbeddingPropagator(**kwargs)
+
+
+def test_attention_ep_has_no_packed_attention_options():
+    with pytest.raises(TypeError):
+        cl.EmbeddingPropagator(attention=4)
+    with pytest.raises(TypeError):
+        cl.EmbeddingPropagator(context_window=2)

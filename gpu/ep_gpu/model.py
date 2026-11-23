@@ -8,11 +8,11 @@ to one node's features, which flat attention over every neighbour's features can
 at useful batch sizes.
 
   mean       the weighted mean of the feature embeddings: cloverleaf's averaged model, EP-B.
-  attention  multi-head self-attention over the tokens, then their weighted mean.  Unlike
-             cloverleaf's attention, which stores per-head query/key slices in every feature's
-             embedding, the query, key, value and output projections are shared across features,
-             so the table stays one `dims`-wide vector per feature.  The output projection starts
-             at zero, so training starts from mean pooling.
+  attention  multi-head self-attention over the tokens, then their weighted mean: cloverleaf's
+             attention model (src/algos/ep/attention.rs).  The query, key, value and output
+             projections are shared across features, so the table stays one `dims`-wide vector
+             per feature.  The output projection starts at zero, so training starts from mean
+             pooling.
 """
 import math
 

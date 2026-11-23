@@ -31,6 +31,13 @@ with mean or attention pooling, or in PyTorch with `ep_gpu.embed_feature_sets`; 
   terms, as `src/algos/ep/loss.rs` does.
 * `max_features` (a fraction or a count), `max_nodes`, weighted sampling and weighted averaging,
   where averaging skips the edge weights for neighbours already sampled by weight.
+* Attention pooling (`--pooling attention`) is cloverleaf's attention model: multi-head
+  self-attention over a node's features with query, key, value and output projections shared by
+  every feature, the node embedding being the features' mean plus the projected mean attention
+  context (the output projection starts at zero, so training starts from mean pooling).  A
+  reconstruction pools each sampled neighbour from its own features, then takes the neighbours'
+  weighted mean (`reconstruction="nested"`, the default for attention, with
+  `neighbour_pooling="mean"`).  Weights move both ways through the `PREFIX.aggregator` file.
 * Adam on the feature table with sparse updates; "cosine" (20% warmup from lr/100, then cosine
   decay to lr/100) or "constant" learning rates; "unit" or "glorot" initialisation.
 * `update_frequency`: "batch" (an update after every batch) or "epoch" (every batch of a pass is
@@ -44,17 +51,10 @@ from the exported feature table exactly, and features-only EP on Cora scores the
 
 ## What differs
 
-* Attention: cloverleaf stores per-head query and key slices in every feature's embedding.  Here
-  the query, key, value and output projections are shared across features, so the table stays
-  one `dims`-wide vector per feature (several times less memory).  Attention is
-  self-attention over a node's tokens followed by their weighted mean; the output projection
-  starts at zero, so training starts from mean pooling.
 * Nodes with more neighbours than `max_nodes` are sampled with replacement (cloverleaf samples
   without); hard negatives aren't implemented.
-* Attention reconstructs a node in two levels (`reconstruction`, "auto" by default): each
-  sampled neighbour is pooled from its own features, then the neighbours are pooled together.
-  Cloverleaf attends over all the neighbours' features at once, which on a GPU runs out of
-  memory at useful batch sizes.  Mean pooling keeps cloverleaf's flat reconstruction.
+* `neighbour_pooling="attention"` (a nested reconstruction's neighbours combined by attention
+  rather than their weighted mean) and flat attention reconstructions are GPU only.
 
 ## Speed and precision
 

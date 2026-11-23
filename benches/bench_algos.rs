@@ -65,7 +65,7 @@ fn embedding_propagation(c: &mut Criterion) {
         let model = AveragedFeatureModel::new(Sample::All, Sample::Fixed(10), false, false);
 
         let label = format!("ep:{}", num_feats);
-        c.bench_function(&label, |b| b.iter(|| ep.learn(&ccsr, &feature_store, None, &model)));
+        c.bench_function(&label, |b| b.iter(|| ep.learn(&ccsr, &feature_store, None, &model).unwrap()));
     }
 }
 

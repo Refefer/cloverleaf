@@ -41,9 +41,7 @@ def run_propagation(graph, features, *, attention=False):
         valid_pct=0.0,
         hard_negatives=0,
         indicator=False,
-        attention=1 if attention else None,
         attention_heads=1 if attention else None,
-        context_window=None,
         noise=0.0,
     )
     return propagator.learn_features(graph, features, None)

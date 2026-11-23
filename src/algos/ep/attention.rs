@@ -1,12 +1,11 @@
-//! This module constructs a node embedding from a set of features through various different
-//! attention methods.  Notably, we use averaged versus concat -> linear projection due to
-//! performance cost.  This has representational downsides but performs significantly faster and
-//! with no extra parmeters.
+//! Attention pooling: multi-head self-attention over a node's feature embeddings, the same model
+//! as the GPU trainer's `AttentionPool` (gpu/ep_gpu/model.py), so weights trained by either embed
+//! nodes identically.  [`AttentionWeights`] holds the weights and pools in plain f32, for
+//! embedding nodes after training; [`attention_pool`] is the same computation on the autograd
+//! graph, for training.
 use crate::autograd::*;
-use float_ord::FloatOrd;
 use rand::prelude::*;
 
-use crate::algos::utils::Sample;
 use crate::error::Error;
 
 /// Attention pooling's weights: multi-head self-attention over a node's feature embeddings with
@@ -80,6 +79,23 @@ impl AttentionWeights {
         self.heads * self.head_dims
     }
 
+    /// Every weight, `qkv` then `out`, the order optimisers and [`AttentionVars::gradients`] use.
+    pub fn parameters(&self) -> Vec<f32> {
+        self.qkv.iter().chain(self.out.iter()).cloned().collect()
+    }
+
+    /// The same shapes with new weights, in [`parameters`](Self::parameters) order.
+    pub fn with_parameters(&self, parameters: Vec<f32>) -> Result<Self, Error> {
+        let split = self.qkv.len();
+        if parameters.len() != split + self.out.len() {
+            return Err(Error::InvalidArgument(format!(
+                "expected {} attention parameters, got {}", split + self.out.len(), parameters.len())))
+        }
+        let mut qkv = parameters;
+        let out = qkv.split_off(split);
+        AttentionWeights::new(self.dims, self.heads, self.head_dims, qkv, out)
+    }
+
     /// Pools tokens `x` (each `dims` wide) with weights `w` into `out`.  Tokens with weight 0 are
     /// ignored; with none left the result is zeros.
     pub fn pool(&self, x: &[&[f32]], w: &[f32], out: &mut [f32]) {
@@ -132,454 +148,65 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-/// The number of heads to use, and parmeters, for attention.
-#[derive(Copy,Clone)]
-pub struct MultiHeadedAttention {
-    /// Number of attention heads
-    pub num_heads: usize,
-
-    /// Number of dimentions to use for both query and key vectors
-    pub d_k: usize,
-
-    /// Attention type
-    pub attention_type: AttentionType
+/// The weights as autograd variables, made once per training forward pass from a snapshot of
+/// the current weights, so every embedding in the pass uses (and its gradient flows to) the same
+/// ones.
+pub struct AttentionVars {
+    qkv: ANode,
+    out: ANode,
+    heads: usize,
+    head_dims: usize
 }
 
-#[derive(Copy,Clone)]
-pub enum AttentionType {
-    /// Computes the full attention matrix of the feature step.  Incredibly expensive if the
-    /// feature size is large: O(N^2)
-    Full,
-
-    /// Sliding attention, which looks at [i-window_size:i+window_size] for each attention matrix.  Quite a bit faster than Full, but can't attend to features beyond the window size: O(N * window_size * 2)
-    Sliding { window_size: usize },
-
-    /// Randomly selects num_features and computes full attention on it.  Can learn longer distance
-    /// relationships due to random selection at the expense of longer train times.
-    Random { num_features: Sample }
-}
-
-// Multi-headed attention is encoded as
-// Q1,K1,Q2,K2,V1,V2
-impl MultiHeadedAttention {
-    pub fn new(num_heads: usize, d_k: usize, attention_type: AttentionType) -> Self {
-        MultiHeadedAttention { num_heads, d_k, attention_type }
-    }
-
-    pub fn preserve_feature_order(&self) -> bool {
-        matches!(self.attention_type,  AttentionType::Sliding {window_size:_})
-    }
-
-    fn get_query_vec(&self, emb: &ANode, head_num: usize) -> ANode {
-        let start = self.d_k * head_num;
-        emb.slice(start, self.d_k)
-    }
-
-    fn get_key_vec(&self, emb: &ANode, head_num: usize) -> ANode {
-        let start = (self.num_heads * self.d_k) + self.d_k * head_num;
-        emb.slice(start, self.d_k)
-    }
-
-    fn get_value_vec(&self, emb: &ANode, head_num: usize) -> ANode {
-        let query_key_size = self.num_heads * self.d_k * 2;
-        let v = emb.value().len();
-        let d_model = ((v - query_key_size) as f32 / self.num_heads as f32) as usize;
-        let start = query_key_size + d_model * head_num;
-        emb.slice(start, d_model)
-    }
-
-}
-
-/// Struct for easy access of the different pieces of the vector.
-#[derive(Clone)]
-struct Attention {
-    query: ANode,
-    key: ANode,
-    value: ANode
-}
-
-impl Attention {
-    fn new(node: &ANode, mha: &MultiHeadedAttention, head: usize) -> Self {
-        let query = mha.get_query_vec(&node, head);
-        let key = mha.get_key_vec(&node, head);
-        let value = mha.get_value_vec(&node, head);
-        Attention {query, key, value}
-    }
-
-}
-
-/// The big chalupa: given attention and a set of vectors, computes the attention according to the
-/// attention type within the MHA parameter.  
-pub fn attention_mean<'a>(
-    it: impl Iterator<Item=&'a (ANode, f32)>,
-    mha: &MultiHeadedAttention,
-    rng: &mut impl Rng
-) -> ANode {
-
-    let features = it.collect::<Vec<_>>();
-
-    // A lone feature attends only to itself, so each head returns its value slice.
-    if features.len() == 1 {
-        let node = &features[0].0;
-        let values = (0..mha.num_heads)
-            .map(|head| mha.get_value_vec(node, head))
-            .collect::<Vec<_>>();
-        return values.sum_all() / (mha.num_heads as f32)
-    }
-
-    let mut averages = Vec::with_capacity(mha.num_heads);
-    for head in 0..mha.num_heads {
-        let items: Vec<_> = features.iter().map(|(node, count)| {
-            (Attention::new(node, mha, head), *count)
-        }).collect();
-
-        // Compute attention matrix
-        let attention_matrix = compute_attention_matrix(&items, &mha.attention_type, rng);
-        
-        let sm_att_mat = compute_attention_softmax(attention_matrix, mha.d_k);
-
-        let n = items.len() as f32;
-        let mean = scale_vecs(items, &sm_att_mat)
-            .collect::<Vec<_>>().sum_all() / n;
-
-        //averages.push(mean.tanh());
-        averages.push(mean);
-    }
-
-    averages.sum_all() / (mha.num_heads as f32)
-}
-
-/// Computes value level attention scaling.
-fn scale_vecs<'a>(
-    items: Vec<(Attention, f32)>, 
-    sm_att_mat: &'a AttentionMatrix 
-) -> impl Iterator<Item=ANode> + 'a {
-
-    let mut rows = vec![Vec::new(); sm_att_mat.len()];
-    sm_att_mat.iter().enumerate().for_each(|(ri, row)| {
-        items.iter().zip(row.iter()).for_each(|((att, _), scaled_v)| {
-            if let Some(v) = scaled_v {
-                rows[ri].push(&att.value * v);
-            }
-        });
-    });
-
-    rows.into_iter().map(|sums| sums.sum_all())
-}
-
-type AttentionMatrix = Vec<Vec<Option<ANode>>>;
-
-#[inline]
-fn compute_attention_matrix(
-    items: &[(Attention, f32)],
-    at: &AttentionType,
-    rng: &mut impl Rng
-) -> AttentionMatrix {
-    match at {
-        AttentionType::Full => compute_full_attention_matrix(items),
-        AttentionType::Sliding{ window_size } => {
-            compute_sliding_attention_matrix(items, *window_size)
-        },
-        AttentionType::Random { num_features } => {
-            compute_random_attention_matrix(items, *num_features, rng)
-        }
-    }
-}
-
-// Computes the full N^2 attention matrix.  
-fn compute_full_attention_matrix(
-    items: &[(Attention, f32)]
-) -> AttentionMatrix {
-    
-     // Get the attention for each feature
-    let mut scaled = vec![vec![None; items.len()]; items.len()];
-    for i in 0..items.len() {
-        let (at_i, ic) = &items[i];
-        let row = &mut scaled[i];
-        for j in 0..items.len() {
-            let (at_j, jc) = &items[j];
-            let mut dot_i_j = (&at_i.query).dot(&at_j.key);
-            let num = ic * jc;
-            if num >= 1f32 {
-                dot_i_j = dot_i_j * (num as f32);
-            }
-            row[j] = Some(dot_i_j);
-        }
-    }
-    scaled
-}
-
-// Computes the sliding attention matrix
-fn compute_sliding_attention_matrix(
-    items: &[(Attention, f32)],
-    window: usize
-) -> AttentionMatrix {
-    
-     // Get the attention for each feature
-    let mut scaled = vec![vec![None; items.len()]; items.len()];
-    for i in 0..items.len() {
-        let (j_start, j_end) = {
-            let start = if window > i { 0 } else {i - window};
-            let stop = (i + window+ 1).min(items.len());
-            (start, stop)
-        };
-
-        let at_i = &items[i].0;
-        let row = &mut scaled[i];
-        for j in j_start..j_end {
-            let at_j = &items[j].0;
-            let dot_i_j = (&at_i.query).dot(&at_j.key);
-            row[j] = Some(dot_i_j);
-        }
-    }
-    scaled
-}
-
-// Computes the random attention matrix.  For each features, we select k random features to attend
-// toward.
-fn compute_random_attention_matrix(
-    items: &[(Attention, f32)],
-    sample: Sample,
-    rng: &mut impl Rng
-) -> AttentionMatrix {
-    
-    // Sample K features.  The softmax normalizes over whichever keys were sampled, so the logits
-    // need no correction for the sampling rate.
-    let (k, _) = sample.sample(items.len(), true, rng);
-
-    // Get the attention for each feature
-    let mut scaled = vec![vec![None; items.len()]; items.len()];
-    let mut buff = vec![0; k];
-    for i in 0..items.len() {
-        let at_i = &items[i].0;
-        let row = &mut scaled[i];
-        items.iter().enumerate().map(|(i,_)| i).choose_multiple_fill(rng, buff.as_mut_slice());
-        for j in buff.iter() {
-            let at_j = &items[*j].0;
-            let dot_i_j = (&at_i.query).dot(&at_j.key);
-            row[*j] = Some(dot_i_j);
-        }
-    }
-    scaled
-}
-
-
-// Learn the softmax of the attention matrix.  Lots of effort in place to make this efficient,
-// within the limitations of dynamic allocations.  Might make sense to make a special attention
-// operator ala pytorch/tensorflow within the autograd backend.
-fn compute_attention_softmax(
-    mut attention_matrix: AttentionMatrix,
-    d_k: usize
-) -> AttentionMatrix {
-    // Compute softmax
-    let d_k = Constant::scalar((d_k as f32).sqrt());
-
-    // Compute softmax for each non-masked feature
-    attention_matrix.iter_mut().for_each(|row| {
-        // Get non-zero rows
-        let non_zero_row: Vec<_>  = row.iter()
-            .filter(|x| x.is_some())
-            .map(|x| x.clone().unwrap())
-            .collect();
-
-        let nz_row = non_zero_row.concat() / &d_k;
-        let sm = softmax(nz_row, false);
-
-        let mut idx = 0;
-        row.iter_mut().for_each(|ri| {
-            if ri.is_some() {
-                *ri = Some(sm.slice(idx,1));
-                idx += 1;
-            }
-        });
-    });
-    attention_matrix
-}
-
-// Simple softmax.
-pub fn softmax(numers: ANode, exact: bool) -> ANode {
-    // Doesn't need to be part of the graph
-    let numer_values = numers.value();
-    let max_value = numer_values.iter()
-        .max_by_key(|v| FloatOrd(**v))
-        .expect("Shouldn't be non-zero!");
-
-    let mv = Constant::scalar(*max_value);
-    let n = if exact {
-        (numers - &mv).exp()
-    } else {
-        (numers - &mv).exp_approx()
-    };
-    &n / n.sum()
-}
-
-#[cfg(test)]
-mod attention_tests {
-    use super::*;
-    use rand_xorshift::XorShiftRng;
-
-    fn create_att_vecs() -> Vec<(Attention, f32)> {
-        let mha = MultiHeadedAttention {
-            d_k: 1,
-            num_heads: 1,
-            attention_type: AttentionType::Full
-        };
-        vec![
-            (Attention::new(&Variable::new(vec![-1., -1., 1., 1.]), &mha, 0), 1f32),
-            (Attention::new(&Variable::new(vec![0., 0., 2., 2.]), &mha, 0), 1f32),
-            (Attention::new(&Variable::new(vec![1., 1., -1., -1.]), &mha, 0), 1f32)
-        ]
-    }
-
-    #[test]
-    fn test_attention_matrix_global() {
-        let feats = create_att_vecs();
-
-        let exp_att_matrix = vec![
-            vec![vec![-1. * -1.], vec![-1. * 0.], vec![-1. * 1.]],
-            vec![vec![0.  * -1.], vec![0.  * 0.], vec![0.  * 1.]],
-            vec![vec![1.  * -1.], vec![1.  * 0.], vec![1.  * 1.]],
-        ];
-
-        let mut rng = XorShiftRng::seed_from_u64(0);
-        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Full, &mut rng);
-        for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
-            for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
-                assert_eq!(ri.unwrap().value(), eri);
-            }
-        }
-
-    }
-
-    #[test]
-    fn test_attention_matrix_cw() {
-        let feats = create_att_vecs();
-
-        let exp_att_matrix = vec![
-            vec![vec![-1. * -1.], vec![-1. * 0.], vec![0.]],
-            vec![vec![0.  * -1.], vec![0.  * 0.], vec![0.  * 1.]],
-            vec![vec![0.], vec![1.  * 0.], vec![1.  * 1.]],
-        ];
-
-        let mut rng = XorShiftRng::seed_from_u64(0);
-        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Sliding {window_size: 1}, &mut rng);
-        for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
-            assert_eq!(row.len(), exp_row.len());
-            for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
-                if let Some(v) = ri {
-                    assert_eq!(v.value(), eri);
-                } else {
-                    assert_eq!(eri, vec![0f32]);
-                }
-            }
-        }
-
-        let exp_att_matrix = vec![
-            vec![vec![-1. * -1.], vec![-1. * 0.], vec![-1. * 1.]],
-            vec![vec![0.  * -1.], vec![0.  * 0.], vec![0.  * 1.]],
-            vec![vec![1.  * -1.], vec![1.  * 0.], vec![1.  * 1.]],
-        ];
-
-        // larger window than feat set
-        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Sliding { window_size: 10}, &mut rng);
-        for (row, exp_row) in att_matrix.into_iter().zip(exp_att_matrix.into_iter()) {
-            assert_eq!(row.len(), exp_row.len());
-            for (ri, eri) in row.into_iter().zip(exp_row.into_iter()) {
-                if let Some(v) = ri {
-                    assert_eq!(v.value(), eri);
-                } else {
-                    assert_eq!(eri, vec![0f32]);
-                }
-            }
+impl AttentionVars {
+    pub fn new(weights: &AttentionWeights) -> Self {
+        let (dims, inner) = (weights.dims, weights.inner());
+        AttentionVars {
+            qkv: Variable::matrix(&weights.qkv, 3 * inner, dims),
+            out: Variable::matrix(&weights.out, dims, inner),
+            heads: weights.heads,
+            head_dims: weights.head_dims
         }
     }
 
-    #[test]
-    fn test_att_softmax() {
-        let feats = create_att_vecs();
-
-        let exp_softmax = vec![
-            vec![0.66524096,0.24472847,0.09003057],
-            vec![1./3.,1./3.,1./3.],
-            vec![0.09003057, 0.24472847, 0.66524096],
-        ];
-
-        let mut rng = XorShiftRng::seed_from_u64(0);
-        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Full, &mut rng);
-        let softmax_matrix = compute_attention_softmax(att_matrix, 1);
-
-        assert_eq!(softmax_matrix.len(), exp_softmax.len());
-        for (row, exp_row) in softmax_matrix.into_iter().zip(exp_softmax.into_iter()) {
-            let r: Vec<_> = row.into_iter().map(|x| x.unwrap()).collect();
-            assert_eq!(r.concat().value(), exp_row);
+    /// The gradients of `qkv` then `out` after `graph`'s backward pass, in
+    /// [`AttentionWeights::parameters`] order, or None when the loss didn't use the weights.
+    pub fn gradients(&self, graph: &Graph) -> Option<Vec<f32>> {
+        let (qkv, out) = (graph.get_grad(&self.qkv), graph.get_grad(&self.out));
+        if qkv.is_none() && out.is_none() {
+            return None
         }
-
+        let qkv = qkv.unwrap_or_else(|| vec![0f32; self.qkv.value().len()]);
+        let out = out.unwrap_or_else(|| vec![0f32; self.out.value().len()]);
+        Some(qkv.into_iter().chain(out).collect())
     }
+}
 
-    #[test]
-    fn test_att_reweighted() {
-        let feats = create_att_vecs();
-
-        let mut rng = XorShiftRng::seed_from_u64(0);
-        let att_matrix = compute_attention_matrix(&feats, &mut AttentionType::Full, &mut rng);
-        let softmax_matrix = compute_attention_softmax(att_matrix, 1);
-        let reweighted = scale_vecs(feats, &softmax_matrix).collect::<Vec<_>>();
-
-        let exp_weights = vec![
-            vec![ 1.0647,  1.0647],
-            vec![ 0.6667,  0.6667],
-            vec![-0.0858, -0.0858]
-        ];
-
-        for row in reweighted.iter() {
-            println!("{:?}", row.value());
-        }
-
-        for (row, erow) in reweighted.iter().zip(exp_weights.into_iter()) {
-            for (ri, eri) in row.value().iter().zip(erow.iter()) {
-                assert!((ri - eri).abs() < 1e-4);
-            }
-        }
+/// [`AttentionWeights::pool`] on the autograd graph: pools `tokens` (feature embeddings and
+/// their weights) into one embedding, differentiable in the tokens and the weights.
+pub fn attention_pool(tokens: &[(ANode, f32)], vars: &AttentionVars) -> ANode {
+    let tokens: Vec<&(ANode, f32)> = tokens.iter().filter(|(_, w)| *w > 0f32).collect();
+    let total: f32 = tokens.iter().map(|(_, w)| w).sum();
+    let dims = vars.out.shape()[0];
+    if tokens.is_empty() || total <= 0f32 {
+        return Constant::new(vec![0f32; dims])
     }
-
-
-
-    /// Layout per feature with d_k=1, 2 heads, d_model=1: [Q1, Q2, K1, K2, V1, V2].  One feature
-    /// gives the mean over heads of V_h, the same as the general path.
-    #[test]
-    fn test_single_feature_uses_all_heads() {
-        let mha = MultiHeadedAttention::new(2, 1, AttentionType::Full);
-        let feats = vec![(Variable::new(vec![0., 0., 0., 0., 1., 3.]), 1f32)];
-        let mut rng = XorShiftRng::seed_from_u64(0);
-        let out = attention_mean(feats.iter(), &mha, &mut rng);
-        assert_eq!(out.value(), &[2.]);
-    }
-
-    /// Sampling keys must not change the logits of the keys that were sampled: each should be
-    /// the plain q_i . k_j, as in Full attention.  Softmax already normalizes over the sample.
-    #[test]
-    fn test_random_attention_does_not_rescale_logits() {
-        let mha = MultiHeadedAttention::new(1, 1, AttentionType::Random {
-            num_features: Sample::Fixed(2)
-        });
-        let items: Vec<_> = (0..4).map(|i| {
-            let e = Variable::new(vec![1. + i as f32, 2. - i as f32, 1.]);
-            (Attention::new(&e, &mha, 0), 1f32)
-        }).collect();
-        let mut rng = XorShiftRng::seed_from_u64(0);
-        let m = compute_attention_matrix(&items, &mha.attention_type, &mut rng);
-        let mut checked = 0;
-        for (i, row) in m.iter().enumerate() {
-            for (j, logit) in row.iter().enumerate() {
-                if let Some(l) = logit {
-                    let expected = (1. + i as f32) * (2. - j as f32);
-                    assert_eq!(l.value(), &[expected], "logit ({}, {})", i, j);
-                    checked += 1;
-                }
-            }
-        }
-        assert_eq!(checked, 8);
-    }
+    let (hd, inner) = (vars.head_dims, vars.heads * vars.head_dims);
+    let x = ANode::stack(&tokens.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>());
+    // (1, T): each token's share of the weighted means.
+    let shares = Constant::matrix(&tokens.iter().map(|(_, w)| w / total).collect::<Vec<_>>(), 1, tokens.len());
+    let proj = x.matmul(&vars.qkv.t());
+    let scale = 1f32 / (hd as f32).sqrt();
+    let heads: Vec<ANode> = (0..vars.heads).map(|h| {
+        let q = proj.narrow(1, h * hd, hd);
+        let k = proj.narrow(1, inner + h * hd, hd);
+        let v = proj.narrow(1, 2 * inner + h * hd, hd);
+        let attention = (q.matmul(&k.t()) * scale).softmax_rows();
+        // The weighted mean of the tokens' contexts, (1, hd).
+        shares.matmul(&attention.matmul(&v))
+    }).collect();
+    let context = ANode::hcat(&heads);
+    (shares.matmul(&x) + context.matmul(&vars.out.t())).flatten()
 }
 
 #[cfg(test)]
@@ -683,5 +310,79 @@ mod attention_weights_tests {
         assert_eq!(w.qkv().len(), 3 * 160 * 151);
         let bound = 1. / 151f32.sqrt();
         assert!(w.qkv().iter().all(|v| v.abs() <= bound));
+    }
+}
+
+#[cfg(test)]
+mod attention_pool_tests {
+    use super::*;
+    use rand_xorshift::XorShiftRng;
+
+    fn random_weights(seed: u64, dims: usize, heads: usize) -> AttentionWeights {
+        let mut rng = XorShiftRng::seed_from_u64(seed);
+        let w = AttentionWeights::init(dims, heads, &mut rng).unwrap();
+        let out = (0..w.out().len()).map(|_| rng.gen::<f32>() - 0.5).collect();
+        AttentionWeights::new(dims, heads, w.head_dims(), w.qkv().to_vec(), out).unwrap()
+    }
+
+    /// The autograd forward pass is the plain one, for any token count and weights.
+    #[test]
+    fn test_autograd_pool_matches_plain_pool() {
+        let mut rng = XorShiftRng::seed_from_u64(3);
+        for (dims, heads, tokens) in [(5, 2, 1), (5, 2, 4), (13, 3, 7), (4, 1, 2)] {
+            let w = random_weights(tokens as u64, dims, heads);
+            let x: Vec<Vec<f32>> = (0..tokens).map(|_| (0..dims).map(|_| rng.gen::<f32>() * 2. - 1.).collect()).collect();
+            let weights: Vec<f32> = (0..tokens).map(|i| 0.5 + i as f32).collect();
+            let mut expected = vec![0f32; dims];
+            w.pool(&x.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &weights, &mut expected);
+            let toks: Vec<(ANode, f32)> = x.iter().zip(weights.iter()).map(|(v, wi)| (Constant::new(v.clone()), *wi)).collect();
+            let got = attention_pool(&toks, &AttentionVars::new(&w)).value();
+            assert_eq!(got.len(), dims);
+            assert!(got.iter().zip(expected.iter()).all(|(a, b)| (a - b).abs() < 1e-5), "{:?} vs {:?}", got, expected);
+        }
+    }
+
+    #[test]
+    fn test_autograd_pool_with_no_tokens_is_zeros() {
+        let w = random_weights(1, 4, 2);
+        assert_eq!(attention_pool(&[], &AttentionVars::new(&w)).value(), vec![0.; 4]);
+    }
+
+    /// Gradients reach the tokens and both projections, in `parameters` order, and match
+    /// finite differences of the plain forward pass.
+    #[test]
+    fn test_gradients_reach_tokens_and_weights() {
+        let w = random_weights(5, 4, 2);
+        let x = [vec![0.3f32, -0.2, 0.8, 0.1], vec![-0.5, 0.4, 0.2, 0.9]];
+        let target = [0.2f32, -0.1, 0.4, 0.3];
+        let loss_of = |w: &AttentionWeights| {
+            let mut out = vec![0f32; 4];
+            w.pool(&[&x[0], &x[1]], &[1., 1.], &mut out);
+            out.iter().zip(target.iter()).map(|(o, t)| o * t).sum::<f32>()
+        };
+        let vars = AttentionVars::new(&w);
+        let toks: Vec<(ANode, f32)> = x.iter().map(|v| (Variable::pooled(v), 1f32)).collect();
+        let loss = (attention_pool(&toks, &vars) * Constant::new(target.to_vec())).sum();
+        let mut graph = Graph::new();
+        graph.backward(&loss);
+        assert!(graph.get_grad(&toks[0].0).is_some());
+        let grads = vars.gradients(&graph).unwrap();
+        let params = w.parameters();
+        assert_eq!(grads.len(), params.len());
+        let h = 1e-2f32;
+        for i in (0..params.len()).step_by(7) {
+            let (mut up, mut down) = (params.clone(), params.clone());
+            up[i] += h;
+            down[i] -= h;
+            let numeric = (loss_of(&w.with_parameters(up).unwrap()) - loss_of(&w.with_parameters(down).unwrap())) / (2. * h);
+            assert!((grads[i] - numeric).abs() < 2e-3, "parameter {}: {} vs {}", i, grads[i], numeric);
+        }
+    }
+
+    #[test]
+    fn test_with_parameters_round_trips_and_checks_length() {
+        let w = random_weights(2, 3, 2);
+        assert_eq!(w.with_parameters(w.parameters()).unwrap(), w);
+        assert!(w.with_parameters(vec![0.; 3]).is_err());
     }
 }

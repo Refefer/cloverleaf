@@ -32,7 +32,7 @@ use crate::io::{read_node_values,EmbeddingLoadError,FeatureFileError,GraphLoadEr
 use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::ann::Ann;
 use crate::algos::connected::find_connected_components;
-use crate::algos::ep::attention::{AttentionType,AttentionWeights,MultiHeadedAttention};
+use crate::algos::ep::attention::AttentionWeights;
 use crate::algos::ep::{EmbeddingPropagation,EmbeddingInit,LearningRateSchedule,UpdateFrequency,LossWeighting as EPLW};
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
@@ -1199,7 +1199,7 @@ impl EmbeddingPropagator {
     ///
     ///    weighted_neighbor_averaging : Bool - Optional
     ///        Reconstructs the node from the edge-weighted mean of its neighbors rather than the
-    ///        plain mean.  Ignored by attention models.  Default is False.
+    ///        plain mean.  Default is False.
     ///
     ///    max_features : Int/Float - Optional
     ///        Maximum number of features to use to construct a node embedding.  These features
@@ -1217,26 +1217,23 @@ impl EmbeddingPropagator {
     ///    indicator : Bool - Optional
     ///        Shows a progress bar.  Default is True
     ///    
-    ///    attention : Int - Optional
-    ///        If provided, uses softmax attention to construct node embeddings.  If provided, this
-    ///        adds to the `dim` space into query, key, and value functions.  This specifies the
-    ///        size used for Query and Value, resulting in an embedding that is "2*`attention` +
-    ///        dim".
-    ///
-    ///        Note: while this functionality is here, it is _incredibly_ computationally expensive
-    ///        to do on CPU.  Useful only for small graphs or extreme patience.
-    ///
-    ///        Default is 0.
-    ///    
     ///    attention_heads : Int - Optional
-    ///        Number of heads to use.  This expands the model size even more.
+    ///        If provided, pools each node's features with multi-head self-attention instead of
+    ///        averaging them: query, key, value and output projections shared by every feature,
+    ///        learned alongside the feature embeddings (at `dense_alpha`), the node embedding
+    ///        being the features' mean plus the projected mean attention context.  The same
+    ///        model as the GPU trainer's attention pooling.  Reconstructions pool each sampled
+    ///        neighbor on its own, then average the neighbors.  Each head is dims / heads
+    ///        rounded up to a multiple of 8 wide.  After learning, `feature_aggregator()` gives
+    ///        the aggregator that embeds nodes the same way.
     ///
-    ///        Default is 1.
+    ///        Note: far more expensive than averaging on CPU.
+    ///
+    ///        Default is None (averaging).
     ///    
-    ///    context_window : Int - Optional
-    ///        If provided, uses sliding attention which can be helpful for NLP node features
-    ///
-    ///        Default is None
+    ///    dense_alpha : Float - Optional
+    ///        Learning rate of the attention projections, on the same schedule as alpha.
+    ///        Default is 1e-3.
     ///    
     ///    noise : Float - Optional
     ///        If added, injects gaussian noise into the gradients to help with generalization.  
@@ -1279,7 +1276,7 @@ impl EmbeddingPropagator {
     ///        
     ///    
     #[new]
-    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention=None, attention_heads=None, context_window=None, noise=None, optimizer=None, lr_schedule=None, init=None, update_frequency=None))]
+    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention_heads=None, dense_alpha=None, noise=None, optimizer=None, lr_schedule=None, init=None, update_frequency=None))]
     pub fn new(
         // Learning rate
         alpha: Option<f32>, 
@@ -1324,14 +1321,11 @@ impl EmbeddingPropagator {
         // Whether to have a pretty indicator.
         indicator: Option<bool>,
 
-        // Number of dims to use for attention.  If missing, uses the Averaged model
-        attention: Option<usize>,
-
-        // Number of heads to use.  Defaults to one, but only used if attention dims are set
+        // Attention heads; None for the averaged model
         attention_heads: Option<usize>,
 
-        // Use sliding window context.
-        context_window: Option<usize>,
+        // Learning rate of attention's projections
+        dense_alpha: Option<f32>,
 
         // Use gradient noise where we sample from the normal distribution and blend with `noise`
         noise: Option<f32>,
@@ -1383,8 +1377,12 @@ impl EmbeddingPropagator {
             optimizer: optimizer.map(|o| o.kind).unwrap_or(d.optimizer),
             lr_schedule,
             init,
-            update_frequency
+            update_frequency,
+            dense_alpha: dense_alpha.unwrap_or(d.dense_alpha)
         };
+        if !(ep.dense_alpha.is_finite() && ep.dense_alpha >= 0.) {
+            return Err(PyValueError::new_err("dense_alpha must be finite and >= 0"))
+        }
 
         let wns = weighted_neighbor_sampling.unwrap_or(false);
         let wna = weighted_neighbor_averaging.unwrap_or(false);
@@ -1398,18 +1396,9 @@ impl EmbeddingPropagator {
             .unwrap_or(Ok(Sample::All))
             .map_err(|_err| PyValueError::new_err("max_nodes must be either None, or (0, N)"))?;
 
-        let model = if let Some(d_k) = attention {
-            let num_heads = attention_heads.unwrap_or(1);
-            let at = if let Some(size) = context_window {
-                AttentionType::Sliding{window_size: size}
-            } else {
-                match max_features {
-                    Sample::All => AttentionType::Full,
-                    _ => AttentionType::Random { num_features: max_features }
-                }
-            };
-            let mha = MultiHeadedAttention::new(num_heads, d_k, at);
-            ModelType::Attention(AttentionFeatureModel::new(mha, Sample::All, max_nodes, wns))
+        let model = if let Some(heads) = attention_heads {
+            ModelType::Attention(AttentionFeatureModel::new(heads, max_features, max_nodes, wns, wna)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?)
         } else {
             ModelType::Averaged(AveragedFeatureModel::new(
                 max_features, max_nodes, wns, wna
@@ -1432,19 +1421,39 @@ impl EmbeddingPropagator {
     ///    feature_embeddings : mut NodeEmbeddings - Optional
     ///        If not provided, creates a new randomized feature_embedding set.
     ///    
+    ///    aggregator : FeatureAggregator - Optional
+    ///        Attention models only: continue from these attention weights (for example a GPU
+    ///        trained model's) rather than fresh ones, or the ones the last call learned.  Must
+    ///        have the model's heads and dims.
+    ///    
     ///    Returns
     ///    -------
     ///    NodeEmbeddings
-    ///        A mapping from features -> embedding
+    ///        A mapping from features -> embedding.  With attention, `feature_aggregator()`
+    ///        then gives the learned weights.
     ///    
-    #[pyo3(signature = (graph, features, feature_embeddings=None))]
+    #[pyo3(signature = (graph, features, feature_embeddings=None, aggregator=None))]
     pub fn learn_features(
         &mut self, 
         graph: &Graph, 
         features: &mut FeatureSet,
-        feature_embeddings: Option<&mut NodeEmbeddings>
+        feature_embeddings: Option<&mut NodeEmbeddings>,
+        aggregator: Option<&FeatureAggregator>
     ) -> PyResult<NodeEmbeddings> {
 
+        if let Some(agg) = aggregator {
+            let ModelType::Attention(model) = &self.model else {
+                return Err(PyValueError::new_err("aggregator warm-starts attention models only"))
+            };
+            let weights = agg.agg.attention_weights().ok_or_else(||
+                PyValueError::new_err("aggregator must be an attention aggregator"))?;
+            if weights.dims() != self.ep.d_model {
+                return Err(PyValueError::new_err(format!(
+                    "the aggregator is for {}-dimensional embeddings, the model trains {}",
+                    weights.dims(), self.ep.d_model)))
+            }
+            model.warm_start(weights.clone()).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
         let warm_start = take_warm_start(&graph.inner, &mut features.inner, feature_embeddings)?;
         let learned = match &self.model {
             ModelType::Averaged(model) =>
@@ -1454,6 +1463,18 @@ impl EmbeddingPropagator {
         }?;
         Ok(NodeEmbeddings::from(learned))
 
+    }
+
+    ///    The aggregator that embeds nodes as the model does: `Averaged` for the averaged model,
+    ///    and for attention its learned weights, which it has once learn_features has run (or
+    ///    been warm-started).  Save it to embed new nodes later with a NodeEmbedder.
+    pub fn feature_aggregator(&self) -> PyResult<FeatureAggregator> {
+        let agg = match &self.model {
+            ModelType::Averaged(_) => Some(CoreFeatureAggregator::averaged()),
+            ModelType::Attention(model) => model.aggregator()
+        };
+        agg.map(|agg| FeatureAggregator { agg })
+            .ok_or_else(|| PyValueError::new_err("the attention model has no weights until learn_features runs"))
     }
     
     /// Simple Python representation 
