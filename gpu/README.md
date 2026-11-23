@@ -1,21 +1,66 @@
 # EP on the GPU
 
-A PyTorch implementation of cloverleaf's Embedding Propagation, for experiments that are too slow
-on the CPU, attention pooling in particular.  It reads cloverleaf's graph and feature files and
-writes embeddings cloverleaf loads, so alignment, ANN search and evaluation still use cloverleaf.
+A PyTorch implementation of cloverleaf's Embedding Propagation, for graphs where training on the
+CPU is too slow, attention pooling in particular.  It reads cloverleaf's graph and feature files
+and writes files cloverleaf loads, so embedding new nodes, alignment, ANN search and evaluation
+all stay in cloverleaf.
+
+## Install
+
+From the repository root, `make gpu` builds cloverleaf into a virtualenv and installs torch and the
+other requirements into it (see the main README).  Or, with cloverleaf already installed:
 
 ```
 pip install -r requirements.txt
-python -m ep_gpu.train --edges GRAPH --features FEATURES --out PREFIX \
-    --loss margin --gamma 1 --negatives 5 --max-nodes 10 --max-features 0.5 \
-    --pooling attention --heads 4 --batch-size 1024 --passes 100
 ```
 
-writes `PREFIX.node-embeddings` (every node, pooled from all its features),
-`PREFIX.feature-embeddings` (the feature table), `PREFIX.aggregator` (the pooling, as a cloverleaf
-`FeatureAggregator` file) and `PREFIX.pt` (the model).  New nodes are embedded from their features
-by cloverleaf, `NodeEmbedder(FeatureAggregator.load(PREFIX.aggregator))` over the feature table,
-with mean or attention pooling, or in PyTorch with `ep_gpu.embed_feature_sets`; the two agree.
+## Quickstart
+
+```
+cd examples
+python quickstart.py
+```
+
+trains on a small synthetic query/product graph, then embeds a query the graph has never seen,
+aligns it and retrieves products, all in cloverleaf.  `examples/` has the other examples.
+
+## Training
+
+The recommended configuration, also in `examples/train.sh`:
+
+```
+python -m ep_gpu.train --edges GRAPH --features FEATURES --out PREFIX \
+    --dims 128 --lr 0.3 --loss starspace --gamma 0.1 --negatives 12 \
+    --max-nodes 12 --max-features 0.5 --weighted-averaging --valid-pct 0.01 --passes 100 \
+    --pooling attention --heads 4 --neighbour-pooling mean --batch-size 2048 \
+    --optimizer rowwise_adagrad --table-dtype bfloat16 \
+    --lr-schedule sawtooth --lr-cycles 4 --graph-cache PREFIX.graph.pt
+```
+
+Attention pooling with mean-combined neighbours and StarSpace retrieved best in our experiments;
+row-wise Adagrad with a bfloat16 table needs a fraction of Adam's memory; and the sawtooth
+schedule (4 cycles of linear decay, restarting at the peak rate) reaches a lower validation loss
+than cosine in the same passes.  Tune `dims`, `lr`, `gamma`, `negatives`, `max_nodes` and
+`max_features` for your graph.  `python -m ep_gpu.train --help` lists every option; the `Config`
+class in `ep_gpu/train.py` documents them.
+
+## Output
+
+`PREFIX.node-embeddings` (every node, pooled from all its features), `PREFIX.feature-embeddings`
+(the feature table), `PREFIX.aggregator` (the pooling, as a cloverleaf `FeatureAggregator` file)
+and `PREFIX.pt` (the model).  In cloverleaf:
+
+```python
+import cloverleaf as cl
+features = cl.NodeEmbeddings.load("PREFIX.feature-embeddings", cl.Distance.Cosine)
+embedder = cl.NodeEmbedder(cl.FeatureAggregator.load("PREFIX.aggregator"))
+new_node = embedder.embed_adhoc([("query", "red"), ("query", "shoes")], features, strict=False)
+```
+
+embeds a node from its features exactly as the trained model does, with mean or attention
+pooling (`tests/test_cloverleaf_parity.py` checks this; `ep_gpu.embed_feature_sets` does the same
+in PyTorch).  After `NeighborhoodAligner`, `EmbeddingAligner(k, method="mean_shift")` places such
+a node in the aligned space by how its nearest nodes moved.
 
 ## What matches cloverleaf
 
@@ -49,7 +94,9 @@ with mean or attention pooling, or in PyTorch with `ep_gpu.embed_feature_sets`; 
 
 With mean pooling, cloverleaf's averaged `NodeEmbedder` rebuilds the exported node embeddings
 from the exported feature table exactly, and features-only EP on Cora scores the same on both
-(77.32 ± 1.29 GPU, 77.43 ± 1.13 CPU; `examples/parity_cora.py`).
+(77.32 ± 1.29 GPU, 77.43 ± 1.13 CPU; `examples/parity_cora.py`).  With attention pooling,
+cloverleaf embeds nodes from the exported feature table and aggregator to within 1e-5 of the
+GPU model.
 
 ## What differs
 
@@ -57,6 +104,10 @@ from the exported feature table exactly, and features-only EP on Cora scores the
   without); hard negatives aren't implemented.
 * `neighbour_pooling="attention"` (a nested reconstruction's neighbours combined by attention
   rather than their weighted mean) and flat attention reconstructions are GPU only.
+* GPU only: the "sawtooth" learning rate (`lr_cycles` equal cycles, each a linear decay from `lr`
+  to `lr`/100, the first after the warmup), row-wise optimisers and a bfloat16 table, InfoNCE and
+  the listwise losses, feature pruning on load (`--prune-min-count`), shared feature namespaces
+  (`--shared-namespace`) and `epoch_after`.
 
 ## Speed and precision
 

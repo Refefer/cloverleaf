@@ -37,3 +37,7 @@ Cargo.lock
 
 # Python bytecode
 __pycache__/
+
+# Python virtualenv and wheels made by the Makefile
+/.venv/
+/dist/
