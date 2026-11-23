@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from ep_gpu.optim import SparseTableOptimizer, stochastic_round_bf16
+from ep_gpu.optim import EpochGradients, SparseTableOptimizer, stochastic_round_bf16
 
 
 def sparse_grad(n, d, rows, values):
@@ -76,3 +76,38 @@ def test_bfloat16_table_keeps_small_updates_on_average():
     # weights move by the full amount: sum_k 1e-3 / sqrt(k) for k = 1..10.
     expected = 1 - sum(1e-3 / k ** 0.5 for k in range(1, 11))
     assert abs(w.float().mean().item() - expected) < 5e-4
+
+
+@pytest.mark.parametrize("kind", ["adam", "rowwise_adam", "rowwise_adagrad"])
+@pytest.mark.parametrize("chunk_rows", [1, 2, 1 << 16])
+def test_epoch_gradients_take_one_step_with_the_summed_gradient(kind, chunk_rows):
+    torch.manual_seed(0)
+    start = torch.randn(6, 3)
+    batches = [([0, 2], torch.randn(2, 3)), ([2, 3], torch.randn(2, 3)), ([0, 0, 5], torch.randn(3, 3))]
+    summed = torch.zeros(6, 3)
+    for rows, values in batches:
+        summed.index_add_(0, torch.tensor(rows), values)
+
+    ref = torch.nn.Parameter(start.clone())
+    ref_opt = SparseTableOptimizer(ref, kind, lr=0.1)
+    ref.grad = sparse_grad(6, 3, [0, 2, 3, 5], summed[[0, 2, 3, 5]].tolist())
+    ref_opt.step()
+
+    w = torch.nn.Parameter(start.clone())
+    opt = SparseTableOptimizer(w, kind, lr=0.1)
+    acc = EpochGradients(w, chunk_rows=chunk_rows)
+    for rows, values in batches:
+        acc.add(sparse_grad(6, 3, rows, values.tolist()))
+    assert torch.equal(w, start)                       # nothing moves until the pass ends
+    acc.apply(opt)
+    assert opt.steps == 1
+    assert torch.allclose(w, ref, atol=1e-6)
+    assert torch.equal(w[[1, 4]], start[[1, 4]])       # untouched rows stay put
+    assert not acc.touched.any() and not acc.sums.any()
+
+
+def test_epoch_gradients_with_nothing_added_take_no_step():
+    w = torch.nn.Parameter(torch.ones(3, 2))
+    opt = SparseTableOptimizer(w, "rowwise_adagrad", lr=0.1)
+    EpochGradients(w).apply(opt)
+    assert opt.steps == 0 and torch.equal(w, torch.ones(3, 2))

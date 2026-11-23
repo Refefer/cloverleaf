@@ -6,6 +6,7 @@ Feature file: one node per line, `node_type<TAB>name<TAB>f1 f2 ...`.
 As in cloverleaf, nodes are numbered in the order they first appear in the graph file, features
 are namespaced (by node type, or a single namespace), feature lines for nodes outside the graph
 are ignored, and a node without features gets one of its own, ("node", "<node id>").
+Optionally every token also gets a feature in one namespace shared across node types.
 """
 from dataclasses import dataclass, fields
 
@@ -25,6 +26,7 @@ class Graph:
     feat_ptr: torch.Tensor     # (N + 1,) features of v are feat_idx[feat_ptr[v]:feat_ptr[v + 1]]
     feat_idx: torch.Tensor     # (M,) feature ids
     feature_keys: list         # feature id -> (namespace, name)
+    zero_init: torch.Tensor = None  # feature ids whose rows start at zero (offsets), or None
 
     @property
     def num_nodes(self):
@@ -63,7 +65,8 @@ def _csr(n, rows, cols, vals):
     return np.cumsum(ptr), cols, vals
 
 
-def load(edges_path, features_path=None, directed=False, namespace="node_type", prune_min_count=0):
+def load(edges_path, features_path=None, directed=False, namespace="node_type", prune_min_count=0,
+         shared_namespace=None):
     """Reads a cloverleaf graph file and, optionally, a feature file.
 
     namespace: "node_type" puts each feature in its node's type namespace (cloverleaf's
@@ -71,7 +74,15 @@ def load(edges_path, features_path=None, directed=False, namespace="node_type", 
     (FeatureNamespace.single(namespace)).
     prune_min_count: drops features that fewer than this many of the graph's nodes have, as
     cloverleaf's FeatureSet.prune_min_count does; a node left with none gets its own feature.
+    shared_namespace: with namespace "node_type", also gives every token a feature in this one
+    namespace, shared across node types.  The node-type features then start at zero
+    (Graph.zero_init), so each is a learned offset from its token's shared feature: a query word
+    and the same word in a title start out identical and drift apart only as training needs.
+    Pruning counts the two separately, so a token on both sides can keep its shared feature
+    and lose an offset.
     """
+    if shared_namespace is not None and namespace != "node_type":
+        raise ValueError("shared_namespace needs namespace='node_type'")
     if isinstance(prune_min_count, bool) or not isinstance(prune_min_count, int) or prune_min_count < 0:
         raise ValueError(f"prune_min_count must be an int >= 0, got {prune_min_count!r}")
     index, types, names = {}, [], []
@@ -121,7 +132,11 @@ def load(edges_path, features_path=None, directed=False, namespace="node_type", 
                 if v is None:
                     continue
                 ns = pieces[0] if namespace == "node_type" else namespace
-                node_feats[v] = sorted({feature((ns, tok)) for tok in pieces[2].split()})
+                tokens = pieces[2].split()
+                keys = [(ns, tok) for tok in tokens]
+                if shared_namespace is not None:
+                    keys += [(shared_namespace, tok) for tok in tokens]
+                node_feats[v] = sorted({feature(k) for k in keys})
     if prune_min_count > 1 and feature_keys:
         counts = np.bincount(np.fromiter((f for fs in node_feats for f in fs), np.int64),
                              minlength=len(feature_keys))
@@ -131,9 +146,18 @@ def load(edges_path, features_path=None, directed=False, namespace="node_type", 
         node_feats = [[int(remap[f]) for f in fs if remap[f] >= 0] for fs in node_feats]
         feature_keys = [feature_keys[i] for i in kept]
         feature_ids = {k: i for i, k in enumerate(feature_keys)}
+    fallbacks = set()
     for v in range(n):
         if not node_feats[v]:
             node_feats[v] = [feature(("node", str(v)))]
+            fallbacks.add(node_feats[v][0])
+    if shared_namespace is not None and (shared_namespace in set(types) or shared_namespace == "node"):
+        raise ValueError(f"shared_namespace {shared_namespace!r} collides with a node type's namespace")
+    zero_init = None
+    if shared_namespace is not None:
+        node_types = set(types)
+        zero_init = torch.tensor([i for i, (ns, _) in enumerate(feature_keys)
+                                  if ns in node_types and i not in fallbacks], dtype=torch.int64)
     lengths = np.fromiter((len(fs) for fs in node_feats), np.int64, n)
     feat_ptr = np.concatenate([[0], np.cumsum(lengths)])
     feat_idx = np.fromiter((f for fs in node_feats for f in fs), np.int64, int(feat_ptr[-1]))
@@ -145,11 +169,11 @@ def load(edges_path, features_path=None, directed=False, namespace="node_type", 
     t = torch.from_numpy
     return Graph(types, names, t(adj_ptr), ids(adj_idx, n), t(adj_w), t(feat_ptr),
                  ids(feat_idx, len(feature_keys)),
-                 feature_keys)
+                 feature_keys, zero_init)
 
 
 def load_cached(cache_path, edges_path, features_path=None, directed=False, namespace="node_type",
-                prune_min_count=0):
+                prune_min_count=0, shared_namespace=None):
     """`load`, saving the parsed graph to `cache_path` the first time and reading it back after.
     The cache records its inputs and settings, and is rebuilt if they change."""
     import os
@@ -157,12 +181,12 @@ def load_cached(cache_path, edges_path, features_path=None, directed=False, name
            "features": features_path and os.path.abspath(features_path),
            "features_mtime": features_path and os.path.getmtime(features_path),
            "directed": directed, "namespace": namespace, "prune_min_count": prune_min_count,
-           "format": 2}
+           "shared_namespace": shared_namespace, "format": 3}
     if os.path.exists(cache_path):
         saved = torch.load(cache_path, weights_only=False)
         if saved["key"] == key:
             return saved["graph"]
-    graph = load(edges_path, features_path, directed, namespace, prune_min_count)
+    graph = load(edges_path, features_path, directed, namespace, prune_min_count, shared_namespace)
     torch.save({"key": key, "graph": graph}, cache_path)
     return graph
 

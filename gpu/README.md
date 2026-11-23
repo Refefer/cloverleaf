@@ -19,6 +19,9 @@ embedded from their features with `ep_gpu.embed_feature_sets`.
 
 * Files: nodes numbered in order of first appearance, features namespaced by node type (or one
   shared namespace), and a node without features gets its own `("node", id)` feature.
+  `--shared-namespace NAME` (GPU only) gives each token a feature in NAME as well as its node
+  type's, and starts the node-type features at zero: each is an offset from the shared one, so
+  the same word on two node types starts out identical and diverges only as training needs.
 * h(v) pools a node's own features; h~(v) pools all its sampled neighbours' features together,
   so a feature shared by several neighbours counts once per neighbour.
 * Negatives are uniform random nodes other than the anchor, embedded from their own features.
@@ -28,6 +31,10 @@ embedded from their features with `ep_gpu.embed_feature_sets`.
   where averaging skips the edge weights for neighbours already sampled by weight.
 * Adam on the feature table with sparse updates; "cosine" (20% warmup from lr/100, then cosine
   decay to lr/100) or "constant" learning rates; "unit" or "glorot" initialisation.
+* `update_frequency`: "batch" (an update after every batch) or "epoch" (every batch of a pass is
+  computed against the same embeddings, their gradients are summed, and one update applies the
+  sum at the pass's end; the schedule counts one step per pass).  Epoch updates keep a float32
+  gradient table the size of the feature table, on the table's device.
 
 With mean pooling, cloverleaf's averaged `NodeEmbedder` rebuilds the exported node embeddings
 from the exported feature table exactly, and features-only EP on Cora scores the same on both

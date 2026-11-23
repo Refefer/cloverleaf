@@ -155,3 +155,56 @@ def test_pool_negatives_needs_infonce(two_cliques):
     with pytest.raises(ValueError):
         train(two_cliques, Config(dims=4, passes=1, loss="starspace", pool_negatives=True, device="cpu"),
               log=lambda m: None)
+
+
+@pytest.mark.parametrize("pooling", ["mean", "attention"])
+def test_offset_features_start_at_zero_and_learn(tmp_path, pooling):
+    edges = tmp_path / "g.edges"
+    edges.write_text("".join(f"q\tq{i}\tp\tp{(i + j) % 6}\t1\n" for i in range(6) for j in range(2)))
+    feats = tmp_path / "g.features"
+    feats.write_text("".join(f"q\tq{i}\tw{i} w{(i + 1) % 6}\np\tp{i}\tw{i} t{i}\n" for i in range(6)))
+    g = data.load(str(edges), str(feats), shared_namespace="feat")
+    offsets = g.zero_init
+    shared = torch.tensor([i for i, (ns, _) in enumerate(g.feature_keys) if ns == "feat"])
+    start = train(g, Config(dims=8, passes=0, pooling=pooling, heads=2, device="cpu"), log=lambda m: None)
+    assert (start.features.weight[offsets] == 0).all()
+    assert (start.features.weight[shared].float().norm(dim=1) > 0.5).all()
+    cfg = Config(dims=8, passes=5, batch_size=4, negatives=2, pooling=pooling, heads=2, device="cpu")
+    model = train(g, cfg, log=lambda m: None)
+    assert (model.features.weight[offsets].float().norm(dim=1) > 0).any()
+    assert torch.isfinite(node_embeddings(model, g)).all()
+
+
+
+@pytest.mark.parametrize("pooling", ["mean", "attention"])
+def test_epoch_updates_equal_batch_updates_with_one_batch_per_pass(two_cliques, pooling):
+    common = dict(dims=8, passes=3, batch_size=64, lr=0.1, negatives=2, pooling=pooling, heads=2,
+                  optimizer="rowwise_adagrad", device="cpu", seed=5)
+    batch = train(two_cliques, Config(**common), log=lambda m: None)
+    epoch = train(two_cliques, Config(**common, update_frequency="epoch"), log=lambda m: None)
+    for a, b in zip(batch.state_dict().values(), epoch.state_dict().values()):
+        assert torch.allclose(a.float(), b.float(), atol=1e-6)
+
+
+def test_epoch_updates_step_once_per_pass(two_cliques, monkeypatch):
+    from ep_gpu import optim
+    steps, applies = [], []
+    monkeypatch.setattr(optim.SparseTableOptimizer, "step", lambda self: steps.append(1))
+    real_apply = optim.EpochGradients.apply
+    monkeypatch.setattr(optim.EpochGradients, "apply", lambda self, o: (applies.append(1), real_apply(self, o)))
+    cfg = Config(dims=8, passes=3, batch_size=4, update_frequency="epoch", device="cpu")
+    train(two_cliques, cfg, log=lambda m: None)
+    assert not steps and len(applies) == 3
+
+
+@pytest.mark.parametrize("pooling", ["mean", "attention"])
+def test_epoch_updates_learn_the_cliques(two_cliques, pooling):
+    cfg = Config(dims=16, passes=60, batch_size=4, lr=0.2, loss="starspace", gamma=0.5, negatives=3,
+                 pooling=pooling, heads=2, optimizer="rowwise_adagrad", update_frequency="epoch",
+                 device="cpu", seed=3)
+    assert separation(node_embeddings(train(two_cliques, cfg, log=lambda m: None), two_cliques)) > 0.3
+
+
+def test_unknown_update_frequency_is_rejected(two_cliques):
+    with pytest.raises(ValueError):
+        train(two_cliques, Config(dims=4, passes=1, update_frequency="step", device="cpu"), log=lambda m: None)

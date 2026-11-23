@@ -212,3 +212,44 @@ def test_graph_cache_rebuilds_when_pruning_changes(tmp_path):
     cache = str(tmp_path / "g.pt")
     assert data.load_cached(cache, str(edges), str(feats)).num_features == 2
     assert data.load_cached(cache, str(edges), str(feats), prune_min_count=2).num_features == 1
+
+
+def test_shared_namespace_gives_each_token_a_shared_feature_and_a_zeroed_offset(tmp_path):
+    edges = tmp_path / "g.edges"
+    edges.write_text("q\ta\tp\tb\t1\nq\ta\tp\tc\t1\n")
+    feats = tmp_path / "g.features"
+    feats.write_text("q\ta\tx y\np\tb\tx z\n")
+    g = data.load(str(edges), str(feats), shared_namespace="feat")
+    assert features(g, g.node_id("q", "a")) == {("q", "x"), ("q", "y"), ("feat", "x"), ("feat", "y")}
+    assert features(g, g.node_id("p", "b")) == {("p", "x"), ("p", "z"), ("feat", "x"), ("feat", "z")}
+    assert features(g, g.node_id("p", "c")) == {("node", "2")}
+    zeroed = {g.feature_keys[i] for i in g.zero_init.tolist()}
+    assert zeroed == {("q", "x"), ("q", "y"), ("p", "x"), ("p", "z")}   # not the shared ones or ("node", "2")
+    assert data.load(str(edges), str(feats)).zero_init is None
+
+
+def test_shared_namespace_prunes_shared_and_offset_features_separately(tmp_path):
+    edges = tmp_path / "g.edges"
+    edges.write_text("q\ta\tp\tb\t1\n")
+    feats = tmp_path / "g.features"
+    feats.write_text("q\ta\tx\np\tb\tx\n")
+    g = data.load(str(edges), str(feats), prune_min_count=2, shared_namespace="feat")
+    assert g.feature_keys == [("feat", "x")] and g.zero_init.tolist() == []
+
+
+@pytest.mark.parametrize("namespace,shared", [("one", "feat"), ("node_type", "q"), ("node_type", "node")])
+def test_shared_namespace_rejects_conflicting_settings(tmp_path, namespace, shared):
+    edges = tmp_path / "g.edges"
+    edges.write_text("q\ta\tp\tb\t1\n")
+    with pytest.raises(ValueError):
+        data.load(str(edges), namespace=namespace, shared_namespace=shared)
+
+
+def test_graph_cache_rebuilds_when_shared_namespace_changes(tmp_path):
+    edges = tmp_path / "g.edges"
+    edges.write_text("n\ta\tn\tb\t1\n")
+    feats = tmp_path / "g.features"
+    feats.write_text("n\ta\tx\nn\tb\tx y\n")
+    cache = str(tmp_path / "g.pt")
+    assert data.load_cached(cache, str(edges), str(feats)).num_features == 2
+    assert data.load_cached(cache, str(edges), str(feats), shared_namespace="feat").num_features == 4

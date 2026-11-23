@@ -56,3 +56,16 @@ def test_training_with_graph_and_table_in_host_memory(two_cliques, pooling):
 def test_unknown_placement_is_rejected(two_cliques):
     with pytest.raises(ValueError):
         train(two_cliques, Config(dims=4, passes=1, table_device="disk", device="cpu"), log=lambda m: None)
+
+
+@cuda
+def test_epoch_updates_with_the_table_in_host_memory(two_cliques):
+    cfg = Config(dims=16, passes=60, batch_size=4, lr=0.2, loss="starspace", gamma=0.5, negatives=3,
+                 table_device="cpu", optimizer="rowwise_adagrad", table_dtype="bfloat16",
+                 update_frequency="epoch", device="cuda", seed=3)
+    model = train(two_cliques, cfg, log=lambda m: None)
+    assert model.features.weight.device.type == "cpu"
+    e = torch.nn.functional.normalize(node_embeddings(model, two_cliques).float(), dim=1)
+    d = 1 - e @ e.T
+    within = (d[:10, :10].sum() + d[10:, 10:].sum()) / 180
+    assert float(d[:10, 10:].mean() - within) > 0.3

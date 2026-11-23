@@ -15,7 +15,7 @@ import torch
 
 from . import data, losses, ppr, sampling
 from .model import EPModel
-from .optim import SparseTableOptimizer
+from .optim import EpochGradients, SparseTableOptimizer
 
 
 @dataclass
@@ -68,6 +68,12 @@ class Config:
                                      # and sample there, copying each batch's ids over
     table_device: str = "same"       # "same" or "cpu": keep the feature table and its optimiser
                                      # state in pinned host memory, copying each batch's rows over
+    update_frequency: str = "batch"  # "batch": an update after every batch; "epoch": every batch of
+                                     # a pass computes its gradients against the same embeddings,
+                                     # they're summed, and one update applies them at the pass's end
+                                     # (cloverleaf's update_frequency).  Only `passes` updates, so it
+                                     # needs a larger lr or more passes; keeps a float32 gradient
+                                     # table the size of the feature table.
     valid_pct: float = 0.0           # nodes held out of the anchors; their loss is reported
     seed: int = 2017
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -96,6 +102,7 @@ def autocast(cfg, device):
 
 
 TABLE_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
+UPDATE_FREQUENCIES = ("batch", "epoch")
 
 
 def listwise(cfg):
@@ -128,12 +135,16 @@ def placement(cfg, setting):
     return torch.device(cfg.device if value == "same" else "cpu")
 
 
-def build(cfg, num_features, device, generator=None):
-    """The model, the feature table's optimiser and, with attention, an Adam for its weights."""
+def build(cfg, num_features, device, generator=None, zero_init=None):
+    """The model, the feature table's optimiser and, with attention, an Adam for its weights.
+    zero_init: feature ids whose rows start at zero (Graph.zero_init)."""
     if cfg.table_dtype not in TABLE_DTYPES:
         raise ValueError(f"table_dtype must be float32 or bfloat16, got {cfg.table_dtype!r}")
     model = EPModel(num_features, cfg.dims, cfg.pooling, cfg.heads, cfg.init, cfg.seed,
                     TABLE_DTYPES[cfg.table_dtype], cfg.neighbour_pooling).to(device)
+    if zero_init is not None:
+        with torch.no_grad():
+            model.features.weight[zero_init.to(model.features.weight.device)] = 0
     model.device = device
     table_device = placement(cfg, "table_device")
     if table_device != device:
@@ -259,13 +270,17 @@ def train(graph, cfg, log=print, lists=None):
     check_loss(cfg)
     if listwise(cfg) and lists is None:
         raise ValueError(f"{cfg.loss} needs PPR lists; see build_lists")
+    if cfg.update_frequency not in UPDATE_FREQUENCIES:
+        raise ValueError(f"update_frequency must be one of {', '.join(UPDATE_FREQUENCIES)}, "
+                         f"got {cfg.update_frequency!r}")
     set_precision(cfg, device)
     graph_device = placement(cfg, "graph_device")
     g = graph.to(graph_device)
     torch.manual_seed(cfg.seed)
     gen = torch.Generator(device=graph_device).manual_seed(cfg.seed)
     model, table_opt, dense_opt = build(cfg, g.num_features, device,
-                                        torch.Generator(device=device).manual_seed(cfg.seed + 2))
+                                        torch.Generator(device=device).manual_seed(cfg.seed + 2),
+                                        graph.zero_init)
 
     if lists is not None:
         lists = lists.to(graph_device)
@@ -273,26 +288,47 @@ def train(graph, cfg, log=print, lists=None):
     n_valid = int(g.num_nodes * cfg.valid_pct)
     valid, anchors = order[:n_valid], order[n_valid:]
     steps_per_pass = math.ceil(len(anchors) / cfg.batch_size)
-    total, step = steps_per_pass * cfg.passes, 0
+    # Epoch updates: the table's gradients are summed here; the attention weights' accumulate in
+    # their .grad, which is cleared only once a pass.
+    epoch = EpochGradients(model.features.weight) if cfg.update_frequency == "epoch" else None
+    total, step = (1 if epoch else steps_per_pass) * cfg.passes, 0
+
+    def set_lr(lr):
+        table_opt.lr = lr
+        if dense_opt is not None:
+            for group in dense_opt.param_groups:
+                group["lr"] = lr * cfg.dense_lr / cfg.lr
+
     for p in range(cfg.passes):
         start, running, lr = time.time(), 0.0, learning_rate(cfg, step, total)
         perm = anchors[torch.randperm(len(anchors), device=graph_device, generator=gen)]
         model.train()
+        if epoch and dense_opt is not None:
+            dense_opt.zero_grad()
         for b in range(steps_per_pass):
             nodes = perm[b * cfg.batch_size:(b + 1) * cfg.batch_size]
-            lr = learning_rate(cfg, step, total)
-            table_opt.lr = lr
             table_opt.zero_grad()
-            if dense_opt is not None:
-                for group in dense_opt.param_groups:
-                    group["lr"] = lr * cfg.dense_lr / cfg.lr
-                dense_opt.zero_grad()
+            if not epoch:
+                lr = learning_rate(cfg, step, total)
+                set_lr(lr)
+                if dense_opt is not None:
+                    dense_opt.zero_grad()
             loss = batch_loss(model, g, nodes, cfg, gen, lists)
             loss.backward()
-            table_opt.step()
+            if epoch:
+                epoch.add(model.features.weight.grad)
+            else:
+                table_opt.step()
+                if dense_opt is not None:
+                    dense_opt.step()
+                step += 1
+            running = running + loss.detach() * len(nodes)
+        if epoch:
+            set_lr(lr)
+            table_opt.zero_grad()
+            epoch.apply(table_opt)
             if dense_opt is not None:
                 dense_opt.step()
-            running = running + loss.detach() * len(nodes)
             step += 1
         message = f"pass {p + 1}/{cfg.passes}: loss {float(running) / len(anchors):.5f}, lr {lr:.5f}"
         if len(valid):
@@ -361,6 +397,9 @@ def main():
                    help="Drop features fewer than this many nodes have (cloverleaf's prune_min_count).")
     p.add_argument("--namespace", default="node_type",
                    help="'node_type' namespaces features by node type; anything else is one shared namespace.")
+    p.add_argument("--shared-namespace", default=None,
+                   help="With --namespace node_type, also give every token a feature in this shared "
+                        "namespace; the node-type features start at zero, as offsets from it.")
     defaults = Config()
     for name, value in asdict(defaults).items():
         flag = "--" + name.replace("_", "-")
@@ -379,9 +418,10 @@ def main():
     start = time.time()
     if args.graph_cache:
         graph = data.load_cached(args.graph_cache, args.edges, args.features, args.directed,
-                                 args.namespace, args.prune_min_count)
+                                 args.namespace, args.prune_min_count, args.shared_namespace)
     else:
-        graph = data.load(args.edges, args.features, args.directed, args.namespace, args.prune_min_count)
+        graph = data.load(args.edges, args.features, args.directed, args.namespace, args.prune_min_count,
+                          args.shared_namespace)
     print(f"loaded in {time.time() - start:.0f}s", flush=True)
     print(f"{graph.num_nodes} nodes, {len(graph.adj_idx)} directed edges, "
           f"{graph.num_features} features; {cfg}", flush=True)

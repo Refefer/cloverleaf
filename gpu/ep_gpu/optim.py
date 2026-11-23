@@ -12,6 +12,9 @@ A bfloat16 table halves the 4d.  Its updates are computed in float32 and written
 stochastic rounding, which keeps small steps on average instead of rounding them all away.
 
 Only rows with a gradient are updated (and, for Adam, their moments decayed), as SparseAdam does.
+
+EpochGradients sums a whole pass's gradients so one step can apply them at its end (cloverleaf's
+update_frequency "epoch").
 """
 import torch
 
@@ -52,8 +55,12 @@ class SparseTableOptimizer:
         if grad is None:
             return
         grad = grad.coalesce()
-        rows, g = grad.indices()[0], grad.values().float()
         self.steps += 1
+        self._update(grad.indices()[0], grad.values().float())
+
+    @torch.no_grad()
+    def _update(self, rows, g):
+        """Updates distinct `rows` with their float32 gradients `g`, as step `self.steps`."""
         if self.kind == "rowwise_adagrad":
             v = self.v[rows] + g.pow(2).mean(dim=1)
             self.v[rows] = v
@@ -74,3 +81,41 @@ class SparseTableOptimizer:
         if self.weight.dtype == torch.bfloat16:
             new = stochastic_round_bf16(new, self.generator)
         self.weight[rows] = new.to(self.weight.dtype)
+
+
+class EpochGradients:
+    """Sums the feature table's sparse gradients over a pass; `apply` then takes one optimiser
+    step with the sums of every row that received any, leaving untouched rows (and, for Adam,
+    their moments) alone, as a batch step does.  Keeps a float32 table the size of the weights,
+    on the same device, and applies in chunks of rows so the step's temporaries stay small."""
+
+    def __init__(self, weight, chunk_rows=1 << 16):
+        self.sums = torch.zeros(weight.shape, device=weight.device)
+        self.touched = torch.zeros(weight.shape[0], dtype=torch.bool, device=weight.device)
+        self.chunk_rows = chunk_rows
+
+    def state_bytes(self):
+        return self.sums.numel() * self.sums.element_size() + self.touched.numel()
+
+    @torch.no_grad()
+    def add(self, grad):
+        """Adds a sparse gradient (the table's .grad after a backward pass)."""
+        if grad is None:
+            return
+        grad = grad.coalesce()
+        rows = grad.indices()[0]
+        self.sums.index_add_(0, rows, grad.values().float())
+        self.touched[rows] = True
+
+    @torch.no_grad()
+    def apply(self, optimizer):
+        """One step of `optimizer` with the summed gradients, then resets the sums."""
+        rows = self.touched.nonzero().squeeze(1)
+        if len(rows) == 0:
+            return
+        optimizer.steps += 1
+        for s in range(0, len(rows), self.chunk_rows):
+            chunk = rows[s:s + self.chunk_rows]
+            optimizer._update(chunk, self.sums[chunk])
+            self.sums[chunk] = 0
+        self.touched.zero_()
