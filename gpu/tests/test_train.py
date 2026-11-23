@@ -208,3 +208,26 @@ def test_epoch_updates_learn_the_cliques(two_cliques, pooling):
 def test_unknown_update_frequency_is_rejected(two_cliques):
     with pytest.raises(ValueError):
         train(two_cliques, Config(dims=4, passes=1, update_frequency="step", device="cpu"), log=lambda m: None)
+
+
+def test_epoch_after_switches_from_batch_to_epoch_updates(two_cliques, monkeypatch):
+    from ep_gpu import optim
+    steps, applies = [], []
+    real_step, real_apply = optim.SparseTableOptimizer.step, optim.EpochGradients.apply
+    monkeypatch.setattr(optim.SparseTableOptimizer, "step", lambda self: (steps.append(1), real_step(self)))
+    monkeypatch.setattr(optim.EpochGradients, "apply", lambda self, o: (applies.append(1), real_apply(self, o)))
+    cfg = Config(dims=8, passes=5, batch_size=4, update_frequency="epoch", epoch_after=2, device="cpu")
+    train(two_cliques, cfg, log=lambda m: None)
+    assert len(steps) == 2 * 5 and len(applies) == 3     # 20 nodes in batches of 4: 5 per pass
+
+
+def test_batch_then_epoch_updates_learn_the_cliques(two_cliques):
+    cfg = Config(dims=16, passes=60, batch_size=4, lr=0.2, loss="starspace", gamma=0.5, negatives=3,
+                 optimizer="rowwise_adagrad", update_frequency="epoch", epoch_after=20, device="cpu", seed=3)
+    assert separation(node_embeddings(train(two_cliques, cfg, log=lambda m: None), two_cliques)) > 0.3
+
+
+@pytest.mark.parametrize("kwargs", [dict(epoch_after=3), dict(update_frequency="epoch", epoch_after=0)])
+def test_epoch_after_needs_epoch_updates_and_a_positive_count(two_cliques, kwargs):
+    with pytest.raises(ValueError, match="epoch_after"):
+        train(two_cliques, Config(dims=4, passes=1, device="cpu", **kwargs), log=lambda m: None)

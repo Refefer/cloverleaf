@@ -76,6 +76,9 @@ class Config:
                                      # (cloverleaf's update_frequency).  Only `passes` updates, so it
                                      # needs a larger lr or more passes; keeps a float32 gradient
                                      # table the size of the feature table.
+    epoch_after: int | None = None   # update_frequency "epoch" only: batch updates for this many
+                                     # passes first, then epoch updates.  The schedule runs over
+                                     # passes either way, so the switch doesn't jump the rate.
     valid_pct: float = 0.0           # nodes held out of the anchors; their loss is reported
     seed: int = 2017
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -275,6 +278,8 @@ def train(graph, cfg, log=print, lists=None):
     if cfg.update_frequency not in UPDATE_FREQUENCIES:
         raise ValueError(f"update_frequency must be one of {', '.join(UPDATE_FREQUENCIES)}, "
                          f"got {cfg.update_frequency!r}")
+    if cfg.epoch_after is not None and (cfg.update_frequency != "epoch" or cfg.epoch_after < 1):
+        raise ValueError(f"epoch_after needs update_frequency 'epoch' and a value >= 1, got {cfg.epoch_after!r}")
     set_precision(cfg, device)
     graph_device = placement(cfg, "graph_device")
     g = graph.to(graph_device)
@@ -291,9 +296,13 @@ def train(graph, cfg, log=print, lists=None):
     valid, anchors = order[:n_valid], order[n_valid:]
     steps_per_pass = math.ceil(len(anchors) / cfg.batch_size)
     # Epoch updates: the table's gradients are summed here; the attention weights' accumulate in
-    # their .grad, which is cleared only once a pass.
+    # their .grad, which is cleared only once a pass.  They start after `epoch_after` passes of
+    # batch updates, or from the first pass.
     epoch = EpochGradients(model.features.weight) if cfg.update_frequency == "epoch" else None
-    total, step = (1 if epoch else steps_per_pass) * cfg.passes, 0
+    epoch_from = (cfg.epoch_after or 0) if epoch else cfg.passes
+    # The schedule's position is in batches, so it advances at the same rate per pass whichever
+    # kind of update a pass makes; an epoch update uses the rate at the start of its pass.
+    total = steps_per_pass * cfg.passes
 
     def set_lr(lr):
         table_opt.lr = lr
@@ -302,36 +311,35 @@ def train(graph, cfg, log=print, lists=None):
                 group["lr"] = lr * cfg.dense_lr / cfg.lr
 
     for p in range(cfg.passes):
-        start, running, lr = time.time(), 0.0, learning_rate(cfg, step, total)
+        per_pass = p >= epoch_from
+        start, running, lr = time.time(), 0.0, learning_rate(cfg, p * steps_per_pass, total)
         perm = anchors[torch.randperm(len(anchors), device=graph_device, generator=gen)]
         model.train()
-        if epoch and dense_opt is not None:
+        if per_pass and dense_opt is not None:
             dense_opt.zero_grad()
         for b in range(steps_per_pass):
             nodes = perm[b * cfg.batch_size:(b + 1) * cfg.batch_size]
             table_opt.zero_grad()
-            if not epoch:
-                lr = learning_rate(cfg, step, total)
+            if not per_pass:
+                lr = learning_rate(cfg, p * steps_per_pass + b, total)
                 set_lr(lr)
                 if dense_opt is not None:
                     dense_opt.zero_grad()
             loss = batch_loss(model, g, nodes, cfg, gen, lists)
             loss.backward()
-            if epoch:
+            if per_pass:
                 epoch.add(model.features.weight.grad)
             else:
                 table_opt.step()
                 if dense_opt is not None:
                     dense_opt.step()
-                step += 1
             running = running + loss.detach() * len(nodes)
-        if epoch:
+        if per_pass:
             set_lr(lr)
             table_opt.zero_grad()
             epoch.apply(table_opt)
             if dense_opt is not None:
                 dense_opt.step()
-            step += 1
         message = f"pass {p + 1}/{cfg.passes}: loss {float(running) / len(anchors):.5f}, lr {lr:.5f}"
         if len(valid):
             model.eval()
@@ -410,7 +418,7 @@ def main():
             p.add_argument(flag, action="store_true")
         elif name == "max_features":
             p.add_argument(flag, type=lambda s: float(s) if "." in s else int(s), default=None)
-        elif name in ("max_nodes", "ppr_sample"):
+        elif name in ("max_nodes", "ppr_sample", "epoch_after"):
             p.add_argument(flag, type=int, default=None)
         else:
             p.add_argument(flag, type=type(value), default=value)

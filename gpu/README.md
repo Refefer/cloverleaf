@@ -43,7 +43,9 @@ with mean or attention pooling, or in PyTorch with `ep_gpu.embed_feature_sets`; 
 * `update_frequency`: "batch" (an update after every batch) or "epoch" (every batch of a pass is
   computed against the same embeddings, their gradients are summed, and one update applies the
   sum at the pass's end; the schedule counts one step per pass).  Epoch updates keep a float32
-  gradient table the size of the feature table, on the table's device.
+  gradient table the size of the feature table, on the table's device.  With `epoch_after K`
+  (GPU only), the first K passes make batch updates and the rest epoch updates; the schedule
+  runs over passes, so the rate doesn't jump at the switch, and the optimiser state carries over.
 
 With mean pooling, cloverleaf's averaged `NodeEmbedder` rebuilds the exported node embeddings
 from the exported feature table exactly, and features-only EP on Cora scores the same on both
