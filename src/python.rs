@@ -33,9 +33,9 @@ use crate::algos::alignment::{NeighborhoodAligner as NA};
 use crate::algos::ann::Ann;
 use crate::algos::connected::find_connected_components;
 use crate::algos::ep::attention::AttentionWeights;
-use crate::algos::ep::{EmbeddingPropagation,EmbeddingInit,LearningRateSchedule,UpdateFrequency,LossWeighting as EPLW};
+use crate::algos::ep::{EmbeddingPropagation,LossWeighting as EPLW};
 use crate::algos::ep::loss::Loss;
-use crate::algos::ep::model::{AveragedFeatureModel,AttentionFeatureModel};
+use crate::algos::ep::model::FeatureModel;
 use crate::algos::feat_propagation::propagate_features;
 use crate::algos::graph_ann::NodeDistance;
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
@@ -1027,10 +1027,7 @@ impl OptimizerSpec {
     #[staticmethod]
     #[pyo3(signature = (weight_decay=None))]
     pub fn adamw(weight_decay: Option<f32>) -> PyResult<Self> {
-        let rate = weight_decay.unwrap_or(0.001);
-        let wd = WeightDecay::new(rate).ok_or_else(|| PyValueError::new_err(
-            format!("weight_decay must be finite and non-negative, got {}", rate)))?;
-        Ok(OptimizerSpec { kind: OptimizerKind::AdamW(wd) })
+        Ok(OptimizerSpec { kind: OptimizerKind::adamw(weight_decay.unwrap_or(WeightDecay::DEFAULT))? })
     }
 
     pub fn __repr__(&self) -> String {
@@ -1070,7 +1067,7 @@ impl EPLoss {
     #[staticmethod]
     #[pyo3(signature = (gamma, negatives=None))]
     pub fn margin(gamma: f32, negatives: Option<usize>) -> Self {
-        EPLoss { loss: Loss::MarginLoss(gamma, negatives.unwrap_or(1)) }
+        EPLoss { loss: Loss::margin(gamma, negatives.unwrap_or(1)) }
     }
 
     ///    Uses temperature controlled contrastive loss with cosine similarity for optimization.
@@ -1093,7 +1090,7 @@ impl EPLoss {
     ///    
     #[staticmethod]
     pub fn contrastive(positive_margin: f32, negative_margin: f32, negatives: usize) -> Self {
-        EPLoss { loss: Loss::Contrastive(positive_margin, negative_margin, negatives.max(1)) }
+        EPLoss { loss: Loss::contrastive(positive_margin, negative_margin, negatives) }
     }
 
     ///    Uses the Starspace loss for optimization, as seen in the Starspace paper.
@@ -1114,7 +1111,7 @@ impl EPLoss {
     ///    
     #[staticmethod]
     pub fn starspace(gamma: f32, negatives: usize) -> Self {
-        EPLoss { loss: Loss::StarSpace(gamma, negatives.max(1)) }
+        EPLoss { loss: Loss::starspace(gamma, negatives) }
     }
 
     ///    Optimizes for the NLL of a 1-N classification task.  This is also known as ListNet,
@@ -1135,7 +1132,7 @@ impl EPLoss {
     ///    
     #[staticmethod]
     pub fn rank(tau: f32, negatives: usize) -> Self {
-        EPLoss { loss: Loss::RankLoss(tau, negatives.max(1)) }
+        EPLoss { loss: Loss::rank(tau, negatives) }
     }
 
     ///    Combines Starspace and RankLoss losses as an aggregate.  Starspace better regulates
@@ -1156,7 +1153,7 @@ impl EPLoss {
     ///    
     #[staticmethod]
     pub fn rankspace(tau: f32, negatives: usize) -> Self {
-        EPLoss { loss: Loss::RankSpace(tau, negatives.max(1)) }
+        EPLoss { loss: Loss::rankspace(tau, negatives) }
     }
 
     ///    PPR is an interesting loss.  Unlike the other losses, it constructs the positive node
@@ -1182,7 +1179,7 @@ impl EPLoss {
     ///    
     #[staticmethod]
     pub fn ppr(gamma: f32, negatives: usize, restart_p: f32) -> Self {
-        EPLoss { loss: Loss::PPR(gamma, negatives.max(1), restart_p) }
+        EPLoss { loss: Loss::ppr(gamma, negatives, restart_p) }
     }
     
     /// Simple representation of the GraphBuilder
@@ -1193,16 +1190,12 @@ impl EPLoss {
 }
 
 /// A wrapper for model types
-enum ModelType {
-    Averaged(AveragedFeatureModel),
-    Attention(AttentionFeatureModel)
-}
 
 /// The main embedding class.  Flexible with loads of options.
 #[pyclass]
 struct EmbeddingPropagator {
     ep: EmbeddingPropagation,
-    model: ModelType 
+    model: FeatureModel
 }
 
 #[pymethods]
@@ -1388,26 +1381,10 @@ impl EmbeddingPropagator {
         // When to update the feature embeddings: "batch" or "epoch"
         update_frequency: Option<String>
     ) -> PyResult<Self> {
-        let lr_schedule = match lr_schedule.as_deref().unwrap_or("cosine") {
-            "cosine" => LearningRateSchedule::CosineWarmup,
-            "constant" => LearningRateSchedule::Constant,
-            other => return Err(PyValueError::new_err(
-                format!("lr_schedule must be \"cosine\" or \"constant\", got {:?}", other)))
-        };
-        let init = match init.as_deref().unwrap_or("unit") {
-            "unit" => EmbeddingInit::UnitNorm,
-            "glorot" => EmbeddingInit::GlorotUniform,
-            other => return Err(PyValueError::new_err(
-                format!("init must be \"unit\" or \"glorot\", got {:?}", other)))
-        };
-        let update_frequency = match update_frequency.as_deref().unwrap_or("batch") {
-            "batch" => UpdateFrequency::Batch,
-            "epoch" => UpdateFrequency::Epoch,
-            other => return Err(PyValueError::new_err(
-                format!("update_frequency must be \"batch\" or \"epoch\", got {:?}", other)))
-        };
-        let loss_weighting = loss_weighting.map(|lw| lw.loss).unwrap_or(EPLW::None);
         let d = EmbeddingPropagation::default();
+        let lr_schedule = lr_schedule.map(|v| v.parse()).transpose()?.unwrap_or(d.lr_schedule);
+        let init = init.map(|v| v.parse()).transpose()?.unwrap_or(d.init);
+        let update_frequency = update_frequency.map(|v| v.parse()).transpose()?.unwrap_or(d.update_frequency);
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(d.alpha),
             batch_size: batch_size.unwrap_or(d.batch_size),
@@ -1415,7 +1392,7 @@ impl EmbeddingPropagator {
             passes: passes.unwrap_or(d.passes),
             loss: loss.map(|l|l.loss).unwrap_or(d.loss),
             hard_negs: hard_negatives.unwrap_or(d.hard_negs),
-            loss_weighting: loss_weighting,
+            loss_weighting: loss_weighting.map(|lw| lw.loss).unwrap_or(d.loss_weighting),
             valid_pct: valid_pct.unwrap_or(d.valid_pct),
             seed: seed.unwrap_or(d.seed),
             indicator: indicator.unwrap_or(d.indicator),
@@ -1426,9 +1403,7 @@ impl EmbeddingPropagator {
             update_frequency,
             dense_alpha: dense_alpha.unwrap_or(d.dense_alpha)
         };
-        if !(ep.dense_alpha.is_finite() && ep.dense_alpha >= 0.) {
-            return Err(PyValueError::new_err("dense_alpha must be finite and >= 0"))
-        }
+        ep.validate()?;
 
         let wns = weighted_neighbor_sampling.unwrap_or(false);
         let wna = weighted_neighbor_averaging.unwrap_or(false);
@@ -1442,14 +1417,7 @@ impl EmbeddingPropagator {
             .unwrap_or(Ok(Sample::All))
             .map_err(|_err| PyValueError::new_err("max_nodes must be either None, or (0, N)"))?;
 
-        let model = if let Some(heads) = attention_heads {
-            ModelType::Attention(AttentionFeatureModel::new(heads, max_features, max_nodes, wns, wna)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?)
-        } else {
-            ModelType::Averaged(AveragedFeatureModel::new(
-                max_features, max_nodes, wns, wna
-            ))
-        };
+        let model = FeatureModel::new(attention_heads, max_features, max_nodes, wns, wna)?;
 
         Ok(EmbeddingPropagator{ ep, model })
     }
@@ -1488,25 +1456,11 @@ impl EmbeddingPropagator {
     ) -> PyResult<NodeEmbeddings> {
 
         if let Some(agg) = aggregator {
-            let ModelType::Attention(model) = &self.model else {
-                return Err(PyValueError::new_err("aggregator warm-starts attention models only"))
-            };
-            let weights = agg.agg.attention_weights().ok_or_else(||
-                PyValueError::new_err("aggregator must be an attention aggregator"))?;
-            if weights.dims() != self.ep.d_model {
-                return Err(PyValueError::new_err(format!(
-                    "the aggregator is for {}-dimensional embeddings, the model trains {}",
-                    weights.dims(), self.ep.d_model)))
-            }
-            model.warm_start(weights.clone()).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            // Before take_warm_start, which moves the caller's embeddings out.
+            self.model.warm_start_from(&agg.agg, self.ep.d_model)?;
         }
         let warm_start = take_warm_start(&graph.inner, &mut features.inner, feature_embeddings)?;
-        let learned = match &self.model {
-            ModelType::Averaged(model) =>
-                self.ep.learn_features(&graph.inner, &mut features.inner, warm_start, model),
-            ModelType::Attention(model) =>
-                self.ep.learn_features(&graph.inner, &mut features.inner, warm_start, model)
-        }?;
+        let learned = self.model.learn_features(&self.ep, &graph.inner, &mut features.inner, warm_start)?;
         Ok(NodeEmbeddings::from(learned))
 
     }
@@ -1515,11 +1469,7 @@ impl EmbeddingPropagator {
     ///    and for attention its learned weights, which it has once learn_features has run (or
     ///    been warm-started).  Save it to embed new nodes later with a NodeEmbedder.
     pub fn feature_aggregator(&self) -> PyResult<FeatureAggregator> {
-        let agg = match &self.model {
-            ModelType::Averaged(_) => Some(CoreFeatureAggregator::averaged()),
-            ModelType::Attention(model) => model.aggregator()
-        };
-        agg.map(|agg| FeatureAggregator { agg })
+        self.model.aggregator().map(|agg| FeatureAggregator { agg })
             .ok_or_else(|| PyValueError::new_err("the attention model has no weights until learn_features runs"))
     }
     
@@ -3601,21 +3551,8 @@ impl PolicyEvaluation {
 #[pyclass]
 #[derive(Clone,Debug)]
 struct PprRankLearner {
-    alpha: f32,
-    batch_size: usize,
-    dims: usize,
-    passes: usize,
-    negatives: usize,
-    loss: String,
-    weight_decay: f32,
-    steps: Sample,
-    walks: usize,
-    k: usize,
-    num_features: Option<f32>,
-    compression: f32,
-    valid_pct: f32,
-    beta: f32,
-    optimizer: OptimizerKind
+    /// The learner; each learn_features call sets its indicator and seed.
+    ppr_rank: PprRank
 }
 
 #[pymethods]
@@ -3751,24 +3688,21 @@ impl PprRankLearner {
 
         let steps = Sample::steps(steps)
             .map_err(|_| PyValueError::new_err("Steps must be between [0, inf)"))?;
-
-        Ok(PprRankLearner {
-            alpha,
-            batch_size,
-            dims,
-            passes,
-            steps,
-            negatives,
-            walks,
-            k,
+        let num_features = num_features
+            .map(|mf| Sample::new(mf))
+            .unwrap_or(Ok(Sample::All))
+            .map_err(|_err| PyValueError::new_err("num features must be either None, or (0, N)"))?;
+        let d = PprRank::new(alpha, batch_size, dims, passes, steps, walks, k, negatives);
+        let loss = PprLoss::from_name(loss.as_deref().unwrap_or("listnet"), weight_decay.unwrap_or(0f32))?;
+        Ok(PprRankLearner { ppr_rank: PprRank {
+            loss,
             num_features,
-            weight_decay: weight_decay.unwrap_or(0f32),
-            loss: loss.unwrap_or_else(||"listnet".into()),
-            compression: compression.unwrap_or(1f32),
-            valid_pct: valid_pct.unwrap_or(0.1),
-            beta: beta.unwrap_or(0.8),
-            optimizer: optimizer.map(|o| o.kind).unwrap_or(OptimizerKind::Adam)
-        })
+            compression: compression.unwrap_or(d.compression),
+            valid_pct: valid_pct.unwrap_or(d.valid_pct),
+            beta: beta.unwrap_or(d.beta),
+            optimizer: optimizer.map(|o| o.kind).unwrap_or(d.optimizer),
+            ..d
+        } })
     }
     
     /// Simple Python representation 
@@ -3817,34 +3751,10 @@ impl PprRankLearner {
         seed: Option<u64>
     ) -> PyResult<NodeEmbeddings> {
 
-        let loss = if self.loss == "listnet" {
-            PprLoss::ListNet { passive: true, weight_decay: self.weight_decay }
-        } else {
-            PprLoss::ListMLE { weight_decay: self.weight_decay }
-        };
-
-        let num_features = self.num_features 
-            .map(|mf| Sample::new(mf))
-            .unwrap_or(Ok(Sample::All))
-            .map_err(|_err| PyValueError::new_err("num features must be either None, or (0, N)"))?;
-
         let ppr_rank = PprRank {
-            alpha: self.alpha,
-            batch_size: self.batch_size,
-            dims: self.dims,
-            passes: self.passes,
-            steps: self.steps,
-            loss: loss,
-            negatives: self.negatives,
-            num_walks: self.walks,
-            beta: self.beta,
-            k: self.k,
-            num_features: num_features,
-            compression: self.compression,
-            valid_pct: self.valid_pct,
             indicator: indicator.unwrap_or(true),
             seed: seed.unwrap_or(SEED),
-            optimizer: self.optimizer
+            ..self.ppr_rank.clone()
         };
 
         let warm_start = take_warm_start(&graph.inner, &mut features.inner, feature_embeddings)?;
@@ -4794,20 +4704,17 @@ fn ppr_lists<'py>(
 ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
     let steps = Sample::steps(steps)
         .map_err(|_err| PyValueError::new_err("steps must be in (0, 1) or [1, inf)"))?;
-    if walks == 0 || k == 0 {
-        return Err(PyValueError::new_err("walks and k must be positive"))
-    }
+    let d = crate::algos::pprrank::PprListOptions::new(k, walks, steps);
+    let opts = crate::algos::pprrank::PprListOptions {
+        beta: beta.unwrap_or(d.beta),
+        compression: compression.unwrap_or(d.compression),
+        other_type_only: other_type_only.unwrap_or(d.other_type_only),
+        seed: seed.unwrap_or(SEED),
+        indicator: indicator.unwrap_or(d.indicator),
+        ..d
+    };
     let named = &graph.inner;
-    let (nodes, weights) = py.detach(|| {
-        let vocab = &named.vocab;
-        let other_type = other_type_only.unwrap_or(false);
-        let keep = |node: NodeID, other: NodeID| {
-            !other_type || vocab.get_node_type(node) != vocab.get_node_type(other)
-        };
-        crate::algos::pprrank::ppr_lists(named.graph(), steps, walks, beta.unwrap_or(0.8), k,
-            compression.unwrap_or(1f32), seed.unwrap_or(SEED), keep, indicator.unwrap_or(true))
-            .into_parts()
-    });
+    let (nodes, weights) = py.detach(|| crate::algos::pprrank::ppr_lists_named(named, &opts))?.into_parts();
     let node_bytes: Vec<u8> = nodes.iter().flat_map(|n| (*n as i64).to_le_bytes()).collect();
     let weight_bytes: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
     Ok((PyBytes::new(py, &node_bytes), PyBytes::new(py, &weight_bytes)))

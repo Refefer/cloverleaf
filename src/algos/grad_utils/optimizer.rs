@@ -45,6 +45,9 @@ pub trait Optimizer: Sync {
 pub struct WeightDecay(f32);
 
 impl WeightDecay {
+    /// The default rate, about 0.1% shrinkage a pass.
+    pub const DEFAULT: f32 = 0.001;
+
     pub fn new(rate: f32) -> Option<Self> {
         if rate.is_finite() && rate >= 0f32 { Some(WeightDecay(rate)) } else { None }
     }
@@ -65,6 +68,14 @@ pub enum OptimizerKind {
     /// step sizes.  The rate is per pass: at the end of each pass every feature embedding is
     /// multiplied by `exp(-m * rate)`, where `m` is the learning rate schedule's multiplier.
     AdamW(WeightDecay)
+}
+
+impl OptimizerKind {
+    /// AdamW with weight decay `rate` per pass, which must be finite and non-negative.
+    pub fn adamw(rate: f32) -> Result<Self, crate::error::Error> {
+        WeightDecay::new(rate).map(OptimizerKind::AdamW).ok_or_else(|| crate::error::Error::InvalidArgument(
+            format!("weight_decay must be finite and non-negative, got {}", rate)))
+    }
 }
 
 /// Adam Optimizer, with optional decoupled weight decay (AdamW).  Should basically be always
@@ -188,6 +199,13 @@ impl DenseAdam {
 
 #[cfg(test)]
 mod optimizer_tests {
+
+    #[test]
+    fn test_adamw_constructor_checks_the_rate() {
+        assert_eq!(OptimizerKind::adamw(0.1).unwrap(), OptimizerKind::AdamW(WeightDecay::new(0.1).unwrap()));
+        assert!(OptimizerKind::adamw(-1.).is_err() && OptimizerKind::adamw(f32::NAN).is_err());
+    }
+
     use super::*;
 
     /// A constant gradient moves every parameter by alpha per step, in the gradient's

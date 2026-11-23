@@ -27,13 +27,26 @@ use crate::algos::grad_utils::node_sampler::{RandomWalkHardStrategy,NodeSampler,
 use crate::algos::grad_utils::optimizer::{Optimizer,AdamOptimizer,OptimizerKind};
 use crate::algos::grad_utils::scheduler::LRScheduler;
 
-#[derive(Copy,Clone)]
+#[derive(Copy,Clone,Debug,PartialEq)]
 pub enum Loss {
     ListNet { passive:bool, weight_decay: f32 },
     ListMLE { weight_decay: f32 }
 }
 
+impl Loss {
+    /// "listnet" (in passive mode) or "listmle", with L2 weight decay `weight_decay`.
+    pub fn from_name(name: &str, weight_decay: f32) -> Result<Self, Error> {
+        match name {
+            "listnet" => Ok(Loss::ListNet { passive: true, weight_decay }),
+            "listmle" => Ok(Loss::ListMLE { weight_decay }),
+            other => Err(Error::InvalidArgument(format!(
+                "loss must be \"listnet\" or \"listmle\", got {:?}", other)))
+        }
+    }
+}
+
 /// Defines PPR Rank
+#[derive(Clone,Debug)]
 pub struct PprRank {
     /// Optimization to use for computing loss
     pub loss: Loss,
@@ -88,6 +101,26 @@ pub struct PprRank {
 }
 
 impl PprRank {
+    /// A learner with the defaults the Python bindings use: passive ListNet without weight
+    /// decay, compression 1, beta 0.8, 10% of nodes for validation, every feature, Adam, the
+    /// default seed and a progress bar.
+    pub fn new(
+        alpha: f32,
+        batch_size: usize,
+        dims: usize,
+        passes: usize,
+        steps: Sample,
+        num_walks: usize,
+        k: usize,
+        negatives: usize
+    ) -> Self {
+        PprRank {
+            loss: Loss::ListNet { passive: true, weight_decay: 0. },
+            alpha, batch_size, dims, passes, negatives, num_walks, steps,
+            beta: 0.8, k, num_features: Sample::All, compression: 1., seed: crate::DEFAULT_SEED,
+            valid_pct: 0.1, indicator: true, optimizer: OptimizerKind::Adam
+        }
+    }
 
     /// Learns the feature embeddings.
     /// Learns feature embeddings over a named graph and returns them named by feature.  Nodes
@@ -387,6 +420,48 @@ impl PprRank {
 /// restart (see [`RWR`]) that follow edges in proportion to their weight.  The node itself, and
 /// any node `keep(node, other)` rejects, are left out; the rest are weighted score^compression
 /// and normalised to sum to 1.
+/// Settings for [`ppr_lists_named`].
+#[derive(Clone,Copy,Debug)]
+pub struct PprListOptions {
+    /// List length.
+    pub k: usize,
+    /// Random walks per node.
+    pub walks: usize,
+    /// A restart probability (below 1) or a fixed walk length.
+    pub steps: Sample,
+    /// The popularity discount: scores / degree^beta.
+    pub beta: f32,
+    /// Weights are score^compression, normalised.
+    pub compression: f32,
+    /// Keep only nodes of a different type from the start node.
+    pub other_type_only: bool,
+    pub seed: u64,
+    pub indicator: bool
+}
+
+impl PprListOptions {
+    /// `k`-long lists from `walks` walks per node of `steps` steps, with the defaults: beta 0.8,
+    /// compression 1, every node type, the default seed and a progress bar.
+    pub fn new(k: usize, walks: usize, steps: Sample) -> Self {
+        PprListOptions { k, walks, steps, beta: 0.8, compression: 1., other_type_only: false,
+                         seed: crate::DEFAULT_SEED, indicator: true }
+    }
+}
+
+/// [`ppr_lists`] over a named graph: every node's top-k PPR list, in node id order.
+pub fn ppr_lists_named(graph: &NamedGraph, opts: &PprListOptions) -> Result<WalkLibrary, Error> {
+    if opts.walks == 0 || opts.k == 0 {
+        return Err(Error::InvalidArgument(format!(
+            "walks and k must be positive, got {} and {}", opts.walks, opts.k)))
+    }
+    let vocab = graph.vocab();
+    let keep = |node: NodeID, other: NodeID| {
+        !opts.other_type_only || vocab.get_node_type(node) != vocab.get_node_type(other)
+    };
+    Ok(ppr_lists(graph.graph(), opts.steps, opts.walks, opts.beta, opts.k, opts.compression,
+                 opts.seed, keep, opts.indicator))
+}
+
 pub fn ppr_lists<G: CGraph + CDFGraph + Send + Sync>(
     graph: &G,
     steps: Sample,
@@ -707,5 +782,38 @@ mod ep_tests {
         let swapped = vec![ranked[0].clone(), ranked[1].clone(), ranked[3].clone(), ranked[2].clone()];
         let swapped_loss = list_mle_loss(&query, &swapped, 2).value()[0] as f64;
         assert!((loss - swapped_loss).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_loss_names_are_strict() {
+        assert_eq!(Loss::from_name("listnet", 0.1).unwrap(), Loss::ListNet { passive: true, weight_decay: 0.1 });
+        assert_eq!(Loss::from_name("listmle", 0.).unwrap(), Loss::ListMLE { weight_decay: 0. });
+        for bad in ["ListNet", "list_mle", ""] {
+            assert!(Loss::from_name(bad, 0.).is_err(), "{}", bad);
+        }
+    }
+
+    /// Named PPR lists check their sizes, and can keep only the other node type.
+    #[test]
+    fn test_ppr_lists_named() {
+        use crate::named_graph::NamedGraph;
+        use crate::vocab::Vocab;
+        use crate::graph::{CSR, CumCSR};
+        use std::sync::Arc;
+        let mut vocab = Vocab::new();
+        for (t, n) in [("q", "a"), ("p", "x"), ("q", "b"), ("p", "y")] { vocab.get_or_insert(t, n); }
+        let edges = vec![(0, 1, 1.), (1, 0, 1.), (2, 1, 1.), (1, 2, 1.), (2, 3, 1.), (3, 2, 1.)];
+        let graph = NamedGraph::new(Arc::new(vocab), Arc::new(CumCSR::convert(CSR::construct_from_edges(edges, false)))).unwrap();
+        let steps = Sample::steps(0.5).unwrap();
+        assert!(ppr_lists_named(&graph, &PprListOptions::new(0, 10, steps)).is_err());
+        assert!(ppr_lists_named(&graph, &PprListOptions::new(2, 0, steps)).is_err());
+        let opts = PprListOptions { other_type_only: true, indicator: false, ..PprListOptions::new(3, 200, steps) };
+        let (nodes, weights) = ppr_lists_named(&graph, &opts).unwrap().into_parts();
+        let types = [0, 1, 0, 1];
+        for v in 0..4 {
+            for (u, w) in nodes[v * 3..v * 3 + 3].iter().zip(&weights[v * 3..v * 3 + 3]) {
+                if *w > 0. { assert_ne!(types[*u], types[v], "node {} kept {}", v, u); }
+            }
+        }
     }
 }

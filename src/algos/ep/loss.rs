@@ -37,6 +37,39 @@ pub enum Loss {
     PPR(f32, usize, f32)
 }
 
+/// Constructors; every loss uses at least one negative.
+impl Loss {
+    /// Max-margin loss over Euclidean distances, with margin `gamma`.
+    pub fn margin(gamma: f32, negatives: usize) -> Self {
+        Loss::MarginLoss(gamma, negatives.max(1))
+    }
+
+    /// Contrastive loss with a positive and a negative margin.
+    pub fn contrastive(positive_margin: f32, negative_margin: f32, negatives: usize) -> Self {
+        Loss::Contrastive(positive_margin, negative_margin, negatives.max(1))
+    }
+
+    /// StarSpace: max-margin loss over cosine similarities, with margin `gamma`.
+    pub fn starspace(gamma: f32, negatives: usize) -> Self {
+        Loss::StarSpace(gamma, negatives.max(1))
+    }
+
+    /// Softmax rank loss with temperature `tau`.
+    pub fn rank(tau: f32, negatives: usize) -> Self {
+        Loss::RankLoss(tau, negatives.max(1))
+    }
+
+    /// StarSpace and rank loss combined, with temperature `tau`.
+    pub fn rankspace(tau: f32, negatives: usize) -> Self {
+        Loss::RankSpace(tau, negatives.max(1))
+    }
+
+    /// Margin loss towards nodes reached by random walks restarting with probability `restart_p`.
+    pub fn ppr(gamma: f32, negatives: usize, restart_p: f32) -> Self {
+        Loss::PPR(gamma, negatives.max(1), restart_p)
+    }
+}
+
 impl Loss {
     pub fn negatives(&self) -> usize {
         match self {
@@ -262,6 +295,16 @@ pub fn softmax(numers: ANode, exact: bool) -> ANode {
 
 #[cfg(test)]
 mod ep_loss_tests {
+
+    /// Every constructor uses at least one negative.
+    #[test]
+    fn test_constructors_clamp_negatives() {
+        assert_eq!(Loss::margin(1., 0).negatives(), 1);
+        assert_eq!(Loss::starspace(0.5, 0).negatives(), 1);
+        assert_eq!(Loss::rankspace(0.5, 3).negatives(), 3);
+        assert_eq!(Loss::ppr(1., 0, 0.5).negatives(), 1);
+    }
+
     use super::*;
 
     #[test]

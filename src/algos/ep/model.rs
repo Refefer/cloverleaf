@@ -242,6 +242,69 @@ impl AttentionFeatureModel {
     }
 }
 
+/// Either feature model, chosen at run time: averaged, or attention with some number of heads.
+pub enum FeatureModel {
+    Averaged(AveragedFeatureModel),
+    Attention(AttentionFeatureModel)
+}
+
+impl FeatureModel {
+    /// Attention pooling with `attention_heads` heads, or averaging when None.
+    pub fn new(
+        attention_heads: Option<usize>,
+        max_features: Sample,
+        max_neighbor_nodes: Sample,
+        weighted_neighbor_sampling: bool,
+        weighted_neighbor_averaging: bool
+    ) -> Result<Self, Error> {
+        Ok(match attention_heads {
+            Some(heads) => FeatureModel::Attention(AttentionFeatureModel::new(heads, max_features,
+                max_neighbor_nodes, weighted_neighbor_sampling, weighted_neighbor_averaging)?),
+            None => FeatureModel::Averaged(AveragedFeatureModel::new(max_features, max_neighbor_nodes,
+                weighted_neighbor_sampling, weighted_neighbor_averaging))
+        })
+    }
+
+    /// Continues an attention model from `aggregator`'s weights, which must be attention
+    /// weights for `dims`-dimensional embeddings with the model's heads.
+    pub fn warm_start_from(&self, aggregator: &FeatureAggregator, dims: usize) -> Result<(), Error> {
+        let FeatureModel::Attention(model) = self else {
+            return Err(Error::InvalidArgument("an aggregator warm-starts attention models only".into()))
+        };
+        let weights = aggregator.attention_weights().ok_or_else(||
+            Error::InvalidArgument("the warm start must be an attention aggregator".into()))?;
+        if weights.dims() != dims {
+            return Err(Error::InvalidArgument(format!(
+                "the aggregator is for {}-dimensional embeddings, the model trains {}", weights.dims(), dims)))
+        }
+        model.warm_start(weights.clone())
+    }
+
+    /// The aggregator that embeds nodes as the model does: averaging, or the attention weights
+    /// once there are some.
+    pub fn aggregator(&self) -> Option<FeatureAggregator> {
+        match self {
+            FeatureModel::Averaged(_) => Some(FeatureAggregator::averaged()),
+            FeatureModel::Attention(model) => model.aggregator()
+        }
+    }
+
+    /// [`EmbeddingPropagation::learn_features`](super::EmbeddingPropagation::learn_features)
+    /// with this model.
+    pub fn learn_features(
+        &self,
+        ep: &super::EmbeddingPropagation,
+        graph: &crate::named_graph::NamedGraph,
+        features: &mut crate::feature_store::FeatureSet,
+        warm_start: Option<crate::embeddings::NodeEmbeddings>
+    ) -> Result<crate::embeddings::NodeEmbeddings, Error> {
+        match self {
+            FeatureModel::Averaged(model) => ep.learn_features(graph, features, warm_start, model),
+            FeatureModel::Attention(model) => ep.learn_features(graph, features, warm_start, model)
+        }
+    }
+}
+
 impl Model for AttentionFeatureModel {
     type Params = AttentionVars;
 

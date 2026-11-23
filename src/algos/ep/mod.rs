@@ -70,6 +70,38 @@ pub enum UpdateFrequency {
     Epoch
 }
 
+fn parse_choice<T: Copy>(what: &str, value: &str, choices: &[(&str, T)]) -> Result<T, Error> {
+    choices.iter().find(|(name, _)| *name == value).map(|(_, v)| *v).ok_or_else(|| {
+        let names: Vec<String> = choices.iter().map(|(n, _)| format!("{:?}", n)).collect();
+        Error::InvalidArgument(format!("{} must be {}, got {:?}", what, names.join(" or "), value))
+    })
+}
+
+/// "cosine" or "constant".
+impl std::str::FromStr for LearningRateSchedule {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Error> {
+        parse_choice("lr_schedule", s, &[("cosine", LearningRateSchedule::CosineWarmup),
+                                         ("constant", LearningRateSchedule::Constant)])
+    }
+}
+
+/// "unit" or "glorot".
+impl std::str::FromStr for EmbeddingInit {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Error> {
+        parse_choice("init", s, &[("unit", EmbeddingInit::UnitNorm), ("glorot", EmbeddingInit::GlorotUniform)])
+    }
+}
+
+/// "batch" or "epoch".
+impl std::str::FromStr for UpdateFrequency {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Error> {
+        parse_choice("update_frequency", s, &[("batch", UpdateFrequency::Batch), ("epoch", UpdateFrequency::Epoch)])
+    }
+}
+
 #[derive(Clone,Copy,Debug)]
 pub enum LossWeighting {
     DegreeLog,
@@ -134,6 +166,25 @@ pub struct EmbeddingPropagation {
 }
 
 impl EmbeddingPropagation {
+    /// Checks the settings can train: positive dims, batch size and learning rate, a
+    /// non-negative dense learning rate and noise, all finite, and a validation share in [0, 1).
+    /// Learning checks this first.
+    pub fn validate(&self) -> Result<(), Error> {
+        let bad = |what: &str, v: f32| Error::InvalidArgument(format!("{} must be finite and {}, got {}", what,
+            if what == "alpha" { "positive" } else { "non-negative" }, v));
+        if !(self.alpha.is_finite() && self.alpha > 0.) { return Err(bad("alpha", self.alpha)) }
+        if !(self.dense_alpha.is_finite() && self.dense_alpha >= 0.) { return Err(bad("dense_alpha", self.dense_alpha)) }
+        if !(self.noise.is_finite() && self.noise >= 0.) { return Err(bad("noise", self.noise)) }
+        if self.d_model == 0 || self.batch_size == 0 {
+            return Err(Error::InvalidArgument(format!(
+                "dims and batch_size must be positive, got {} and {}", self.d_model, self.batch_size)))
+        }
+        if !(0. ..1.).contains(&self.valid_pct) {
+            return Err(Error::InvalidArgument(format!("valid_pct must be in [0, 1), got {}", self.valid_pct)))
+        }
+        Ok(())
+    }
+
     /// Learns feature embeddings over a named graph and returns them named by feature.  Nodes
     /// without features get one of their own; `warm_start` continues from earlier feature
     /// embeddings, which must be indexed by the features.
@@ -196,6 +247,7 @@ impl EmbeddingPropagation {
         feature_embeddings: Option<EmbeddingStore>,
         model: &M
     ) -> Result<EmbeddingStore, Error> {
+        self.validate()?;
 
         let mut rng = XorShiftRng::seed_from_u64(self.seed);
 
@@ -854,6 +906,59 @@ mod ep_tests {
         model.warm_start(fitting.clone()).unwrap();
         attention_ep(UpdateFrequency::Batch, 0).learn_feature_embeddings(&graph, &features, None, &model).unwrap();
         assert_eq!(*model.weights().unwrap(), fitting);
+    }
+
+
+    #[test]
+    fn test_settings_parse_from_strings() {
+        assert_eq!("constant".parse::<LearningRateSchedule>().unwrap(), LearningRateSchedule::Constant);
+        assert_eq!("glorot".parse::<EmbeddingInit>().unwrap(), EmbeddingInit::GlorotUniform);
+        assert_eq!("epoch".parse::<UpdateFrequency>().unwrap(), UpdateFrequency::Epoch);
+        for bad in ["", "Cosine", "linear"] {
+            assert!(matches!(bad.parse::<LearningRateSchedule>(), Err(Error::InvalidArgument(_))), "{}", bad);
+        }
+        assert!("step".parse::<UpdateFrequency>().is_err() && "xavier".parse::<EmbeddingInit>().is_err());
+    }
+
+    /// Settings that can't train are rejected before training starts.
+    #[test]
+    fn test_validate_rejects_untrainable_settings() {
+        assert!(EmbeddingPropagation::default().validate().is_ok());
+        let bad = [
+            EmbeddingPropagation { alpha: 0., ..EmbeddingPropagation::default() },
+            EmbeddingPropagation { dense_alpha: f32::NAN, ..EmbeddingPropagation::default() },
+            EmbeddingPropagation { batch_size: 0, ..EmbeddingPropagation::default() },
+            EmbeddingPropagation { d_model: 0, ..EmbeddingPropagation::default() },
+            EmbeddingPropagation { valid_pct: 1., ..EmbeddingPropagation::default() },
+            EmbeddingPropagation { noise: -1., ..EmbeddingPropagation::default() },
+        ];
+        let graph = two_cliques();
+        let mut features = FeatureStore::new(graph.len());
+        features.fill_missing_nodes();
+        let model = super::model::AveragedFeatureModel::new(Sample::All, Sample::All, false, false);
+        for ep in bad.iter() {
+            assert!(ep.validate().is_err());
+            assert!(ep.learn(&graph, &features, None, &model).is_err());
+        }
+    }
+
+    /// FeatureModel picks the model, warm-starts attention only, and gives each model's aggregator.
+    #[test]
+    fn test_feature_model() {
+        use super::model::FeatureModel;
+        use crate::algos::aggregator::FeatureAggregator;
+        let averaged = FeatureModel::new(None, Sample::All, Sample::All, false, false).unwrap();
+        assert_eq!(averaged.aggregator().unwrap().to_string(), "Averaged");
+        let mut rng = XorShiftRng::seed_from_u64(1);
+        let weights = FeatureAggregator::attention(super::attention::AttentionWeights::init(8, 2, &mut rng).unwrap());
+        assert!(averaged.warm_start_from(&weights, 8).is_err());
+        let attention = FeatureModel::new(Some(2), Sample::All, Sample::All, false, false).unwrap();
+        assert!(attention.aggregator().is_none(), "no weights before training or a warm start");
+        assert!(attention.warm_start_from(&FeatureAggregator::averaged(), 8).is_err());
+        assert!(attention.warm_start_from(&weights, 6).is_err());
+        attention.warm_start_from(&weights, 8).unwrap();
+        assert_eq!(attention.aggregator().unwrap().attention_weights(), weights.attention_weights());
+        assert!(FeatureModel::new(Some(0), Sample::All, Sample::All, false, false).is_err());
     }
 
 }
