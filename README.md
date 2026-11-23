@@ -21,17 +21,37 @@ The library is broken up into a few different methods:
     - Luce Spectral Ranking
 5. Utilities
     - Approximate Nearest Neighbors (ANN) via Random Projections
-    - Neighborhood Alignment
+    - Neighborhood Alignment, and aligning nodes with no edges yet (by matching distances, or by mean shift)
+
+Everything above runs on the CPU.  For graphs where Embedding Propagation, attention pooling especially, is too slow there, `gpu/` holds an optional PyTorch trainer for the same models: it reads and writes cloverleaf's files, so cloverleaf embeds new nodes, aligns and searches with what it trains (see [gpu/README.md](gpu/README.md)).
 
 ## Installation
 
-1. Create a new python virtualenv (Python 3.9 or newer)
-2. `pip install "maturin>=1.9.4" numpy`
-3. Ensure you have the latest Rust compiler (1.85 or newer)
-4. `RUSTFLAGS="-C target-cpu=native" maturin develop --release`
-5. Profit!
+You need Rust 1.85 or newer (`rustup update`) and Python 3.9 or newer.  From a checkout:
 
-To run the tests, `cargo test --release --features python` covers the Rust side, including the binding code; for the Python bindings themselves, `pip install pytest`, build the module as above, then run `pytest`.  `tests/python/test_snapshot.py` checks the bindings' results against a recorded snapshot; after an intended change to them, rerun it with `python tests/python/test_snapshot.py --update` and review the diff to `snapshot.json`.
+```
+make python                  # builds the bindings into .venv (or your active virtualenv)
+source .venv/bin/activate
+python -c "import cloverleaf; print(cloverleaf.Graph)"
+```
+
+`make python` creates the virtualenv if needed, installs maturin, and builds a release module optimised for this machine's CPU (`-C target-cpu=native`).  `make gpu` does the same and also installs the GPU trainer's dependencies (torch).  `make wheel` builds a portable wheel in `dist/` to install elsewhere, and `make help` lists the targets.
+
+Without make, either let pip build it (portable, release mode):
+
+```
+pip install .                                            # from a checkout
+pip install "git+https://github.com/Refefer/cloverleaf"  # or straight from GitHub
+```
+
+or build it in place with maturin, as `make python` does:
+
+```
+pip install "maturin>=1.9.4" numpy
+RUSTFLAGS="-C target-cpu=native" maturin develop --release
+```
+
+`make test` runs every test suite.  Separately: `cargo test --release` for the Rust side, `pytest` for the Python bindings, and `cd gpu && pytest tests` for the GPU trainer.  `tests/python/test_snapshot.py` checks the bindings' results against a recorded snapshot; after an intended change to them, rerun it with `python tests/python/test_snapshot.py --update` and review the diff to `snapshot.json`.
 
 ### Using Cloverleaf from Rust
 
@@ -248,7 +268,11 @@ The paper's results reproduce: `examples/ep_paper/reproduce.py` trains EP-B with
 
 To maximize cpu utilization, Hogwild [8] is used to update weights lock free.  This has the side effect of non-determinism in runs as well; similarly, if collisions between features are likely, the fidelity of the embeddings will be impacted.  In practice it's a non-issue but worth paying attention to, especially if reproducability is critical.
 
-The result of the optimization phase is feature embeddings, which can be used to construct node embeddings dynamically or in batch.
+The result of the optimization phase is feature embeddings, which can be used to construct node embeddings dynamically or in batch: `NodeEmbedder(aggregator).embed_feature_set(...)` for every node, or `embed_adhoc(...)` for a node that wasn't in the graph, from its features alone.  The aggregator is `FeatureAggregator.Averaged()` for the averaged model; for attention it's the learned weights, `ep.feature_aggregator()`, which can be saved and loaded with the embeddings.
+
+Neighborhood alignment (`NeighborhoodAligner`) then pulls each node towards its neighbors.  A new node has no neighbors, so `EmbeddingAligner` places it in the aligned space from its nearest nodes: `method="distances"` keeps its distances to them, and `method="mean_shift"` moves it as they moved on average.  Mean shift with training queries as the anchors works well for new search queries.
+
+For large graphs, the GPU trainer in `gpu/` trains the same averaged and attention models much faster, and its output loads straight into the classes above.  It also has losses and schedules the CPU trainer doesn't, such as a sawtooth learning rate, which is its recommended setting; see [gpu/README.md](gpu/README.md).
 
 #### Parameters
 1. `alpha` - Learning rate for the optimization step.
