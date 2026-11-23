@@ -11,6 +11,7 @@ use rayon::prelude::*;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError,PyTypeError,PyRuntimeError};
 use pyo3::buffer::PyBuffer;
+use pyo3::types::PyBytes;
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
 
@@ -4581,9 +4582,77 @@ fn write_embeddings(
     py.detach(move || Ok(crate::io::write_embedding_matrix(&path, &keys, &values, dims, comp_level)?))
 }
 
+///    Each node's top-k personalised PageRank list, as PprRankLearner builds them: random walks
+///    with restart from every node, following edges in proportion to their weight, score each
+///    node reached count / (walks * degree^beta); a node's list is its top k other nodes,
+///    weighted score^compression and normalised to sum to 1.
+///    
+///    Parameters
+///    ----------
+///    graph : Graph
+///    k : Int
+///        Length of each list.
+///    walks : Int
+///        Walks per node.
+///    steps : Float
+///        When steps ~ [0,1), the probability of stopping after each step.  When steps ~ [1,inf],
+///        a fixed walk length.
+///    beta : Float - Optional
+///        Popularity discount.  Default is 0.8, as PprRankLearner.
+///    compression : Float - Optional
+///        Default is 1.
+///    other_type_only : Bool - Optional
+///        Only list nodes whose type differs from the start node's.  Default is False.
+///    seed : Int - Optional
+///    indicator : Bool - Optional
+///        Whether to show a progress bar.  Default is True.
+///    
+///    Returns
+///    -------
+///    (Bytes, Bytes)
+///        Node ids as little-endian int64 and weights as little-endian float32, each
+///        graph.nodes() * k long: node v's list is entries v * k to (v + 1) * k, padded with
+///        node 0 at weight 0.  Node ids are the graph's, in the order of graph.vocab().
+///
+#[pyfunction]
+#[pyo3(signature = (graph, k, walks, steps, beta=None, compression=None, other_type_only=None, seed=None, indicator=None))]
+fn ppr_lists<'py>(
+    py: Python<'py>,
+    graph: &Graph,
+    k: usize,
+    walks: usize,
+    steps: f32,
+    beta: Option<f32>,
+    compression: Option<f32>,
+    other_type_only: Option<bool>,
+    seed: Option<u64>,
+    indicator: Option<bool>
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let steps = Sample::steps(steps)
+        .map_err(|_err| PyValueError::new_err("steps must be in (0, 1) or [1, inf)"))?;
+    if walks == 0 || k == 0 {
+        return Err(PyValueError::new_err("walks and k must be positive"))
+    }
+    let named = &graph.inner;
+    let (nodes, weights) = py.detach(|| {
+        let vocab = &named.vocab;
+        let other_type = other_type_only.unwrap_or(false);
+        let keep = |node: NodeID, other: NodeID| {
+            !other_type || vocab.get_node_type(node) != vocab.get_node_type(other)
+        };
+        crate::algos::pprrank::ppr_lists(named.graph(), steps, walks, beta.unwrap_or(0.8), k,
+            compression.unwrap_or(1f32), seed.unwrap_or(SEED), keep, indicator.unwrap_or(true))
+            .into_parts()
+    });
+    let node_bytes: Vec<u8> = nodes.iter().flat_map(|n| (*n as i64).to_le_bytes()).collect();
+    let weight_bytes: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
+    Ok((PyBytes::new(py, &node_bytes), PyBytes::new(py, &weight_bytes)))
+}
+
 #[pymodule(gil_used = true)]
 fn cloverleaf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Graph>()?;
+    m.add_function(wrap_pyfunction!(ppr_lists, m)?)?;
     m.add_class::<Distance>()?;
     m.add_class::<GraphBuilder>()?;
     m.add_class::<EdgeType>()?;

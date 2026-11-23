@@ -475,6 +475,12 @@ PprRankLearner(
 )
 ```
 
+`loss` is `"listnet"` (default): cross entropy between each node's PPR list, as a distribution,
+and a softmax over its dot products with the listed nodes and the negatives.  Positives already
+predicted at least as likely as their PPR weight are skipped.  `"listmle"` is top-k ListMLE: the
+Plackett–Luce likelihood of the listed nodes coming first, in PPR order, ahead of the negatives.
+The order among the negatives isn't scored.  `ppr_lists` (below) returns the lists themselves.
+
 ### Feature handling
 | Class | Constructor (Python) | Key Methods |
 |-------|----------------------|-------------|
@@ -489,6 +495,7 @@ PprRankLearner(
 |-------|----------------------|-------------|
 | `NodeEmbeddings` | • `NodeEmbeddings.new(graph: Graph, dims: int, distance: Distance)`<br>• `NodeEmbeddings.new_from_list(list: list[tuple[tuple[str,str], list[float]]], distance: Distance)` | `contains(node: tuple[str,str]) -> bool`<br>`get_embedding(node: tuple[str,str]) -> list[float]`<br>`set_embedding(node: tuple[str,str], embedding: list[float])`<br>`nearest_neighbor(emb: list[float], k: int, filter_type: str \| list[str] \| None = None) -> list[tuple[tuple[str,str], float]]`<br>`compute_distance(e1: Query, e2: Query) -> float`<br>`l2norm()`<br>`save(path: str, comp_level: int \| None = None)`<br>`load(path: str, distance: Distance \| None = None, filter_type: ... ) -> NodeEmbeddings` |
 | `write_embeddings` (function) | `write_embeddings(path: str, keys: list[tuple[str,str]], embeddings: 2-D float32 array, comp_level: int \| None = None)` | Writes embeddings made outside cloverleaf (e.g. a numpy array, or a PyTorch tensor via `.cpu().numpy()`) in the format `NodeEmbeddings.load` reads, formatting rows in parallel. |
+| `ppr_lists` (function) | `ppr_lists(graph: Graph, k: int, walks: int, steps: float, beta: float = 0.8, compression: float = 1.0, other_type_only: bool = False, seed: int \| None = None, indicator: bool = True) -> tuple[bytes, bytes]` | Every node's top-k personalised PageRank list, as `PprRankLearner` trains on: little-endian int64 node ids and float32 weights, `graph.nodes() * k` of each, for `numpy.frombuffer(...).reshape(-1, k)`. `other_type_only` keeps only nodes of a different type from the start node. |
 | `EmbeddingPropagator` | See full signature below* (many optional arguments) | `learn_features(graph: Graph, features: FeatureSet, feature_embeddings: NodeEmbeddings \| None = None) -> NodeEmbeddings` |
 | `NodeEmbedder` | `NodeEmbedder(feat_agg: FeatureAggregator)` | `embed_feature_set(feat_set: FeatureSet, feature_embeddings: NodeEmbeddings) -> NodeEmbeddings`<br>`embed_adhoc(features: list[tuple[str,str]], feature_embeddings: NodeEmbeddings, strict: bool = True) -> list[float]` |
 | `EmbeddingAligner` | `EmbeddingAligner(num_nodes: int, random_nodes: int, alpha: float, error: float, max_iters: int)` | (see methods above) |

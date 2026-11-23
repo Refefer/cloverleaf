@@ -252,6 +252,46 @@ def test_write_embeddings_round_trips(tmp_path):
             assert loaded.get_embedding(key) == [float(x) for x in row]
 
 
+def _lists(graph, k, **kwargs):
+    import struct
+    nodes, weights = cl.ppr_lists(graph, k, 500, 0.5, indicator=False, **kwargs)
+    count = graph.nodes() * k
+    assert len(nodes) == 8 * count and len(weights) == 4 * count
+    return (struct.unpack(f"<{count}q", nodes), struct.unpack(f"<{count}f", weights))
+
+
+def test_ppr_lists_are_normalised_and_exclude_the_start(graph):
+    k = 3
+    nodes, weights = _lists(graph, k)
+    vocab = list(graph.vocab())
+    for v in range(graph.nodes()):
+        listed = [(nodes[v * k + i], weights[v * k + i]) for i in range(k) if weights[v * k + i] > 0]
+        assert listed and abs(sum(w for _, w in listed) - 1) < 1e-5
+        assert all(vocab[u] != vocab[v] for u, _ in listed)
+        assert [w for _, w in listed] == sorted((w for _, w in listed), reverse=True)
+
+
+def test_ppr_lists_other_type_only():
+    gb = cl.GraphBuilder()
+    for q in range(4):
+        for p in range(q, q + 2):
+            gb.add_edge(("q", str(q)), ("p", str(p)), 1.0, cl.EdgeType.Undirected)
+    g = gb.build_graph()
+    k = 3
+    nodes, weights = _lists(g, k, other_type_only=True)
+    vocab = list(g.vocab())
+    for v in range(g.nodes()):
+        for i in range(k):
+            if weights[v * k + i] > 0:
+                assert vocab[nodes[v * k + i]][0] != vocab[v][0]
+
+
+@pytest.mark.parametrize("args", [(3, 500, 0.0), (3, 0, 0.5), (0, 500, 0.5)])
+def test_ppr_lists_rejects_bad_arguments(graph, args):
+    with pytest.raises(ValueError):
+        cl.ppr_lists(graph, *args, indicator=False)
+
+
 def test_write_embeddings_rejects_bad_shapes(tmp_path):
     np = pytest.importorskip("numpy")
     path = str(tmp_path / "bad.emb")

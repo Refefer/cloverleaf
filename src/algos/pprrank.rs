@@ -21,7 +21,6 @@ use crate::feature_store::{FeatureStore, FeatureSet};
 use crate::embeddings::NodeEmbeddings;
 use crate::error::Error;
 use crate::named_graph::NamedGraph;
-use crate::algos::ep::attention::softmax;
 use crate::algos::ep::model::{construct_node_embedding,NodeCounts};
 use crate::algos::ep::extract_grads;
 use crate::algos::grad_utils::node_sampler::{RandomWalkHardStrategy,NodeSampler,BatchSamplerStrategy};
@@ -299,47 +298,8 @@ impl PprRank {
         graph: &G,
         seed: u64
     ) -> WalkLibrary {
-        let mut walk_lib = WalkLibrary::new(graph.len(), self.k);
-        let rwr = RWR {
-            steps: self.steps.clone(),
-            walks: self.num_walks,
-            beta: self.beta,
-            single_threaded: false,
-            seed: seed + 13
-        };
-
-        let pb = CLProgressBar::new(graph.len() as u64, self.indicator);
-        pb.update_message(|msg| write!(msg, "Computing random walks...").unwrap());
-        let idxs = (0..graph.len()).collect::<Vec<_>>();
-        idxs.chunks(1024).for_each(|node_ids| {
-            let groups: Vec<_> = node_ids.par_iter().map(|node_id| {
-                let mut nodes = Vec::with_capacity(self.k);
-                let mut weights = Vec::with_capacity(self.k);
-                
-                let scores = rwr.sample(graph, &Weighted, *node_id).into_iter();
-                let mut scores: Vec<_> = scores.collect();
-                scores.sort_by_key(|(_k, v)| FloatOrd(-*v));
-                scores.into_iter()
-                    .filter(|(k,_v)| k != node_id)
-                    .map(|(k, v)| (k, v.powf(self.compression)))
-                    .take(self.k)
-                    .for_each(|(k, v)| {
-                        nodes.push(k);
-                        weights.push(v);
-                    });
-
-                let sum = weights.iter().sum::<f32>();
-                weights.iter_mut().for_each(|v| *v /= sum);
-                pb.inc(1);
-                (*node_id, nodes, weights)
-            }).collect();
-
-            groups.into_iter().for_each(|(node_id, nodes, weights)| {
-                walk_lib.set(node_id, &nodes, &weights);
-            });
-        });
-        pb.finish();
-        walk_lib
+        ppr_lists(graph, self.steps.clone(), self.num_walks, self.beta, self.k, self.compression,
+                  seed, |_node, _other| true, self.indicator)
     }
 
     fn run_forward_pass<G: CGraph + Send + Sync, R: Rng, S: NodeSampler>(
@@ -383,14 +343,14 @@ impl PprRank {
         // Compute error
         let loss = match self.loss {
             Loss::ListNet { passive, weight_decay } => {
-                let mut list_loss = self.listnet_loss(&query_node, &ranked_embeddings, &ranked_scores, node, passive);
+                let mut list_loss = listnet_loss(&query_node, &ranked_embeddings, &ranked_scores, passive);
                 if weight_decay > 0f32 {
                     list_loss = list_loss + weight_decay * comp_weight_decay(&query_node, &ranked_embeddings, 0.1f32)
                 }
                 list_loss
             },
             Loss::ListMLE { weight_decay } => {
-                let mut list_loss = self.list_mle_loss(&query_node, &ranked_embeddings, &ranked_scores, node);
+                let mut list_loss = list_mle_loss(&query_node, &ranked_embeddings, nodes.len());
                 if weight_decay > 0f32 {
                     list_loss = list_loss + weight_decay * comp_weight_decay(&query_node, &ranked_embeddings, 0.1f32)
                 }
@@ -399,67 +359,6 @@ impl PprRank {
         };
 
         (loss, feat_maps)
-    }
-
-    fn listnet_loss(
-        &self,
-        query_node: &ANode,
-        ranked_nodes: &[ANode],
-        node_weights: &[f32],
-        node_id: NodeID,
-        passive: bool
-    ) -> ANode {
-
-        let scores = compute_distances(query_node, ranked_nodes, false);
-        let sm_scores = softmax(scores, true);
-
-        let ordered = node_weights.iter().enumerate()
-            .filter(|(i, s)| {
-                let nonzero = **s > 0f32;
-                if passive {
-                    nonzero && sm_scores.value()[*i] <= **s
-                } else { nonzero }
-            })
-            .map(|(idx, s)| {
-                let k = sm_scores.slice(idx, 1);
-                k.ln() * *s
-            }).collect::<Vec<ANode>>();
-
-        if ordered.len() == 0 {
-            //println!("Node:{}, {:?} -> {:?}", node_id, node_weights, sm_scores.value());
-            Constant::scalar(0f32)
-        } else {
-            let loss = -ordered.sum_all();
-            if node_id == 0 {
-                println!("loss:{}, {:?} -> {:?}", loss.value()[0], node_weights, sm_scores.value());
-            }
-            loss
-        }
-    }
-
-    fn list_mle_loss(
-        &self,
-        query_node: &ANode,
-        ranked_nodes: &[ANode],
-        node_weights: &[f32],
-        node_id: NodeID
-    ) -> ANode {
-
-        let logits = ranked_nodes.iter().map(|n| {
-            query_node.dot(n)
-        }).collect::<Vec<_>>().concat();
-
-        let loss = plackett_luce_nll(&logits);
-        if loss.value()[0].is_nan() || loss.value()[0].is_infinite() {
-            println!("logits: {:?}", logits.value());
-            Constant::scalar(0f32)
-        } else {
-            if node_id == 0 {
-                println!("loss:{}, {:?} -> {:?}", loss.value()[0], node_weights, logits.value());
-            }
-            loss
-        }
-
     }
 
     fn extract_gradients(
@@ -484,33 +383,121 @@ impl PprRank {
 
 }
 
-fn compute_distances(query_node: &ANode, ranked_nodes: &[ANode], cosine: bool) -> ANode {
-    if cosine {
-        // Compute the dot products to construct our yis
-        let qn = il2norm(query_node);
-        (ranked_nodes.iter().map(|n| {
-            qn.dot(&il2norm(n))
-        }).collect::<Vec<_>>().concat() * 5f32).exp()
+/// Each node's top-k personalised PageRank list, estimated with `walks` random walks with
+/// restart (see [`RWR`]) that follow edges in proportion to their weight.  The node itself, and
+/// any node `keep(node, other)` rejects, are left out; the rest are weighted score^compression
+/// and normalised to sum to 1.
+pub fn ppr_lists<G: CGraph + CDFGraph + Send + Sync>(
+    graph: &G,
+    steps: Sample,
+    walks: usize,
+    beta: f32,
+    k: usize,
+    compression: f32,
+    seed: u64,
+    keep: impl Fn(NodeID, NodeID) -> bool + Sync,
+    indicator: bool
+) -> WalkLibrary {
+    let mut walk_lib = WalkLibrary::new(graph.len(), k);
+    let rwr = RWR { steps, walks, beta, single_threaded: false, seed: seed + 13 };
+
+    let pb = CLProgressBar::new(graph.len() as u64, indicator);
+    pb.update_message(|msg| write!(msg, "Computing random walks...").unwrap());
+    let idxs = (0..graph.len()).collect::<Vec<_>>();
+    idxs.chunks(1024).for_each(|node_ids| {
+        let groups: Vec<_> = node_ids.par_iter().map(|node_id| {
+            let mut nodes = Vec::with_capacity(k);
+            let mut weights = Vec::with_capacity(k);
+
+            let mut scores: Vec<_> = rwr.sample(graph, &Weighted, *node_id).into_iter().collect();
+            // Ties broken by node id, so the lists don't depend on hash map order.
+            scores.sort_by_key(|(n, v)| (FloatOrd(-*v), *n));
+            scores.into_iter()
+                .filter(|(n, _v)| n != node_id && keep(*node_id, *n))
+                .map(|(n, v)| (n, v.powf(compression)))
+                .take(k)
+                .for_each(|(n, v)| {
+                    nodes.push(n);
+                    weights.push(v);
+                });
+
+            let sum = weights.iter().sum::<f32>();
+            weights.iter_mut().for_each(|v| *v /= sum);
+            pb.inc(1);
+            (*node_id, nodes, weights)
+        }).collect();
+
+        groups.into_iter().for_each(|(node_id, nodes, weights)| {
+            walk_lib.set(node_id, &nodes, &weights);
+        });
+    });
+    pb.finish();
+    walk_lib
+}
+
+/// ListNet: cross entropy between the PPR distribution over the ranked nodes (zero for the
+/// negatives) and a softmax over the query's dot products with them.  With `passive`, positives
+/// already predicted at least as likely as their PPR weight contribute nothing.
+fn listnet_loss(
+    query_node: &ANode,
+    ranked_nodes: &[ANode],
+    node_weights: &[f32],
+    passive: bool
+) -> ANode {
+    let log_p = log_softmax(&compute_logits(query_node, ranked_nodes, false));
+    let log_p_values = log_p.value();
+    let terms = node_weights.iter().enumerate()
+        .filter(|(i, s)| **s > 0f32 && !(passive && log_p_values[*i].exp() > **s))
+        .map(|(i, s)| log_p.slice(i, 1) * *s)
+        .collect::<Vec<ANode>>();
+
+    if terms.is_empty() {
+        Constant::scalar(0f32)
     } else {
-        ranked_nodes.iter().map(|n| {
-            query_node.dot(n)
-        }).collect::<Vec<_>>().concat().exp()
-        //ranked_nodes.iter().map(|n| {
-        //    1f32 / (1f32 + l2norm(&(query_node - n)))
-        //}).collect::<Vec<_>>().concat()
-        
+        -terms.sum_all()
     }
 }
 
-/// Negative log likelihood of the Plackett-Luce model for items already in ranked order.
-/// Sums log probabilities rather than multiplying probabilities, which underflows for long lists.
-fn plackett_luce_nll(logits: &ANode) -> ANode {
+/// Top-k ListMLE: the Plackett-Luce likelihood of the positives coming first, in PPR order, with
+/// the negatives competing in every denominator.  The negatives' own order is arbitrary, so it
+/// isn't scored.
+fn list_mle_loss(query_node: &ANode, ranked_nodes: &[ANode], num_positives: usize) -> ANode {
+    let logits = compute_logits(query_node, ranked_nodes, false);
+    let loss = plackett_luce_nll(&logits, num_positives);
+    if loss.value()[0].is_finite() { loss } else { Constant::scalar(0f32) }
+}
+
+/// The query's scores for each ranked node: dot products, or cosine similarities times 5.  These
+/// are logits; the losses apply the softmax.
+fn compute_logits(query_node: &ANode, ranked_nodes: &[ANode], cosine: bool) -> ANode {
+    if cosine {
+        let qn = il2norm(query_node);
+        ranked_nodes.iter().map(|n| qn.dot(&il2norm(n))).collect::<Vec<_>>().concat() * 5f32
+    } else {
+        ranked_nodes.iter().map(|n| query_node.dot(n)).collect::<Vec<_>>().concat()
+    }
+}
+
+/// log softmax, shifted by the max so exp can't overflow.
+fn log_softmax(logits: &ANode) -> ANode {
+    let shift = Constant::scalar(
+        logits.value().iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    let shifted = logits - &shift;
+    let log_sum = shifted.exp().sum().ln();
+    shifted - &log_sum
+}
+
+/// Negative log likelihood of the Plackett-Luce model for the first `top` items, already in
+/// ranked order, each chosen from itself and everything after it.  Sums log probabilities rather
+/// than multiplying probabilities, which underflows for long lists.
+fn plackett_luce_nll(logits: &ANode, top: usize) -> ANode {
     let values = logits.value();
     let n = values.len();
-    if n == 0 {
+    let top = top.min(n);
+    if top == 0 {
         return Constant::scalar(0f32)
     }
-    let terms: Vec<_> = (0..n).map(|i| {
+    let terms: Vec<_> = (0..top).map(|i| {
         // Shift by the tail's max so the largest exp is 1: exp can't overflow and the tail sum is
         // at least 1, so its log can't be -inf.  The shift cancels out of the term.
         let shift = Constant::scalar(
@@ -548,7 +535,8 @@ fn comp_weight_decay(query_node: &ANode, ranked_nodes: &[ANode], threshold: f32)
     mag.concat().sum()
 }
 
-struct WalkLibrary {
+/// Each node's top-k personalised PageRank list, as [`ppr_lists`] builds it.
+pub struct WalkLibrary {
     k: usize,
     nodes: Vec<NodeID>,
     weights: Vec<f32>,
@@ -574,7 +562,14 @@ impl WalkLibrary {
             });
     }
 
-    fn get(&self, node_id: NodeID) -> (&[NodeID], &[f32]) {
+    /// The list length.
+    pub fn k(&self) -> usize { self.k }
+
+    /// Every node's list, flattened: node `v`'s is entries `v * k .. (v + 1) * k`, padded with
+    /// node 0 at weight 0.
+    pub fn into_parts(self) -> (Vec<NodeID>, Vec<f32>) { (self.nodes, self.weights) }
+
+    pub fn get(&self, node_id: NodeID) -> (&[NodeID], &[f32]) {
         let offset: usize = node_id * self.k;
         let len = self.lens[node_id];
         let ns = &self.nodes[offset..(offset+len)];
@@ -639,7 +634,7 @@ mod ep_tests {
     fn test_plackett_luce_nll_no_underflow() {
         let logits: Vec<f32> = (0..10).map(|i| i as f32 * 5.).collect();
         let reference = plackett_luce_reference(&logits.iter().map(|l| *l as f64).collect::<Vec<_>>());
-        let loss = plackett_luce_nll(&Variable::new(logits)).value()[0];
+        let loss = plackett_luce_nll(&Variable::new(logits), 10).value()[0];
         assert!(((loss as f64 - reference) / reference).abs() < 1e-4,
             "loss {} reference {}", loss, reference);
     }
@@ -649,7 +644,68 @@ mod ep_tests {
     fn test_plackett_luce_nll_no_overflow() {
         let logits = vec![100f32, 0.];
         let reference = plackett_luce_reference(&[100., 0.]);
-        let loss = plackett_luce_nll(&Variable::new(logits)).value()[0];
+        let loss = plackett_luce_nll(&Variable::new(logits), 2).value()[0];
         assert!((loss as f64 - reference).abs() < 1e-5, "loss {} reference {}", loss, reference);
+    }
+
+    fn log_softmax_reference(logits: &[f64]) -> Vec<f64> {
+        let m = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let lse = m + logits.iter().map(|l| (l - m).exp()).sum::<f64>().ln();
+        logits.iter().map(|l| l - lse).collect()
+    }
+
+    fn query_and_ranked() -> (ANode, Vec<ANode>, Vec<f64>) {
+        let query = Variable::new(vec![1f32, -2., 0.5]);
+        let ranked: Vec<Vec<f32>> = vec![vec![0.5, 1., 2.], vec![3., -1., 0.], vec![-1., -1., 1.],
+                                          vec![0., 2., -4.]];
+        let logits = ranked.iter()
+            .map(|r| r.iter().zip([1f64, -2., 0.5]).map(|(a, b)| *a as f64 * b).sum())
+            .collect();
+        (query, ranked.into_iter().map(Variable::new).collect(), logits)
+    }
+
+    /// ListNet is the cross entropy against one softmax over the dot products, not exp(exp(.)).
+    #[test]
+    fn test_listnet_is_cross_entropy_over_dot_products() {
+        let (query, ranked, logits) = query_and_ranked();
+        let weights = [0.7f32, 0.3, 0., 0.];
+        let log_p = log_softmax_reference(&logits);
+        let reference = -(0.7 * log_p[0] + 0.3 * log_p[1]);
+        let loss = listnet_loss(&query, &ranked, &weights, false).value()[0] as f64;
+        assert!((loss - reference).abs() < 1e-5, "loss {} reference {}", loss, reference);
+    }
+
+    /// Passive ListNet skips positives already predicted at least as likely as their weight.
+    #[test]
+    fn test_listnet_passive_skips_satisfied_positives() {
+        let (query, ranked, logits) = query_and_ranked();
+        let log_p = log_softmax_reference(&logits);
+        // logits are [-0.5, 5, 1.5, -6]: node 1 takes nearly all the mass, node 0 almost none.
+        let weights = [0.5f32, 0.5, 0., 0.];
+        let reference = -(0.5 * log_p[0]);
+        let loss = listnet_loss(&query, &ranked, &weights, true).value()[0] as f64;
+        assert!((loss - reference).abs() < 1e-5, "loss {} reference {}", loss, reference);
+    }
+
+    /// Large dot products must not overflow.
+    #[test]
+    fn test_listnet_stable_for_large_logits() {
+        let query = Variable::new(vec![100f32]);
+        let ranked = vec![Variable::new(vec![1f32]), Variable::new(vec![-1f32])];
+        let loss = listnet_loss(&query, &ranked, &[0f32, 1.], false).value()[0];
+        assert!((loss - 200.).abs() < 1e-3, "loss {}", loss);
+    }
+
+    /// Top-k ListMLE scores only the positives' positions: reordering the negatives changes nothing.
+    #[test]
+    fn test_list_mle_ignores_negative_order() {
+        let (query, ranked, logits) = query_and_ranked();
+        let loss = list_mle_loss(&query, &ranked, 2).value()[0] as f64;
+        let reference = plackett_luce_reference(&logits) - plackett_luce_reference(&logits[2..]);
+        assert!((loss - reference).abs() < 1e-5, "loss {} reference {}", loss, reference);
+
+        let swapped = vec![ranked[0].clone(), ranked[1].clone(), ranked[3].clone(), ranked[2].clone()];
+        let swapped_loss = list_mle_loss(&query, &swapped, 2).value()[0] as f64;
+        assert!((loss - swapped_loss).abs() < 1e-6);
     }
 }
