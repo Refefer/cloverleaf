@@ -1,7 +1,7 @@
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::OnceLock;
 
-use candle_core::{backprop::GradStore, Device, Tensor, Var};
+use candle_core::{backprop::GradStore, CpuStorage, CustomOp2, Device, Layout, Shape, Tensor, Var};
 
 fn unwrap_tensor(result: candle_core::Result<Tensor>, context: &str) -> Tensor {
     result.unwrap_or_else(|err| panic!("Candle autograd error in {context}: {err}"))
@@ -58,9 +58,16 @@ impl ANode {
         Self::from_tensor(unwrap_tensor(Tensor::stack(&tensors, 0), "stack"))
     }
 
-    /// Matrix product of two matrices.
+    /// Matrix product of two matrices.  On the CPU it runs on the calling thread: candle's own
+    /// matmul spreads every product over all cores, which for the small matrices of one node's
+    /// forward pass, already run in parallel across nodes, costs far more than it saves.
     pub fn matmul(&self, rhs: &Self) -> Self {
-        Self::from_tensor(unwrap_tensor(self.tensor.matmul(rhs.as_tensor()), "matmul"))
+        let product = if self.tensor.device().is_cpu() {
+            self.tensor.contiguous().and_then(|a| rhs.tensor.contiguous().and_then(|b| a.apply_op2(&b, SerialMatMul)))
+        } else {
+            self.tensor.matmul(rhs.as_tensor())
+        };
+        Self::from_tensor(unwrap_tensor(product, "matmul"))
     }
 
     /// The transpose of a matrix.
@@ -178,6 +185,46 @@ impl Constant {
         ANode::from_tensor(
             Tensor::from_slice(data, (rows, cols), device()).expect("Candle matrix constant"),
         )
+    }
+}
+
+/// A single-threaded f32 matrix product, with its gradient, for small CPU matrices.
+struct SerialMatMul;
+
+fn serial_matmul(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
+    a.contiguous()?.apply_op2_no_bwd(&b.contiguous()?, &SerialMatMul)
+}
+
+impl CustomOp2 for SerialMatMul {
+    fn name(&self) -> &'static str {
+        "serial-matmul"
+    }
+
+    fn cpu_fwd(&self, s1: &CpuStorage, l1: &Layout, s2: &CpuStorage, l2: &Layout) -> candle_core::Result<(CpuStorage, Shape)> {
+        let (m, k) = l1.shape().dims2()?;
+        let (k2, n) = l2.shape().dims2()?;
+        if k != k2 {
+            candle_core::bail!("serial-matmul: ({}, {}) x ({}, {})", m, k, k2, n)
+        }
+        let slice = |s: &CpuStorage, l: &Layout| -> candle_core::Result<Vec<f32>> {
+            let CpuStorage::F32(v) = s else { candle_core::bail!("serial-matmul needs f32") };
+            match l.contiguous_offsets() {
+                Some((start, end)) => Ok(v[start..end].to_vec()),
+                None => candle_core::bail!("serial-matmul needs contiguous inputs")
+            }
+        };
+        let (a, b) = (slice(s1, l1)?, slice(s2, l2)?);
+        let mut out = vec![0f32; m * n];
+        for (row, a_row) in out.chunks_exact_mut(n.max(1)).zip(a.chunks_exact(k.max(1))) {
+            for (a_ip, b_row) in a_row.iter().zip(b.chunks_exact(n.max(1))) {
+                row.iter_mut().zip(b_row).for_each(|(o, b_pj)| *o += a_ip * b_pj);
+            }
+        }
+        Ok((CpuStorage::F32(out), Shape::from((m, n))))
+    }
+
+    fn bwd(&self, a: &Tensor, b: &Tensor, _res: &Tensor, grad: &Tensor) -> candle_core::Result<(Option<Tensor>, Option<Tensor>)> {
+        Ok((Some(serial_matmul(grad, &b.t()?)?), Some(serial_matmul(&a.t()?, grad)?)))
     }
 }
 
@@ -444,6 +491,19 @@ mod matrix_op_tests {
         let w = Constant::matrix(&[0.5, -1., 2., 0.25, 1., -0.5], 3, 2);
         check_gradient(&[0.3, -0.7, 1.1, 0.2, 0.9, -0.4], 2, 3, |x| x.matmul(&w).pow(2.).sum());
         check_gradient(&[0.3, -0.7, 1.1, 0.2, 0.9, -0.4], 2, 3, |x| x.t().matmul(x).narrow(0, 1, 2).sum());
+    }
+
+    /// The serial product equals candle's, including on transposed (non-contiguous) inputs.
+    #[test]
+    fn test_serial_matmul_matches_candle() {
+        let a: Vec<f32> = (0..7 * 13).map(|i| ((i * 37 % 11) as f32 - 5.) / 3.).collect();
+        let b: Vec<f32> = (0..13 * 5).map(|i| ((i * 17 % 7) as f32 - 3.) / 2.).collect();
+        let (ta, tb) = (Constant::matrix(&a, 7, 13), Constant::matrix(&b, 13, 5));
+        let expected = ta.as_tensor().matmul(tb.as_tensor()).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(ta.matmul(&tb).value().iter().zip(expected.iter()).all(|(x, y)| (x - y).abs() < 1e-4));
+        let expected_t = tb.as_tensor().t().unwrap().matmul(&ta.as_tensor().t().unwrap()).unwrap()
+            .flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(tb.t().matmul(&ta.t()).value().iter().zip(expected_t.iter()).all(|(x, y)| (x - y).abs() < 1e-4));
     }
 
     #[test]
