@@ -16,10 +16,16 @@
 //! | `NeighborhoodAligner`, `EmbeddingAligner` | [`algos::alignment::NeighborhoodAligner`], [`algos::emb_aligner::EmbeddingAligner`] |
 //! | `TournamentBuilder`, `LSR` | [`algos::lsr::TournamentBuilder`], [`algos::lsr::LSR::learn`] |
 //! | `PageRank`, `PolicyEvaluation` | [`algos::pagerank::PageRank::learn`], [`algos::policy_evaluation::PolicyEvaluation::optimize`] |
+//! | `Query` | [`Query`], looked up with [`NodeEmbeddings::resolve`] |
+//! | `RandomWalker`, `SparsePPR`, `RandomPath` | [`algos::rwr::RWR::walk_scores`], [`algos::rwr::SparsePpr`], [`algos::rwr::seeded_rollouts`] |
+//! | `BiasedRandomWalker` | [`algos::grwr::GuidedRWR::walk_named`] |
+//! | `GraphAnn`, `EmbAnn` | [`algos::graph_ann::GraphAnn`], [`algos::ann::Ann::fit_named`] |
+//! | `InstantEmbeddings`, `PPREmbedder` | [`algos::instantembedding::InstantEmbeddings::learn`], [`algos::pprembed::PPREmbed::learn_features`] |
+//! | `DistanceEmbedder`, `ClusterLPAEmbedder`, `SLPAEmbedder`, `ConnectedComponents` | [`algos::dist::DistanceEmbedder`], [`algos::lpa::ClusterLpa`], [`algos::slpa::Slpa`], [`algos::connected::connected_components`] |
 //!
 //! The other algorithms live under [`algos`].  They take the graph itself ([`NamedGraph::graph`])
 //! and return results indexed by node id; [`Vocab`] maps ids back to names, and
-//! [`algos::utils::top_k_scores`] ranks scores the way the Python walkers do.  Where Python
+//! [`Vocab::top_k_named`] ranks and names scores the way the Python walkers do.  Where Python
 //! looks a node up by name, Rust returns [`Error::UnknownNode`]; combining structures built on
 //! different vocabularies is an [`Error::VocabMismatch`] rather than silently misindexed.
 //!
@@ -78,7 +84,7 @@ pub const DEFAULT_SEED: u64 = 20222022;
 pub use crate::graph::{CSR, CumCSR, EdgeType, Graph, NodeID};
 pub use crate::named_graph::{NamedGraph, GraphBuilder, GraphLoadOptions};
 pub use crate::vocab::Vocab;
-pub use crate::embeddings::{EmbeddingStore, NodeEmbeddings, NodeEmbeddingsBuilder};
+pub use crate::embeddings::{EmbeddingStore, NodeEmbeddings, NodeEmbeddingsBuilder, Query};
 pub use crate::distance::Distance;
 pub use crate::feature_store::{FeatureStore, FeatureSet, FeatureNamespace};
 pub use crate::error::Error;

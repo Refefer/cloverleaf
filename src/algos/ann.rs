@@ -1,5 +1,5 @@
 use std::cmp::{Ordering,Eq};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap,HashSet};
 
 use rand::prelude::*;
 use rand_xorshift::XorShiftRng;
@@ -7,8 +7,11 @@ use rayon::prelude::*;
 use float_ord::FloatOrd;
 
 use crate::graph::NodeID;
-use crate::embeddings::{EmbeddingStore,Entity};
+use crate::embeddings::{EmbeddingStore,Entity,NodeEmbeddings};
 use crate::algos::graph_ann::{NodeDistance,TopK};
+
+/// Seed for [`Ann::fit_named`]'s trees when none is given.
+pub const ANN_SEED: u64 = crate::DEFAULT_SEED + 10;
 
 #[inline(always)]
 fn dot(x: &[f32], y: &[f32]) -> f32 {
@@ -250,6 +253,23 @@ impl Ann {
 
         self.trees = trees;
 
+    }
+
+    /// [`fit`](Self::fit)s named embeddings, indexing only the nodes whose type is in
+    /// `node_types` when given.
+    pub fn fit_named(
+        &mut self,
+        embeddings: &NodeEmbeddings,
+        n_trees: usize,
+        max_nodes_per_leaf: usize,
+        test_hp_per_split: Option<usize>,
+        num_sampled_nodes_split_test: Option<usize>,
+        node_types: Option<&HashSet<String>>,
+        seed: u64
+    ) {
+        let node_ids = node_types.map(|nts| embeddings.vocab().nodes_of_types(nts));
+        self.fit(embeddings.store(), n_trees, max_nodes_per_leaf, test_hp_per_split,
+                 num_sampled_nodes_split_test, node_ids, seed);
     }
 
     pub fn depth(&self) -> Vec<usize> {
@@ -592,6 +612,28 @@ mod ann_split_tests {
     #[test]
     fn test_fit_duplicate_node_ids_terminates() {
         fit_with_timeout(8, 2, Some(vec![3, 3, 3, 3]));
+    }
+
+    /// Only nodes of the given types are indexed.
+    #[test]
+    fn test_fit_named_filters_node_types() {
+        let mut b = crate::embeddings::NodeEmbeddingsBuilder::new(Distance::Euclidean);
+        for i in 0..8 {
+            b.add_embedding(if i % 2 == 0 { "even" } else { "odd" }, &i.to_string(), &[i as f32]).unwrap();
+        }
+        let ne = b.build().unwrap();
+        let evens = HashSet::from(["even".to_string()]);
+        let mut ann = Ann::new();
+        ann.fit_named(&ne, 2, 2, None, None, Some(&evens), ANN_SEED);
+        let found = ann.predict(ne.store(), &[3.], 8, Some(8));
+        assert_eq!(found.len(), 4);
+        assert!(found.iter().all(|nd| nd.1 % 2 == 0), "{:?}", found);
+
+        let mut all = Ann::new();
+        all.fit_named(&ne, 2, 2, None, None, None, ANN_SEED);
+        let mut direct = Ann::new();
+        direct.fit(ne.store(), 2, 2, None, None, None, ANN_SEED);
+        assert_eq!(all.predict(ne.store(), &[3.], 3, None), direct.predict(ne.store(), &[3.], 3, None));
     }
 
     /// An index over no nodes returns no neighbors rather than panicking.

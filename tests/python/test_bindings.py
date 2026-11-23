@@ -149,6 +149,33 @@ def test_align_accepts_aligned_embeddings(graph):
     assert out.dims() == 2
 
 
+def test_graph_ann_rejects_misaligned_embeddings(graph):
+    ann = cl.GraphAnn(graph, max_steps=20)
+    with pytest.raises(ValueError):
+        ann.find(cl.Query.embedding([1.0, 1.0]), embeddings([3, 2, 1, 0]), 2, seed=1)
+
+
+def test_graph_ann_accepts_aligned_embeddings(graph):
+    found = cl.GraphAnn(graph, max_steps=20).find(cl.Query.node(*n(1)), embeddings(range(4)), 2, seed=1)
+    assert len(found) == 2 and all(node in [n(i) for i in range(4)] for node, _ in found)
+
+
+def test_ppr_embedder_rejects_misaligned_features(graph, tmp_path):
+    path = tmp_path / "feats_reordered"
+    path.write_text("".join(f"n\t{i}\tf{i}\n" for i in [3, 2, 1, 0]))
+    fs = cl.FeatureSet.new_from_file(str(path))
+    with pytest.raises(ValueError):
+        cl.PPREmbedder(8, 10, 0.5).learn(graph, fs)
+
+
+def test_ppr_embedder_learns_aligned_features(graph):
+    fs = cl.FeatureSet.new_from_graph(graph)
+    out = cl.PPREmbedder(8, 10, 0.5).learn(graph, fs, seed=1)
+    assert (out.len(), out.dims()) == (4, 8)
+    # Featureless nodes were given a feature of their own.
+    assert fs.num_features() == 4
+
+
 def test_embedding_aligner_node_query_uses_original_embedding():
     # A node query is a point in the original space, where its anchors are searched for: it must
     # map exactly like the raw embedding the node has there, not its translated one.
@@ -463,6 +490,34 @@ def test_write_embeddings_takes_keys_from_a_graph_or_feature_set(tmp_path, graph
     assert cl.NodeEmbeddings.load(path, cl.Distance.Cosine).get_embedding(fs.feature_keys()[1]) == [2.0, 3.0]
 
 
+# Walkers and graph embedders
+
+
+@pytest.mark.parametrize("restarts", [0.3, 2])
+@pytest.mark.parametrize("weighted", [True, False])
+def test_random_walker_walks(graph, restarts, weighted):
+    walker = cl.RandomWalker(restarts, 200, beta=0.5)
+    out = walker.walk(graph, n(0), seed=1, k=3, weighted=weighted)
+    assert 0 < len(out) <= 3
+    assert all(node in [n(i) for i in range(4)] for node, _ in out)
+    assert [s for _, s in out] == sorted((s for _, s in out), reverse=True)
+    assert out == walker.walk(graph, n(0), seed=1, k=3, weighted=weighted)
+
+
+def test_random_path_is_seeded(graph):
+    walks = cl.RandomPath(seed=1).rollout(graph, n(0), 3, 0.5, True)
+    assert len(walks) == 3 and all(w[0] == n(0) for w in walks)
+    assert walks == cl.RandomPath(seed=1).rollout(graph, n(0), 3, 0.5, True)
+
+
+@pytest.mark.parametrize("ie", [lambda: cl.InstantEmbeddings.random_walk(8, 2, 20, 2.0, seed=1),
+                                lambda: cl.InstantEmbeddings.sparse_ppr(8, 2, 0.3)])
+def test_instant_embeddings_learn(graph, ie):
+    out = ie().learn(graph)
+    assert (out.len(), out.dims()) == (4, 8)
+    assert list(out.vocab()) == list(graph.vocab())
+
+
 # Settings the core now checks
 
 
@@ -481,3 +536,10 @@ def test_ppr_rank_rejects_unknown_losses(loss):
 def test_embedding_propagator_rejects_untrainable_settings(kwargs):
     with pytest.raises(ValueError):
         cl.EmbeddingPropagator(**kwargs)
+
+
+@pytest.mark.parametrize("make", [lambda: cl.SparsePPR(float("nan")),
+                                  lambda: cl.InstantEmbeddings.sparse_ppr(8, 2, float("nan"))])
+def test_sparse_ppr_rejects_nan_restarts(make):
+    with pytest.raises(ValueError):
+        make()

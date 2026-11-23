@@ -529,7 +529,7 @@ The order among the negatives isn't scored.  `ppr_lists` (below) returns the lis
 ### ANN utilities
 | Class | Constructor (Python) | Key Methods |
 |-------|----------------------|-------------|
-| `GraphAnn` | `GraphAnn(graph: Graph, max_steps: int = 1000)` | `find(query: Query, embeddings: NodeEmbeddings, k: int, seed: int \| None = None) -> list[tuple[tuple[str,str], float]]` |
+| `GraphAnn` | `GraphAnn(graph: Graph, max_steps: int = 1000)` | `find(query: Query, embeddings: NodeEmbeddings, k: int, seed: int \| None = None) -> list[tuple[tuple[str,str], float]]` (raises `ValueError` unless `embeddings` has the graph's nodes in the same order) |
 | `EmbAnn` | `EmbAnn(embs: NodeEmbeddings, n_trees: int, max_nodes_per_leaf: int, test_hp_per_split: int \| None = None, num_sampled_nodes_split_test: int \| None = None, filter_type: str \| list[str] \| None = None, seed: int \| None = None)` | `find(embeddings: NodeEmbeddings, query: Query, k: int, min_search_size: int \| None = None) -> list[tuple[tuple[str,str], float]]`<br>`find_leaf_indices(query: list[float]) -> list[int]`<br>`find_leaf_paths(query: list[float]) -> list[list[int]]`<br>`depth() -> list[int]` |
 
 ### Advanced Embeddings
@@ -540,8 +540,8 @@ The order among the negatives isn't scored.  `ppr_lists` (below) returns the lis
 | `SLPAEmbedder` | `SLPAEmbedder(t: int, threshold: int, memory_size: int \| None = None, rule: ListenerRule \| None = None, seed: int \| None = None)` | `learn(graph: Graph) -> NodeEmbeddings` |
 | `VpcgEmbedder` | `VpcgEmbedder(max_terms: int, passes: int, dims: int, alpha: float = 1.0, err: float = 1e-5, feature_weight: FeatureWeight = FeatureWeight.Uniform)` | `learn(graph: Graph, features: FeatureSet, start_node_type: str \| list[str]) -> NodeEmbeddings`<br>`learn_feature_mapping(... ) -> VpcgFeatureMappings` |
 | `VpcgFeatureMappings` | *(returned by `VpcgEmbedder.learn_feature_mapping`)* | `get_feature_map(node: tuple[str,str]) -> list[tuple[int,float]]`<br>`__getitem__(node_id: int) -> list[tuple[int,float]]` |
-| `PPREmbedder` | *static constructors*:<br>`PPREmbedder.random_walk(dims: int, hashes: int, num_walks: int, steps: float, beta: float = 0.8, seed: int \| None = None)`<br>`PPREmbedder.sparse_ppr(dims: int, hashes: int, steps: float, eps: float = 1e-5)` | `learn(graph: Graph) -> NodeEmbeddings` |
-| `InstantEmbeddings` | *static constructors*:<br>`InstantEmbeddings.random_walk(...)`<br>`InstantEmbeddings.sparse_ppr(...)` | `learn(graph: Graph) -> NodeEmbeddings` |
+| `PPREmbedder` | `PPREmbedder(dims: int, num_walks: int, steps: float, beta: float = 0.8, eps: float = 1e-5)` | `learn(graph: Graph, features: FeatureSet, seed: int \| None = None) -> NodeEmbeddings` (raises `ValueError` unless `features` has the graph's nodes in the same order, as `FeatureSet.new_from_graph` builds) |
+| `InstantEmbeddings` | *static constructors*:<br>`InstantEmbeddings.random_walk(dims: int, hashes: int, num_walks: int, steps: float, beta: float = 0.8, seed: int \| None = None)`<br>`InstantEmbeddings.sparse_ppr(dims: int, hashes: int, steps: float, eps: float = 1e-5)` | `learn(graph: Graph) -> NodeEmbeddings` |
 
 ### Ranking & Tournament
 | Class | Constructor (Python) | Key Methods |

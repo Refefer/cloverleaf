@@ -6,10 +6,12 @@ use hashbrown::HashMap;
 
 use crate::algos::rwr::RWR;
 use crate::algos::utils::{Sample,FeatureHasher};
-use crate::embeddings::EmbeddingStore;
+use crate::embeddings::{EmbeddingStore, NodeEmbeddings};
 use crate::distance::Distance;
-use crate::feature_store::FeatureStore;
+use crate::error::Error;
+use crate::feature_store::{FeatureSet, FeatureStore};
 use crate::graph::{CDFGraph,Graph};
+use crate::named_graph::NamedGraph;
 use crate::progress::CLProgressBar;
 
 pub struct PPREmbed {
@@ -34,6 +36,40 @@ pub struct PPREmbed {
 }
 
 impl PPREmbed {
+    /// Degree discount the Python bindings use when none is given.
+    pub const DEFAULT_BETA: f32 = 0.8;
+
+    /// Minimum weight the Python bindings use when none is given.
+    pub const DEFAULT_EPS: f32 = 1e-5;
+
+    /// `dims`-dimensional embeddings from `num_walks` walks per node.  `steps` >= 1 walks that
+    /// many steps, 0 < `steps` < 1 stops after each step with that probability; anything else is
+    /// an [`Error::InvalidArgument`].
+    pub fn new(
+        dims: usize,
+        num_walks: usize,
+        steps: f32,
+        beta: f32,
+        eps: f32,
+        seed: u64
+    ) -> Result<Self, Error> {
+        let steps = Sample::steps(steps)
+            .map_err(|_| Error::InvalidArgument("Steps must be between [0, inf)".into()))?;
+        Ok(PPREmbed { num_walks, steps, beta, dims, eps, seed })
+    }
+
+    /// Embeds every node of `graph` from the features of its neighbourhood, with cosine
+    /// distance.  `features` must index the graph's nodes, else an [`Error::VocabMismatch`];
+    /// featureless nodes are given a feature of their own first.
+    pub fn learn_features(
+        &self,
+        graph: &NamedGraph,
+        features: &mut FeatureSet
+    ) -> Result<NodeEmbeddings, Error> {
+        features.prepare_for_learning(graph, None)?;
+        NodeEmbeddings::new(graph.vocab().clone(), self.learn(graph.graph(), features.store()))
+    }
+
     /// Learns the feature embeddings.
     pub fn learn<G: Graph + CDFGraph + Send + Sync>(
         &self, 
@@ -82,3 +118,50 @@ impl PPREmbed {
     }
 }
 
+
+#[cfg(test)]
+mod pprembed_tests {
+    use super::*;
+    use crate::graph::EdgeType;
+    use crate::named_graph::GraphBuilder;
+
+    fn triangle(node_type: &str) -> NamedGraph {
+        let mut gb = GraphBuilder::new();
+        for (a, b) in [("a", "b"), ("b", "c"), ("c", "a")] {
+            gb.add_edge((node_type, a), (node_type, b), 1., EdgeType::Undirected);
+        }
+        gb.build(true).unwrap()
+    }
+
+    #[test]
+    fn test_new_validates_steps() {
+        let ppr = PPREmbed::new(8, 10, 0.5, PPREmbed::DEFAULT_BETA, PPREmbed::DEFAULT_EPS, 1).unwrap();
+        assert!(matches!(ppr.steps, Sample::Probability(p) if p == 0.5));
+        assert!(matches!(PPREmbed::new(8, 10, 3., 0.8, 1e-5, 1).unwrap().steps, Sample::Fixed(3)));
+        for bad in [0., -1., f32::NAN] {
+            assert!(matches!(PPREmbed::new(8, 10, bad, 0.8, 1e-5, 1), Err(Error::InvalidArgument(_))));
+        }
+    }
+
+    #[test]
+    fn test_learn_features_fills_missing_nodes() {
+        let g = triangle("n");
+        let mut features = FeatureSet::from_graph(&g);
+        let ppr = PPREmbed::new(8, 10, 2., 0.8, 1e-5, 1).unwrap();
+        let ne = ppr.learn_features(&g, &mut features).unwrap();
+        assert!(std::sync::Arc::ptr_eq(ne.vocab(), g.vocab()));
+        assert_eq!((ne.len(), ne.dims()), (3, 8));
+        // Every node got a feature of its own.
+        assert_eq!(features.num_features(), 3);
+    }
+
+    /// Features over another graph's nodes are rejected rather than misindexed.
+    #[test]
+    fn test_learn_features_rejects_misaligned_features() {
+        let g = triangle("n");
+        let mut other = FeatureSet::from_graph(&triangle("m"));
+        let ppr = PPREmbed::new(8, 10, 2., 0.8, 1e-5, 1).unwrap();
+        assert!(matches!(ppr.learn_features(&g, &mut other), Err(Error::VocabMismatch(_))));
+        assert_eq!(other.num_features(), 0, "features were changed before the check");
+    }
+}

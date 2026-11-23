@@ -1,12 +1,17 @@
 use rand::prelude::*;
 use rand_distr::Uniform;
 use rand_xorshift::XorShiftRng;
+use rayon::prelude::*;
 
 use crate::autograd::*;
 use crate::algos::ann::Ann;
 use crate::algos::graph_ann::NodeDistance;
 use crate::distance::Distance;
-use crate::embeddings::NodeEmbeddings;
+use crate::embeddings::{NodeEmbeddings, Query};
+use crate::error::Error;
+
+/// Seed for the random anchors when none is given.
+pub const ALIGN_SEED: u64 = crate::DEFAULT_SEED + 123123;
 
 /// Maps an embedding from one embedding space into another, using nodes embedded in both as
 /// anchors: the query's nearest neighbours in the original space, found with `Ann`, plus
@@ -48,6 +53,44 @@ impl AlignMethod {
     /// `Distances` with the defaults the Python bindings use.
     pub fn distances() -> Self {
         AlignMethod::Distances { alpha: 1e-1, error: 1e-2, max_iters: 10 }
+    }
+
+    /// The method called `name`, "distances" or "mean_shift".  `alpha`, `error` and `max_iters`
+    /// override the [`distances`](Self::distances) defaults; giving any of them with
+    /// "mean_shift", or any other name, is an [`Error::InvalidArgument`].
+    pub fn parse(
+        name: &str,
+        alpha: Option<f32>,
+        error: Option<f32>,
+        max_iters: Option<usize>
+    ) -> Result<Self, Error> {
+        match name {
+            "distances" => {
+                let AlignMethod::Distances { alpha: a, error: e, max_iters: m } = AlignMethod::distances() else {
+                    unreachable!("distances() is a Distances")
+                };
+                Ok(AlignMethod::Distances {
+                    alpha: alpha.unwrap_or(a), error: error.unwrap_or(e), max_iters: max_iters.unwrap_or(m)
+                })
+            },
+            "mean_shift" => {
+                if alpha.is_some() || error.is_some() || max_iters.is_some() {
+                    return Err(Error::InvalidArgument(
+                        "alpha, error and max_iters apply only to method \"distances\"".into()))
+                }
+                Ok(AlignMethod::MeanShift)
+            },
+            other => Err(Error::InvalidArgument(format!(
+                "method must be \"distances\" or \"mean_shift\", got {:?}", other)))
+        }
+    }
+
+    /// The name [`parse`](Self::parse) reads.
+    pub fn name(&self) -> &'static str {
+        match self {
+            AlignMethod::Distances { .. } => "distances",
+            AlignMethod::MeanShift => "mean_shift"
+        }
     }
 }
 
@@ -106,6 +149,34 @@ impl EmbeddingAligner {
                 out
             }
         }
+    }
+
+    /// [`align`](Self::align)s what `query` refers to in `orig`: a node's original embedding,
+    /// or an embedding in `orig`'s space.  Errors when the node isn't in `orig`.
+    pub fn align_query(
+        &self,
+        orig: &NodeEmbeddings,
+        orig_ann: &Ann,
+        translated: &NodeEmbeddings,
+        query: &Query,
+        seed: u64
+    ) -> Result<Vec<f32>, Error> {
+        // The query lives in the original space: that's where its anchors are searched for.
+        Ok(self.align(orig, orig_ann, translated, orig.resolve(query)?, seed))
+    }
+
+    /// [`align_query`](Self::align_query) for each query, in parallel, every one with `seed`.
+    pub fn bulk_align(
+        &self,
+        orig: &NodeEmbeddings,
+        orig_ann: &Ann,
+        translated: &NodeEmbeddings,
+        queries: &[Query],
+        seed: u64
+    ) -> Result<Vec<Vec<f32>>, Error> {
+        queries.par_iter()
+            .map(|query| self.align_query(orig, orig_ann, translated, query, seed))
+            .collect()
     }
 }
 
@@ -228,6 +299,42 @@ mod emb_aligner_tests {
         // Anchors a and b moved by (1, 1) and (2, 1); "far" isn't among the 2 nearest.
         let out = aligner.align(&orig, &ann, &translated, &[0.5, 0.], 1);
         assert_eq!(out, vec![2.0, 1.0]);
+    }
+
+    #[test]
+    fn test_parse_methods() {
+        assert_eq!(AlignMethod::parse("distances", None, None, None).unwrap(), AlignMethod::distances());
+        assert_eq!(AlignMethod::parse("distances", Some(0.5), None, Some(3)).unwrap(),
+                   AlignMethod::Distances { alpha: 0.5, error: 1e-2, max_iters: 3 });
+        assert_eq!(AlignMethod::parse("mean_shift", None, None, None).unwrap(), AlignMethod::MeanShift);
+        for (alpha, error, max_iters) in [(Some(0.1), None, None), (None, Some(0.1), None), (None, None, Some(1))] {
+            assert!(matches!(AlignMethod::parse("mean_shift", alpha, error, max_iters),
+                             Err(Error::InvalidArgument(_))));
+        }
+        assert!(matches!(AlignMethod::parse("median", None, None, None), Err(Error::InvalidArgument(_))));
+        for method in [AlignMethod::distances(), AlignMethod::MeanShift] {
+            assert_eq!(AlignMethod::parse(method.name(), None, None, None).unwrap(), method);
+        }
+    }
+
+    /// Node queries align the node's original embedding; bulk alignment matches one at a time.
+    #[test]
+    fn test_align_queries() {
+        let orig = embeddings(&[("a", [0., 0.]), ("b", [1., 0.]), ("c", [0., 1.])]);
+        let translated = embeddings(&[("a", [0., 0.]), ("b", [2., 0.]), ("c", [0., 2.])]);
+        let ann = fitted_ann(&orig);
+        let aligner = EmbeddingAligner { random_nodes: 1, ..EmbeddingAligner::new(2) };
+        let by_name = Query::Node("n".into(), "b".into());
+        let one = aligner.align_query(&orig, &ann, &translated, &by_name, ALIGN_SEED).unwrap();
+        assert_eq!(one, aligner.align(&orig, &ann, &translated, &[1., 0.], ALIGN_SEED));
+
+        let queries = [by_name, Query::Embedding(vec![0.5, 0.5])];
+        let bulk = aligner.bulk_align(&orig, &ann, &translated, &queries, ALIGN_SEED).unwrap();
+        assert_eq!(bulk, vec![one, aligner.align(&orig, &ann, &translated, &[0.5, 0.5], ALIGN_SEED)]);
+
+        let unknown = [Query::Embedding(vec![0., 0.]), Query::Node("n".into(), "zzz".into())];
+        assert!(matches!(aligner.bulk_align(&orig, &ann, &translated, &unknown, ALIGN_SEED),
+                         Err(Error::UnknownNode { .. })));
     }
 
     /// With no anchor in the translated space, both methods leave the query where it is.

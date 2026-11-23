@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::ops::Deref;
 use std::collections::HashSet;
 
-use rayon::prelude::*;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError,PyIOError,PyKeyError,PyIndexError,PyTypeError,PyRuntimeError};
 use pyo3::buffer::PyBuffer;
@@ -17,38 +16,39 @@ use rand_xorshift::XorShiftRng;
 
 use crate::graph::{CumCSR,Graph as CGraph,NodeID};
 use crate::vocab::Vocab;
-use crate::sampler::{Weighted,Unweighted};
 use crate::distance::{Distance as EDist};
-use crate::embeddings::{EmbeddingStore,DimensionMismatch};
+use crate::embeddings::{EmbeddingStore,DimensionMismatch,Query as CoreQuery};
 use crate::feature_store::FeatureSet as CoreFeatureSet;
 use crate::named_graph::NamedGraph;
 use crate::feature_store::FeatureNamespace as CoreFeatureNamespace;
 use crate::embeddings::NodeEmbeddingsBuilder as CoreNodeEmbeddingsBuilder;
 use crate::algos::aggregator::{FeatureAggregator as CoreFeatureAggregator, NodeEmbedder as CoreNodeEmbedder};
-use crate::algos::emb_aligner::{AlignMethod, EmbeddingAligner as CoreEmbeddingAligner};
+use crate::algos::emb_aligner::{AlignMethod, EmbeddingAligner as CoreEmbeddingAligner, ALIGN_SEED};
 use crate::embeddings::NodeEmbeddings as CoreNodeEmbeddings;
 use crate::io::{read_node_values,EmbeddingLoadError,FeatureFileError,GraphLoadError};
 
 use crate::algos::alignment::{NeighborhoodAligner as NA};
-use crate::algos::ann::Ann;
-use crate::algos::connected::find_connected_components;
+use crate::algos::ann::{Ann, ANN_SEED};
+use crate::algos::connected::connected_components;
+use crate::algos::dist::DistanceEmbedder as CoreDistanceEmbedder;
 use crate::algos::ep::attention::AttentionWeights;
 use crate::algos::ep::{EmbeddingPropagation,LossWeighting as EPLW};
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::FeatureModel;
 use crate::algos::feat_propagation::propagate_features;
-use crate::algos::graph_ann::NodeDistance;
+use crate::algos::graph_ann::{GraphAnn as CoreGraphAnn, GRAPH_ANN_SEED};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
 use crate::algos::instantembedding::{InstantEmbeddings as IE,Estimator};
+use crate::algos::lpa::ClusterLpa;
 use crate::algos::lsr::{LSR as ALSR, TournamentBuilder as CoreTournamentBuilder, Tournament as CoreTournament};
 use crate::algos::pprembed::PPREmbed;
 use crate::algos::pprrank::{PprRank, Loss as PprLoss};
 use crate::algos::grad_utils::optimizer::{OptimizerKind, WeightDecay};
 use crate::algos::policy_evaluation::{PolicyEvaluation as PEA};
-use crate::algos::reweighter::{Reweighter};
-use crate::algos::rwr::{RWR,ppr_estimate,rollouts};
+use crate::algos::rwr::{RWR,SparsePpr,ROLLOUT_SEED,seeded_rollouts};
+use crate::algos::slpa::Slpa;
 use crate::algos::smci::SupervisedMCIteration;
-use crate::algos::utils::{Sample, top_k_scores};
+use crate::algos::utils::Sample;
 use crate::error::Error;
 use crate::named_graph::{GraphBuilder as CoreGraphBuilder, GraphLoadOptions};
 use crate::algos::vpcg::{VPCG, FeatureWeight as VFeatureWeight};
@@ -122,21 +122,6 @@ const SEED: u64 = crate::DEFAULT_SEED;
 /// Simplifies a lot of the type signatures
 type FQNode = (String, String);
 
-/// Maps an iterator of node ids and scores back to their pretty names with optional top K and
-/// filtering by node types.
-fn convert_scores(
-    vocab: &Vocab, 
-    scores: impl Iterator<Item=(NodeID, f32)>, 
-    k: Option<usize>,
-    filtered_node_type: Option<HashSet<String>>
-) -> Vec<(FQNode, f32)> {
-    let top = match &filtered_node_type {
-        Some(nts) => top_k_scores(scores, k, |id| vocab.has_node_type(id, nts)),
-        None => top_k_scores(scores, k, |_id| true)
-    };
-    top.into_iter().map(|(node_id, w)| (convert_node_id_to_fqn(vocab, node_id), w)).collect()
-}
-
 fn convert_node_id_to_fqn(
     vocab: &Vocab,
     node_id: NodeID
@@ -177,18 +162,11 @@ fn get_node_id<A: AsRef<str>, B: AsRef<str>>(
 }
 
 
-#[derive(Clone)]
-enum QueryType {
-    Node(String, String),
-    Embedding(Vec<f32>),
-    NodeID(NodeID)
-}
-
 /// Type of Query to issue: a direct node lookup or an embedding
 #[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct Query {
-    qt: QueryType
+    query: CoreQuery
 }
 
 #[pymethods]
@@ -211,7 +189,7 @@ impl Query {
         node_type: String,
         node_name: String
     ) -> Self {
-        Query { qt: QueryType::Node(node_type, node_name) }
+        Query { query: CoreQuery::Node(node_type, node_name) }
     }
 
     ///    Creates a query using a provided embedding.
@@ -229,7 +207,7 @@ impl Query {
     pub fn embedding(
         emb: Vec<f32>
     ) -> Self {
-        Query { qt: QueryType::Embedding(emb) }
+        Query { query: CoreQuery::Embedding(emb) }
     }
 
     ///    Creates a Query using a referenced NodeID
@@ -246,7 +224,7 @@ impl Query {
     pub fn node_id(
         node_id: NodeID
     ) -> Self {
-        Query { qt: QueryType::NodeID(node_id) }
+        Query { query: CoreQuery::NodeId(node_id) }
     }
  
 }
@@ -554,8 +532,8 @@ impl Graph {
 #[pyclass]
 #[derive(Clone)]
 struct RandomWalker {
-    restarts: Sample,
-    walks: usize,
+    rwr: RWR,
+    /// As given, for the repr.
     beta: Option<f32>
 }
 
@@ -587,18 +565,14 @@ impl RandomWalker {
     #[new]
     #[pyo3(signature = (restarts, walks, beta=None))]
     fn new(restarts: f32, walks: usize, beta: Option<f32>) -> PyResult<Self> {
-        // Reject 0 and NaN explicitly: neither is a meaningful restart probability or walk length.
-        if !(restarts > 0f32) {
-            return Err(PyValueError::new_err("restarts must be in (0, 1) or [1, inf)"))
-        }
-        Sample::new(restarts)
-            .map_err(|_err| PyValueError::new_err("restarts must be in (0, 1) or [1, inf)"))
-            .map(|restarts| RandomWalker { restarts, walks, beta })
+        let mut rwr = RWR::from_restarts(restarts, walks)?;
+        rwr.beta = beta.unwrap_or(rwr.beta);
+        Ok(RandomWalker { rwr, beta })
     }
 
     /// Simple representation of the RandomWalker
     pub fn __repr__(&self) -> String {
-        format!("RandomWalker<restarts={:?}, walks={}, beta={:?}>", self.restarts, self.walks, self.beta)
+        format!("RandomWalker<restarts={:?}, walks={}, beta={:?}>", self.rwr.steps, self.rwr.walks, self.beta)
     }
 
     ///    Performs a random walk on a graph, returning a list of nodes and their approxmiate
@@ -641,19 +615,15 @@ impl RandomWalker {
         weighted: Option<bool>
     ) -> PyResult<Vec<(FQNode, f32)>> {
         let node_id = graph.node_id(&node.0, &node.1)?;
-        let mut rwr = RWR::new(self.restarts, self.walks);
-        rwr.beta = self.beta.unwrap_or(rwr.beta);
-        rwr.single_threaded = single_threaded.unwrap_or(rwr.single_threaded);
-        rwr.seed = seed.unwrap_or(rwr.seed);
-
-        let results = if weighted.unwrap_or(true) {
-            rwr.sample_bfs(graph.graph(), node_id)
-        } else {
-            rwr.sample(graph.graph(), &Unweighted, node_id)
+        let rwr = RWR {
+            single_threaded: single_threaded.unwrap_or(self.rwr.single_threaded),
+            seed: seed.unwrap_or(self.rwr.seed),
+            ..self.rwr
         };
+        let results = rwr.walk_scores(graph.graph(), node_id, weighted.unwrap_or(true));
 
         let fts = convert_filter_type(filter_type)?;
-        Ok(convert_scores(&graph.vocab, results.into_iter(), k, fts))
+        Ok(graph.vocab.top_k_named(results, k, fts.as_ref()))
     }
 
 }
@@ -763,28 +733,17 @@ impl BiasedRandomWalker {
         rerank_context: Option<&Query>,
         filter_type: Option<&Bound<'_, PyAny>>
     ) -> PyResult<Vec<(FQNode, f32)>> {
-        ensure_aligned(&graph.vocab, &embeddings.vocab, "Graph and NodeEmbeddings")?;
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
-        let g_emb = lookup_embedding(context, embeddings)?;
-        
         let mut grwr = GuidedRWR::new(GSteps::from_restarts(self.restarts)?, self.walks);
         grwr.alpha = self.blend.unwrap_or(grwr.alpha);
         grwr.beta = self.beta.unwrap_or(grwr.beta);
         grwr.seed = seed.unwrap_or(grwr.seed);
 
-        let node_embeddings = &embeddings.embeddings;
-        let mut results = grwr.sample(graph.graph.as_ref(), 
-                                  &Weighted, node_embeddings, node_id, g_emb);
-        
-        // Reweight results if requested
-        if let Some(cn) = rerank_context {
-            let c_emb = lookup_embedding(cn, embeddings)?;
-            Reweighter::new(self.blend.unwrap_or(0.5))
-                .reweight(&mut results, node_embeddings, c_emb);
-        }
+        let results = grwr.walk_named(&graph.inner, &embeddings.inner, node_id, &context.query,
+                                      rerank_context.map(|q| &q.query))?;
 
         let fts = convert_filter_type(filter_type)?;
-        Ok(convert_scores(&graph.vocab, results.into_iter(), k, fts))
+        Ok(graph.vocab.top_k_named(results, k, fts.as_ref()))
     }
 
 
@@ -794,8 +753,7 @@ impl BiasedRandomWalker {
 #[pyclass]
 #[derive(Clone)]
 struct SparsePPR {
-    restarts: f32,
-    eps: f32
+    ppr: SparsePpr
 }
 
 #[pymethods]
@@ -827,15 +785,12 @@ impl SparsePPR {
     #[new]
     #[pyo3(signature = (restarts, eps=None))]
     fn new(restarts: f32, eps: Option<f32>) -> PyResult<Self> {
-        if restarts <= 0f32 || restarts >= 1f32 {
-            return Err(PyValueError::new_err("restarts must be between (0, 1)"))
-        }
-        Ok(SparsePPR { restarts, eps: eps.unwrap_or(1e-5) })
+        Ok(SparsePPR { ppr: SparsePpr::new(restarts, eps.unwrap_or(SparsePpr::DEFAULT_EPS))? })
     }
 
     /// Simple representation of the SparsePPR
     pub fn __repr__(&self) -> String {
-        format!("SparsePPR<restarts={}, eps={}>", self.restarts, self.eps)
+        format!("SparsePPR<restarts={}, eps={}>", self.ppr.restarts(), self.ppr.eps())
     }
 
     ///    Computes the personalized page rank estimate for a given node
@@ -869,11 +824,11 @@ impl SparsePPR {
     ) -> PyResult<Vec<(FQNode, f32)>> {
 
         let node_id = get_node_id(graph.vocab.deref(), node.0, node.1)?;
-        let results = ppr_estimate(graph.graph.as_ref(), node_id, self.restarts, self.eps);
+        let results = self.ppr.compute(graph.graph.as_ref(), node_id);
 
         let fts = convert_filter_type(filter_type)?;
 
-        Ok(convert_scores(&graph.vocab, results.into_iter(), k, fts))
+        Ok(graph.vocab.top_k_named(results, k, fts.as_ref()))
     }
 
 }
@@ -2085,8 +2040,7 @@ impl NodeEmbedder {
 /// Struct for defining ALT embeddings
 #[pyclass]
 struct DistanceEmbedder {
-    landmarks: crate::algos::dist::LandmarkSelection,
-    n_landmarks: usize
+    embedder: CoreDistanceEmbedder
 }
 
 #[pymethods]
@@ -2121,21 +2075,12 @@ impl DistanceEmbedder {
     #[new]
     #[pyo3(signature = (n_landmarks, seed=None))]
     pub fn new(n_landmarks: usize, seed: Option<u64>) -> Self {
-        let ls = if let Some(seed) = seed {
-            crate::algos::dist::LandmarkSelection::Random(seed)
-        } else {
-            crate::algos::dist::LandmarkSelection::Degree
-        };
-        DistanceEmbedder {
-            landmarks: ls,
-            n_landmarks
-        }
-
+        DistanceEmbedder { embedder: CoreDistanceEmbedder::new(n_landmarks, seed) }
     }
     
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
-        format!("DistanceEmbedder<landmarks={:?}, n_landmarks={}>", self.landmarks, self.n_landmarks)
+        format!("DistanceEmbedder<landmarks={:?}, n_landmarks={}>", self.embedder.landmarks, self.embedder.n_landmarks)
     }
 
 
@@ -2151,20 +2096,16 @@ impl DistanceEmbedder {
     ///    NodeEmbeddings
     ///        Embedding set, using the Distance.ALT method for similarity.
     ///    
-    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
-        let es = crate::algos::dist::construct_walk_distances(graph.graph.as_ref(), self.n_landmarks, self.landmarks);
-        NodeEmbeddings::from(CoreNodeEmbeddings {
-            vocab: graph.vocab.clone(),
-            embeddings: es
-        })
+    pub fn learn(&self, graph: &Graph) -> PyResult<NodeEmbeddings> {
+        Ok(NodeEmbeddings::from(self.embedder.learn(&graph.inner)?))
     }
 }
 
 /// Struct for learning Clustered LPA embeddings.  Uses Hamming Distance for equivalence.
 #[pyclass]
 struct ClusterLPAEmbedder{
-    k: usize, 
-    passes: usize, 
+    lpa: ClusterLpa,
+    /// As given, for the repr.
     seed: Option<u64>
 }
 
@@ -2194,14 +2135,13 @@ impl ClusterLPAEmbedder {
     #[new]
     #[pyo3(signature = (k, passes, seed=None))]
     pub fn new(k: usize, passes: usize, seed: Option<u64>) -> Self {
-        ClusterLPAEmbedder {
-            k, passes, seed
-        }
+        let d = ClusterLpa::new(k, passes);
+        ClusterLPAEmbedder { lpa: ClusterLpa { seed: seed.unwrap_or(d.seed), ..d }, seed }
     }
 
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
-        format!("ClusterLPAEmbedder<k={}, passes={}, seed={:?}>", self.k, self.passes, self.seed)
+        format!("ClusterLPAEmbedder<k={}, passes={}, seed={:?}>", self.lpa.k, self.lpa.passes, self.seed)
     }
 
 
@@ -2217,13 +2157,8 @@ impl ClusterLPAEmbedder {
     ///    NodeEmbeddings
     ///        Set of NodeEmbeddings with Distance.Hamming.
     ///    
-    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
-        let seed = self.seed.unwrap_or(SEED);
-        let es = crate::algos::lpa::construct_lpa_embedding(graph.graph.as_ref(), self.k, self.passes, seed);
-        NodeEmbeddings::from(CoreNodeEmbeddings {
-            vocab: graph.vocab.clone(),
-            embeddings: es
-        })
+    pub fn learn(&self, graph: &Graph) -> PyResult<NodeEmbeddings> {
+        Ok(NodeEmbeddings::from(self.lpa.learn(&graph.inner)?))
     }
 }
 
@@ -2238,10 +2173,8 @@ pub enum ListenerRule {
 /// distance.
 #[pyclass]
 struct SLPAEmbedder {
-    t: usize, 
-    threshold: usize, 
-    rule: crate::algos::slpa::ListenerRule,
-    memory_size: Option<usize>,
+    slpa: Slpa,
+    /// As given, for the repr.
     seed: Option<u64>
 }
 
@@ -2282,27 +2215,24 @@ impl SLPAEmbedder {
         seed: Option<u64>
     ) -> Self {
         use crate::algos::slpa::{ListenerRule as SLR};
-        let lr_rule = if let Some(rule) = rule {
-            match rule {
-                ListenerRule::Best => SLR::Best,
-                ListenerRule::Probabilistic => SLR::Probabilistic
-            }
-        } else {
-            SLR::Best
+        let d = Slpa::new(t, threshold);
+        let rule = match rule {
+            Some(ListenerRule::Best) => SLR::Best,
+            Some(ListenerRule::Probabilistic) => SLR::Probabilistic,
+            None => d.rule
         };
-
-        SLPAEmbedder {
-            t: t.max(1), 
-            rule: lr_rule,
-            threshold, 
-            memory_size,
-            seed
-        }
+        let slpa = Slpa {
+            rule,
+            memory_size: memory_size.unwrap_or(d.memory_size),
+            seed: seed.unwrap_or(d.seed),
+            ..d
+        };
+        SLPAEmbedder { slpa, seed }
     }
 
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
-        format!("SLPAEmbedder<t={}, threshold={}, seed={:?}>", self.t, self.threshold, self.seed)
+        format!("SLPAEmbedder<t={}, threshold={}, seed={:?}>", self.slpa.t, self.slpa.threshold, self.seed)
     }
 
     ///    Learn SLPA Embeddings
@@ -2317,20 +2247,8 @@ impl SLPAEmbedder {
     ///    NodeEmbeddings
     ///        
     ///    
-    pub fn learn(&self, graph: &Graph) -> NodeEmbeddings {
-        let seed = self.seed.unwrap_or(SEED);
-        let es = crate::algos::slpa::construct_slpa_embedding(
-            graph.graph.as_ref(), 
-            self.rule,
-            self.t, 
-            self.threshold, 
-            self.memory_size.unwrap_or(self.t),
-            seed
-        );
-        NodeEmbeddings::from(CoreNodeEmbeddings {
-            vocab: graph.vocab.clone(),
-            embeddings: es
-        })
+    pub fn learn(&self, graph: &Graph) -> PyResult<NodeEmbeddings> {
+        Ok(NodeEmbeddings::from(self.slpa.learn(&graph.inner)?))
     }
 
 }
@@ -2567,7 +2485,7 @@ impl NodeEmbeddings {
     ) -> PyResult<Vec<(FQNode, f32)>> {
         let fts = convert_filter_type(filter_type)?;
         let dists = self.inner.nearest_neighbor(&emb, k, fts.as_ref());
-        Ok(convert_node_distance(&self.vocab, dists))
+        Ok(self.vocab.name_distances(dists))
     }
 
     ///    Returns the number of dimensions for an embedding.
@@ -2626,10 +2544,7 @@ impl NodeEmbeddings {
         e1: &Query,
         e2: &Query
     ) -> PyResult<f32> {
-        let e1_emb = lookup_embedding(e1, self)?;
-        let e2_emb = lookup_embedding(e2, self)?;
-        let result = self.embeddings.distance().compute(e1_emb, e2_emb);
-        Ok(result)
+        Ok(self.inner.compute_distance(&e1.query, &e2.query)?)
     }
 
     ///    Returns the node and embedding at internal index `idx`.
@@ -2982,25 +2897,7 @@ impl EmbeddingAligner {
         method: Option<String>
     ) -> PyResult<Self> {
         let d = CoreEmbeddingAligner::new(num_nodes);
-        let method = match method.as_deref().unwrap_or("distances") {
-            "distances" => {
-                let AlignMethod::Distances { alpha: a, error: e, max_iters: m } = AlignMethod::distances() else {
-                    unreachable!("distances() is a Distances")
-                };
-                AlignMethod::Distances {
-                    alpha: alpha.unwrap_or(a), error: error.unwrap_or(e), max_iters: max_iters.unwrap_or(m)
-                }
-            },
-            "mean_shift" => {
-                if alpha.is_some() || error.is_some() || max_iters.is_some() {
-                    return Err(PyValueError::new_err(
-                        "alpha, error and max_iters apply only to method \"distances\""))
-                }
-                AlignMethod::MeanShift
-            },
-            other => return Err(PyValueError::new_err(format!(
-                "method must be \"distances\" or \"mean_shift\", got {:?}", other)))
-        };
+        let method = AlignMethod::parse(method.as_deref().unwrap_or("distances"), alpha, error, max_iters)?;
         Ok(EmbeddingAligner { aligner: CoreEmbeddingAligner {
             num_nodes,
             random_nodes: random_nodes.unwrap_or(d.random_nodes),
@@ -3010,12 +2907,8 @@ impl EmbeddingAligner {
 
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
-        let method = match self.aligner.method {
-            AlignMethod::Distances { .. } => "distances",
-            AlignMethod::MeanShift => "mean_shift"
-        };
         format!("EmbeddingAligner<NumNodes={}, RandomNodes={}, Method={}>",
-                self.aligner.num_nodes, self.aligner.random_nodes, method)
+                self.aligner.num_nodes, self.aligner.random_nodes, self.aligner.method.name())
     }
 
     ///    Transforms an embedding to the post neighborhood aligned space.
@@ -3050,10 +2943,8 @@ impl EmbeddingAligner {
         emb: &Query,
         seed: Option<u64>
     ) -> PyResult<Vec<f32>> {
-        // The query lives in the original space: that's where its anchors are searched for.
-        let query_embedding = lookup_embedding(emb, orig_embeddings)?;
-        Ok(self.aligner.align(&orig_embeddings.inner, &orig_ann.ann, &translated_embeddings.inner,
-                              query_embedding, seed.unwrap_or(SEED + 123123)))
+        Ok(self.aligner.align_query(&orig_embeddings.inner, &orig_ann.ann, &translated_embeddings.inner,
+                                    &emb.query, seed.unwrap_or(ALIGN_SEED))?)
     }
 
     ///    Transforms a set of embeddings to the post neighborhood aligned space.
@@ -3088,11 +2979,9 @@ impl EmbeddingAligner {
         queries: Vec<Query>,
         seed: Option<u64>
     ) -> PyResult<Vec<Vec<f32>>> {
-        let results: PyResult<Vec<_>> = queries.into_par_iter().map(|query| {
-            self.align(orig_embeddings, orig_ann, translated_embeddings, &query, seed)
-        }).collect();
-
-        results
+        let queries: Vec<_> = queries.into_iter().map(|q| q.query).collect();
+        Ok(self.aligner.bulk_align(&orig_embeddings.inner, &orig_ann.ann, &translated_embeddings.inner,
+                                   &queries, seed.unwrap_or(ALIGN_SEED))?)
     }
 
 
@@ -3101,9 +2990,7 @@ impl EmbeddingAligner {
 /// Wrapper for the relatively crappy ANN solution.
 #[pyclass]
 struct GraphAnn {
-    graph: Arc<CumCSR>,
-    vocab: Arc<Vocab>,
-    max_steps: usize
+    ann: CoreGraphAnn
 }
 
 #[pymethods]
@@ -3131,17 +3018,13 @@ impl GraphAnn {
     #[new]
     #[pyo3(signature = (graph, max_steps=None))]
     pub fn new(graph: &Graph, max_steps: Option<usize>) -> Self {
-        GraphAnn {
-            graph: graph.graph.clone(),
-            vocab: graph.vocab.clone(),
-            max_steps: max_steps.unwrap_or(1000),
-        }
-
+        let max_steps = max_steps.unwrap_or(CoreGraphAnn::DEFAULT_MAX_STEPS);
+        GraphAnn { ann: CoreGraphAnn::new(&graph.inner, max_steps) }
     }
 
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
-        format!("GraphANN<MaxSteps={}>", self.max_steps)
+        format!("GraphANN<MaxSteps={}>", self.ann.max_steps())
     }
 
     ///    Attempts to find approximate nearest neighbors in graph space
@@ -3173,11 +3056,8 @@ impl GraphAnn {
         k: usize, 
         seed: Option<u64>
     ) -> PyResult<Vec<(FQNode, f32)>> {
-        let query_embedding = lookup_embedding(query, embeddings)?;
-        let seed = seed.unwrap_or(SEED + 10);
-        let ann = crate::algos::graph_ann::Ann::new(k, self.max_steps + k, seed);
-        let nodes = ann.find(query_embedding, &(*self.graph), &embeddings.embeddings);
-        Ok(convert_node_distance(&self.vocab, nodes))
+        let nodes = self.ann.find(&query.query, &embeddings.inner, k, seed.unwrap_or(GRAPH_ANN_SEED))?;
+        Ok(self.ann.graph().vocab().name_distances(nodes))
     }
 }
 
@@ -3234,21 +3114,11 @@ impl EmbAnn {
         filter_type: Option<&Bound<'_, PyAny>>,
         seed: Option<u64>
     ) -> PyResult<Self> {
-        let mut ann = Ann::new();
-        let seed = seed.unwrap_or(SEED + 10);
-
         // If filter_type is provided, only build an index to reference those nodes.
-        let node_ids = convert_filter_type(filter_type)?.map(|hs| embs.vocab.nodes_of_types(&hs));
-
-        ann.fit(
-            &embs.embeddings, 
-            n_trees, 
-            max_nodes_per_leaf, 
-            test_hp_per_split,
-            num_sampled_nodes_split_test,
-            node_ids,
-            seed);
-
+        let fts = convert_filter_type(filter_type)?;
+        let mut ann = Ann::new();
+        ann.fit_named(&embs.inner, n_trees, max_nodes_per_leaf, test_hp_per_split,
+                      num_sampled_nodes_split_test, fts.as_ref(), seed.unwrap_or(ANN_SEED));
         Ok(EmbAnn { ann: ann })
 
     }
@@ -3281,9 +3151,9 @@ impl EmbAnn {
         k: usize,
         min_search_size: Option<usize>
     ) -> PyResult<Vec<(FQNode, f32)>> {
-        let query_embedding = lookup_embedding(query, embeddings)?;
+        let query_embedding = embeddings.inner.resolve(&query.query)?;
         let nodes = self.ann.predict(&embeddings.embeddings, query_embedding, k, min_search_size);
-        Ok(convert_node_distance(&embeddings.vocab, nodes))
+        Ok(embeddings.vocab.name_distances(nodes))
     }
 
     pub fn find_leaf_indices(
@@ -4044,8 +3914,8 @@ impl PPREmbedder {
             dims,
             num_walks,
             steps,
-            beta: beta.unwrap_or(0.8),
-            eps: eps.unwrap_or(1e-5)
+            beta: beta.unwrap_or(PPREmbed::DEFAULT_BETA),
+            eps: eps.unwrap_or(PPREmbed::DEFAULT_EPS)
         }
     }
 
@@ -4078,28 +3948,9 @@ impl PPREmbedder {
         features: &mut FeatureSet,
         seed: Option<u64>
     ) -> PyResult<NodeEmbeddings> {
-        features.features.fill_missing_nodes();
-
-        let steps = Sample::steps(self.steps)
-            .map_err(|_| PyValueError::new_err("Steps must be between [0, inf)"))?;
-
-        let embedder = PPREmbed {
-            dims: self.dims,
-            num_walks: self.num_walks,
-            steps: steps,
-            beta: self.beta,
-            eps: self.eps,
-            seed: seed.unwrap_or(SEED)
-        };
-
-        let embs = embedder.learn(graph.graph.as_ref(), &features.features);
-        
-        let node_embeddings = NodeEmbeddings::from(CoreNodeEmbeddings {
-            vocab: graph.vocab.clone(),
-            embeddings:embs 
-        });
-
-        Ok(node_embeddings)
+        let embedder = PPREmbed::new(self.dims, self.num_walks, self.steps, self.beta, self.eps,
+                                     seed.unwrap_or(SEED))?;
+        Ok(NodeEmbeddings::from(embedder.learn_features(&graph.inner, &mut features.inner)?))
     }
 
 }
@@ -4107,9 +3958,7 @@ impl PPREmbedder {
 /// Computes node embeddings using InstantEmbeddings
 #[pyclass]
 struct InstantEmbeddings {
-    dims: usize,
-    hashes: usize,
-    estimator: Estimator
+    embedder: IE
 }
 
 #[pymethods]
@@ -4160,20 +4009,9 @@ impl InstantEmbeddings {
         beta: Option<f32>,
         seed: Option<u64>
     ) -> PyResult<Self> {
-        let steps = Sample::steps(steps)
-            .map_err(|_| PyValueError::new_err("Steps must be between [0, inf)"))?;
-
-        let ie = InstantEmbeddings { 
-            dims,
-            hashes,
-            estimator: Estimator::RandomWalk {
-                walks: num_walks,
-                steps,
-                beta: beta.unwrap_or(0.8),
-                seed: seed.unwrap_or(SEED)
-            }
-        };
-        Ok(ie)
+        let estimator = Estimator::random_walk(num_walks, steps, beta.unwrap_or(Estimator::DEFAULT_BETA),
+                                               seed.unwrap_or(SEED))?;
+        Ok(InstantEmbeddings { embedder: IE { dims, hashes, estimator } })
     }
 
     ///    Creates an InstantEmbedding implementation using a sparse PPR estimation which is
@@ -4210,20 +4048,8 @@ impl InstantEmbeddings {
         steps: f32, 
         eps: Option<f32>
     ) -> PyResult<Self> {
-        if steps <= 0f32 || steps >= 1f32 {
-            return Err(PyValueError::new_err("Steps must be between (0, 1)"))
-        }
-
-        let ie = InstantEmbeddings { 
-            dims,
-            hashes,
-            estimator: Estimator::SparsePPR {
-                p: steps,
-                eps: eps.unwrap_or(1e-5)
-            }
-        };
-
-        Ok(ie)
+        let estimator = Estimator::sparse_ppr(steps, eps.unwrap_or(Estimator::DEFAULT_EPS))?;
+        Ok(InstantEmbeddings { embedder: IE { dims, hashes, estimator } })
     }
 
     ///    Learns Instant Embeddings.
@@ -4241,27 +4067,13 @@ impl InstantEmbeddings {
     pub fn learn(&self, 
         graph: &Graph, 
     ) -> PyResult<NodeEmbeddings> {
-
-        let embedder = IE {
-            dims: self.dims,
-            hashes: self.hashes,
-            estimator: self.estimator
-        };
-
-        let embs = embedder.learn(graph.graph.as_ref());
-        
-        let node_embeddings = NodeEmbeddings::from(CoreNodeEmbeddings {
-            vocab: graph.vocab.clone(),
-            embeddings:embs 
-        });
-
-        Ok(node_embeddings)
+        Ok(NodeEmbeddings::from(self.embedder.learn(&graph.inner)?))
     }
 
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
         format!("InstantEmbeddings<Dims={}, Hashes={}, Estimator={:?}>",
-                self.dims, self.hashes, self.estimator)
+                self.embedder.dims, self.embedder.hashes, self.embedder.estimator)
     }
 
 }
@@ -4451,12 +4263,8 @@ impl ConnectedComponents {
     ///        component id.  All nodes sharing the same component id are connected.
     ///    
     #[staticmethod]
-    pub fn learn(graph: &Graph) -> NodeEmbeddings {
-        let es = find_connected_components(graph.graph.as_ref());
-        NodeEmbeddings::from(CoreNodeEmbeddings {
-            vocab: graph.vocab.clone(),
-            embeddings: es
-        })
+    pub fn learn(graph: &Graph) -> PyResult<NodeEmbeddings> {
+        Ok(NodeEmbeddings::from(connected_components(&graph.inner)?))
     }
     
     ///    Creates a subgraph of the largest K connected components.  Only guaranteed to work
@@ -4493,7 +4301,7 @@ impl RandomPath {
     #[new]
     #[pyo3(signature = (seed=None))]
     pub fn new(seed: Option<u64>) -> Self {
-        let rng = XorShiftRng::seed_from_u64(seed.unwrap_or(SEED + 125));
+        let rng = XorShiftRng::seed_from_u64(seed.unwrap_or(ROLLOUT_SEED));
         RandomPath { rng }
     }
     
@@ -4534,16 +4342,9 @@ impl RandomPath {
         let steps = Sample::new(restarts)
             .map_err(|_s| PyValueError::new_err("restarts must be between [0, inf)"))?;
 
-        //let sampler: Box<dyn Sampler<_>> = if weighted { Box::new(Weighted) } else { Box::new(Unweighted) };
-        let g = graph.graph.as_ref();
-
-        let rngs: Vec<_> = (0..count as u64)
-            .map(|i| XorShiftRng::seed_from_u64(self.rng.gen::<u64>() + i))
-            .collect();
-
         let vocab = graph.vocab.deref(); 
         let node_id = get_node_id(vocab, node.0, node.1)?;
-        let outputs = rollouts(g, steps, weighted, node_id, rngs);
+        let outputs = seeded_rollouts(graph.graph.as_ref(), steps, weighted, node_id, count, &mut self.rng);
 
         let it = outputs.into_iter().map(|walk| walk.into_iter().map(|node_id| {
             convert_node_id_to_fqn(vocab, node_id)
@@ -4554,28 +4355,6 @@ impl RandomPath {
 
 }
 
-
-/// Helper method for looking up an embedding.
-fn lookup_embedding<'a>(
-    query: &'a Query, 
-    embeddings: &'a NodeEmbeddings
-) -> PyResult<&'a [f32]> {
-    match &query.qt {
-        QueryType::Node(nt, nn) => Ok(embeddings.inner.get_embedding(nt, nn)?),
-        QueryType::Embedding(ref emb) => Ok(emb),
-        QueryType::NodeID(node_id) => Ok(embeddings.inner.get_embedding_by_id(*node_id)?)
-    }
-}
-
-fn convert_node_distance(
-    vocab: &Vocab, 
-    dists: Vec<NodeDistance>
-) -> Vec<(FQNode, f32)> {
-    dists.into_iter().map(|n| {
-        let (node_id, dist) = n.to_tup();
-        (convert_node_id_to_fqn(vocab, *node_id), dist)
-    }).collect()
-}
 
 fn single_or_multistring(xs: &Bound<'_, PyAny>) -> PyResult<HashSet<String>> {
     // Try to extract a single string first.

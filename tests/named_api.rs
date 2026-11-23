@@ -150,3 +150,73 @@ fn policy_evaluation_copies_shared_graphs() {
     assert!(g.graph_mut().is_some());
     assert!(pe.optimize(&mut g, &rewards[1..]).is_err());
 }
+
+/// Walks, ranked and named, the way the Python walkers return them.
+#[test]
+fn walks_by_name() {
+    use cloverleaf::algos::rwr::{RWR, SparsePpr};
+    let g = two_triangles();
+    let start = g.node_id("n", "a").unwrap();
+    let rwr = RWR::from_restarts(0.3, 1000).unwrap();
+    let only_n = HashSet::from(["n".to_string()]);
+    for weighted in [true, false] {
+        let top = g.vocab().top_k_named(rwr.walk_scores(g.graph(), start, weighted), Some(3), Some(&only_n));
+        assert_eq!(top.len(), 3);
+        assert!(top.iter().all(|((node_type, _), _)| node_type == "n"));
+        assert!(top.windows(2).all(|w| w[0].1 >= w[1].1));
+    }
+    assert!(matches!(RWR::from_restarts(0., 10), Err(Error::InvalidArgument(_))));
+
+    let ppr = SparsePpr::new(0.2, SparsePpr::DEFAULT_EPS).unwrap();
+    let top = g.vocab().top_k_named(ppr.compute(g.graph(), start), Some(1), None);
+    assert_eq!(top[0].0, ("n".to_string(), "a".to_string()));
+    assert!(matches!(SparsePpr::new(1., 1e-5), Err(Error::InvalidArgument(_))));
+}
+
+/// Graph embedders name their results by the graph's nodes.
+#[test]
+fn graph_embedders() {
+    use cloverleaf::algos::connected::connected_components;
+    use cloverleaf::algos::instantembedding::{Estimator, InstantEmbeddings};
+    let g = two_triangles();
+    let components = connected_components(&g).unwrap();
+    assert!(Arc::ptr_eq(components.vocab(), g.vocab()));
+    assert_eq!(components.get_embedding("n", "a").unwrap(), components.get_embedding("m", "x").unwrap());
+
+    let estimator = Estimator::random_walk(20, 2., Estimator::DEFAULT_BETA, 1).unwrap();
+    let ie = InstantEmbeddings { estimator, dims: 4, hashes: 2 }.learn(&g).unwrap();
+    assert_eq!((ie.len(), ie.dims()), (g.nodes(), 4));
+}
+
+/// Embeddings and features must index the graph's nodes: these list them in another order.
+#[test]
+fn graph_ann_and_ppr_embed_reject_misaligned_inputs() {
+    use cloverleaf::Query;
+    use cloverleaf::algos::graph_ann::{GraphAnn, GRAPH_ANN_SEED};
+    use cloverleaf::algos::pprembed::PPREmbed;
+    let g = two_triangles();
+    let names: Vec<_> = g.vocab().iter().map(|(t, n)| (t.to_string(), n.to_string())).collect();
+    let embeddings = |order: &mut dyn Iterator<Item=&(String, String)>| {
+        let mut b = NodeEmbeddingsBuilder::new(Distance::Euclidean);
+        for (i, (t, n)) in order.enumerate() {
+            b.add_embedding(t, n, &[i as f32]).unwrap();
+        }
+        b.build().unwrap()
+    };
+
+    let ann = GraphAnn::new(&g, GraphAnn::DEFAULT_MAX_STEPS);
+    let query = Query::Node("n".into(), "a".into());
+    let aligned = embeddings(&mut names.iter());
+    let found = ann.find(&query, &aligned, 2, GRAPH_ANN_SEED).unwrap();
+    assert_eq!(found.len(), 2);
+    let reordered = embeddings(&mut names.iter().rev());
+    assert!(matches!(ann.find(&query, &reordered, 2, GRAPH_ANN_SEED), Err(Error::VocabMismatch(_))));
+
+    let ppr = PPREmbed::new(8, 10, 0.5, PPREmbed::DEFAULT_BETA, PPREmbed::DEFAULT_EPS, 1).unwrap();
+    let mut features = FeatureSet::from_graph(&g);
+    assert_eq!(ppr.learn_features(&g, &mut features).unwrap().len(), g.nodes());
+    let mut gb = GraphBuilder::new();
+    gb.add_edge(("q", "1"), ("q", "2"), 1., EdgeType::Directed);
+    let mut other = FeatureSet::from_graph(&gb.build(false).unwrap());
+    assert!(matches!(ppr.learn_features(&g, &mut other), Err(Error::VocabMismatch(_))));
+}

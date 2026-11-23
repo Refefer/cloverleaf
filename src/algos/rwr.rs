@@ -7,9 +7,14 @@ use rand_distr::{Binomial,Distribution,Uniform};
 use rayon::prelude::*;
 
 use crate::graph::{Graph,NodeID,CDFtoP,CDFGraph};
+use crate::error::Error;
 use crate::sampler::{Sampler, Weighted, Unweighted, weighted_sample_cdf};
 use crate::algos::utils::Sample;
 
+/// Seed for the rng [`seeded_rollouts`] draws rollout seeds from, when none is given.
+pub const ROLLOUT_SEED: u64 = crate::DEFAULT_SEED + 125;
+
+#[derive(Clone,Copy,Debug)]
 pub struct RWR {
     pub steps: Sample,
     pub walks: usize,
@@ -23,6 +28,31 @@ impl RWR {
     /// default seed.
     pub fn new(steps: Sample, walks: usize) -> Self {
         RWR { steps, walks, beta: 0.5, single_threaded: false, seed: crate::DEFAULT_SEED }
+    }
+
+    /// [`new`](Self::new) with the walk length given as a restart parameter: `restarts` >= 1
+    /// walks that many steps, 0 < `restarts` < 1 stops after each step with that probability.
+    /// Anything else is an [`Error::InvalidArgument`].
+    pub fn from_restarts(restarts: f32, walks: usize) -> Result<Self, Error> {
+        let steps = Sample::steps(restarts).map_err(|_| Error::InvalidArgument(
+            "restarts must be in (0, 1) or [1, inf)".into()))?;
+        Ok(RWR::new(steps, walks))
+    }
+
+    /// Each node's score as the end of a walk from `start_node`, discounted by degree.  Weighted
+    /// walks follow edges by weight, sampled level by level ([`sample_bfs`](Self::sample_bfs));
+    /// unweighted ones pick neighbours uniformly, one walk at a time ([`sample`](Self::sample)).
+    pub fn walk_scores<G: CDFGraph + Send + Sync>(
+        &self,
+        graph: &G,
+        start_node: NodeID,
+        weighted: bool
+    ) -> HashMap<NodeID, f32> {
+        if weighted {
+            self.sample_bfs(graph, start_node)
+        } else {
+            self.sample(graph, &Unweighted, start_node)
+        }
     }
 
     pub fn sample<G: Graph + Send + Sync>(
@@ -238,6 +268,24 @@ pub fn rollouts<G>(
     }).collect()
 }
 
+/// [`rollouts`] of `count` walks, the i-th seeded with the next value drawn from `rng` plus i.
+pub fn seeded_rollouts<G>(
+    graph: &G,
+    steps: Sample,
+    weighted: bool,
+    start_node: NodeID,
+    count: usize,
+    rng: &mut impl Rng
+) -> Vec<Vec<NodeID>>
+    where G: Graph + Send + Sync,
+          Weighted: Sampler<G>
+{
+    let rngs = (0..count as u64)
+        .map(|i| XorShiftRng::seed_from_u64(rng.gen::<u64>().wrapping_add(i)))
+        .collect();
+    rollouts(graph, steps, weighted, start_node, rngs)
+}
+
 pub fn rollout<G: Graph + Send + Sync>(
     graph: &G, 
     steps: Sample, 
@@ -266,6 +314,45 @@ pub fn rollout<G: Graph + Send + Sync>(
        },
        Sample::All => { panic!("Sample::All is illegal!") }
    };
+}
+
+/// Personalized PageRank estimated by pushing residual mass along edges until what is left at
+/// each node is below `eps` per edge: deterministic, and fast on graphs of low degree.
+#[derive(Clone,Copy,Debug)]
+pub struct SparsePpr {
+    restarts: f32,
+    eps: f32
+}
+
+impl SparsePpr {
+    /// Error tolerance the Python bindings use when none is given.
+    pub const DEFAULT_EPS: f32 = 1e-5;
+
+    /// Restarts with probability `restarts`, which must be in (0, 1), and stops pushing below
+    /// `eps`, which must be positive and finite (at 0 the push never ends); else an
+    /// [`Error::InvalidArgument`].
+    pub fn new(restarts: f32, eps: f32) -> Result<Self, Error> {
+        if !(restarts > 0f32 && restarts < 1f32) {
+            return Err(Error::InvalidArgument("restarts must be between (0, 1)".into()))
+        }
+        if !(eps > 0f32 && eps.is_finite()) {
+            return Err(Error::InvalidArgument(format!("eps must be positive and finite, got {}", eps)))
+        }
+        Ok(SparsePpr { restarts, eps })
+    }
+
+    pub fn restarts(&self) -> f32 {
+        self.restarts
+    }
+
+    pub fn eps(&self) -> f32 {
+        self.eps
+    }
+
+    /// The estimate for walks from `start_node`.
+    pub fn compute<G: Graph>(&self, graph: &G, start_node: NodeID) -> HashMap<NodeID, f32> {
+        ppr_estimate(graph, start_node, self.restarts, self.eps)
+    }
 }
 
 pub fn ppr_estimate<G: Graph>(
@@ -425,6 +512,51 @@ mod rwr_tests {
         let scores = rwr.sample_bfs(&graph, 0);
         assert_eq!(scores.len(), 1, "{:?}", scores);
         assert_eq!(scores.get(&0), Some(&1.0), "{:?}", scores);
+    }
+
+    #[test]
+    fn test_from_restarts() {
+        assert!(matches!(RWR::from_restarts(3., 10).unwrap().steps, Sample::Fixed(3)));
+        assert!(matches!(RWR::from_restarts(0.25, 10).unwrap().steps, Sample::Probability(p) if p == 0.25));
+        let rwr = RWR::from_restarts(1., 7).unwrap();
+        assert_eq!((rwr.walks, rwr.beta, rwr.single_threaded, rwr.seed), (7, 0.5, false, crate::DEFAULT_SEED));
+        for bad in [0., -1., f32::NAN] {
+            assert!(matches!(RWR::from_restarts(bad, 10), Err(Error::InvalidArgument(_))), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn test_walk_scores_dispatch_on_weighted() {
+        let ccsr = CumCSR::convert(CSR::construct_from_edges(build_edges(), false));
+        let rwr = RWR { seed: 1234, ..RWR::from_restarts(0.3, 500).unwrap() };
+        assert_eq!(rwr.walk_scores(&ccsr, 0, true), rwr.sample_bfs(&ccsr, 0));
+        assert_eq!(rwr.walk_scores(&ccsr, 0, false), rwr.sample(&ccsr, &Unweighted, 0));
+    }
+
+    #[test]
+    fn test_sparse_ppr_validates_restarts() {
+        let ccsr = CumCSR::convert(CSR::construct_from_edges(build_edges(), false));
+        let ppr = SparsePpr::new(0.2, SparsePpr::DEFAULT_EPS).unwrap();
+        assert_eq!(ppr.compute(&ccsr, 0), ppr_estimate(&ccsr, 0, 0.2, 1e-5));
+        for bad in [0., 1., -0.5, 2., f32::NAN] {
+            assert!(matches!(SparsePpr::new(bad, 1e-5), Err(Error::InvalidArgument(_))), "{}", bad);
+        }
+        for bad_eps in [0., -1e-5, f32::INFINITY, f32::NAN] {
+            assert!(matches!(SparsePpr::new(0.2, bad_eps), Err(Error::InvalidArgument(_))), "{}", bad_eps);
+        }
+    }
+
+    /// Each rollout is seeded from the rng, so the same seed gives the same rollouts.
+    #[test]
+    fn test_seeded_rollouts_match_explicit_seeds() {
+        let ccsr = CumCSR::convert(CSR::construct_from_edges(build_edges(), false));
+        let mut rng = XorShiftRng::seed_from_u64(ROLLOUT_SEED);
+        let walks = seeded_rollouts(&ccsr, Sample::Probability(0.3), true, 0, 5, &mut rng);
+
+        let mut rng = XorShiftRng::seed_from_u64(ROLLOUT_SEED);
+        let rngs = (0..5u64).map(|i| XorShiftRng::seed_from_u64(rng.gen::<u64>().wrapping_add(i))).collect();
+        assert_eq!(walks, rollouts(&ccsr, Sample::Probability(0.3), true, 0, rngs));
+        assert!(walks.iter().all(|w| w[0] == 0));
     }
 
     /// A walk can end on a node with no out edges; its degree of zero must not make the score
