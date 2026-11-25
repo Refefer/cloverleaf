@@ -271,9 +271,9 @@ To maximize cpu utilization, Hogwild [8] is used to update weights lock free.  T
 
 The result of the optimization phase is feature embeddings, which can be used to construct node embeddings dynamically or in batch: `NodeEmbedder(aggregator).embed_feature_set(...)` for every node, or `embed_adhoc(...)` for a node that wasn't in the graph, from its features alone.  The aggregator is `FeatureAggregator.Averaged()` for the averaged model; for attention it's the learned weights, `ep.feature_aggregator()`, which can be saved and loaded with the embeddings.
 
-Neighborhood alignment (`NeighborhoodAligner`) then pulls each node towards its neighbors.  A new node has no neighbors, so `EmbeddingAligner` places it in the aligned space from its nearest nodes: `method="distances"` keeps its distances to them, and `method="mean_shift"` moves it as they moved on average.  Mean shift with training queries as the anchors works well for new search queries.
+Neighborhood alignment (`NeighborhoodAligner`) then pulls each node towards its neighbors.  A new node has no neighbors, so `EmbeddingAligner` places it in the aligned space from its nearest nodes: `method="distances"` keeps its distances to them, and `method="mean_shift"` moves it as they moved on average.  Mean shift with training queries as the anchors works well for new search queries.  Both aligners average in Euclidean space: use them with Euclidean embeddings, and Poincaré ones unaligned (they already place nodes by their neighbourhoods).
 
-For large graphs, the GPU trainer in `gpu/` trains the same averaged and attention models much faster, and its output loads straight into the classes above.  It also has losses and schedules the CPU trainer doesn't, such as a sawtooth learning rate, which is its recommended setting; see [gpu/README.md](gpu/README.md).
+For large graphs, the GPU trainer in `gpu/` trains the same averaged and attention models, in Euclidean space or the Poincaré ball, much faster, and its output loads straight into the classes above.  It also has losses, negative sampling and schedules the CPU trainer doesn't; [gpu/README.md](gpu/README.md) gives guidance on choosing a configuration for a task.
 
 #### The Poincaré ball
 

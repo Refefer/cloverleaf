@@ -26,23 +26,55 @@ aligns it and retrieves products, all in cloverleaf.  `examples/` has the other 
 
 ## Training
 
-The recommended configuration, also in `examples/train.sh`:
+`python -m ep_gpu.train --edges GRAPH --features FEATURES --out PREFIX` trains with the defaults;
+`--help` lists every option and the `Config` class in `ep_gpu/train.py` documents them.
+`examples/train.sh` is a starting point for large graphs.  Which settings suit a graph depends
+on the task, so start from the guidance below and choose by a retrieval evaluation on held-out
+nodes, not by training or validation loss, which have ranked models differently from retrieval.
 
-```
-python -m ep_gpu.train --edges GRAPH --features FEATURES --out PREFIX \
-    --dims 128 --lr 0.3 --loss starspace --gamma 0.1 --negatives 12 \
-    --max-nodes 12 --max-features 0.5 --weighted-averaging --valid-pct 0.01 --passes 100 \
-    --pooling attention --heads 4 --neighbour-pooling mean --batch-size 2048 \
-    --optimizer rowwise_adagrad --table-dtype bfloat16 \
-    --lr-schedule sawtooth --lr-cycles 4 --graph-cache PREFIX.graph.pt
-```
+**Loss.**  StarSpace (a margin on cosine, or on distance in the Poincaré ball) is the robust
+default for retrieval.  The margin loss (EP-B's) suits embeddings used as features, such as node
+classification.  InfoNCE puts more weight on the top of the ranking but overfits: pair it with
+`--valid-edges` and `--keep-best-probe` to stop at the best pass.  The listwise losses (ListNet,
+ListMLE) train against personalised PageRank lists, for multi-hop relevance.
 
-Attention pooling with mean-combined neighbours and StarSpace retrieved best in our experiments;
-row-wise Adagrad with a bfloat16 table needs a fraction of Adam's memory; and the sawtooth
-schedule (4 cycles of linear decay, restarting at the peak rate) reaches a lower validation loss
-than cosine in the same passes.  Tune `dims`, `lr`, `gamma`, `negatives`, `max_nodes` and
-`max_features` for your graph.  `python -m ep_gpu.train --help` lists every option; the `Config`
-class in `ep_gpu/train.py` documents them.
+**Negatives.**  Random negatives give the broadest separation from unrelated nodes.  To retrieve
+one node type for another (items for queries, papers for authors), draw each side's negatives
+from the other side (`--negative-types`), which trains the ranking retrieval uses.  A few hard
+negatives (`--hard-negatives`) alongside random ones sharpen the top of the ranking at some cost
+to recall; because margin losses average only violated margins, even one carries much of the
+gradient.
+
+**Geometry.**  Euclidean space (cosine) suits graphs without a strong hierarchy.  On graphs with
+a hierarchy or a heavily skewed popularity (a few hubs, a long tail of rare nodes), the Poincaré
+ball (`--geometry poincare`) can place general, popular nodes near the origin and specific ones
+further out, and holds up at far lower widths.  Lower `--curvature` is flatter and closer to
+Euclidean; higher favours the hierarchy at the head.  Margins are then in distance units, so
+scale `--gamma` up from cosine values.
+
+**Pooling.**  Mean pooling is the safe default.  Learned weightings (attention, `--attention-mode
+weights`, `--feature-importance`) help when nodes carry many features of uneven value, such as
+long documents, and tend to memorise identifier-like features (a node's own id, codes in a
+title) otherwise, most of all in the Poincaré ball.  If you use attention there, use
+`--attention-keeps-norm` and a strong `--attention-dropout` (0.6 or more).
+
+**Alignment.**  Neighbourhood alignment (cloverleaf's `NeighborhoodAligner`, then
+`EmbeddingAligner(method="mean_shift")` for nodes without edges) helps Euclidean models,
+most of all ones trained with random negatives.  Poincaré models already place nodes by their
+neighbourhoods, and averaging a node with neighbours at different distances from the origin
+blurs that, so use their embeddings unaligned; cloverleaf's aligners also average in Euclidean
+space, which isn't the ball's own mean.
+
+**Width.**  Euclidean models usually want 100 or more dimensions; Poincaré ones often do as well
+with 32-64, a several-fold smaller feature table.
+
+**Scale and optimisation.**  For large graphs, row-wise Adagrad with a bfloat16 table
+(`--optimizer rowwise_adagrad --table-dtype bfloat16`) needs a fraction of Adam's memory and
+takes a larger learning rate (around 0.1-0.5); use large batches (thousands of nodes) there and
+small ones (tens to hundreds) on graphs of a few thousand nodes.  The cosine schedule is a good
+default.  Sample a dozen or so neighbours per reconstruction (`--max-nodes`) and about half of
+each node's features (`--max-features`) as regularisation, and use `--weighted-averaging` when
+edge weights carry signal.  `--graph-cache` saves the parsed graph for the next run.
 
 ## Output
 
@@ -196,10 +228,7 @@ general it is: popular, general nodes end up near the origin, specific ones furt
   scattered word vectors average towards the origin, where every long title would look generic.
 * The rank and rankspace losses score by dot product, so they need Euclidean space.
 
-A starting point: the recommended configuration with `--geometry poincare --curvature 0.3
---loss starspace --gamma 1.0` (the margin is now in distance units) and mean pooling (see
-Pooling options).  In our tests hyperbolic models held up at far lower widths than Euclidean ones,
-so try 32-64.
+When to use it, and how to set the curvature, margin and width: see Training.
 * With tangent pooling the exported aggregator records the geometry, and cloverleaf's
   `NodeEmbedder` maps new nodes into the ball exactly as the model does; search the node
   embeddings with `cloverleaf.PoincareDistance(curvature)`.
