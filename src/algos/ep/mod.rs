@@ -19,6 +19,7 @@ use crate::autograd::*;
 use crate::graph::{Graph as CGraph,NodeID};
 use crate::embeddings::EmbeddingStore;
 use crate::distance::Distance;
+use crate::geometry::Geometry;
 use crate::progress::CLProgressBar;
 use crate::feature_store::{FeatureStore, FeatureSet};
 use crate::embeddings::NodeEmbeddings;
@@ -162,7 +163,12 @@ pub struct EmbeddingPropagation {
     /// Learning rate of the model's own dense weights (attention's projections), on the same
     /// schedule as `alpha`.  Dense matrices every node uses need far smaller steps than sparse
     /// feature embeddings.
-    pub dense_alpha: f32
+    pub dense_alpha: f32,
+
+    /// The space node embeddings live in: pooled vectors are mapped into it before the loss
+    /// (see [`crate::geometry`]).  Node embeddings are then built with this geometry too:
+    /// [`FeatureAggregator::with_geometry`](crate::algos::aggregator::FeatureAggregator::with_geometry).
+    pub geometry: Geometry
 }
 
 impl EmbeddingPropagation {
@@ -181,6 +187,11 @@ impl EmbeddingPropagation {
         }
         if !(0. ..1.).contains(&self.valid_pct) {
             return Err(Error::InvalidArgument(format!("valid_pct must be in [0, 1), got {}", self.valid_pct)))
+        }
+        if !self.loss.supports(&self.geometry) {
+            return Err(Error::InvalidArgument(format!(
+                "{:?} scores by dot product or cosine, so it needs geometry \"euclidean\", not {}",
+                self.loss, self.geometry)))
         }
         Ok(())
     }
@@ -221,7 +232,8 @@ impl Default for EmbeddingPropagation {
             lr_schedule: LearningRateSchedule::CosineWarmup,
             init: EmbeddingInit::UnitNorm,
             update_frequency: UpdateFrequency::Batch,
-            dense_alpha: 1e-3
+            dense_alpha: 1e-3,
+            geometry: Geometry::Euclidean
         }
     }
 }
@@ -533,8 +545,10 @@ impl EmbeddingPropagation {
             hus.push(hu);
         });
 
-        // Compute error
-        let loss = self.loss.compute(thv, hv.clone(), &hus);
+        // Into the embedding space (the identity in Euclidean space), then the error.
+        let g = &self.geometry;
+        let hus: Vec<ANode> = hus.into_iter().map(|hu| g.to_space_node(hu)).collect();
+        let loss = self.loss.compute(g.to_space_node(thv), g.to_space_node(hv), &hus, g);
 
         (loss, hv_vars, thv_vars, hu_vars)
 
@@ -691,7 +705,8 @@ mod ep_tests {
             lr_schedule: LearningRateSchedule::CosineWarmup,
             init: EmbeddingInit::UnitNorm,
             update_frequency: UpdateFrequency::Batch,
-            dense_alpha: 1e-3
+            dense_alpha: 1e-3,
+            geometry: Geometry::Euclidean
         };
 
         let embeddings = ep.learn_feature_embeddings(&ccsr, &feature_store, None, &model).unwrap();
@@ -765,6 +780,30 @@ mod ep_tests {
         let across = (21..40).map(|i| dist(1, i)).sum::<f32>() / 19.;
         // Untrained, both are near 1.
         assert!(across - within > 1.0, "within-clique distance {}, across {}", within, across);
+    }
+
+    /// EP in the Poincaré ball learns too: each clique ends up closer to itself, by hyperbolic
+    /// distance, than to the other, with either distance loss.
+    #[test]
+    fn test_poincare_ep_separates_the_cliques() {
+        use crate::geometry::{Curvature, PoincareBall};
+        let graph = two_cliques();
+        let mut features = FeatureStore::new(graph.len());
+        features.fill_missing_nodes();
+        let model = super::model::AveragedFeatureModel::new(Sample::All, Sample::All, false, false);
+        let ball = PoincareBall::new(Curvature::new(0.5).unwrap(), None).unwrap();
+        for loss in [Loss::MarginLoss(1., 3), Loss::StarSpace(1., 3)] {
+            let ep = EmbeddingPropagation { loss, geometry: Geometry::Poincare(ball),
+                                            ..quick_ep(UpdateFrequency::Batch, 0.05, 30) };
+            let embs = ep.learn_feature_embeddings(&graph, &features, None, &model).unwrap();
+            let point = |i: usize| { let mut v = embs.get_embedding(i).to_vec(); ep.geometry.to_space(&mut v); v };
+            let dist = |a: usize, b: usize| ball.curvature().distance(&point(a), &point(b));
+            let within = (2..20).map(|i| dist(1, i)).sum::<f32>() / 18.;
+            let across = (21..40).map(|i| dist(1, i)).sum::<f32>() / 19.;
+            // The GPU trainer's clique test's criterion: StarSpace separates id-only cliques only
+            // weakly in the ball (all distances grow together), the margin loss clearly.
+            assert!(across > within, "{:?}: within-clique distance {}, across {}", loss, within, across);
+        }
     }
 
     /// AdamW's weight decay is once per pass, so every feature decays by the same factor with
@@ -931,6 +970,8 @@ mod ep_tests {
             EmbeddingPropagation { d_model: 0, ..EmbeddingPropagation::default() },
             EmbeddingPropagation { valid_pct: 1., ..EmbeddingPropagation::default() },
             EmbeddingPropagation { noise: -1., ..EmbeddingPropagation::default() },
+            EmbeddingPropagation { loss: Loss::RankLoss(0.5, 3),
+                geometry: Geometry::new("poincare", Some(1.), None).unwrap(), ..EmbeddingPropagation::default() },
         ];
         let graph = two_cliques();
         let mut features = FeatureStore::new(graph.len());

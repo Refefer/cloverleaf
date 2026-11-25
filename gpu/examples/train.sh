@@ -1,8 +1,11 @@
 #!/bin/bash
-# The recommended GPU EP configuration from the command line: attention pooling with
-# mean-combined neighbours, StarSpace, row-wise Adagrad with a bfloat16 table, and the sawtooth
-# learning rate (4 cycles).  Tune dims, lr, gamma, negatives, max_nodes and max_features for
-# your graph; the rest are good defaults.
+# A starting point for GPU EP on a large graph: StarSpace, mean pooling, row-wise Adagrad with a
+# bfloat16 table, and the cosine schedule.  The choices that depend on the task (negatives,
+# geometry, pooling, width, margin) are discussed under Training in ../README.md; pass them as
+# extra options, e.g. for item retrieval on a skewed query/item graph:
+#
+#   ./train.sh GRAPH FEATURES PREFIX --geometry poincare --gamma 1.0 --dims 64 \
+#       --negatives 6 --hard-negatives 6 --negative-types "query=item;item=query"
 #
 #   ./train.sh GRAPH FEATURES PREFIX [more ep_gpu.train options]
 #
@@ -17,10 +20,8 @@ shift 3
 mkdir -p "$(dirname "$prefix")"
 cd "$(dirname "$0")/.."
 python -m ep_gpu.train --edges "$edges" --features "$features" --out "$prefix" \
-  --dims 128 --lr 0.3 --loss starspace --gamma 0.1 --negatives 12 \
+  --dims 128 --loss starspace --gamma 0.1 --negatives 12 \
   --max-nodes 12 --max-features 0.5 --weighted-averaging --valid-pct 0.01 --passes 100 \
-  --pooling attention --heads 4 --neighbour-pooling mean --batch-size 2048 \
-  --optimizer rowwise_adagrad --table-dtype bfloat16 \
-  --lr-schedule sawtooth --lr-cycles 4 \
+  --optimizer rowwise_adagrad --table-dtype bfloat16 --lr 0.3 --batch-size 4096 \
   --graph-cache "$prefix.graph.pt" \
   "$@"

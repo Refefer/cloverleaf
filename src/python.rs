@@ -17,6 +17,7 @@ use rand_xorshift::XorShiftRng;
 use crate::graph::{Graph as CGraph,NodeID};
 use crate::vocab::Vocab;
 use crate::distance::{Distance as EDist};
+use crate::geometry::{Curvature, Geometry};
 use crate::embeddings::{EmbeddingStore,DimensionMismatch,Query as CoreQuery};
 use crate::feature_store::FeatureSet as CoreFeatureSet;
 use crate::named_graph::NamedGraph;
@@ -263,17 +264,75 @@ impl Distance {
         }
     }
 
-    fn from_edist(dist: EDist) -> Distance {
-        match dist {
+    fn from_edist(dist: EDist) -> AnyDistance {
+        AnyDistance::Simple(match dist {
             EDist::Cosine => Distance::Cosine,
             EDist::Dot => Distance::Dot,
             EDist::Euclidean => Distance::Euclidean,
             EDist::ALT => Distance::ALT,
             EDist::Hamming => Distance::Hamming,
-            EDist::Jaccard => Distance::Jaccard  
-        }
+            EDist::Jaccard => Distance::Jaccard,
+            EDist::Poincare(curvature) => return AnyDistance::Poincare(PoincareDistance { curvature })
+        })
     }
 
+}
+
+///    Hyperbolic distance in the Poincaré ball of curvature -c, for embeddings trained with
+///    geometry="poincare" (EmbeddingPropagator, or the GPU trainer's --geometry poincare).  Use
+///    it wherever a Distance is accepted, for example NodeEmbeddings.load(path,
+///    PoincareDistance(0.3)).
+///
+///    Parameters
+///    ----------
+///    curvature : Float
+///        The ball's curvature magnitude c, as trained.  Must be positive.
+///
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct PoincareDistance {
+    curvature: Curvature
+}
+
+#[pymethods]
+impl PoincareDistance {
+    #[new]
+    pub fn new(curvature: f32) -> PyResult<Self> {
+        Ok(PoincareDistance { curvature: Curvature::new(curvature)? })
+    }
+
+    #[getter]
+    pub fn curvature(&self) -> f32 {
+        self.curvature.value()
+    }
+
+    pub fn compute(&self, e1: Vec<f32>, e2: Vec<f32>) -> f32 {
+        self.curvature.distance(e1.as_slice(), e2.as_slice())
+    }
+
+    pub fn __eq__(&self, other: &Self) -> bool {
+        self.curvature == other.curvature
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!("PoincareDistance(curvature={})", self.curvature.value())
+    }
+}
+
+/// Any distance a NodeEmbeddings can use: one of the Distance values, or a PoincareDistance.
+#[derive(FromPyObject, IntoPyObject)]
+pub enum AnyDistance {
+    Simple(Distance),
+    Poincare(PoincareDistance)
+}
+
+impl AnyDistance {
+    fn to_edist(&self) -> EDist {
+        match self {
+            AnyDistance::Simple(d) => d.to_edist(),
+            AnyDistance::Poincare(p) => EDist::Poincare(p.curvature)
+        }
+    }
 }
 
 #[pymethods]
@@ -1266,7 +1325,7 @@ impl EmbeddingPropagator {
     ///        
     ///    
     #[new]
-    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention_heads=None, dense_alpha=None, noise=None, optimizer=None, lr_schedule=None, init=None, update_frequency=None))]
+    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention_heads=None, dense_alpha=None, noise=None, optimizer=None, lr_schedule=None, init=None, update_frequency=None, geometry=None, curvature=None, max_tangent_norm=None))]
     pub fn new(
         // Learning rate
         alpha: Option<f32>, 
@@ -1330,7 +1389,16 @@ impl EmbeddingPropagator {
         init: Option<String>,
 
         // When to update the feature embeddings: "batch" or "epoch"
-        update_frequency: Option<String>
+        update_frequency: Option<String>,
+
+        // The embeddings' space: "euclidean" or "poincare"
+        geometry: Option<String>,
+
+        // Poincaré ball curvature magnitude
+        curvature: Option<f32>,
+
+        // Poincaré: clip pooled tangent vectors to this norm before the map
+        max_tangent_norm: Option<f32>
     ) -> PyResult<Self> {
         let d = EmbeddingPropagation::default();
         let lr_schedule = lr_schedule.map(|v| v.parse()).transpose()?.unwrap_or(d.lr_schedule);
@@ -1352,7 +1420,8 @@ impl EmbeddingPropagator {
             lr_schedule,
             init,
             update_frequency,
-            dense_alpha: dense_alpha.unwrap_or(d.dense_alpha)
+            dense_alpha: dense_alpha.unwrap_or(d.dense_alpha),
+            geometry: Geometry::new(geometry.as_deref().unwrap_or("euclidean"), curvature, max_tangent_norm)?
         };
         ep.validate()?;
 
@@ -1420,7 +1489,7 @@ impl EmbeddingPropagator {
     ///    and for attention its learned weights, which it has once learn_features has run (or
     ///    been warm-started).  Save it to embed new nodes later with a NodeEmbedder.
     pub fn feature_aggregator(&self) -> PyResult<FeatureAggregator> {
-        self.model.aggregator().map(|agg| FeatureAggregator { agg })
+        self.model.aggregator().map(|agg| FeatureAggregator { agg: agg.with_geometry(self.ep.geometry) })
             .ok_or_else(|| PyValueError::new_err("the attention model has no weights until learn_features runs"))
     }
     
@@ -1516,8 +1585,10 @@ impl FeatureSet {
     ///    path : String
     ///        Path to load features from.
     ///    
-    ///    namespace : String - Optional
-    ///        If provided, overrides the default 'node type' for a feature.  Default is 'feat'.
+    ///    namespace : FeatureNamespace - Optional
+    ///        The namespace features are keyed under: FeatureNamespace.single(name) puts every
+    ///        feature under `name`, FeatureNamespace.node_type() under its node's type.  Default
+    ///        is FeatureNamespace.single("feat").
     ///    
     ///    Returns
     ///    -------
@@ -1804,6 +1875,30 @@ impl FeatureAggregator {
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
         format!("FeatureAggregator<{}>", self.agg)
+    }
+
+    ///    The same pooling, mapping pooled vectors into `geometry`: "euclidean", or "poincare"
+    ///    with its curvature (default 1) and optional max_tangent_norm, as the model was trained.
+    ///    Node embeddings then come out as points of the Poincaré ball; compare them with
+    ///    PoincareDistance(curvature).
+    #[pyo3(signature = (geometry, curvature=None, max_tangent_norm=None))]
+    pub fn with_geometry(&self, geometry: &str, curvature: Option<f32>, max_tangent_norm: Option<f32>) -> PyResult<Self> {
+        Ok(FeatureAggregator { agg: self.agg.clone().with_geometry(Geometry::new(geometry, curvature, max_tangent_norm)?) })
+    }
+
+    ///    The geometry node embeddings are mapped into: "euclidean" or "poincare".
+    #[getter]
+    pub fn geometry(&self) -> &'static str {
+        self.agg.geometry().name()
+    }
+
+    ///    The Poincaré ball's curvature, or None in Euclidean space.
+    #[getter]
+    pub fn curvature(&self) -> Option<f32> {
+        match self.agg.geometry() {
+            Geometry::Poincare(ball) => Some(ball.curvature().value()),
+            Geometry::Euclidean => None
+        }
     }
 
     ///    Attention pooling with trained weights: multi-head self-attention over a node's
@@ -2357,14 +2452,14 @@ impl NodeEmbeddings {
     ///        
     ///    
     #[new]
-    pub fn new(graph: &Graph, dims: usize, distance: Distance) -> Self {
+    pub fn new(graph: &Graph, dims: usize, distance: AnyDistance) -> Self {
         NodeEmbeddings::from(CoreNodeEmbeddings::zeros(graph.vocab.clone(), dims, distance.to_edist()))
     }
 
     #[staticmethod]
     pub fn new_from_list(
         list: Vec<((String, String), Vec<f32>)>, 
-        distance: Distance
+        distance: AnyDistance
     ) -> PyResult<Self> {
         Ok(NodeEmbeddings::from(CoreNodeEmbeddings::from_list(list, distance.to_edist())?))
     }
@@ -2437,7 +2532,7 @@ impl NodeEmbeddings {
         VocabIterator::new(self.vocab.clone())
     }
 
-    pub fn get_distance(&self) -> Distance {
+    pub fn get_distance(&self) -> AnyDistance {
         Distance::from_edist(self.embeddings.distance())
     }
 
@@ -2603,7 +2698,7 @@ impl NodeEmbeddings {
     pub fn load(
         py: Python<'_>,
         path: &str, 
-        distance: Option<Distance>, 
+        distance: Option<AnyDistance>, 
         filter_type: Option<&Bound<'_, PyAny>>, 
         chunk_size: Option<usize>,
         skip_rows: Option<usize>
@@ -2638,7 +2733,7 @@ impl NodeEmbeddingsBuilder {
     ///        
     ///    
     #[new]
-    pub fn new(dist: Distance) -> Self {
+    pub fn new(dist: AnyDistance) -> Self {
         NodeEmbeddingsBuilder { builder: CoreNodeEmbeddingsBuilder::new(dist.to_edist()) }
     }
     /// Simple Python representation 
@@ -4411,6 +4506,7 @@ fn cloverleaf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Graph>()?;
     m.add_function(wrap_pyfunction!(ppr_lists, m)?)?;
     m.add_class::<Distance>()?;
+    m.add_class::<PoincareDistance>()?;
     m.add_class::<GraphBuilder>()?;
     m.add_class::<EdgeType>()?;
     m.add_class::<EmbeddingPropagator>()?;

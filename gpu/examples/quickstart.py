@@ -66,13 +66,11 @@ def main():
     graph = data.load(edges, features)
     print(f"{graph.num_nodes} nodes, {graph.num_features} features, in {directory}")
 
-    # The recommended configuration: attention pooling with mean-combined neighbours, StarSpace,
-    # row-wise Adagrad with a bfloat16 table, and the sawtooth learning rate.
+    # A general starting point: StarSpace with mean pooling, row-wise Adagrad with a bfloat16
+    # table and the cosine schedule (see Training in ../README.md for task-specific choices).
     cfg = Config(dims=32, passes=args.passes, batch_size=256, lr=0.3, loss="starspace", gamma=0.1,
                  negatives=12, max_nodes=12, max_features=0.5, weighted_averaging=True,
-                 pooling="attention", heads=4, neighbour_pooling="mean",
-                 optimizer="rowwise_adagrad", table_dtype="bfloat16",
-                 lr_schedule="sawtooth", lr_cycles=4, valid_pct=0.05)
+                 optimizer="rowwise_adagrad", table_dtype="bfloat16", valid_pct=0.05)
     model = train(graph, cfg, log=lambda m: print(" ", m) if m.startswith("pass") and
                   int(m.split()[1].split("/")[0]) % 5 == 0 else None)
     prefix = os.path.join(directory, "ep")

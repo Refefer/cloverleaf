@@ -3,6 +3,7 @@
 Every function takes a 1-D tensor of node ids and returns padded tensors plus a mask (or token
 weights, 0 for padding), so a whole batch is handled with a few tensor operations.
 """
+import numpy as np
 import torch
 
 
@@ -103,6 +104,66 @@ def pick_from_pool(pool, nodes, count, generator=None):
     return pick
 
 
+def parse_negative_types(spec):
+    """"query=product;product=product,query" -> {"query": ["product"], "product": ["product",
+    "query"]}: for each anchor node type, the node types its negatives may be."""
+    mapping = {}
+    for part in filter(None, (p.strip() for p in spec.split(";"))):
+        anchor, sep, allowed = part.partition("=")
+        types = [t.strip() for t in allowed.split(",") if t.strip()]
+        if not sep or not anchor.strip() or not types:
+            raise ValueError(f"negative_types: expected ANCHOR=TYPE[,TYPE...] separated by ';', got {part!r}")
+        if anchor.strip() in mapping:
+            raise ValueError(f"negative_types: anchor type {anchor.strip()!r} given twice")
+        mapping[anchor.strip()] = types
+    if not mapping:
+        raise ValueError("negative_types is empty")
+    return mapping
+
+
+class NegativeTypes:
+    """Which node types each anchor's negatives may be, from a mapping anchor type -> allowed
+    types (parse_negative_types); anchor types it leaves out may draw any type.  The shared pool
+    is drawn per allowed type in equal shares, so every anchor has candidates of every type it
+    may use, however rare the type."""
+
+    def __init__(self, node_types, mapping, device):
+        names = sorted(set(node_types))
+        index = {n: i for i, n in enumerate(names)}
+        for anchor, allowed in mapping.items():
+            unknown = [t for t in [anchor, *allowed] if t not in index]
+            if unknown:
+                raise ValueError(f"negative_types names node types not in the graph: {', '.join(unknown)} "
+                                 f"(it has {', '.join(names)})")
+        _, ids = np.unique(np.asarray(node_types), return_inverse=True)
+        self.type_of = torch.from_numpy(ids).to(device)
+        self.allowed = torch.ones(len(names), len(names), dtype=torch.bool, device=device)
+        for anchor, allowed in mapping.items():
+            self.allowed[index[anchor]] = False
+            self.allowed[index[anchor], [index[t] for t in allowed]] = True
+        used = self.allowed.any(0).nonzero(as_tuple=True)[0].tolist()
+        self.members = [(self.type_of == t).nonzero(as_tuple=True)[0] for t in used]
+
+    def pool(self, size, generator=None):
+        share = -(-size // len(self.members))
+        return torch.cat([m[torch.randint(0, len(m), (share,), device=m.device, generator=generator)]
+                          for m in self.members])[:size]
+
+    def allowed_mask(self, nodes, pool):
+        """(len(nodes), len(pool)): True where the pool node's type may be the anchor's negative."""
+        return self.allowed[self.type_of[nodes]][:, self.type_of[pool]]
+
+
+def pick_allowed(allowed, count, generator=None):
+    """`count` positions per row drawn uniformly, with replacement, among those `allowed` (B, P)
+    marks True.  Returns (B, count) indices."""
+    if count == 0:
+        return torch.zeros(allowed.shape[0], 0, dtype=torch.long, device=allowed.device)
+    if not allowed.any(1).all():
+        raise ValueError("an anchor has no allowed negative in the pool; enlarge negative_pool")
+    return torch.multinomial(allowed.float(), count, replacement=True, generator=generator)
+
+
 def neighbour_features(graph, nodes, max_nodes=None, max_features=None, weighted_sampling=False,
                        weighted_averaging=False, generator=None):
     """Each sampled neighbour's own features, one row per neighbour, and each neighbour's weight
@@ -135,3 +196,17 @@ def neighbourhood_tokens(graph, nodes, max_nodes=None, max_features=None, weight
     l = fidx.shape[1]
     tok_w = (w.reshape(-1, 1) * fmask).reshape(b, k * l)
     return fidx.reshape(b, k * l), tok_w
+
+
+def edge_keys(graph):
+    """Every edge as one sorted int64 key, source * N + target, for `are_neighbours`."""
+    n = graph.num_nodes
+    src = torch.repeat_interleave(torch.arange(n, device=graph.adj_ptr.device), graph.degrees())
+    return torch.sort(src * n + graph.adj_idx.long()).values
+
+
+def are_neighbours(keys, num_nodes, a, b):
+    """Whether each b[i, j] is a neighbour of a[i] (a (B,), b (B, K)), from `edge_keys`."""
+    query = (a.long()[:, None] * num_nodes + b.long()).reshape(-1)
+    pos = torch.searchsorted(keys, query).clamp(max=max(len(keys) - 1, 0))
+    return (keys[pos] == query).reshape(b.shape) if len(keys) else torch.zeros(b.shape, dtype=torch.bool, device=b.device)

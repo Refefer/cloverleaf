@@ -632,3 +632,52 @@ def test_policy_evaluation_copies_shared_graphs_only_when_told(graph):
     pe.optimize(graph, no_copy=False, indicator=False)
     assert graph.get_edges(n(2), normalized=True) != before
     del smci
+
+
+def test_poincare_distance():
+    d = cl.PoincareDistance(1.0)
+    assert d.curvature == 1.0 and d == cl.PoincareDistance(1.0)
+    # d(0, (r, 0)) = 2 artanh(r) at curvature 1.
+    assert math.isclose(d.compute([0.0, 0.0], [0.5, 0.0]), 2 * math.atanh(0.5), rel_tol=1e-5)
+    for bad in (0.0, -1.0, float("nan")):
+        with pytest.raises(ValueError):
+            cl.PoincareDistance(bad)
+    ne = cl.NodeEmbeddings.new_from_list([(n(0), [0.1, 0.2]), (n(1), [-0.3, 0.1])], cl.PoincareDistance(0.5))
+    assert isinstance(ne.get_distance(), cl.PoincareDistance) and ne.get_distance().curvature == 0.5
+    assert isinstance(cl.NodeEmbeddings.new_from_list([(n(0), [1.0])], cl.Distance.Cosine).get_distance(), cl.Distance)
+
+
+def test_aggregator_geometry_round_trips(tmp_path):
+    agg = cl.FeatureAggregator.Averaged().with_geometry("poincare", 0.3, 2.0)
+    assert agg.geometry == "poincare" and math.isclose(agg.curvature, 0.3, rel_tol=1e-6)
+    assert cl.FeatureAggregator.Averaged().geometry == "euclidean"
+    assert cl.FeatureAggregator.Averaged().curvature is None
+    path = str(tmp_path / "agg")
+    agg.save(path)
+    loaded = cl.FeatureAggregator.load(path)
+    assert repr(loaded) == repr(agg) and math.isclose(loaded.curvature, 0.3, rel_tol=1e-6)
+    with pytest.raises(ValueError):
+        cl.FeatureAggregator.Averaged().with_geometry("euclidean", 1.0)
+    with pytest.raises(ValueError):
+        cl.FeatureAggregator.Averaged().with_geometry("spherical")
+
+
+def test_poincare_embedder_maps_into_the_ball():
+    fe = cl.NodeEmbeddings.new_from_list([(("f", "a"), [3.0, 0.0]), (("f", "b"), [0.0, 4.0])], cl.Distance.Cosine)
+    embedder = cl.NodeEmbedder(cl.FeatureAggregator.Averaged().with_geometry("poincare", 1.0))
+    x = embedder.embed_adhoc([("f", "a"), ("f", "b")], fe)
+    # exp0 of the mean (1.5, 2): radius tanh(|v|) = tanh(2.5) along (0.6, 0.8).
+    r = math.tanh(2.5)
+    assert all(math.isclose(a, b, rel_tol=1e-5) for a, b in zip(x, [0.6 * r, 0.8 * r]))
+
+
+def test_embedding_propagator_geometry_options():
+    ep = cl.EmbeddingPropagator(geometry="poincare", curvature=0.3, max_tangent_norm=2.0,
+                                loss=cl.EPLoss.starspace(1.0, 3), indicator=False)
+    assert "Poincare" in repr(ep)
+    for kwargs in [dict(geometry="spherical"), dict(curvature=0.3),
+                   dict(geometry="poincare", curvature=0.0),
+                   dict(geometry="poincare", max_tangent_norm=-1.0),
+                   dict(geometry="poincare", loss=cl.EPLoss.rank(0.5, 3))]:
+        with pytest.raises(ValueError):
+            cl.EmbeddingPropagator(indicator=False, **kwargs)

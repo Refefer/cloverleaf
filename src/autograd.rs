@@ -143,6 +143,11 @@ impl ANode {
     pub fn maximum(&self, min: f32) -> Self {
         Self::from_tensor(unwrap_tensor(self.tensor.maximum(min as f64), "maximum"))
     }
+
+    /// Clamps from above: min(self, max), with no gradient where the clamp applies.
+    pub fn minimum(&self, max: f32) -> Self {
+        Self::from_tensor(unwrap_tensor(self.tensor.minimum(max as f64), "minimum"))
+    }
 }
 
 pub struct Variable;

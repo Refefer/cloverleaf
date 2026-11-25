@@ -8,6 +8,7 @@ use rand_distr::{Distribution,Uniform};
 use crate::EmbeddingStore;
 use crate::FeatureStore;
 use crate::graph::{Graph as CGraph,NodeID};
+use crate::geometry::Geometry;
 use super::model::*;
 use float_ord::FloatOrd;
 
@@ -82,17 +83,45 @@ impl Loss {
         }
     }
 
+    /// Whether the loss can score embeddings in `geometry`: the rank and contrastive losses
+    /// score by dot product and cosine, which the Poincaré ball doesn't have.
+    pub fn supports(&self, geometry: &Geometry) -> bool {
+        matches!(geometry, Geometry::Euclidean)
+            || matches!(self, Loss::MarginLoss(..) | Loss::PPR(..) | Loss::StarSpace(..))
+    }
+
     // hv is the embedding constructed from its features
     // thv is the reconstruction of v from its neighbor nodes or 
     // a random positive, depending on the loss
     // hu is a random negative node constructed via its neighbors
-    pub fn compute(&self, thv: ANode, hv: ANode, hus: &[ANode]) -> ANode {
+    // All three are already in `geometry`'s space (Geometry::to_space_node).  In the Poincaré ball
+    // the margin losses use hyperbolic distance, and StarSpace negative hyperbolic distance in
+    // place of cosine similarity.
+    pub fn compute(&self, thv: ANode, hv: ANode, hus: &[ANode], geometry: &Geometry) -> ANode {
+        if let (Geometry::Poincare(ball), Loss::StarSpace(gamma, _)) = (geometry, self) {
+            // max(0, gamma - (s(thv, hv) - s(hv, hu))) with s = -d: gamma + d(thv, hv) - d(hv, hu).
+            let d_pos = *gamma + ball.distance_node(&thv, &hv);
+            let losses = hus.iter()
+                .map(|hu| (&d_pos - ball.distance_node(hu, &hv)).maximum(0f32))
+                .filter(|l| l.value()[0] > 0f32)
+                .collect::<Vec<_>>();
+            return if losses.len() > 0 {
+                let n_losses = losses.len() as f32;
+                losses.sum_all() / n_losses
+            } else {
+                Constant::scalar(0f32)
+            }
+        }
+        let distance = |a: &ANode, b: &ANode| match geometry {
+            Geometry::Euclidean => euclidean_distance(a, b),
+            Geometry::Poincare(ball) => ball.distance_node(a, b)
+        };
         match self {
 
             Loss::MarginLoss(gamma, _) | Loss::PPR(gamma, _, _) => {
-                let d1 = *gamma + euclidean_distance(&thv, &hv);
+                let d1 = *gamma + distance(&thv, &hv);
                 let pos_losses = hus.iter()
-                    .map(|hu| &d1 - euclidean_distance(&thv, hu))
+                    .map(|hu| &d1 - distance(&thv, hu))
                     .filter(|loss| loss.value()[0] > 0f32)
                     .collect::<Vec<_>>();
 
@@ -106,8 +135,8 @@ impl Loss {
             },
 
             Loss::RankSpace(gamma, n) => {
-                let ss_loss = Loss::StarSpace(*gamma, *n).compute(thv.clone(), hv.clone(), hus);
-                let rank_loss = Loss::RankLoss(*gamma, *n).compute(thv, hv, hus);
+                let ss_loss = Loss::StarSpace(*gamma, *n).compute(thv.clone(), hv.clone(), hus, geometry);
+                let rank_loss = Loss::RankLoss(*gamma, *n).compute(thv, hv, hus, geometry);
                 ss_loss + rank_loss
             }
 
@@ -313,6 +342,43 @@ mod ep_loss_tests {
         let y = Variable::new(vec![3f32, 5f32]);
         let dist = euclidean_distance(&x, &y);
         assert_eq!(dist.value(), &[(8f32).powf(0.5)]);
+    }
+
+    /// The Poincaré losses match the GPU trainer's (gpu/ep_gpu/losses.py) on the same tangent
+    /// vectors: values and the gradient with respect to h(v)'s tangent vector, through exp0 with
+    /// clipping (the third negative is past max_tangent_norm).
+    #[test]
+    fn test_poincare_losses_match_the_gpu_trainer() {
+        use crate::geometry::{Curvature, PoincareBall};
+        let geometry = Geometry::Poincare(PoincareBall::new(Curvature::new(0.7).unwrap(), Some(2.0)).unwrap());
+        let cases = [
+            (Loss::StarSpace(0.5, 3), 0.95257360f32, [0.20113260f32, 0.01119233, 0.33772844, 0.26259622]),
+            (Loss::MarginLoss(1.0, 3), 1.62045932, [1.09414995, 0.59685302, -1.69100356, 1.61992657]),
+        ];
+        for (loss, expected, expected_grad) in cases {
+            let t = Variable::new(vec![0.3, -0.8, 0.5, 0.1]);
+            let h = Variable::new(vec![0.4, -0.6, 0.2, 0.3]);
+            let hus: Vec<ANode> = [vec![-0.5f32, 0.9, 0.3, -0.2], vec![0.35, -0.7, 0.4, 0.2], vec![2.5, 1.0, -1.5, 0.5]]
+                .into_iter().map(|v| geometry.to_space_node(Variable::new(v))).collect();
+            let value = loss.compute(geometry.to_space_node(t), geometry.to_space_node(h.clone()), &hus, &geometry);
+            assert!((value.value()[0] - expected).abs() < 1e-4, "{:?}: {} vs {}", loss, value.value()[0], expected);
+            let mut graph = Graph::new();
+            graph.backward(&value);
+            let grad = graph.get_grad(&h).unwrap();
+            for (g, e) in grad.iter().zip(expected_grad.iter()) {
+                assert!((g - e).abs() < 1e-3, "{:?}: grad {:?} vs {:?}", loss, grad, expected_grad);
+            }
+        }
+    }
+
+    #[test]
+    fn test_only_distance_losses_support_the_poincare_ball() {
+        use crate::geometry::{Curvature, PoincareBall};
+        let ball = Geometry::Poincare(PoincareBall::new(Curvature::new(1.).unwrap(), None).unwrap());
+        assert!(Loss::StarSpace(0.1, 1).supports(&ball) && Loss::MarginLoss(1., 1).supports(&ball));
+        assert!(!Loss::RankLoss(0.1, 1).supports(&ball) && !Loss::RankSpace(0.1, 1).supports(&ball));
+        assert!(!Loss::Contrastive(0.5, 0.1, 1).supports(&ball));
+        assert!(Loss::RankLoss(0.1, 1).supports(&Geometry::Euclidean));
     }
 
     #[test]
