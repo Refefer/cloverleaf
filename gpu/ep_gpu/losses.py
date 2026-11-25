@@ -3,9 +3,15 @@
 Each takes t = h~(v) (B, d), h = h(v) (B, d) and hu = h(u) for the negatives (B, n, d), and returns
 one loss per node (B,).  Margin and StarSpace average only their non-zero per-negative terms, and
 are 0 when all are zero, as cloverleaf does.
+
+`space` (geometry.py) says how embeddings compare: in Euclidean space, by cosine similarity, and
+by Euclidean distance for the margin loss, as cloverleaf does; in the Poincaré ball, by negative
+hyperbolic distance, and by that distance for the margin loss.  The embeddings passed in are
+already in that space (space.to_space).
 """
 import torch
-import torch.nn.functional as F
+
+from .geometry import EUCLIDEAN
 
 
 def _mean_of_positive(terms):
@@ -15,71 +21,111 @@ def _mean_of_positive(terms):
                        torch.zeros_like(count, dtype=terms.dtype))
 
 
-def margin(t, h, hu, gamma):
-    """max(0, gamma + |t - h| - |t - hu_i|), Euclidean."""
-    d_pos = torch.linalg.vector_norm(t - h, dim=-1)
-    d_neg = torch.linalg.vector_norm(t[:, None, :] - hu, dim=-1)
+def margin(t, h, hu, gamma, space=EUCLIDEAN):
+    """max(0, gamma + d(t, h) - d(t, hu_i)), with the space's distance."""
+    d_pos = space.distance(t, h)
+    d_neg = space.distance(t[:, None, :], hu)
     return _mean_of_positive(torch.relu(gamma + d_pos[:, None] - d_neg))
 
 
-def starspace(t, h, hu, gamma):
-    """max(0, gamma - (cos(t, h) - cos(h, hu_i)))."""
-    tn, hn, hun = F.normalize(t, dim=-1), F.normalize(h, dim=-1), F.normalize(hu, dim=-1)
-    pos = (tn * hn).sum(-1)
-    neg = (hun * hn[:, None, :]).sum(-1)
+def margin_sq(t, h, hu, gamma, space=EUCLIDEAN, adaptive=False):
+    """max(0, m + d(t, h)^2 - d(t, hu_i)^2), the hyperbolic recommenders' margin ranking loss
+    (HGCF, HICF): squared distance is smooth where d -> 0, where d's own slope is infinite.
+    m = gamma, or with `adaptive`, HICF's geometry-aware margin gamma * sigmoid(delta),
+      delta = (d0(t)^2 + d0(h)^2 - d(t, h)^2) / (cosh d0(t) cosh d0(h)),
+    d0 the distance from the origin: pairs near the origin (popular, general nodes) get larger
+    margins, pairs out by the edge (the tail) smaller ones."""
+    d_pos = space.distance(t, h)
+    d_neg = space.distance(t[:, None, :], hu)
+    m = gamma
+    if adaptive:
+        r_t, r_h = space.origin_distance(t), space.origin_distance(h)
+        delta = (r_t ** 2 + r_h ** 2 - d_pos ** 2) / (torch.cosh(r_t) * torch.cosh(r_h))
+        m = gamma * torch.sigmoid(delta)[:, None]
+    return _mean_of_positive(torch.relu(m + d_pos[:, None] ** 2 - d_neg ** 2))
+
+
+def starspace(t, h, hu, gamma, space=EUCLIDEAN):
+    """max(0, gamma - (s(t, h) - s(h, hu_i))), s the space's similarity (cosine in Euclidean
+    space, negative distance in the Poincaré ball)."""
+    pos = space.similarity(t, h)
+    neg = space.similarity(hu, h[:, None, :])
     return _mean_of_positive(torch.relu(gamma - (pos[:, None] - neg)))
 
 
-def rank(t, h, hu, tau):
-    """-log p(positive) under a softmax over [h.hu_1, ..., h.hu_n, h.t], when p < tau."""
+def rank(t, h, hu, tau, space=EUCLIDEAN):
+    """-log p(positive) under a softmax over [h.hu_1, ..., h.hu_n, h.t], when p < tau.  Dot
+    products, so Euclidean space only."""
+    if space is not EUCLIDEAN:
+        raise ValueError("the rank loss scores by dot product, so it needs Euclidean space")
     logits = torch.cat([(hu * h[:, None, :]).sum(-1), (h * t).sum(-1, keepdim=True)], dim=1)
     log_p = torch.log_softmax(logits, dim=1)[:, -1]
     return torch.where(log_p.exp() < tau, -log_p, torch.zeros_like(log_p))
 
 
-def rankspace(t, h, hu, gamma):
-    return starspace(t, h, hu, gamma) + rank(t, h, hu, gamma)
+def rankspace(t, h, hu, gamma, space=EUCLIDEAN):
+    return starspace(t, h, hu, gamma, space) + rank(t, h, hu, gamma, space)
 
 
-def infonce(t, h, hu, temperature):
-    """-log p(positive) under a softmax over cosine similarities divided by the temperature:
-    [cos(h, t), cos(h, hu_1), ..., cos(h, hu_n)] / temperature.  Always on, unlike rank."""
-    hn = F.normalize(h, dim=-1)
-    pos = (hn * F.normalize(t, dim=-1)).sum(-1, keepdim=True)
-    neg = (F.normalize(hu, dim=-1) * hn[:, None, :]).sum(-1)
-    return -torch.log_softmax(torch.cat([pos, neg], dim=1) / temperature, dim=1)[:, 0]
+def similarities(t, h, hu=None, pool=None, space=EUCLIDEAN):
+    """(s(h, t) (B,), s(h, negatives) (B, K)), the negatives given per node (hu, (B, n, d))
+    or as a pool shared by every node (pool, (P, d)), scored with one matrix multiply."""
+    pos = space.similarity(h, t)
+    if pool is not None:
+        return pos, space.pairwise_similarity(h, pool)
+    return pos, space.similarity(hu, h[:, None, :])
 
 
-def infonce_pool(t, h, pool, exclude, temperature):
+def infonce_from_similarities(pos, neg, temperature, exclude=None):
+    """-log p(positive) under a softmax over [pos, neg_1, ..., neg_K] / temperature; negatives
+    where `exclude` (B, K) is True don't count."""
+    if exclude is not None:
+        neg = neg.masked_fill(exclude, float("-inf"))
+    return -torch.log_softmax(torch.cat([pos[:, None], neg], dim=1) / temperature, dim=1)[:, 0]
+
+
+def starspace_from_similarities(pos, neg, gamma, exclude=None):
+    """StarSpace's hinge, mean of the non-zero max(0, gamma - (pos - neg_i)), over negatives not
+    in `exclude`."""
+    terms = torch.relu(gamma - (pos[:, None] - neg))
+    if exclude is not None:
+        terms = terms.masked_fill(exclude, 0.0)
+    return _mean_of_positive(terms)
+
+
+def infonce(t, h, hu, temperature, space=EUCLIDEAN):
+    """-log p(positive) under a softmax over similarities divided by the temperature:
+    [s(h, t), s(h, hu_1), ..., s(h, hu_n)] / temperature.  Always on, unlike rank."""
+    return infonce_from_similarities(*similarities(t, h, hu=hu, space=space), temperature)
+
+
+def infonce_pool(t, h, pool, exclude, temperature, space=EUCLIDEAN):
     """infonce against every node of a shared negative pool at once: one (B, P) matrix multiply
     rather than gathering P negatives per node.  exclude: (B, P), True where the pool node is the
-    anchor itself."""
-    hn = F.normalize(h, dim=-1)
-    pos = (hn * F.normalize(t, dim=-1)).sum(-1, keepdim=True)
-    neg = (hn @ F.normalize(pool, dim=-1).T).masked_fill(exclude, float("-inf"))
-    return -torch.log_softmax(torch.cat([pos, neg], dim=1) / temperature, dim=1)[:, 0]
+    anchor itself (or must otherwise not count)."""
+    return infonce_from_similarities(*similarities(t, h, pool=pool, space=space), temperature, exclude)
 
 
-LOSSES = {"margin": margin, "starspace": starspace, "rank": rank, "rankspace": rankspace,
+LOSSES = {"margin": margin, "margin_sq": margin_sq, "starspace": starspace, "rank": rank, "rankspace": rankspace,
           "infonce": infonce}
 
 
 # Listwise losses over each node's PPR list (ppr.py).  Unlike the losses above there's no
 # reconstruction: h(v) is scored against its listed nodes' own embeddings, as retrieval scores
-# them, with logits cos(h(v), h(u)) / temperature.  pos_w (B, k) are the list's weights, 0 for
+# them, with logits s(h(v), h(u)) / temperature (s the space's similarity).  pos_w (B, k) are the list's weights, 0 for
 # padding; the negatives' logits (B, n) have MASKED where a negative must not count.
 
 MASKED = -1e4   # finite, so logcumsumexp's backward pass stays finite
 
 
-def cosine_logits(h, others, temperature):
+def logits(h, others, temperature, space=EUCLIDEAN):
     """(B, d) against (B, n, d) -> (B, n)."""
-    return (F.normalize(others, dim=-1) * F.normalize(h, dim=-1)[:, None, :]).sum(-1) / temperature
+    return space.similarity(others, h[:, None, :]) / temperature
 
 
-def pool_logits(h, pool, temperature):
+def pool_logits(h, pool, temperature, space=EUCLIDEAN):
     """(B, d) against a shared (P, d) pool -> (B, P)."""
-    return F.normalize(h, dim=-1) @ F.normalize(pool, dim=-1).T / temperature
+    return space.pairwise_similarity(h, pool) / temperature
 
 
 def listnet(pos_logits, pos_w, neg_logits, passive=False):

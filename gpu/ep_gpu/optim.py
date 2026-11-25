@@ -31,6 +31,34 @@ def stochastic_round_bf16(x, generator=None):
     return ((bits + noise) & -65536).view(torch.float32).to(torch.bfloat16)
 
 
+class TableOptimizers:
+    """Several sparse tables (the feature embeddings, and their importance scalars) stepped as one,
+    on the same learning rate."""
+
+    def __init__(self, *optimizers):
+        self.optimizers = optimizers
+
+    @property
+    def lr(self):
+        return self.optimizers[0].lr
+
+    @lr.setter
+    def lr(self, value):
+        for o in self.optimizers:
+            o.lr = value
+
+    def zero_grad(self):
+        for o in self.optimizers:
+            o.zero_grad()
+
+    def step(self):
+        for o in self.optimizers:
+            o.step()
+
+    def state_bytes(self):
+        return sum(o.state_bytes() for o in self.optimizers)
+
+
 class SparseTableOptimizer:
     def __init__(self, weight, kind="adam", lr=0.01, betas=(0.9, 0.999), eps=1e-8, generator=None):
         if kind not in KINDS:

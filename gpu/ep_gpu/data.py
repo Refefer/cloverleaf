@@ -149,17 +149,22 @@ def load_cached(cache_path, edges_path, features_path=None, directed=False, name
 def save_aggregator(path, model):
     """Writes the model's pooling as a cloverleaf FeatureAggregator file, which
     `cloverleaf.FeatureAggregator.load` reads: Averaged for mean pooling, or Attention with the
-    query/key/value and output projections (PyTorch Linear weights).  A nested reconstruction's
-    neighbour pooling is only used in training and isn't written."""
+    query/key/value and output projections (PyTorch Linear weights), with the Poincaré geometry
+    (curvature and clip) for a Poincaré model.  A nested reconstruction's neighbour pooling is
+    only used in training and isn't written.  Only for models train.aggregator_representable
+    accepts."""
     from .model import AttentionPool
     pool = model.pool
     if not isinstance(pool, AttentionPool):
-        cl.FeatureAggregator.Averaged().save(path)
-        return
-    qkv = pool.qkv.weight.detach().float().cpu()
-    out = pool.out.weight.detach().float().cpu()
-    cl.FeatureAggregator.Attention(out.shape[0], pool.heads, pool.head_dims,
-                                   qkv.flatten().tolist(), out.flatten().tolist()).save(path)
+        aggregator = cl.FeatureAggregator.Averaged()
+    else:
+        qkv = pool.qkv.weight.detach().float().cpu()
+        out = pool.out.weight.detach().float().cpu()
+        aggregator = cl.FeatureAggregator.Attention(out.shape[0], pool.heads, pool.head_dims,
+                                                    qkv.flatten().tolist(), out.flatten().tolist())
+    if model.space.name == "poincare":
+        aggregator = aggregator.with_geometry("poincare", model.space.c, model.space.max_tangent_norm)
+    aggregator.save(path)
 
 
 def save_embeddings(path, keys, embeddings):
