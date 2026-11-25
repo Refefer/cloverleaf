@@ -116,8 +116,21 @@ impl ANode {
         Self::from_tensor(unwrap_tensor(self.tensor.sum_all(), "sum"))
     }
 
+    /// `self` to the power `exp`.  Squares and square roots, the distances' and norms' powers,
+    /// use Candle's own ops: its general power goes through `powf` per element, many times
+    /// slower than a multiply.
     pub fn pow(&self, exp: f32) -> Self {
+        if exp == 2.0 {
+            return self.sqr()
+        }
+        if exp == 0.5 {
+            return self.sqrt()
+        }
         Self::from_tensor(unwrap_tensor(self.tensor.powf(exp as f64), "pow"))
+    }
+
+    pub fn sqr(&self) -> Self {
+        Self::from_tensor(unwrap_tensor(self.tensor.sqr(), "sqr"))
     }
 
     pub fn sqrt(&self) -> Self {
@@ -461,6 +474,36 @@ impl_commutative_scalar_lhs_op!(Mul, mul, *);
 
 impl_binary_op!(Div, div, Tensor::broadcast_div, "div");
 impl_scalar_rhs_op!(Div, div, |lhs, s| lhs.affine(1.0 / s, 0.0), "div scalar");
+
+#[cfg(test)]
+mod pow_tests {
+    use super::*;
+
+    /// Squares and square roots take the fast path; values and gradients match the general
+    /// power.
+    #[test]
+    fn test_pow_fast_path_matches_powf() {
+        let data = [0.25f32, 1.5, 3.0, 7.75];
+        for exp in [2f32, 0.5] {
+            let fast = Variable::new(data.to_vec());
+            let general = Variable::new(data.to_vec());
+            let general_out = ANode::from_tensor(unwrap_tensor(general.tensor.powf(exp as f64), "pow"));
+            let fast_out = fast.pow(exp);
+            for (a, b) in fast_out.value().iter().zip(general_out.value().iter()) {
+                assert!((a - b).abs() <= 1e-6 * b.abs().max(1.), "pow({}) {} vs {}", exp, a, b);
+            }
+            let (mut gf, mut gg) = (Graph::new(), Graph::new());
+            gf.backward(&fast_out.sum());
+            gg.backward(&general_out.sum());
+            let (df, dg) = (gf.get_grad(&fast).unwrap(), gg.get_grad(&general).unwrap());
+            for (a, b) in df.iter().zip(dg.iter()) {
+                assert!((a - b).abs() <= 1e-5 * b.abs().max(1.), "d pow({}) {} vs {}", exp, a, b);
+            }
+        }
+        // Other exponents still work.
+        assert!((Variable::new(vec![2.0]).pow(3.0).value()[0] - 8.0).abs() < 1e-5);
+    }
+}
 
 #[cfg(test)]
 mod matrix_op_tests {

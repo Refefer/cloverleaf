@@ -520,7 +520,9 @@ PprRankLearner(
     beta: float | None = None,
     num_features: float | None = None,
     weight_decay: float | None = None,
-    valid_pct: float | None = None
+    valid_pct: float | None = None,
+    optimizer: Optimizer | None = None,
+    temperature: float | None = None
 )
 ```
 
@@ -528,7 +530,11 @@ PprRankLearner(
 and a softmax over its dot products with the listed nodes and the negatives.  Positives already
 predicted at least as likely as their PPR weight are skipped.  `"listmle"` is top-k ListMLE: the
 Plackett–Luce likelihood of the listed nodes coming first, in PPR order, ahead of the negatives.
-The order among the negatives isn't scored.  `ppr_lists` (below) returns the lists themselves.
+The order among the negatives isn't scored.  `"approxndcg"` (Qin, Liu and Li, 2010) optimises
+NDCG itself: one minus NDCG over the list, with the PPR weights as gains and each node's rank
+replaced by a smooth estimate, `1 + sum_j sigmoid((s_j - s_i) / temperature)`.  `temperature`
+(default 0.1) sets how closely that tracks the true rank; lower is closer but has sharper
+gradients.  CPU only.  `ppr_lists` (below) returns the lists themselves.
 
 ### Feature handling
 | Class | Constructor (Python) | Key Methods |

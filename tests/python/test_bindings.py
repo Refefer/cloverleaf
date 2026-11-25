@@ -531,6 +531,20 @@ def test_ppr_rank_rejects_unknown_losses(loss):
         cl.PprRankLearner(0.1, 2, 4, 2, 3.0, 2, 2, 1, loss=loss)
 
 
+@pytest.mark.parametrize("kwargs", [dict(loss="approxndcg"), dict(loss="approxndcg", temperature=0.5)])
+def test_ppr_rank_learns_with_approx_ndcg(graph, kwargs):
+    learner = cl.PprRankLearner(0.1, 2, 4, 2, 3.0, 2, 2, 1, valid_pct=0.0, **kwargs)
+    feats = learner.learn_features(graph, cl.FeatureSet.new_from_graph(graph), indicator=False)
+    assert feats.dims() == 4
+
+
+@pytest.mark.parametrize("kwargs", [dict(temperature=0.5), dict(loss="listmle", temperature=0.5),
+                                    dict(loss="approxndcg", temperature=0.0)])
+def test_ppr_rank_rejects_bad_temperatures(kwargs):
+    with pytest.raises(ValueError):
+        cl.PprRankLearner(0.1, 2, 4, 2, 3.0, 2, 2, 1, **kwargs)
+
+
 @pytest.mark.parametrize("kwargs", [dict(alpha=0.0), dict(batch_size=0), dict(dims=0), dict(valid_pct=1.0),
                                     dict(noise=-1.0), dict(dense_alpha=float("nan"))])
 def test_embedding_propagator_rejects_untrainable_settings(kwargs):
