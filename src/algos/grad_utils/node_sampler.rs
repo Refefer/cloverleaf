@@ -69,8 +69,38 @@ impl <'a, 'b> BatchSamplerStrategy for &'b RandomWalkHardStrategy<'a> {
             // Hard coded right now; should be parameterized
             p: 0.25, 
             num_hard_negatives: self.num_hard_negatives,
-            train_idxs: self.train_idxs
+            source: NegativeSource::Nodes(self.train_idxs)
         }
+    }
+}
+
+/// The nodes uniform negatives are drawn from.
+#[derive(Clone, Copy, Debug)]
+pub enum NegativeSource<'a> {
+    /// These nodes only.
+    Nodes(&'a [NodeID]),
+    /// Every node of a graph with this many, without a list of them.
+    All(usize)
+}
+
+impl <'a> NegativeSource<'a> {
+    pub fn len(&self) -> usize {
+        match self {
+            NegativeSource::Nodes(nodes) => nodes.len(),
+            NegativeSource::All(n) => *n
+        }
+    }
+
+    fn get(&self, i: usize) -> NodeID {
+        match self {
+            NegativeSource::Nodes(nodes) => nodes[i],
+            NegativeSource::All(_) => i
+        }
+    }
+
+    /// A node uniformly at random.
+    pub fn sample<R: Rng>(&self, rng: &mut R) -> NodeID {
+        self.get(Uniform::new(0, self.len()).sample(rng))
     }
 }
 
@@ -78,8 +108,15 @@ pub struct RandomWalkHardSampler<'a> {
     // Restart probability
     p: f32,
     num_hard_negatives: usize,
-    /// Only sample from the train IDs for obvious reasons.
-    train_idxs: &'a [NodeID]
+    /// Where uniform negatives come from.
+    source: NegativeSource<'a>
+}
+
+impl <'a> RandomWalkHardSampler<'a> {
+    /// Up to `num_hard_negatives` negatives from random walks, the rest uniform from `source`.
+    pub fn new(num_hard_negatives: usize, source: NegativeSource<'a>) -> Self {
+        RandomWalkHardSampler { p: 0.25, num_hard_negatives, source }
+    }
 }
 
 impl <'a> NodeSampler for RandomWalkHardSampler<'a> {
@@ -103,10 +140,9 @@ impl <'a> NodeSampler for RandomWalkHardSampler<'a> {
         }
 
         // The anchor is never its own negative, unless there is nothing else to draw.
-        let dist = Uniform::new(0, self.train_idxs.len());
-        let only_anchor = self.train_idxs.len() == 1 && self.train_idxs[0] == anchor;
+        let only_anchor = self.source.len() == 1 && self.source.get(0) == anchor;
         while negatives.len() < num_negs {
-            let node = self.train_idxs[dist.sample(rng)];
+            let node = self.source.sample(rng);
             if node != anchor || only_anchor {
                 negatives.push(node);
             }

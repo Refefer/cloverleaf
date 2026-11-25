@@ -4,6 +4,7 @@
 pub mod loss;
 pub mod model;
 pub mod attention;
+pub mod negatives;
 
 use std::fmt::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,6 +35,8 @@ use crate::algos::grad_utils::accumulator::GradientAccumulator;
 
 use self::loss::*;
 use self::model::{Model,NodeCounts};
+use self::negatives::{HardNegatives, NegativeTypes, TypedNodes, RandomNegatives, HardPool};
+use crate::vocab::Vocab;
 
 /// How the learning rate changes over training.
 #[derive(Clone,Copy,Debug,PartialEq)]
@@ -128,9 +131,13 @@ pub struct EmbeddingPropagation {
     /// Number of passes to optimize for
     pub passes: usize,
 
-    /// Whether we use hard negatives or not.  We might strip this out since I've had difficulty
-    /// using it to improve test loss
-    pub hard_negs: usize,
+    /// Hard negatives alongside the loss's random ones: none, from random walks, or the
+    /// nearest nodes of a per-batch pool (margin and StarSpace losses).
+    pub hard_negatives: HardNegatives,
+
+    /// Which node types each anchor type's negatives may be (random and nearest ones alike).
+    /// Needs node types, so only [`learn_features`](Self::learn_features) supports it.
+    pub negative_types: Option<NegativeTypes>,
 
     /// Reweights losses according to the number of outbound edges they have
     pub loss_weighting: LossWeighting,
@@ -188,6 +195,16 @@ impl EmbeddingPropagation {
         if !(0. ..1.).contains(&self.valid_pct) {
             return Err(Error::InvalidArgument(format!("valid_pct must be in [0, 1), got {}", self.valid_pct)))
         }
+        if let HardNegatives::Nearest(_) = self.hard_negatives {
+            if !matches!(self.loss, Loss::MarginLoss(..) | Loss::StarSpace(..)) {
+                return Err(Error::InvalidArgument(format!(
+                    "nearest hard negatives need the margin or StarSpace loss, not {:?}", self.loss)))
+            }
+        }
+        if self.negative_types.is_some() && matches!(self.hard_negatives, HardNegatives::RandomWalk(n) if n > 0) {
+            return Err(Error::InvalidArgument(
+                "random-walk hard negatives ignore node types; use nearest hard negatives with negative_types".into()))
+        }
         if !self.loss.supports(&self.geometry) {
             return Err(Error::InvalidArgument(format!(
                 "{:?} scores by dot product or cosine, so it needs geometry \"euclidean\", not {}",
@@ -207,8 +224,9 @@ impl EmbeddingPropagation {
         model: &M
     ) -> Result<NodeEmbeddings, Error> {
         features.prepare_for_learning(graph, warm_start.as_ref())?;
-        let embeddings = self.learn(graph.graph(), &features.features,
-                                    warm_start.map(|w| w.embeddings), model)?;
+        let embeddings = self.learn_feature_embeddings(graph.graph(), &features.features,
+                                                       warm_start.map(|w| w.embeddings), model,
+                                                       Some(graph.vocab()))?;
         Ok(NodeEmbeddings { vocab: Arc::new(features.features.clone_vocab()), embeddings })
     }
 }
@@ -222,7 +240,8 @@ impl Default for EmbeddingPropagation {
             batch_size: 50,
             d_model: 100,
             passes: 100,
-            hard_negs: 0,
+            hard_negatives: HardNegatives::None,
+            negative_types: None,
             loss_weighting: LossWeighting::None,
             seed: crate::DEFAULT_SEED,
             valid_pct: 0.1,
@@ -248,7 +267,11 @@ impl EmbeddingPropagation {
         feature_embeddings: Option<EmbeddingStore>,
         model: &M
     ) -> Result<EmbeddingStore, Error> {
-        self.learn_feature_embeddings(graph, features, feature_embeddings, model)
+        if self.negative_types.is_some() {
+            return Err(Error::InvalidArgument(
+                "negative_types needs node types: learn with learn_features and a NamedGraph".into()))
+        }
+        self.learn_feature_embeddings(graph, features, feature_embeddings, model, None)
     }
     
     // The uber expensive function
@@ -257,7 +280,8 @@ impl EmbeddingPropagation {
         graph: &G,
         features: &FeatureStore,
         feature_embeddings: Option<EmbeddingStore>,
-        model: &M
+        model: &M,
+        vocab: Option<&Vocab>
     ) -> Result<EmbeddingStore, Error> {
         self.validate()?;
 
@@ -321,8 +345,18 @@ impl EmbeddingPropagation {
             LRScheduler::noop()
         };
 
-        // Initialize samplers for negatives.
-        let valid_random_sampler = RandomWalkHardStrategy::new(self.hard_negs, &valid_idxs);
+        // Negatives come from every node, validation nodes included (they just aren't anchors):
+        // a node that is never a negative is only ever pulled towards its neighbours, which in
+        // the Poincaré ball draws it towards the origin, near everything.
+        let num_nodes = graph.len();
+        // Negatives by node type: each type's nodes, resolved once.
+        let typed = match (&self.negative_types, vocab) {
+            (Some(spec), Some(vocab)) => Some(TypedNodes::new(spec, vocab)?),
+            (Some(_), None) => return Err(Error::InvalidArgument("negative_types needs the graph's node types".into())),
+            (None, _) => None
+        };
+        let nearest = match self.hard_negatives { HardNegatives::Nearest(n) => Some(n), _ => None };
+        let random_sampler = RandomNegatives::new(&self.hard_negatives, typed.as_ref(), num_nodes);
 
         let mut last_error = std::f32::INFINITY;
         let step = AtomicUsize::new(1);
@@ -346,14 +380,13 @@ impl EmbeddingPropagation {
 
             // Shuffle for SGD
             node_idxs.shuffle(&mut rng);
-            // Borrows the shuffled node list for easy negatives, so it's rebuilt every pass.
-            let random_sampler = RandomWalkHardStrategy::new(self.hard_negs, &node_idxs);
             let err_cnt: (f32, usize) = node_idxs.par_iter().chunks(self.batch_size).enumerate().map(|(i, nodes)| {
 
-                let sampler = (&random_sampler).initialize_batch(
-                    &nodes,
-                    graph,
-                    features);
+                let sampler = &random_sampler;
+                // Nearest hard negatives: this batch's pool, embedded with the current weights.
+                let pool = nearest.as_ref().map(|n| HardPool::build(
+                    n, typed.as_ref(), num_nodes, features, &feature_embeddings, model, &self.geometry,
+                    node_seed(self.seed, pass, i, usize::MAX)));
                 
                 let n_nodes = nodes.len();
                 // Compute grads for batch
@@ -363,7 +396,7 @@ impl EmbeddingPropagation {
                     let params = model.params();
                     let (mut loss, hv_vars, thv_vars, hu_vars) = self.run_forward_pass(
                         graph, n_id, &features, &feature_embeddings, 
-                        model, &params, &sampler, &mut rng);
+                        model, &params, sampler, pool.as_ref(), &mut rng);
 
                     loss = match self.loss_weighting {
                         LossWeighting::DegreeLog => {
@@ -491,14 +524,17 @@ impl EmbeddingPropagation {
             
             if valid_idxs.len() > 0 {
                 // Validate.  We use the same random seed for consistency across iterations.
-                let valid_errors = valid_idxs.par_iter().chunks(self.batch_size).map(|nodes| {
-                    let sampler = (&valid_random_sampler).initialize_batch(&nodes, graph, features);
+                let valid_errors = valid_idxs.par_iter().chunks(self.batch_size).enumerate().map(|(i, nodes)| {
+                    let sampler = &random_sampler;
+                    let pool = nearest.as_ref().map(|n| HardPool::build(
+                        n, typed.as_ref(), num_nodes, features, &feature_embeddings, model, &self.geometry,
+                        node_seed(self.seed.wrapping_sub(1), 0, i, usize::MAX)));
 
                     nodes.par_iter().map(|node_id| {
                         let mut rng = XorShiftRng::seed_from_u64(self.seed.wrapping_sub(1));
                         let loss = self.run_forward_pass(
                             graph, **node_id, &features, &feature_embeddings, 
-                            model, &model.params(), &sampler, &mut rng).0;
+                            model, &model.params(), sampler, pool.as_ref(), &mut rng).0;
 
                         loss.value()[0]
                     }).sum::<f32>()
@@ -520,22 +556,28 @@ impl EmbeddingPropagation {
         model: &M,
         params: &M::Params,
         sampler: &S,
+        pool: Option<&HardPool>,
         rng: &mut R
     ) -> (ANode, NodeCounts, NodeCounts, Vec<NodeCounts>) {
+        let g = &self.geometry;
         // h(v)
         let (hv_vars, hv) = model.construct_node_embedding(
             params, node, 1f32, features, &feature_embeddings, rng);
         
-        // ~h(v)
+        // ~h(v), in the embedding space (the identity in Euclidean space)
         let (thv_vars, thv) = self.loss.construct_positive(
             params, graph, node, features, &feature_embeddings, model, rng);
+        let thv = g.to_space_node(thv);
         
         // h(u)
         let num_negs = self.loss.negatives();
-        let mut negatives = Vec::with_capacity(num_negs);
+        let mut negatives = Vec::with_capacity(num_negs + self.hard_negatives.extra());
         
-        // Sample random negatives
+        // Sample random negatives, then add the pool's nodes nearest the reconstruction
         sampler.sample_negatives(graph, node, &mut negatives, num_negs, rng);
+        if let Some(pool) = pool {
+            pool.nearest(graph, node, &thv.value(), g, &mut negatives);
+        }
         
         let mut hu_vars = Vec::with_capacity(negatives.len());
         let mut hus = Vec::with_capacity(negatives.len());
@@ -545,10 +587,9 @@ impl EmbeddingPropagation {
             hus.push(hu);
         });
 
-        // Into the embedding space (the identity in Euclidean space), then the error.
-        let g = &self.geometry;
+        // Into the embedding space, then the error.
         let hus: Vec<ANode> = hus.into_iter().map(|hu| g.to_space_node(hu)).collect();
-        let loss = self.loss.compute(g.to_space_node(thv), g.to_space_node(hv), &hus, g);
+        let loss = self.loss.compute(thv, g.to_space_node(hv), &hus, g);
 
         (loss, hv_vars, thv_vars, hu_vars)
 
@@ -693,7 +734,8 @@ mod ep_tests {
             alpha: 1e-2,
             loss: Loss::MarginLoss(1f32, 1usize),
             batch_size: 32,
-            hard_negs: 0,
+            hard_negatives: HardNegatives::None,
+            negative_types: None,
             loss_weighting: LossWeighting::None,
             d_model: 5,
             valid_pct: 0.0,
@@ -709,7 +751,7 @@ mod ep_tests {
             geometry: Geometry::Euclidean
         };
 
-        let embeddings = ep.learn_feature_embeddings(&ccsr, &feature_store, None, &model).unwrap();
+        let embeddings = ep.learn(&ccsr, &feature_store, None, &model).unwrap();
         for idx in 0..embeddings.len() {
             let e = embeddings.get_embedding(idx);
             println!("{:?} -> {:?}", idx, e);
@@ -746,8 +788,8 @@ mod ep_tests {
         features.fill_missing_nodes();
         let model = super::model::AveragedFeatureModel::new(Sample::All, Sample::All, false, false);
         // Same seed, so zero passes gives the starting point.
-        let init = quick_ep(update_frequency, alpha, 0).learn_feature_embeddings(&graph, &features, None, &model).unwrap();
-        let trained = quick_ep(update_frequency, alpha, passes).learn_feature_embeddings(&graph, &features, None, &model).unwrap();
+        let init = quick_ep(update_frequency, alpha, 0).learn(&graph, &features, None, &model).unwrap();
+        let trained = quick_ep(update_frequency, alpha, passes).learn(&graph, &features, None, &model).unwrap();
         (init, trained)
     }
 
@@ -795,7 +837,7 @@ mod ep_tests {
         for loss in [Loss::MarginLoss(1., 3), Loss::StarSpace(1., 3)] {
             let ep = EmbeddingPropagation { loss, geometry: Geometry::Poincare(ball),
                                             ..quick_ep(UpdateFrequency::Batch, 0.05, 30) };
-            let embs = ep.learn_feature_embeddings(&graph, &features, None, &model).unwrap();
+            let embs = ep.learn(&graph, &features, None, &model).unwrap();
             let point = |i: usize| { let mut v = embs.get_embedding(i).to_vec(); ep.geometry.to_space(&mut v); v };
             let dist = |a: usize, b: usize| ball.curvature().distance(&point(a), &point(b));
             let within = (2..20).map(|i| dist(1, i)).sum::<f32>() / 18.;
@@ -823,8 +865,8 @@ mod ep_tests {
                 optimizer: OptimizerKind::AdamW(WeightDecay::new(rate).unwrap()),
                 ..quick_ep(mode, 1e-6, passes)
             };
-            let init = ep(0).learn_feature_embeddings(&graph, &features, None, &model).unwrap();
-            let trained = ep(passes).learn_feature_embeddings(&graph, &features, None, &model).unwrap();
+            let init = ep(0).learn(&graph, &features, None, &model).unwrap();
+            let trained = ep(passes).learn(&graph, &features, None, &model).unwrap();
             for i in 0..init.len() {
                 for (a, b) in init.get_embedding(i).iter().zip(trained.get_embedding(i)) {
                     assert!((a * expected - b).abs() < 1e-4,
@@ -903,7 +945,7 @@ mod ep_tests {
     fn test_attention_learns_the_cliques() {
         let (graph, features) = two_cliques_with_pairs();
         let model = attention_model();
-        let fe = attention_ep(UpdateFrequency::Batch, 30).learn_feature_embeddings(&graph, &features, None, &model).unwrap();
+        let fe = attention_ep(UpdateFrequency::Batch, 30).learn(&graph, &features, None, &model).unwrap();
         let weights = model.weights().unwrap();
         assert_eq!((weights.dims(), weights.heads(), weights.head_dims()), (8, 2, 8));
         assert!(weights.out().iter().any(|v| v.abs() > 1e-3), "the output projection didn't train");
@@ -921,9 +963,9 @@ mod ep_tests {
         let (graph, features) = two_cliques_with_pairs();
         let moved = |mode| {
             let start = attention_model();
-            attention_ep(mode, 0).learn_feature_embeddings(&graph, &features, None, &start).unwrap();
+            attention_ep(mode, 0).learn(&graph, &features, None, &start).unwrap();
             let model = attention_model();
-            attention_ep(mode, 1).learn_feature_embeddings(&graph, &features, None, &model).unwrap();
+            attention_ep(mode, 1).learn(&graph, &features, None, &model).unwrap();
             start.weights().unwrap().parameters().iter().zip(model.weights().unwrap().parameters())
                 .map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
         };
@@ -939,11 +981,11 @@ mod ep_tests {
         let model = attention_model();
         let mut rng = XorShiftRng::seed_from_u64(0);
         model.warm_start(super::attention::AttentionWeights::init(6, 2, &mut rng).unwrap()).unwrap();
-        assert!(attention_ep(UpdateFrequency::Batch, 1).learn_feature_embeddings(&graph, &features, None, &model).is_err());
+        assert!(attention_ep(UpdateFrequency::Batch, 1).learn(&graph, &features, None, &model).is_err());
         assert!(model.warm_start(super::attention::AttentionWeights::init(8, 3, &mut rng).unwrap()).is_err());
         let fitting = super::attention::AttentionWeights::init(8, 2, &mut rng).unwrap();
         model.warm_start(fitting.clone()).unwrap();
-        attention_ep(UpdateFrequency::Batch, 0).learn_feature_embeddings(&graph, &features, None, &model).unwrap();
+        attention_ep(UpdateFrequency::Batch, 0).learn(&graph, &features, None, &model).unwrap();
         assert_eq!(*model.weights().unwrap(), fitting);
     }
 
@@ -959,6 +1001,66 @@ mod ep_tests {
         assert!("step".parse::<UpdateFrequency>().is_err() && "xavier".parse::<EmbeddingInit>().is_err());
     }
 
+    /// Queries and products in two communities; each query is linked to its community's
+    /// products.  Its features: its own id only.
+    fn two_markets() -> (NamedGraph, FeatureSet) {
+        use crate::graph::EdgeType;
+        use crate::named_graph::GraphBuilder;
+        let mut gb = GraphBuilder::new();
+        for c in 0..2 {
+            for q in 0..8 {
+                for p in 0..8 {
+                    gb.add_edge(("query", format!("q{}-{}", c, q).as_str()), ("product", format!("p{}-{}", c, p).as_str()),
+                                1., EdgeType::Undirected);
+                }
+            }
+        }
+        let graph = gb.build(true).unwrap();
+        let features = FeatureSet::from_graph(&graph);
+        (graph, features)
+    }
+
+    /// Cross-type random negatives with nearest hard negatives train in the Poincaré ball: each
+    /// query's nearest products are its own market's.
+    #[test]
+    fn test_typed_nearest_negatives_learn_in_the_ball() {
+        use crate::geometry::{Curvature, PoincareBall};
+        use self::negatives::NearestNegatives;
+        let (graph, mut features) = two_markets();
+        let model = super::model::AveragedFeatureModel::new(Sample::All, Sample::All, false, false);
+        let ball = PoincareBall::new(Curvature::new(0.5).unwrap(), None).unwrap();
+        // Margin loss: on this toy, with only id features, StarSpace in the ball (on either
+        // trainer) doesn't separate the markets, while the margin loss does.
+        let ep = EmbeddingPropagation {
+            loss: Loss::MarginLoss(1., 2), geometry: Geometry::Poincare(ball),
+            hard_negatives: HardNegatives::Nearest(NearestNegatives::new(2, 16).unwrap()),
+            negative_types: Some("query=product;product=query".parse().unwrap()),
+            ..quick_ep(UpdateFrequency::Batch, 0.01, 60)
+        };
+        let embs = ep.learn_features(&graph, &mut features, None, &model).unwrap();
+        let point = |t: &str, n: String| {
+            let node = graph.node_id(t, &n).unwrap();
+            let mut v = embs.embeddings.get_embedding(features.store().get_features(node)[0]).to_vec();
+            ep.geometry.to_space(&mut v);
+            v
+        };
+        // Each query's 8 nearest products are its own community's.
+        let mut right = 0;
+        for c in 0..2 {
+            for q in 0..8 {
+                let x = point("query", format!("q{}-{}", c, q));
+                let mut d: Vec<(f32, usize)> = (0..2).flat_map(|cc| (0..8).map(move |p| (cc, p)))
+                    .map(|(cc, p)| (ep.geometry.distance(&x, &point("product", format!("p{}-{}", cc, p))), cc))
+                    .collect();
+                d.sort_by(|a, b| a.0.total_cmp(&b.0));
+                right += d[..8].iter().filter(|(_, cc)| *cc == c).count();
+            }
+        }
+        assert!(right >= 120, "{} of 128 nearest products in the query's own market", right);
+        // Without node types, negative_types can't be resolved.
+        assert!(ep.learn(graph.graph(), features.store(), None, &model).is_err());
+    }
+
     /// Settings that can't train are rejected before training starts.
     #[test]
     fn test_validate_rejects_untrainable_settings() {
@@ -972,6 +1074,11 @@ mod ep_tests {
             EmbeddingPropagation { noise: -1., ..EmbeddingPropagation::default() },
             EmbeddingPropagation { loss: Loss::RankLoss(0.5, 3),
                 geometry: Geometry::new("poincare", Some(1.), None).unwrap(), ..EmbeddingPropagation::default() },
+            EmbeddingPropagation { loss: Loss::RankLoss(0.5, 3),
+                hard_negatives: HardNegatives::Nearest(self::negatives::NearestNegatives::new(1, 4).unwrap()),
+                ..EmbeddingPropagation::default() },
+            EmbeddingPropagation { hard_negatives: HardNegatives::RandomWalk(2),
+                negative_types: Some("query=product".parse().unwrap()), ..EmbeddingPropagation::default() },
         ];
         let graph = two_cliques();
         let mut features = FeatureStore::new(graph.len());

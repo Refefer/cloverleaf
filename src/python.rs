@@ -36,6 +36,7 @@ use crate::algos::ep::attention::AttentionWeights;
 use crate::algos::ep::{EmbeddingPropagation,LossWeighting as EPLW};
 use crate::algos::ep::loss::Loss;
 use crate::algos::ep::model::FeatureModel;
+use crate::algos::ep::negatives::{HardNegatives, NearestNegatives, NegativeTypes};
 use crate::algos::feat_propagation::{DEFAULT_THRESHOLD as PROPAGATION_THRESHOLD, DEFAULT_MAX_ITERS as PROPAGATION_MAX_ITERS};
 use crate::algos::graph_ann::{GraphAnn as CoreGraphAnn, GRAPH_ANN_SEED};
 use crate::algos::grwr::{Steps as GSteps,GuidedRWR};
@@ -1257,11 +1258,28 @@ impl EmbeddingPropagator {
     ///    
     ///    valid_pct : Float - Optional
     ///        Takes a percentage of the nodes in the graph and uses them to measure validation.
-    ///        Not very useful right now, default is 0.1
+    ///        Validation nodes are never anchors but are drawn as negatives like any other node.
+    ///        Default is 0.1
     ///    
     ///    hard_negatives : Int - Optional
     ///        Finds hard negatives by performing a random walk in the neighborhood and using it to
     ///        select a negative.  Default is 0
+    ///
+    ///    nearest_negatives : Int - Optional
+    ///        Hard negatives from the embeddings themselves: each batch embeds `negative_pool`
+    ///        candidate nodes, and every node adds the `nearest_negatives` candidates nearest its
+    ///        reconstruction (other than itself, its own neighbors and, with negative_types,
+    ///        types it may not draw) to the loss's random negatives.  Margin and StarSpace
+    ///        losses only; can't be combined with hard_negatives.  The GPU trainer's
+    ///        hard_negatives.  Default is None.
+    ///
+    ///    negative_pool : Int - Optional
+    ///        Candidate nodes embedded per batch for nearest_negatives.  Default is 2048.
+    ///
+    ///    negative_types : String - Optional
+    ///        Which node types each node type's negatives may be, as
+    ///        "query=product;product=query"; types left out may draw any type.  Allowed types are
+    ///        drawn in equal shares, however rare.  Default is None (any node).
     ///    
     ///    indicator : Bool - Optional
     ///        Shows a progress bar.  Default is True
@@ -1325,7 +1343,7 @@ impl EmbeddingPropagator {
     ///        
     ///    
     #[new]
-    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, indicator=None, attention_heads=None, dense_alpha=None, noise=None, optimizer=None, lr_schedule=None, init=None, update_frequency=None, geometry=None, curvature=None, max_tangent_norm=None))]
+    #[pyo3(signature = (alpha=None, loss=None, batch_size=None, dims=None, passes=None, seed=None, max_nodes=None, weighted_neighbor_sampling=None, weighted_neighbor_averaging=None, max_features=None, loss_weighting=None, valid_pct=None, hard_negatives=None, nearest_negatives=None, negative_pool=None, negative_types=None, indicator=None, attention_heads=None, dense_alpha=None, noise=None, optimizer=None, lr_schedule=None, init=None, update_frequency=None, geometry=None, curvature=None, max_tangent_norm=None))]
     pub fn new(
         // Learning rate
         alpha: Option<f32>, 
@@ -1367,6 +1385,13 @@ impl EmbeddingPropagator {
         // depend on the quality of the graph
         hard_negatives: Option<usize>,
 
+        // Nearest-in-pool hard negatives, and the per-batch pool they're drawn from
+        nearest_negatives: Option<usize>,
+        negative_pool: Option<usize>,
+
+        // Node types each anchor type's negatives may be: "query=product;product=query"
+        negative_types: Option<String>,
+
         // Whether to have a pretty indicator.
         indicator: Option<bool>,
 
@@ -1404,13 +1429,24 @@ impl EmbeddingPropagator {
         let lr_schedule = lr_schedule.map(|v| v.parse()).transpose()?.unwrap_or(d.lr_schedule);
         let init = init.map(|v| v.parse()).transpose()?.unwrap_or(d.init);
         let update_frequency = update_frequency.map(|v| v.parse()).transpose()?.unwrap_or(d.update_frequency);
+        let hard = match (hard_negatives.filter(|n| *n > 0), nearest_negatives) {
+            (Some(_), Some(_)) => return Err(PyValueError::new_err(
+                "hard_negatives (random walks) and nearest_negatives can't be combined")),
+            (Some(n), None) => HardNegatives::RandomWalk(n),
+            (None, Some(k)) => HardNegatives::Nearest(NearestNegatives::new(k, negative_pool.unwrap_or(2048))?),
+            (None, None) if negative_pool.is_some() => return Err(PyValueError::new_err(
+                "negative_pool applies only with nearest_negatives")),
+            (None, None) => d.hard_negatives
+        };
+        let negative_types = negative_types.map(|t| t.parse::<NegativeTypes>()).transpose()?;
         let ep = EmbeddingPropagation {
             alpha: alpha.unwrap_or(d.alpha),
             batch_size: batch_size.unwrap_or(d.batch_size),
             d_model: dims.unwrap_or(d.d_model),
             passes: passes.unwrap_or(d.passes),
             loss: loss.map(|l|l.loss).unwrap_or(d.loss),
-            hard_negs: hard_negatives.unwrap_or(d.hard_negs),
+            hard_negatives: hard,
+            negative_types,
             loss_weighting: loss_weighting.map(|lw| lw.loss).unwrap_or(d.loss_weighting),
             valid_pct: valid_pct.unwrap_or(d.valid_pct),
             seed: seed.unwrap_or(d.seed),

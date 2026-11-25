@@ -104,6 +104,16 @@ impl Vocab {
         })
     }
 
+    /// A node's type as an index into [`node_types`](Self::node_types).
+    pub fn node_type_id(&self, node: NodeID) -> Option<usize> {
+        self.node_id_to_node.get(node).map(|(nt_id, _)| *nt_id)
+    }
+
+    /// The index of node type `node_type` in [`node_types`](Self::node_types).
+    pub fn node_type_index(&self, node_type: &str) -> Option<usize> {
+        self.node_type_to_id.get(&node_type.to_string()).copied()
+    }
+
     /// Each node's type as an index into [`node_types`](Self::node_types), in node id order.
     pub fn node_type_ids(&self) -> Vec<u32> {
         self.node_id_to_node.iter().map(|(nt_id, _)| *nt_id as u32).collect()

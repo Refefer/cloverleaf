@@ -273,7 +273,7 @@ The result of the optimization phase is feature embeddings, which can be used to
 
 Neighborhood alignment (`NeighborhoodAligner`) then pulls each node towards its neighbors.  A new node has no neighbors, so `EmbeddingAligner` places it in the aligned space from its nearest nodes: `method="distances"` keeps its distances to them, and `method="mean_shift"` moves it as they moved on average.  Mean shift with training queries as the anchors works well for new search queries.  Both aligners average in Euclidean space: use them with Euclidean embeddings, and Poincaré ones unaligned (they already place nodes by their neighbourhoods).
 
-For large graphs, the GPU trainer in `gpu/` trains the same averaged and attention models, in Euclidean space or the Poincaré ball, much faster, and its output loads straight into the classes above.  It also has losses, negative sampling and schedules the CPU trainer doesn't; [gpu/README.md](gpu/README.md) gives guidance on choosing a configuration for a task.
+For large graphs, the GPU trainer in `gpu/` trains the same averaged and attention models, in Euclidean space or the Poincaré ball, much faster, and its output loads straight into the classes above.  It also has losses, pooling variants and schedules the CPU trainer doesn't; [gpu/README.md](gpu/README.md) gives guidance on choosing a configuration for a task.
 
 #### The Poincaré ball
 
@@ -290,6 +290,8 @@ agg = cl.FeatureAggregator.Averaged().with_geometry("poincare", 0.3)
 gpu_nodes = cl.NodeEmbeddings.load("PREFIX.node-embeddings", cl.PoincareDistance(0.3))
 ```
 
+Train in the ball with a much smaller `alpha` than in Euclidean space, around 0.01–0.03 with Adam.  Cosine similarity ignores a vector's length, so in Euclidean space large steps do little harm, but in the ball length is position: Adam moves a sparse feature by about `alpha` per coordinate on each update, and at Euclidean rates the feature vectors grow until nodes pile up at the ball's edge, where the map is clamped and no gradient brings them back.  `max_tangent_norm` bounds how far out they can go.
+
 `FeatureAggregator` files record a Poincaré geometry on a first line (`Poincare<TAB>curvature<TAB>max_tangent_norm`); Euclidean ones are unchanged.  `cl.PoincareDistance(c)` works wherever a `cl.Distance` does.
 
 #### Parameters
@@ -305,7 +307,9 @@ gpu_nodes = cl.NodeEmbeddings.load("PREFIX.node-embeddings", cl.PoincareDistance
 10. `update_frequency` - "batch" (an update after every batch) or "epoch" (gradients summed over a pass, one update at its end).
 11. `noise` - Adds gradient noise to the updates; likely to be removed in the future.
 12. `hard_negatives` - Computes hard negatives through a fixed random walk from the anchor node, providing a similar but non-neighbor to the node.
-13. `valid_pct` - Percentage of nodes in the graph to use for validation.
+    * `nearest_negatives` - Instead, hard negatives from the embeddings themselves: each batch embeds `negative_pool` candidate nodes (default 2048), and every node adds the `nearest_negatives` candidates nearest its reconstruction to the loss's random negatives, never itself or its own neighbors (the nearest nodes are often real neighbors, and pushing them away would fight the positive term).  Margin and StarSpace losses only.  The GPU trainer's `--hard-negatives`.
+    * `negative_types` - Which node types each node type's negatives may be, as `"query=product;product=query"`; types left out may draw any type.  Each allowed type is equally likely however rare, and nearest negatives respect it too.  On a bipartite graph, giving each side the other side's nodes as negatives trains the ranking retrieval uses.  Needs node types, so it works with `learn_features`.
+13. `valid_pct` - Percentage of nodes in the graph to use for validation.  Validation nodes are never anchors, but they are drawn as negatives like any other node.
 14. `optimizer` - `cloverleaf.Optimizer.adam()` (default) or `cloverleaf.Optimizer.adamw(weight_decay)`.  AdamW's decay is per pass: at the end of each pass every feature embedding is multiplied by `exp(-weight_decay)` (scaled down along with the learning rate schedule), however many updates the pass had.  Default `weight_decay` 0.001.
 15. `lr_schedule` - `"cosine"` (default) warms the learning rate up over the first 20% of updates, then decays it along a cosine; `"constant"` keeps it at `alpha`, as in the paper.
 16. `init` - `"unit"` (default) starts each feature embedding as a random unit vector; `"glorot"` uses Glorot uniform, as in the paper.
@@ -545,7 +549,7 @@ The order among the negatives isn't scored.  `ppr_lists` (below) returns the lis
 | `NodeEmbedder` | `NodeEmbedder(feat_agg: FeatureAggregator)` | `embed_feature_set(feat_set: FeatureSet, feature_embeddings: NodeEmbeddings) -> NodeEmbeddings`<br>`embed_adhoc(features: list[tuple[str,str]], feature_embeddings: NodeEmbeddings, strict: bool = True) -> list[float]` |
 | `EmbeddingAligner` | `EmbeddingAligner(num_nodes: int, random_nodes: int = 0, alpha: float = 0.1, error: float = 0.01, max_iters: int = 10, method: str = "distances")` | (see methods above) |
 
-*Full signature for `EmbeddingPropagator.__new__` includes optional arguments such as `alpha`, `loss`, `batch_size`, `dims`, `passes`, `seed`, `max_nodes`, `weighted_neighbor_sampling`, `weighted_neighbor_averaging`, `max_features`, `loss_weighting`, `valid_pct`, `hard_negatives`, `indicator`, `attention_heads`, `dense_alpha`, `noise`, `optimizer`, `lr_schedule`, `init`, `update_frequency` (all default to sensible values).*
+*Full signature for `EmbeddingPropagator.__new__` includes optional arguments such as `alpha`, `loss`, `batch_size`, `dims`, `passes`, `seed`, `max_nodes`, `weighted_neighbor_sampling`, `weighted_neighbor_averaging`, `max_features`, `loss_weighting`, `valid_pct`, `hard_negatives`, `nearest_negatives`, `negative_pool`, `negative_types`, `indicator`, `attention_heads`, `dense_alpha`, `noise`, `optimizer`, `lr_schedule`, `init`, `update_frequency`, `geometry`, `curvature`, `max_tangent_norm` (all default to sensible values).*
 
 ### ANN utilities
 | Class | Constructor (Python) | Key Methods |

@@ -681,3 +681,31 @@ def test_embedding_propagator_geometry_options():
                    dict(geometry="poincare", loss=cl.EPLoss.rank(0.5, 3))]:
         with pytest.raises(ValueError):
             cl.EmbeddingPropagator(indicator=False, **kwargs)
+
+
+def test_embedding_propagator_negative_options(tmp_path):
+    ep = cl.EmbeddingPropagator(nearest_negatives=2, negative_pool=16, negative_types="query=product;product=query",
+                                loss=cl.EPLoss.margin(1.0, 2), indicator=False)
+    assert "Nearest" in repr(ep) and "query" in repr(ep)
+    for kwargs in [dict(hard_negatives=2, nearest_negatives=2), dict(negative_pool=16),
+                   dict(nearest_negatives=0), dict(nearest_negatives=4, negative_pool=2),
+                   dict(nearest_negatives=2, loss=cl.EPLoss.rank(0.5, 3)),
+                   dict(negative_types="query"), dict(negative_types=""),
+                   dict(hard_negatives=2, negative_types="query=product")]:
+        with pytest.raises(ValueError):
+            cl.EmbeddingPropagator(indicator=False, **kwargs)
+
+    # Two markets of queries and products; trains with typed, nearest negatives.
+    path = tmp_path / "m.edges"
+    path.write_text("".join(f"query\tq{c}{i}\tproduct\tp{c}{j}\t1\n"
+                            for c in range(2) for i in range(4) for j in range(4)))
+    graph = cl.Graph.load(str(path), cl.EdgeType.Undirected)
+    features = cl.FeatureSet.new_from_graph(graph)
+    ep = cl.EmbeddingPropagator(nearest_negatives=2, negative_pool=8, negative_types="query=product;product=query",
+                                loss=cl.EPLoss.margin(1.0, 2), dims=4, passes=2, batch_size=4, valid_pct=0.0,
+                                indicator=False)
+    assert len(ep.learn_features(graph, features)) == 16
+    # Types the graph doesn't have are rejected when learning.
+    bad = cl.EmbeddingPropagator(negative_types="query=shoe", dims=4, passes=1, indicator=False)
+    with pytest.raises(ValueError):
+        bad.learn_features(graph, cl.FeatureSet.new_from_graph(graph))

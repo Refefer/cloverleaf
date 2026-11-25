@@ -180,6 +180,14 @@ impl Geometry {
         }
     }
 
+    /// The distance between two embeddings in the space: Euclidean or hyperbolic.
+    pub fn distance(&self, x: &[f32], y: &[f32]) -> f32 {
+        match self {
+            Geometry::Euclidean => x.iter().zip(y.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt(),
+            Geometry::Poincare(ball) => ball.curvature().distance(x, y)
+        }
+    }
+
     /// The distance node embeddings in this space are searched and ranked by.
     pub fn node_distance(&self) -> crate::distance::Distance {
         match self {
