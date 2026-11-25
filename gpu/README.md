@@ -137,14 +137,17 @@ GPU model.
 ## What differs
 
 * Nodes with more neighbours than `max_nodes` are sampled with replacement (cloverleaf samples
-  without).  `hard_negatives` here are the pool nodes nearest the reconstruction (cloverleaf's
-  come from random walks).
+  without).  `hard_negatives` and `negative_pool` here are cloverleaf's `nearest_negatives` and
+  `negative_pool` (cloverleaf's `hard_negatives` come from random walks), and `negative_types`
+  is the same option in both.  Cloverleaf draws random typed negatives from all of a type's
+  training nodes rather than from the batch's pool, and leaves out pool nodes the anchor may
+  not use rather than ranking them last.
 * `neighbour_pooling="attention"` (a nested reconstruction's neighbours combined by attention
   rather than their weighted mean) and flat attention reconstructions are GPU only.
 * GPU only: the "sawtooth" learning rate (`lr_cycles` equal cycles, each a linear decay from `lr`
   to `lr`/100, the first after the warmup), row-wise optimisers and a bfloat16 table, InfoNCE and
   the listwise losses, zero-initialised offsets with `--shared-namespace`, and `epoch_after`; and
-  the options below: midpoint pooling in the Poincaré ball, `negative_types`, `margin_sq`, the
+  the options below: midpoint pooling in the Poincaré ball, `margin_sq`, the
   attention variants and `feature_importance` (cloverleaf has the Poincaré geometry itself, with
   tangent pooling and `max_tangent_norm`).
 
