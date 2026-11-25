@@ -101,13 +101,15 @@ GPU model.
 ## What differs
 
 * Nodes with more neighbours than `max_nodes` are sampled with replacement (cloverleaf samples
-  without); hard negatives aren't implemented.
+  without).  `hard_negatives` here are the pool nodes nearest the reconstruction (cloverleaf's
+  come from random walks).
 * `neighbour_pooling="attention"` (a nested reconstruction's neighbours combined by attention
   rather than their weighted mean) and flat attention reconstructions are GPU only.
 * GPU only: the "sawtooth" learning rate (`lr_cycles` equal cycles, each a linear decay from `lr`
   to `lr`/100, the first after the warmup), row-wise optimisers and a bfloat16 table, InfoNCE and
   the listwise losses, feature pruning on load (`--prune-min-count`), shared feature namespaces
-  (`--shared-namespace`) and `epoch_after`.
+  (`--shared-namespace`) and `epoch_after`; and the options below: the Poincaré geometry,
+  `negative_types`, `margin_sq`, the attention variants and `feature_importance`.
 
 ## Speed and precision
 
@@ -166,11 +168,103 @@ size.
   attention there learns its own transform, which lowers the training loss but makes nodes
   worse at retrieving their neighbours.
 
+## Geometry: the Poincaré ball
+
+`--geometry poincare` (`ep_gpu/geometry.py`) puts the node embeddings in the Poincaré ball of
+curvature `-curvature`.  The feature table and pooling don't change: a node's features pool to a
+vector, which is read as a tangent vector at the origin and mapped into the ball with the
+exponential map, `exp0(v) = tanh(sqrt(c)|v|) v / (sqrt(c)|v|)`.  Pairs are scored by negative
+hyperbolic distance, and the margin loss uses that distance; StarSpace, InfoNCE and the listwise
+losses use it as their similarity (logits are `-distance / gamma`).  Every step is
+differentiable and the parameters stay Euclidean, so the optimisers apply unchanged.  Distance
+grows exponentially towards the ball's edge, so a node's distance from the origin can encode how
+general it is: popular, general nodes end up near the origin, specific ones further out.
+
+* `curvature` (default 1).  Lower curvature is flatter (`c -> 0` is Euclidean); 0.1-1 is the
+  useful range.
+* `max_tangent_norm` clips the pooled tangent vector before the map, keeping points away from
+  the edge, where gradients vanish and float32 loses precision.
+* `poincare_pooling`: `tangent` (default) averages the features' vectors and maps the mean;
+  `midpoint` maps every feature into the ball and takes their weighted gyromidpoint;
+  `neighbour_midpoint` averages features as `tangent` but combines a nested reconstruction's
+  neighbours by their gyromidpoint.  The geometry-aware means haven't beaten `tangent`: many
+  scattered word vectors average towards the origin, where every long title would look generic.
+* The rank and rankspace losses score by dot product, so they need Euclidean space.
+
+A starting point: the recommended configuration with `--geometry poincare --curvature 0.3
+--loss starspace --gamma 1.0` (the margin is now in distance units) and mean pooling (see
+Pooling options).  In our tests hyperbolic models held up at far lower widths than Euclidean ones,
+so try 32-64.
+* The aggregator file isn't written for a Poincaré model (cloverleaf's `FeatureAggregator` pools
+  without the map); load its node embeddings with a Poincaré distance to search them.
+
+Graph reconstruction on a balanced tree (branching 3, depth 6; mean average precision of each
+node's neighbours, InfoNCE over distance with one sampled neighbour per reconstruction):
+
+| | 2 dims | 5 dims |
+|---|---|---|
+| Euclidean, best loss | 0.434 | 0.597 |
+| Poincaré | 0.696 | 0.873 |
+
+## Negatives
+
+* `hard_negatives k`: also use the `k` pool nodes nearest h~(v) as negatives, alongside the
+  `negatives` random ones (`--negatives 0` for hard negatives only).  The anchor's own neighbours
+  are never picked: the nearest nodes are often real neighbours, and pushing them away would
+  fight the positive term.  Hard negatives sharpen the top of the ranking (NDCG) at some cost to
+  separation from random nodes (HitRate).  Because margin losses average only the negatives that
+  violate the margin, even one hard negative carries much of the gradient.
+* `negative_types "query=product;product=query"`: for each anchor node type, the node types its
+  negatives may be; types left out may draw any type.  The pool is drawn per allowed type in
+  equal shares, so a rare type always has candidates.  On a bipartite graph, giving each side the
+  other side's nodes as negatives trains the ranking retrieval uses.
+* `loss margin_sq`: max(0, m + d(t, h)^2 - d(t, hu)^2), the margin ranking loss of hyperbolic
+  recommenders; `adaptive_margin` makes m a geometry-aware margin, `gamma * sigmoid(.)` of the
+  pair's distances from the origin.
+
+## Pooling options
+
+* `pooling attention` adds `out(ctx)`, the output projection of the tokens' attention context,
+  to their mean.  As the value and output projections are linear, that term is one matrix every
+  node shares applied to an attention-weighted mean of the node's features.
+  * `attention_keeps_norm` lets it change only the pooled vector's direction.  In the Poincaré
+    ball, free, the shared projection learns to stretch every node outwards (larger distances
+    satisfy margins cheaply), so a node's distance from the origin stops following its features.
+  * `attention_dropout p` drops the added term's coordinates in training, so the shared
+    projection can't co-adapt into one shift that fits the training nodes.
+  * `attention_mode weights` keeps only the per-node importance: the node is a convex
+    combination of its own feature embeddings, weighted by the attention each receives, with no
+    value or output projection.
+* `feature_importance`: one learned scalar per feature, weighting it by `exp(s)` in every mean it
+  is pooled into (a learned IDF); starts at 0, the plain mean.
+
+Every learned weighting starts as the plain mean and can only move away from it as far as
+training rewards.  Whether that helps depends on the data.  With random negatives the objective
+rewards emphasising whatever tells a node apart from the others, so learned weights drift
+towards identifier-like features (a node's own id, codes in its title) and memorise.  Held-out
+link prediction (HitRate@10 of 10% held-out edges against 1,000 random nodes, 64 dims, margin
+loss; change against mean pooling):
+
+| | Euclidean, ids + words | Euclidean, words | Poincaré, ids + words | Poincaré, words |
+|---|---|---|---|---|
+| Cora, importance | +0.020 | +0.042 | +0.002 | +0.016 |
+| Cora, attention | -0.063 | -0.046 | -0.037 | +0.021 |
+| Citeseer, importance | -0.001 | -0.002 | -0.014 | -0.024 |
+| Citeseer, attention + dropout 0.6 | -0.013 | -0.009 | +0.014 | +0.001 |
+| Pubmed, importance | +0.139 | +0.063 | -0.017 | +0.026 |
+| Pubmed, attention | +0.041 | +0.067 | -0.068 | +0.055 |
+
+Learned weighting helps where nodes carry many features of uneven value (Pubmed) and hurts in the
+Poincaré ball when nodes carry identifiers to memorise.  Mean pooling is the safe default.
+
 ## Export
 
-Embeddings are written with `cloverleaf.write_embeddings` when the installed cloverleaf has it:
-rows are formatted in parallel with the GIL released, tens of times faster than the pure-Python
-fallback.
+The model (`PREFIX.pt`) is written first, then the node and feature embeddings, and the
+aggregator only when cloverleaf's `FeatureAggregator` reproduces the model's node embeddings:
+Euclidean space, mean or `transform` attention, no `attention_keeps_norm` and no feature
+importance.  Embeddings are written with `cloverleaf.write_embeddings` when the installed
+cloverleaf has it: rows are formatted in parallel with the GIL released, tens of times faster
+than the pure-Python fallback.
 
 ## Tests
 

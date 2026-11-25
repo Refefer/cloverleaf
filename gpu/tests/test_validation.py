@@ -93,10 +93,10 @@ def test_infonce_and_starspace_ignore_excluded_negatives():
     from ep_gpu import losses
     pos = torch.tensor([0.5, 0.5])
     neg = torch.tensor([[0.9, 0.0], [0.9, 0.0]])
-    keep_all = losses.infonce_from_cosines(pos, neg, 0.1)
-    drop_close = losses.infonce_from_cosines(pos, neg, 0.1, torch.tensor([[True, False], [False, False]]))
+    keep_all = losses.infonce_from_similarities(pos, neg, 0.1)
+    drop_close = losses.infonce_from_similarities(pos, neg, 0.1, torch.tensor([[True, False], [False, False]]))
     assert drop_close[0] < keep_all[0] and drop_close[1] == keep_all[1]
-    hinge = losses.starspace_from_cosines(pos, neg, 0.2, torch.tensor([[True, False], [False, False]]))
+    hinge = losses.starspace_from_similarities(pos, neg, 0.2, torch.tensor([[True, False], [False, False]]))
     assert hinge[0] == 0 and hinge[1] > 0      # only the close negative violated the margin
 
 

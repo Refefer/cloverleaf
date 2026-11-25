@@ -15,10 +15,10 @@ from dataclasses import asdict, dataclass
 
 import torch
 
-from . import data, losses, ppr, sampling
+from . import data, geometry, losses, ppr, sampling
 from .validation import RankingProbe, hold_out_edges
-from .model import EPModel
-from .optim import EpochGradients, SparseTableOptimizer
+from .model import AttentionPool, EPModel
+from .optim import TableOptimizers, EpochGradients, SparseTableOptimizer
 
 
 @dataclass
@@ -68,6 +68,18 @@ class Config:
     neighbour_pooling: str = "mean"  # nested h~(v)'s second level: a weighted "mean" of the
                                      # neighbours (same space as h(v)) or "attention"
     heads: int = 4
+    attention_keeps_norm: bool = False  # attention changes only the pooled vector's direction, its
+                                     # length staying the features' mean's: in the Poincaré ball,
+                                     # the distance from the origin then follows the node's own
+                                     # features rather than the shared output projection
+    attention_dropout: float = 0.0   # in training, dropout on attention's added term (residual
+                                     # dropout), regularising the output projection every node shares
+    feature_importance: bool = False  # mean pooling: a learned scalar per feature, weighting it by
+                                     # exp(s) in every mean it's pooled into (a learned IDF); starts
+                                     # at 0, the plain mean.  Batch updates, table on the device.
+    attention_mode: str = "transform"  # "transform": mean + out(ctx), a shared linear map of the
+                                     # attended tokens; "weights": per-node feature importance
+                                     # only, the node a convex combination of its own features
     precision: str = "bf16"          # "bf16": the forward pass under bfloat16 autocast (fastest for
                                      # attention); "tf32": float32 matrix multiplies on tensor
                                      # cores; "fp32": exact.  The feature table, optimiser state
@@ -98,6 +110,26 @@ class Config:
     valid_edges: float = 0.0         # this fraction of edges is removed from training (with their
                                      # reverses) and the ranking check scores them instead: link
                                      # prediction on unseen edges rather than on trained ones
+    geometry: str = "euclidean"      # the embeddings' space (geometry.py): "euclidean", compared by
+                                     # cosine, or "poincare", the Poincaré ball, compared by
+                                     # hyperbolic distance (gamma is then in distance units for
+                                     # margin and starspace, and infonce's and the listwise
+                                     # losses' logits are -distance / gamma)
+    curvature: float = 1.0           # poincare: the ball's curvature is -curvature
+    poincare_pooling: str = "tangent"  # poincare: "tangent" (a mean of tangent vectors, mapped into
+                                     # the ball), "midpoint" (features mapped into the ball, then
+                                     # their gyromidpoint; mean pooling only) or
+                                     # "neighbour_midpoint" (features as tangent; a nested h~(v) is
+                                     # the gyromidpoint of its neighbours' embeddings)
+    max_tangent_norm: float | None = None  # poincare: clip pooled tangent vectors to this norm
+                                     # before mapping them into the ball
+    hard_negatives: int = 0          # margin, margin_sq, starspace: also use the k pool nodes
+                                     # nearest h~(v) as negatives, other than v's own neighbours,
+                                     # alongside the `negatives` random ones (0 random: hard only)
+    negative_types: str | None = None  # which node types each anchor type's negatives may be, as
+                                     # "query=product;product=product,query"; anchor types left out
+                                     # may draw any type.  Needs a negative_pool.
+    adaptive_margin: bool = False    # margin_sq: HICF's geometry-aware margin, gamma * sigmoid(.)
     seed: int = 2017
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -162,6 +194,52 @@ def check_loss(cfg):
         raise ValueError(f"ppr_steps must be in (0, 1) or a whole number >= 1, got {cfg.ppr_steps}")
     if cfg.ppr_sample is not None and not 0 < cfg.ppr_sample <= cfg.ppr_k:
         raise ValueError(f"ppr_sample must be in 1..ppr_k ({cfg.ppr_k}), got {cfg.ppr_sample}")
+    if cfg.geometry not in geometry.GEOMETRIES:
+        raise ValueError(f"geometry must be one of {', '.join(geometry.GEOMETRIES)}, got {cfg.geometry!r}")
+    if cfg.geometry != "euclidean" and cfg.loss in ("rank", "rankspace"):
+        raise ValueError(f"{cfg.loss} scores by dot product, so it needs geometry 'euclidean'")
+    if not cfg.curvature > 0:
+        raise ValueError(f"curvature must be > 0, got {cfg.curvature}")
+    if cfg.poincare_pooling not in geometry.POINCARE_POOLING:
+        raise ValueError(f"poincare_pooling must be one of {', '.join(geometry.POINCARE_POOLING)}, got {cfg.poincare_pooling!r}")
+    if cfg.poincare_pooling != "tangent" and cfg.geometry != "poincare":
+        raise ValueError("poincare_pooling applies only to geometry 'poincare'")
+    if cfg.poincare_pooling == "midpoint" and "attention" in (cfg.pooling, cfg.neighbour_pooling):
+        raise ValueError(f"poincare_pooling {cfg.poincare_pooling!r} needs pooling and neighbour_pooling 'mean'")
+    if cfg.poincare_pooling == "neighbour_midpoint" and cfg.neighbour_pooling != "mean":
+        raise ValueError("poincare_pooling 'neighbour_midpoint' needs neighbour_pooling 'mean'")
+    if cfg.poincare_pooling == "neighbour_midpoint" and not nested_reconstruction(cfg):
+        raise ValueError("poincare_pooling 'neighbour_midpoint' needs the nested reconstruction "
+                         "(reconstruction 'nested', or attention pooling)")
+    if cfg.max_tangent_norm is not None and (cfg.geometry != "poincare" or not cfg.max_tangent_norm > 0):
+        raise ValueError("max_tangent_norm needs geometry 'poincare' and a value > 0")
+    if cfg.hard_negatives < 0 or (cfg.hard_negatives and (
+            cfg.loss not in ("margin", "margin_sq", "starspace") or not cfg.negative_pool
+            or cfg.hard_negatives > cfg.negative_pool)):
+        raise ValueError("hard_negatives needs loss margin, margin_sq or starspace, and a "
+                         "negative_pool at least that large")
+    if cfg.negatives < 0 or (cfg.negatives + cfg.hard_negatives < 1 and not cfg.pool_negatives
+                             and not listwise(cfg)):
+        raise ValueError("needs at least one negative: negatives, hard_negatives or pool_negatives")
+    if cfg.negative_types is not None:
+        sampling.parse_negative_types(cfg.negative_types)
+        if not cfg.negative_pool or listwise(cfg):
+            raise ValueError("negative_types needs a negative_pool and a non-listwise loss")
+    if (cfg.attention_keeps_norm or cfg.attention_dropout) and "attention" not in (cfg.pooling, cfg.neighbour_pooling):
+        raise ValueError("attention_keeps_norm and attention_dropout need attention pooling")
+    if cfg.feature_importance and (cfg.pooling != "mean" or cfg.neighbour_pooling != "mean"
+                                   or cfg.poincare_pooling == "midpoint" or cfg.update_frequency != "batch"
+                                   or cfg.table_device != "same"):
+        raise ValueError("feature_importance needs mean pooling, mean neighbour pooling, no midpoint "
+                         "pooling, batch updates and table_device 'same'")
+    if cfg.attention_mode != "transform" and "attention" not in (cfg.pooling, cfg.neighbour_pooling):
+        raise ValueError("attention_mode needs attention pooling")
+    if cfg.attention_mode == "weights" and (cfg.attention_keeps_norm or cfg.attention_dropout):
+        raise ValueError("attention_keeps_norm and attention_dropout apply to attention_mode 'transform' only")
+    if not 0 <= cfg.attention_dropout < 1:
+        raise ValueError(f"attention_dropout must be in [0, 1), got {cfg.attention_dropout}")
+    if cfg.adaptive_margin and cfg.loss != "margin_sq":
+        raise ValueError("adaptive_margin applies only to margin_sq")
     if cfg.ppr_sample_by not in ppr.SAMPLE_BY:
         raise ValueError(f"ppr_sample_by must be one of {', '.join(ppr.SAMPLE_BY)}, got {cfg.ppr_sample_by!r}")
 
@@ -180,7 +258,10 @@ def build(cfg, num_features, device, generator=None, zero_init=None):
     if cfg.table_dtype not in TABLE_DTYPES:
         raise ValueError(f"table_dtype must be float32 or bfloat16, got {cfg.table_dtype!r}")
     model = EPModel(num_features, cfg.dims, cfg.pooling, cfg.heads, cfg.init, cfg.seed,
-                    TABLE_DTYPES[cfg.table_dtype], cfg.neighbour_pooling).to(device)
+                    TABLE_DTYPES[cfg.table_dtype], cfg.neighbour_pooling,
+                    geometry.make(cfg.geometry, cfg.curvature, cfg.poincare_pooling,
+                                  cfg.max_tangent_norm), cfg.attention_keeps_norm,
+                    cfg.attention_dropout, cfg.attention_mode, cfg.feature_importance).to(device)
     if zero_init is not None:
         with torch.no_grad():
             model.features.weight[zero_init.to(model.features.weight.device)] = 0
@@ -193,6 +274,9 @@ def build(cfg, num_features, device, generator=None, zero_init=None):
             model.features.weight.data = model.features.weight.data.pin_memory()
         generator = torch.Generator(device=table_device).manual_seed(cfg.seed + 2)
     table_opt = SparseTableOptimizer(model.features.weight, cfg.optimizer, cfg.lr, generator=generator)
+    if model.importance is not None:
+        table_opt = TableOptimizers(table_opt, SparseTableOptimizer(model.importance.weight, cfg.optimizer,
+                                                                    cfg.lr, generator=generator))
     dense = model.dense_parameters()
     dense_opt = torch.optim.Adam(dense, lr=cfg.dense_lr) if dense else None
     return model, table_opt, dense_opt
@@ -230,12 +314,13 @@ def listwise_loss(model, graph, lists, nodes, cfg, generator):
     with autocast(cfg, device):
         h, hp, neg = model.embed_groups([(fidx, fmask.float()), (pidx, pmask.float()),
                                          (nidx, nmask.float())])
-    h, hp, neg = h.float(), hp.float(), neg.float()
-    pos_logits = losses.cosine_logits(h, hp.view(len(nodes), pos_w.shape[1], -1), cfg.gamma)
+    space = model.space
+    h, hp, neg = (space.to_space(x.float()) for x in (h, hp, neg))
+    pos_logits = losses.logits(h, hp.view(len(nodes), pos_w.shape[1], -1), cfg.gamma, space)
     if cfg.pool_negatives:
-        neg_logits = losses.pool_logits(h, neg, cfg.gamma)
+        neg_logits = losses.pool_logits(h, neg, cfg.gamma, space)
     else:
-        neg_logits = losses.cosine_logits(h, neg[move(pick)], cfg.gamma)
+        neg_logits = losses.logits(h, neg[move(pick)], cfg.gamma, space)
     neg_logits = neg_logits.masked_fill(clash, losses.MASKED)
     if cfg.loss == "listnet":
         per_node = losses.listnet(pos_logits, pos_w, neg_logits, cfg.ppr_passive)
@@ -255,10 +340,11 @@ def build_lists(edges_path, graph, cfg, directed=False, log=print):
     return lists
 
 
-def batch_loss(model, graph, nodes, cfg, generator, lists=None, keys=None):
+def batch_loss(model, graph, nodes, cfg, generator, lists=None, keys=None, negative_types=None):
     """Mean loss over `nodes` that have neighbours (or, for a listwise loss, a PPR list).  Sampling
     runs where the graph is (nodes and generator are on its device); the embedding and loss run
-    on model.device.  keys: sampling.edge_keys(graph), for mask_neighbours."""
+    on model.device.  keys: sampling.edge_keys(graph), for mask_neighbours and hard_negatives;
+    negative_types: a sampling.NegativeTypes restricting each anchor's negatives by node type."""
     if listwise(cfg):
         return listwise_loss(model, graph, lists, nodes, cfg, generator)
     fidx, fmask = sampling.sample_features(graph, nodes, cfg.max_features, generator)
@@ -271,10 +357,16 @@ def batch_loss(model, graph, nodes, cfg, generator, lists=None, keys=None):
         tw = tmask.float()
     else:
         tidx, tw = neighbours
+    allowed = None
     if cfg.negative_pool:
-        pool = torch.randint(0, graph.num_nodes, (cfg.negative_pool,), device=nodes.device,
-                             generator=generator)
-        pick = sampling.pick_from_pool(pool, nodes, cfg.negatives, generator)
+        if negative_types is not None:
+            pool = negative_types.pool(cfg.negative_pool, generator)
+            allowed = negative_types.allowed_mask(nodes, pool)
+            pick = sampling.pick_allowed(allowed & (pool[None, :] != nodes[:, None]), cfg.negatives, generator)
+        else:
+            pool = torch.randint(0, graph.num_nodes, (cfg.negative_pool,), device=nodes.device,
+                                 generator=generator)
+            pick = sampling.pick_from_pool(pool, nodes, cfg.negatives, generator)
         neg_nodes = pool
     else:
         neg_nodes = sampling.sample_negatives(graph.num_nodes, nodes, cfg.negatives, generator).reshape(-1)
@@ -289,31 +381,54 @@ def batch_loss(model, graph, nodes, cfg, generator, lists=None, keys=None):
     with autocast(cfg, device):
         h, t, neg = model.embed_groups([(fidx, fmask.float()), (tidx, tw), (nidx, nmask.float())])
         if nested:
-            t = model.combine_neighbours(t.view(len(nodes), nw.shape[1], -1), nw)
+            t = model.reconstruct(t.view(len(nodes), nw.shape[1], -1), nw)
             tw = nw
-    # Losses in float32: they normalise and take logs.
-    h, t, neg = h.float(), t.float(), neg.float()
+    # Losses in float32: they normalise and take logs.  Pooled vectors become embeddings in the
+    # model's space only now (a nested reconstruction already is one).
+    space = model.space
+    h, neg = (space.to_space(x.float()) for x in (h, neg))
+    t = t.float() if nested else space.to_space(t.float())
     if cfg.loss == "infonce" and (cfg.pool_negatives or cfg.mask_neighbours or cfg.starspace_weight):
         # Against the whole pool, or `negatives` picked from it, leaving out the anchor itself
         # and, with mask_neighbours, its own neighbours.
         if cfg.pool_negatives:
             neg_ids = pool[None, :].expand(len(nodes), -1)
-            pos, neg_cos = losses.cosines(t, h, pool=neg)
+            pos, neg_sim = losses.similarities(t, h, pool=neg, space=space)
         else:
             neg_ids = pool[pick.to(pool.device)] if cfg.negative_pool else neg_nodes.view(len(nodes), -1)
             hu = neg[pick] if cfg.negative_pool else neg.view(len(nodes), cfg.negatives, -1)
-            pos, neg_cos = losses.cosines(t, h, hu=hu)
+            pos, neg_sim = losses.similarities(t, h, hu=hu, space=space)
         exclude = neg_ids == nodes[:, None]
+        if allowed is not None:
+            exclude = exclude | ~(allowed if cfg.pool_negatives else allowed.gather(1, pick.to(allowed.device)))
         if cfg.mask_neighbours:
             exclude = exclude | sampling.are_neighbours(keys, graph.num_nodes, nodes, neg_ids)
         exclude = move(exclude)
-        per_node = losses.infonce_from_cosines(pos, neg_cos, cfg.gamma, exclude)
+        per_node = losses.infonce_from_similarities(pos, neg_sim, cfg.gamma, exclude)
         if cfg.starspace_weight:
             w = cfg.starspace_weight
-            per_node = (1 - w) * per_node + w * losses.starspace_from_cosines(pos, neg_cos, cfg.starspace_margin, exclude)
+            per_node = (1 - w) * per_node + w * losses.starspace_from_similarities(pos, neg_sim, cfg.starspace_margin, exclude)
     else:
-        hu = neg[pick] if cfg.negative_pool else neg.view(len(nodes), cfg.negatives, -1)
-        per_node = losses.LOSSES[cfg.loss](t, h, hu, cfg.gamma)
+        if cfg.hard_negatives:
+            # The pool nodes nearest the reconstruction, leaving out the anchor itself and its own
+            # neighbours: the nearest nodes are often real neighbours, and pushing those away
+            # would fight the positive term (false negatives).
+            with torch.no_grad():
+                d = space.pairwise_distance(t, neg)
+                pool_ids = pool[None, :].expand(len(nodes), -1)
+                own = (pool_ids == nodes[:, None]) | sampling.are_neighbours(keys, graph.num_nodes, nodes, pool_ids)
+                if allowed is not None:
+                    own = own | ~allowed
+                d = d.masked_fill(move(own), float("inf"))
+                hard = d.topk(cfg.hard_negatives, dim=1, largest=False).indices
+            # Mixed: the random negatives and the hard ones together.
+            hu = torch.cat([neg[pick], neg[hard]], dim=1)
+        else:
+            hu = neg[pick] if cfg.negative_pool else neg.view(len(nodes), cfg.negatives, -1)
+        if cfg.loss == "margin_sq":
+            per_node = losses.margin_sq(t, h, hu, cfg.gamma, space, cfg.adaptive_margin)
+        else:
+            per_node = losses.LOSSES[cfg.loss](t, h, hu, cfg.gamma, space)
     has_neighbours = tw.sum(dim=1) > 0
     return (per_node * has_neighbours).sum() / has_neighbours.sum().clamp(min=1)
 
@@ -353,7 +468,9 @@ def train(graph, cfg, log=print, lists=None):
     order = torch.randperm(g.num_nodes, device=graph_device, generator=gen)
     n_valid = int(g.num_nodes * cfg.valid_pct)
     valid, anchors = order[:n_valid], order[n_valid:]
-    keys = sampling.edge_keys(g) if cfg.mask_neighbours else None
+    keys = sampling.edge_keys(g) if cfg.mask_neighbours or cfg.hard_negatives else None
+    negative_types = (sampling.NegativeTypes(g.node_types, sampling.parse_negative_types(cfg.negative_types),
+                                             graph_device) if cfg.negative_types is not None else None)
     probe = None
     if cfg.valid_negatives > 0:
         if held_out is not None:
@@ -394,7 +511,7 @@ def train(graph, cfg, log=print, lists=None):
                 set_lr(lr)
                 if dense_opt is not None:
                     dense_opt.zero_grad()
-            loss = batch_loss(model, g, nodes, cfg, gen, lists, keys)
+            loss = batch_loss(model, g, nodes, cfg, gen, lists, keys, negative_types)
             loss.backward()
             if per_pass:
                 epoch.add(model.features.weight.grad)
@@ -419,7 +536,7 @@ def train(graph, cfg, log=print, lists=None):
                 # at once may not fit.
                 for vs in range(0, len(valid), cfg.batch_size):
                     chunk = valid[vs:vs + cfg.batch_size]
-                    total_vl += batch_loss(model, g, chunk, cfg, vgen, lists, keys) * len(chunk)
+                    total_vl += batch_loss(model, g, chunk, cfg, vgen, lists, keys, negative_types) * len(chunk)
             message += f", valid {float(total_vl) / len(valid):.5f}"
         if probe is not None:
             hr, auc = probe.evaluate(model, g)
@@ -435,7 +552,7 @@ def train(graph, cfg, log=print, lists=None):
 
 @torch.no_grad()
 def node_embeddings(model, graph, batch_size=8192):
-    """Every node, pooled from all its features.  Gathered in host memory a batch at a time, so
+    """Every node, pooled from all its features, in the model's space.  Gathered in host memory a batch at a time, so
     exporting needs no GPU memory for the whole set."""
     model.eval()
     out = []
@@ -449,8 +566,8 @@ def node_embeddings(model, graph, batch_size=8192):
 @torch.no_grad()
 def embed_feature_sets(model, feature_index, feature_sets):
     """Embeds nodes that weren't in the graph from their features, e.g. nodes added after
-    training.  Features missing from the training vocabulary are skipped; a set with none left
-    embeds to zeros."""
+    training, in the model's space.  Features missing from the training vocabulary are skipped; a
+    set with none left embeds to zeros (the origin)."""
     model.eval()
     device = model.device
     ids = [[feature_index[f] for f in fs if f in feature_index] for fs in feature_sets]
@@ -463,13 +580,24 @@ def embed_feature_sets(model, feature_index, feature_sets):
     return model.embed(idx, w)
 
 
+def aggregator_representable(model):
+    """Whether cloverleaf's FeatureAggregator reproduces the model's node embeddings: it pools
+    features into the embedding itself (mean, or attention as mean + out(ctx)), with no map into
+    another space, no per-feature importance and no weighting-only attention."""
+    pool = model.pool
+    return (model.space is geometry.EUCLIDEAN and model.importance is None
+            and (not isinstance(pool, AttentionPool) or (pool.mode == "transform" and not pool.keeps_norm)))
+
+
 def export(model, graph, cfg, prefix):
+    # The model first: it's what everything else can be rebuilt from.
+    torch.save({"config": asdict(cfg), "state": model.state_dict(),
+                "feature_keys": graph.feature_keys}, prefix + ".pt")
     keys = list(zip(graph.node_types, graph.node_names))
     data.save_embeddings(prefix + ".node-embeddings", keys, node_embeddings(model, graph))
     data.save_embeddings(prefix + ".feature-embeddings", graph.feature_keys, model.features.weight.float())
-    data.save_aggregator(prefix + ".aggregator", model)
-    torch.save({"config": asdict(cfg), "state": model.state_dict(),
-                "feature_keys": graph.feature_keys}, prefix + ".pt")
+    if aggregator_representable(model):
+        data.save_aggregator(prefix + ".aggregator", model)
 
 
 def main():
@@ -497,6 +625,10 @@ def main():
             p.add_argument(flag, type=lambda s: float(s) if "." in s else int(s), default=None)
         elif name in ("max_nodes", "ppr_sample", "epoch_after"):
             p.add_argument(flag, type=int, default=None)
+        elif name == "max_tangent_norm":
+            p.add_argument(flag, type=float, default=None)
+        elif name == "negative_types":
+            p.add_argument(flag, type=str, default=None)
         else:
             p.add_argument(flag, type=type(value), default=value)
     args = p.parse_args()

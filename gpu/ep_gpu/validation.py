@@ -4,7 +4,8 @@ The validation loss measures the training objective, which has repeatedly ranked
 differently from retrieval.  This measures retrieval directly: for each validation node, do its
 real neighbours outrank random nodes?  Each neighbour is compared with `negatives` random nodes
 of its own type (a query's products against random products), every node embedded from all its
-features as the exported embeddings are.
+features as the exported embeddings are, and scored with the model's similarity (cosine, or
+negative hyperbolic distance).
 
   hr@10  the fraction of (node, neighbour) pairs where fewer than 10 negatives score at least as
          high as the neighbour (ties count against it), as the retrieval evaluation's HitRate@10
@@ -25,7 +26,6 @@ import dataclasses
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from . import sampling
 
@@ -90,7 +90,7 @@ class RankingProbe:
                 chunk = nodes[s:s + batch_size]
                 fidx, fmask = sampling.sample_features(graph, chunk, None)
                 out.append(model.embed(fidx.to(model.device), fmask.float().to(model.device)).float())
-            return F.normalize(torch.cat(out), dim=1)
+            return torch.cat(out)
 
         negatives = {t: embed(n) for t, n in self.negatives.items()}
         hits = above = 0.0
@@ -98,12 +98,12 @@ class RankingProbe:
             a = embed(self.anchor[s:s + batch_size])
             p = embed(self.positive[s:s + batch_size])
             types = self.positive_type[s:s + batch_size].to(model.device)
-            score = (a * p).sum(1)
+            score = model.space.similarity(a, p)
             beaten = torch.zeros(len(a), device=model.device)
             for t, neg in negatives.items():
                 rows = types == t
                 if rows.any():
-                    beaten[rows] = (a[rows] @ neg.T >= score[rows, None]).sum(1).float()
+                    beaten[rows] = (model.space.pairwise_similarity(a[rows], neg) >= score[rows, None]).sum(1).float()
             hits += float((beaten < 10).sum())
             above += float((self.count - beaten).sum() / self.count)
         return hits / len(self.anchor), above / len(self.anchor)
