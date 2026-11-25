@@ -236,6 +236,25 @@ When to use it, and how to set the curvature, margin and width: see Training.
   `NodeEmbedder` maps new nodes into the ball exactly as the model does; search the node
   embeddings with `cloverleaf.PoincareDistance(curvature)`.
 
+### The hyperboloid
+
+`--geometry lorentz` is the hyperboloid (Lorentz) model of the same hyperbolic space: points
+`x` in `d + 1` dimensions with `<x, x>_L = -1/c`, compared by `arcosh(-c <x, y>_L) / sqrt(c)`.
+Pooled vectors map in from the tangent space at the origin at the ball's scale, so the two models
+are isometric: the same parameters give the same distances, the same settings (`curvature`,
+`gamma`, `max_tangent_norm`, learning rate) carry over, and a Lorentz model exports as the
+Poincaré one it equals, which cloverleaf reads.
+
+They differ only numerically.  The ball clamps points about `12.2 / sqrt(c)` from the origin and
+loses precision on the way there; the hyperboloid has no edge, but its coordinates grow like
+cosh and the inner product of far-out points cancels, so its points are float64, accurate to a
+radius near `30 / sqrt(c)`.  That headroom matters only for models that place nodes past the
+ball's clamp, such as very deep hierarchies.  At ordinary radii they train the same model: on
+real search data (64 dims, the Poincaré settings), held-out NDCG@10 was within 0.003 of a
+Poincaré run in every popularity bucket, no more than two Poincaré runs differ from each other,
+at about 1.6 times the time per pass for the float64 distances.  Prefer the ball unless points
+reach its edge.
+
 Graph reconstruction on a balanced tree (branching 3, depth 6; mean average precision of each
 node's neighbours, InfoNCE over distance with one sampled neighbour per reconstruction):
 

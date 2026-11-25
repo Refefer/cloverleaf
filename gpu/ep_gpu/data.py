@@ -162,7 +162,8 @@ def save_aggregator(path, model):
         out = pool.out.weight.detach().float().cpu()
         aggregator = cl.FeatureAggregator.Attention(out.shape[0], pool.heads, pool.head_dims,
                                                     qkv.flatten().tolist(), out.flatten().tolist())
-    if model.space.name == "poincare":
+    if model.space.name in ("poincare", "lorentz"):
+        # A Lorentz model is written as the Poincaré one it's isometric to: the same distances.
         aggregator = aggregator.with_geometry("poincare", model.space.c, model.space.max_tangent_norm)
     aggregator.save(path)
 

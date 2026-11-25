@@ -9,6 +9,7 @@ import torch
 import cloverleaf as cl
 
 from ep_gpu import data
+from ep_gpu.geometry import Poincare
 from ep_gpu.train import Config, export, train
 
 
@@ -112,14 +113,16 @@ def test_attention_pooled_embeddings_match_cloverleafs_attention_embedder(files,
     assert np.allclose(embedder.embed_adhoc(new_node, feature_embs), ours_new, atol=1e-5)
 
 
+@pytest.mark.parametrize("geometry", ["poincare", "lorentz"])
 @pytest.mark.parametrize("pooling, clip", [("mean", None), ("mean", 1.5), ("attention", None), ("attention", 1.5)])
-def test_poincare_models_rebuild_exactly_in_cloverleaf(files, tmp_path, pooling, clip):
+def test_poincare_models_rebuild_exactly_in_cloverleaf(files, tmp_path, pooling, clip, geometry):
     """A Poincaré model's exported aggregator records the geometry; cloverleaf then embeds every
-    node, and a new feature set, as the GPU model does, and ranks them by the same distances."""
+    node, and a new feature set, as the GPU model does, and ranks them by the same distances.  A
+    Lorentz model exports as the Poincaré model it's isometric to."""
     from ep_gpu.train import embed_feature_sets
     ours = data.load(*files)
     extra = dict(pooling="attention", heads=2, dense_lr=0.05) if pooling == "attention" else {}
-    cfg = Config(dims=13, passes=20, batch_size=2, lr=0.1, loss="starspace", gamma=1.0, geometry="poincare",
+    cfg = Config(dims=13, passes=20, batch_size=2, lr=0.1, loss="starspace", gamma=1.0, geometry=geometry,
                  curvature=0.3, max_tangent_norm=clip, precision="fp32", device="cpu", seed=5, **extra)
     model = train(ours, cfg, log=lambda m: None)
     prefix = str(tmp_path / "ep")
@@ -137,15 +140,22 @@ def test_poincare_models_rebuild_exactly_in_cloverleaf(files, tmp_path, pooling,
         assert np.allclose(rebuilt.get_embedding(node), exported.get_embedding(node), atol=1e-5), node
     nodes = list(graph.vocab())
     X = torch.tensor([exported.get_embedding(n) for n in nodes])      # already points of the ball
-    gpu_d = model.space.distance(X[:, None], X[None, :]).numpy()   # element-wise: exact where x = y
+    ball = Poincare(model.space.c)
+    gpu_d = ball.distance(X[:, None], X[None, :]).numpy()          # element-wise: exact where x = y
+    if geometry == "lorentz":
+        # The model's own distances, on the hyperboloid, are the ball's.
+        L = model.space.to_space(ball.log0(X))
+        assert np.allclose(model.space.distance(L[:, None], L[None, :]).numpy(), gpu_d, atol=1e-3)
     for i, a in enumerate(nodes):
         for j, b in enumerate(nodes):
             d = rebuilt.compute_distance(cl.Query.node(*a), cl.Query.node(*b))
             assert np.isclose(d, gpu_d[i, j], rtol=1e-3, atol=1e-3), (a, b)
 
     new_node = [("n", "x"), ("n", "z"), ("n", "q")]
-    ours_new = embed_feature_sets(model, ours.feature_index(), [new_node])[0].detach().numpy()
-    assert np.allclose(embedder.embed_adhoc(new_node, feature_embs), ours_new, atol=1e-5)
+    ours_new = embed_feature_sets(model, ours.feature_index(), [new_node]).detach()
+    if geometry == "lorentz":
+        ours_new = model.space.to_poincare(ours_new)
+    assert np.allclose(embedder.embed_adhoc(new_node, feature_embs), ours_new[0].numpy(), atol=1e-5)
 
 
 @pytest.mark.parametrize("kwargs", [dict(feature_importance=True), dict(poincare_pooling="midpoint"),

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from ep_gpu import geometry, losses
-from ep_gpu.geometry import EUCLIDEAN, Poincare
+from ep_gpu.geometry import EUCLIDEAN, Lorentz, Poincare
 
 
 def mobius_distance(x, y, c):
@@ -360,6 +360,7 @@ def test_feature_importance_learns_and_trains(tmp_path, geometry):
     (dict(feature_importance=True), False),
     (dict(geometry="poincare"), True),                       # tangent pooling: the aggregator records the ball
     (dict(geometry="poincare", poincare_pooling="midpoint"), False),
+    (dict(geometry="lorentz"), True),                        # written as the isometric ball
 ])
 def test_export_writes_the_aggregator_only_when_cloverleaf_can_reproduce_it(tmp_path, kwargs, representable):
     from ep_gpu import data
@@ -376,3 +377,113 @@ def test_export_writes_the_aggregator_only_when_cloverleaf_can_reproduce_it(tmp_
     import os
     assert os.path.exists(prefix + ".pt") and os.path.exists(prefix + ".node-embeddings")
     assert os.path.exists(prefix + ".aggregator") == representable
+
+
+# The hyperboloid (Lorentz) model
+
+
+@pytest.mark.parametrize("c", [0.3, 1.0, 2.0])
+def test_lorentz_points_lie_on_the_hyperboloid_and_invert(c):
+    space = Lorentz(c)
+    v = torch.randn(64, 7) * torch.logspace(-3, 0, 64)[:, None] / math.sqrt(c)
+    x = space.to_space(v)
+    assert x.shape == (64, 8) and x.dtype == torch.float64 and (x[:, 0] > 0).all()
+    inner = -x[:, 0] ** 2 + (x[:, 1:] ** 2).sum(-1)
+    assert torch.allclose(inner * c, torch.full_like(inner, -1.0), rtol=1e-6)
+    assert torch.allclose(space.log0(x), v, atol=1e-4, rtol=1e-3)
+    # The origin is the zero tangent vector.
+    assert torch.allclose(space.to_space(torch.zeros(1, 7))[0, 1:].float(), torch.zeros(7))
+
+
+@pytest.mark.parametrize("c", [0.3, 1.0, 2.0])
+def test_lorentz_and_poincare_are_isometric(c):
+    """The same tangent vectors give the same points (through the isometry) and distances."""
+    lorentz, ball = Lorentz(c), Poincare(c)
+    u = torch.randn(40, 6) * 0.8
+    v = torch.randn(40, 6) * 0.8
+    xl, yl = lorentz.to_space(u), lorentz.to_space(v)
+    xb, yb = ball.to_space(u), ball.to_space(v)
+    assert torch.allclose(lorentz.to_poincare(xl), xb, atol=1e-5)
+    assert torch.allclose(lorentz.distance(xl, yl), ball.distance(xb, yb), atol=1e-3, rtol=1e-3)
+    assert torch.allclose(lorentz.pairwise_distance(xl, yl), lorentz.distance(xl[:, None], yl[None, :]),
+                          atol=1e-3, rtol=1e-3)
+    assert torch.allclose(lorentz.origin_distance(xl), ball.origin_distance(xb), atol=1e-4, rtol=1e-4)
+
+
+def test_lorentz_keeps_precision_where_the_ball_clamps():
+    """Past the ball's clamp (sqrt(c) |v| > 6.1) it pins points at its edge; the hyperboloid
+    still tells them apart."""
+    lorentz, ball = Lorentz(1.0), Poincare(1.0)
+    v = torch.tensor([[7.0, 0.0], [8.0, 0.0]])
+    assert ball.distance(*ball.to_space(v)) < 0.01
+    assert torch.isclose(lorentz.distance(*lorentz.to_space(v)), torch.tensor(2.0), atol=1e-3)  # 2 per unit of |v|
+
+
+def test_lorentz_gradients_stay_finite_where_points_coincide_or_vanish():
+    space = Lorentz(0.5)
+    v = torch.tensor([[0.3, -0.2], [0.3, -0.2], [0.0, 0.0]], requires_grad=True)
+    x = space.to_space(v)
+    (space.distance(x[0], x[1]) + space.distance(x[0], x[2]) + space.origin_distance(x).sum()).backward()
+    assert torch.isfinite(v.grad).all()
+
+
+def test_lorentz_rejects_ball_pooling_and_bad_curvature():
+    with pytest.raises(ValueError):
+        geometry.make("lorentz", 1.0, "midpoint")
+    with pytest.raises(ValueError):
+        geometry.make("lorentz", 0.0)
+    from ep_gpu.train import Config, check_loss
+    with pytest.raises(ValueError):
+        check_loss(Config(geometry="lorentz", poincare_pooling="midpoint"))
+    with pytest.raises(ValueError):
+        check_loss(Config(geometry="lorentz", loss="rank"))
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(loss="starspace", gamma=1.0, hard_negatives=2, curvature=0.3),
+    dict(loss="margin", gamma=1.0, negatives=4, max_tangent_norm=2.0),
+])
+def test_lorentz_trains_and_separates_two_cliques(tmp_path, kwargs):
+    from ep_gpu import data
+    from ep_gpu.train import Config, node_embeddings, train
+    path = tmp_path / "g.edges"
+    with open(path, "w") as f:
+        for base in (0, 10):
+            for i in range(base, base + 10):
+                for j in range(i + 1, base + 10):
+                    f.write(f"n\t{i}\tn\t{j}\t1\n")
+    graph = data.load(str(path))
+    cfg = Config(dims=8, passes=40, batch_size=4, lr=0.1, negative_pool=16, geometry="lorentz",
+                 device="cpu", **kwargs)
+    model = train(graph, cfg, log=lambda m: None)
+    X = node_embeddings(model, graph)
+    assert X.shape == (20, 9)
+    D = model.space.pairwise_distance(X, X)
+    same = torch.tensor([[(i < 10) == (j < 10) for j in range(20)] for i in range(20)])
+    off = ~torch.eye(20, dtype=torch.bool)
+    assert D[same & off].mean() < D[~same].mean()
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(loss="starspace", gamma=1.0, hard_negatives=2, curvature=0.3),
+    dict(loss="margin_sq", gamma=0.5, pooling="attention", heads=2, dense_lr=0.01),
+])
+def test_lorentz_trains_as_the_isometric_poincare_model(tmp_path, kwargs):
+    """Same parameters, seed and batches: the hyperboloid and the ball learn the same model, to
+    float rounding, since every distance agrees."""
+    from ep_gpu import data
+    from ep_gpu.train import Config, node_embeddings, train
+    path = tmp_path / "g.edges"
+    with open(path, "w") as f:
+        for i in range(12):
+            for j in (i + 1, i + 3):
+                f.write(f"n\t{i}\tn\t{j % 12}\t1\n")
+    graph = data.load(str(path))
+    D = {}
+    for geo in ("poincare", "lorentz"):
+        cfg = Config(dims=6, passes=10, batch_size=4, lr=0.05, negative_pool=8, geometry=geo,
+                     precision="fp32", device="cpu", **kwargs)
+        model = train(graph, cfg, log=lambda m: None)
+        X = node_embeddings(model, graph)
+        D[geo] = model.space.distance(X[:, None], X[None, :])
+    assert torch.allclose(D["poincare"], D["lorentz"], atol=1e-2, rtol=1e-2)

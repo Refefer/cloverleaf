@@ -111,18 +111,19 @@ class Config:
                                      # reverses) and the ranking check scores them instead: link
                                      # prediction on unseen edges rather than on trained ones
     geometry: str = "euclidean"      # the embeddings' space (geometry.py): "euclidean", compared by
-                                     # cosine, or "poincare", the Poincaré ball, compared by
-                                     # hyperbolic distance (gamma is then in distance units for
-                                     # margin and starspace, and infonce's and the listwise
-                                     # losses' logits are -distance / gamma)
-    curvature: float = 1.0           # poincare: the ball's curvature is -curvature
+                                     # cosine, or "poincare" (the Poincaré ball) or "lorentz"
+                                     # (the hyperboloid), compared by hyperbolic distance (gamma
+                                     # is then in distance units for margin and starspace, and
+                                     # infonce's and the listwise losses' logits are
+                                     # -distance / gamma)
+    curvature: float = 1.0           # poincare, lorentz: the space's curvature is -curvature
     poincare_pooling: str = "tangent"  # poincare: "tangent" (a mean of tangent vectors, mapped into
                                      # the ball), "midpoint" (features mapped into the ball, then
                                      # their gyromidpoint; mean pooling only) or
                                      # "neighbour_midpoint" (features as tangent; a nested h~(v) is
                                      # the gyromidpoint of its neighbours' embeddings)
-    max_tangent_norm: float | None = None  # poincare: clip pooled tangent vectors to this norm
-                                     # before mapping them into the ball
+    max_tangent_norm: float | None = None  # poincare, lorentz: clip pooled tangent vectors to
+                                     # this norm before mapping them into the space
     hard_negatives: int = 0          # margin, margin_sq, starspace: also use the k pool nodes
                                      # nearest h~(v) as negatives, other than v's own neighbours,
                                      # alongside the `negatives` random ones (0 random: hard only)
@@ -211,8 +212,8 @@ def check_loss(cfg):
     if cfg.poincare_pooling == "neighbour_midpoint" and not nested_reconstruction(cfg):
         raise ValueError("poincare_pooling 'neighbour_midpoint' needs the nested reconstruction "
                          "(reconstruction 'nested', or attention pooling)")
-    if cfg.max_tangent_norm is not None and (cfg.geometry != "poincare" or not cfg.max_tangent_norm > 0):
-        raise ValueError("max_tangent_norm needs geometry 'poincare' and a value > 0")
+    if cfg.max_tangent_norm is not None and (cfg.geometry not in ("poincare", "lorentz") or not cfg.max_tangent_norm > 0):
+        raise ValueError("max_tangent_norm needs geometry 'poincare' or 'lorentz' and a value > 0")
     if cfg.hard_negatives < 0 or (cfg.hard_negatives and (
             cfg.loss not in ("margin", "margin_sq", "starspace") or not cfg.negative_pool
             or cfg.hard_negatives > cfg.negative_pool)):
@@ -586,7 +587,7 @@ def aggregator_representable(model):
     Euclidean or the Poincaré ball after tangent pooling; it has no per-feature importance,
     norm-keeping or weighting-only attention, or midpoint pooling."""
     pool, space = model.pool, model.space
-    space_ok = space is geometry.EUCLIDEAN or (space.name == "poincare" and space.pooling == "tangent")
+    space_ok = space is geometry.EUCLIDEAN or (space.name in ("poincare", "lorentz") and space.pooling == "tangent")
     return (space_ok and model.importance is None
             and (not isinstance(pool, AttentionPool) or (pool.mode == "transform" and not pool.keeps_norm)))
 
@@ -596,7 +597,11 @@ def export(model, graph, cfg, prefix):
     torch.save({"config": asdict(cfg), "state": model.state_dict(),
                 "feature_keys": graph.feature_keys}, prefix + ".pt")
     keys = list(zip(graph.node_types, graph.node_names))
-    data.save_embeddings(prefix + ".node-embeddings", keys, node_embeddings(model, graph))
+    nodes = node_embeddings(model, graph)
+    if model.space.name == "lorentz":
+        # Cloverleaf reads the ball: the same distances, one coordinate fewer.
+        nodes = model.space.to_poincare(nodes)
+    data.save_embeddings(prefix + ".node-embeddings", keys, nodes)
     data.save_embeddings(prefix + ".feature-embeddings", graph.feature_keys, model.features.weight.float())
     if aggregator_representable(model):
         data.save_aggregator(prefix + ".aggregator", model)

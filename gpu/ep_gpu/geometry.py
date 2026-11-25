@@ -36,6 +36,28 @@ scored:
              metric-learning models do: points then stay well inside the ball, away from the edge
              where gradients vanish and float32 loses precision.
 
+  lorentz    the hyperboloid (Lorentz) model of the same hyperbolic space: points x in R^(d+1) with
+             <x, x>_L = -1/c and x_0 > 0, where <x, y>_L = -x_0 y_0 + x_1 y_1 + ... + x_d y_d.  The
+             pooled vector is a tangent vector at the origin o = (1/sqrt(c), 0, ..., 0), mapped in
+             by
+               exp0(v) = (cosh(2 sqrt(c) |v|) / sqrt(c), sinh(2 sqrt(c) |v|) v / (sqrt(c) |v|)),
+             at the ball's scale: the ball's metric is twice the Euclidean one at its origin, so
+             its exp0 takes v a distance 2|v| out, and so does this one.  Pairs are scored by
+             negative hyperbolic distance
+               d(x, y) = arcosh(-c <x, y>_L) / sqrt(c).
+             The two models are isometric (x -> x_1..d / (1 + sqrt(c) x_0) maps the hyperboloid
+             onto the ball, the origin to the origin), so with tangent pooling a Lorentz model
+             and a Poincaré one compute the same distances from the same parameters, and the same
+             settings (learning rate, gamma, max_tangent_norm) carry over.  They differ only
+             numerically.  The ball loses precision in 1 - c|x|^2 towards its edge and clamps
+             points at distance 2 artanh(1 - 1e-5) / sqrt(c), about 12.2 / sqrt(c), from the
+             origin.  The hyperboloid has no edge, but its coordinates grow like cosh, and the
+             inner product of two far-out points is a difference of huge, nearly equal terms:
+             in float32 it's noise past a radius of about 5 / sqrt(c).  So its points are float64
+             (only a batch's exist at a time; the parameters stay float32), which keeps distances
+             accurate to a radius near 30 / sqrt(c), well beyond the ball's clamp.  Tangent
+             pooling only; models export in Poincaré coordinates, which cloverleaf reads.
+
 Pooling is written as sums, so it can run as a scatter over a batch's tokens: each token
 contributes mean_terms(x) = (numerator, denominator), weighted, and mean_finish turns their sums
 into the pooled vector.  to_space then maps that into the space (exp0 for tangent pooling; the
@@ -202,8 +224,82 @@ class Poincare:
         return -self.pairwise_distance(x, pool)
 
 
+class Lorentz(_ArithmeticMean):
+    """The hyperboloid model; see the module docstring.  Points have one more coordinate than the
+    pooled tangent vectors: x_0 first."""
+    name = "lorentz"
+    pooling = "tangent"
+
+    def __init__(self, curvature=1.0, max_tangent_norm=None, max_scaled_norm=40.0):
+        """max_scaled_norm: 2 sqrt(c) |v| is capped here, far beyond any useful radius, so cosh
+        and sinh stay finite in float32 (their squares too, which distances multiply)."""
+        if not curvature > 0:
+            raise ValueError(f"curvature must be > 0, got {curvature}")
+        if max_tangent_norm is not None and not max_tangent_norm > 0:
+            raise ValueError(f"max_tangent_norm must be > 0, got {max_tangent_norm}")
+        self.c = float(curvature)
+        self.sqrt_c = math.sqrt(self.c)
+        self.max_tangent_norm = max_tangent_norm
+        self.max_scaled_norm = max_scaled_norm
+
+    def exp0(self, v):
+        """exp0(v), in float64, after clipping |v| to max_tangent_norm: (..., d) -> (..., d+1).  A
+        zero vector maps to the origin with a zero gradient."""
+        v = v.double()
+        norm = torch.sqrt((v * v).sum(-1, keepdim=True) + 1e-30)
+        if self.max_tangent_norm is not None:
+            clipped = norm.clamp(max=self.max_tangent_norm)
+            v, norm = v * (clipped / norm), clipped
+        scaled = (2 * self.sqrt_c * norm).clamp(max=self.max_scaled_norm)
+        x0 = torch.cosh(scaled) / self.sqrt_c
+        return torch.cat([x0, torch.sinh(scaled) / (self.sqrt_c * norm) * v], dim=-1)
+
+    def to_space(self, v):
+        return self.exp0(v)
+
+    def log0(self, x):
+        """The inverse of to_space: the tangent vector at the origin that maps to x."""
+        xs = x[..., 1:].double()
+        norm = torch.sqrt((xs * xs).sum(-1, keepdim=True) + 1e-30)
+        return (torch.asinh(self.sqrt_c * norm) / (2 * self.sqrt_c * norm) * xs).float()
+
+    def to_poincare(self, x):
+        """The same points in the Poincaré ball of the same curvature (the isometry that keeps
+        the origin): x_1..d / (1 + sqrt(c) x_0)."""
+        x = x.double()
+        return (x[..., 1:] / (1 + self.sqrt_c * x[..., :1])).float()
+
+    def _arcosh(self, z):
+        """arcosh(z) / sqrt(c) for z >= 1, as arcosh(1 + u) with u floored just above 0: there the
+        clamp passes no gradient, rather than 0 * inf = nan for pairs that coincide."""
+        u = (z - 1).clamp(min=1e-12)
+        return (torch.log1p(u + torch.sqrt(u * (u + 2))) / self.sqrt_c).float()
+
+    def origin_distance(self, x):
+        """d(o, x) = arcosh(sqrt(c) x_0) / sqrt(c)."""
+        return self._arcosh(self.sqrt_c * x[..., 0].double())
+
+    def distance(self, x, y):
+        """Broadcasting over leading dimensions."""
+        x, y = x.double(), y.double()
+        inner = -x[..., 0] * y[..., 0] + (x[..., 1:] * y[..., 1:]).sum(-1)
+        return self._arcosh(-self.c * inner)
+
+    def pairwise_distance(self, x, pool):
+        """(B, d+1) against (P, d+1) -> (B, P), through one matrix multiply."""
+        x, pool = x.double(), pool.double()
+        inner = -x[:, :1] * pool[:, 0][None, :] + x[:, 1:] @ pool[:, 1:].T
+        return self._arcosh(-self.c * inner)
+
+    def similarity(self, x, y):
+        return -self.distance(x, y)
+
+    def pairwise_similarity(self, x, pool):
+        return -self.pairwise_distance(x, pool)
+
+
 EUCLIDEAN = Euclidean()
-GEOMETRIES = ("euclidean", "poincare")
+GEOMETRIES = ("euclidean", "poincare", "lorentz")
 
 
 def make(name, curvature=1.0, pooling="tangent", max_tangent_norm=None):
@@ -211,4 +307,8 @@ def make(name, curvature=1.0, pooling="tangent", max_tangent_norm=None):
         return EUCLIDEAN
     if name == "poincare":
         return Poincare(curvature, pooling, max_tangent_norm)
+    if name == "lorentz":
+        if pooling != "tangent":
+            raise ValueError("geometry 'lorentz' pools in the tangent space only")
+        return Lorentz(curvature, max_tangent_norm)
     raise ValueError(f"geometry must be one of {', '.join(GEOMETRIES)}, got {name!r}")
