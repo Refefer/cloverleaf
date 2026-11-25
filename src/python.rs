@@ -3554,7 +3554,7 @@ impl PprRankLearner {
     ///        Number of random negatives to use.
     ///    
     ///    loss : String - Optional
-    ///        Supports 'listnet' and 'listmle'.
+    ///        'listnet' (default), 'listmle' or 'approxndcg'.
     ///    
     ///    compression : Float - Optional
     ///        This will either accentuate or depress the PPR scores for the local neighborhood.
@@ -3591,7 +3591,7 @@ impl PprRankLearner {
     ///        
     ///    
     #[new]
-    #[pyo3(signature = (alpha, batch_size, dims, passes, steps, walks, k, negatives, loss=None, compression=None, beta=None, num_features=None, weight_decay=None, valid_pct=None, optimizer=None))]
+    #[pyo3(signature = (alpha, batch_size, dims, passes, steps, walks, k, negatives, loss=None, compression=None, beta=None, num_features=None, weight_decay=None, valid_pct=None, optimizer=None, temperature=None))]
     fn new(
          // Learning rate
         alpha: f32, 
@@ -3637,6 +3637,9 @@ impl PprRankLearner {
         // Optimizer for the feature embeddings
         optimizer: Option<OptimizerSpec>,
 
+        // ApproxNDCG's rank temperature
+        temperature: Option<f32>,
+
     ) -> PyResult<Self> {
 
         let steps = Sample::steps(steps)
@@ -3646,7 +3649,11 @@ impl PprRankLearner {
             .unwrap_or(Ok(Sample::All))
             .map_err(|_err| PyValueError::new_err("num features must be either None, or (0, N)"))?;
         let d = PprRank::new(alpha, batch_size, dims, passes, steps, walks, k, negatives);
-        let loss = PprLoss::from_name(loss.as_deref().unwrap_or("listnet"), weight_decay.unwrap_or(0f32))?;
+        let loss = match (PprLoss::from_name(loss.as_deref().unwrap_or("listnet"), weight_decay.unwrap_or(0f32))?, temperature) {
+            (PprLoss::ApproxNdcg { weight_decay, .. }, Some(t)) => PprLoss::approx_ndcg(t, weight_decay)?,
+            (_, Some(_)) => return Err(PyValueError::new_err("temperature applies only to loss \"approxndcg\"")),
+            (loss, None) => loss
+        };
         Ok(PprRankLearner { ppr_rank: PprRank {
             loss,
             num_features,

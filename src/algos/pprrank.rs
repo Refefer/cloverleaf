@@ -30,18 +30,37 @@ use crate::algos::grad_utils::scheduler::LRScheduler;
 #[derive(Copy,Clone,Debug,PartialEq)]
 pub enum Loss {
     ListNet { passive:bool, weight_decay: f32 },
-    ListMLE { weight_decay: f32 }
+    ListMLE { weight_decay: f32 },
+    /// ApproxNDCG (Qin, Liu and Li, 2010): one minus NDCG over the ranked list, with each node's
+    /// rank replaced by a smooth estimate, `1 + sum_j sigmoid((s_j - s_i) / temperature)`, so
+    /// it can be optimised directly.  The gains are the PPR weights.
+    ApproxNdcg { temperature: f32, weight_decay: f32 }
 }
 
 impl Loss {
-    /// "listnet" (in passive mode) or "listmle", with L2 weight decay `weight_decay`.
+    /// ApproxNDCG's default temperature: smaller is closer to the true rank but has sharper
+    /// gradients.
+    pub const DEFAULT_APPROX_NDCG_TEMPERATURE: f32 = 0.1;
+
+    /// "listnet" (in passive mode), "listmle" or "approxndcg" (at the default temperature),
+    /// with L2 weight decay `weight_decay`.
     pub fn from_name(name: &str, weight_decay: f32) -> Result<Self, Error> {
         match name {
             "listnet" => Ok(Loss::ListNet { passive: true, weight_decay }),
             "listmle" => Ok(Loss::ListMLE { weight_decay }),
+            "approxndcg" => Ok(Loss::ApproxNdcg { temperature: Self::DEFAULT_APPROX_NDCG_TEMPERATURE, weight_decay }),
             other => Err(Error::InvalidArgument(format!(
-                "loss must be \"listnet\" or \"listmle\", got {:?}", other)))
+                "loss must be \"listnet\", \"listmle\" or \"approxndcg\", got {:?}", other)))
         }
+    }
+
+    /// ApproxNDCG at `temperature`, which must be finite and positive.
+    pub fn approx_ndcg(temperature: f32, weight_decay: f32) -> Result<Self, Error> {
+        if !(temperature.is_finite() && temperature > 0f32) {
+            return Err(Error::InvalidArgument(format!(
+                "the ApproxNDCG temperature must be finite and positive, got {}", temperature)))
+        }
+        Ok(Loss::ApproxNdcg { temperature, weight_decay })
     }
 }
 
@@ -388,6 +407,14 @@ impl PprRank {
                     list_loss = list_loss + weight_decay * comp_weight_decay(&query_node, &ranked_embeddings, 0.1f32)
                 }
                 list_loss
+            },
+            Loss::ApproxNdcg { temperature, weight_decay } => {
+                let logits = compute_logits(&query_node, &ranked_embeddings, false);
+                let mut list_loss = approx_ndcg_loss(&logits, &ranked_scores, temperature);
+                if weight_decay > 0f32 {
+                    list_loss = list_loss + weight_decay * comp_weight_decay(&query_node, &ranked_embeddings, 0.1f32)
+                }
+                list_loss
             }
         };
 
@@ -540,6 +567,28 @@ fn list_mle_loss(query_node: &ANode, ranked_nodes: &[ANode], num_positives: usiz
     let logits = compute_logits(query_node, ranked_nodes, false);
     let loss = plackett_luce_nll(&logits, num_positives);
     if loss.value()[0].is_finite() { loss } else { Constant::scalar(0f32) }
+}
+
+/// ApproxNDCG: `1 - DCG / IDCG`, with DCG's ranks the smooth estimates
+/// `pi_i = 1 + sum_{j != i} sigmoid((s_j - s_i) / temperature)` and gains `2^y - 1` from the PPR
+/// weights `y` (zero for the negatives, which only push the positives' ranks down).  In [0, 1];
+/// 0 for a list without positives.
+fn approx_ndcg_loss(logits: &ANode, gains: &[f32], temperature: f32) -> ANode {
+    let gain = |y: f32| 2f32.powf(y) - 1f32;
+    let mut ideal: Vec<f32> = gains.iter().filter(|y| **y > 0f32).map(|y| gain(*y)).collect();
+    ideal.sort_by(|a, b| b.total_cmp(a));
+    let idcg: f32 = ideal.iter().enumerate().map(|(r, g)| g / (2f32 + r as f32).log2()).sum();
+    if !(idcg > 0f32) {
+        return Constant::scalar(0f32)
+    }
+    let terms: Vec<ANode> = gains.iter().enumerate().filter(|(_, y)| **y > 0f32).map(|(i, y)| {
+        // sigmoid(x) = (1 + tanh(x / 2)) / 2, which can't overflow.  Summed over every j, the
+        // j = i term adds sigmoid(0) = 1/2, so pi_i = 1/2 + the sum.
+        let x = (logits - &logits.slice(i, 1)) * (0.5f32 / temperature);
+        let rank = (x.tanh() + 1f32).sum() * 0.5f32 + 0.5f32;
+        (gain(*y) * std::f32::consts::LN_2 / idcg) / (rank + 1f32).ln()
+    }).collect();
+    1f32 - terms.sum_all()
 }
 
 /// The query's scores for each ranked node: dot products, or cosine similarities times 5.  These
@@ -788,9 +837,55 @@ mod ep_tests {
     fn test_loss_names_are_strict() {
         assert_eq!(Loss::from_name("listnet", 0.1).unwrap(), Loss::ListNet { passive: true, weight_decay: 0.1 });
         assert_eq!(Loss::from_name("listmle", 0.).unwrap(), Loss::ListMLE { weight_decay: 0. });
-        for bad in ["ListNet", "list_mle", ""] {
+        assert_eq!(Loss::from_name("approxndcg", 0.).unwrap(),
+                   Loss::ApproxNdcg { temperature: Loss::DEFAULT_APPROX_NDCG_TEMPERATURE, weight_decay: 0. });
+        for bad in ["ListNet", "list_mle", "approx_ndcg", ""] {
             assert!(Loss::from_name(bad, 0.).is_err(), "{}", bad);
         }
+        for bad in [0f32, -1., f32::NAN, f32::INFINITY] {
+            assert!(Loss::approx_ndcg(bad, 0.).is_err(), "{}", bad);
+        }
+        assert_eq!(Loss::approx_ndcg(0.5, 0.).unwrap(), Loss::ApproxNdcg { temperature: 0.5, weight_decay: 0. });
+    }
+
+    /// The exact NDCG of ranking by `scores`, for checking ApproxNDCG's low-temperature limit.
+    fn exact_ndcg(scores: &[f32], gains: &[f32]) -> f32 {
+        let g = |y: f32| 2f32.powf(y) - 1f32;
+        let mut order: Vec<usize> = (0..scores.len()).collect();
+        order.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]));
+        let dcg: f32 = order.iter().enumerate().map(|(r, i)| g(gains[*i]) / (2f32 + r as f32).log2()).sum();
+        let mut ideal: Vec<f32> = gains.iter().map(|y| g(*y)).collect();
+        ideal.sort_by(|a, b| b.total_cmp(a));
+        let idcg: f32 = ideal.iter().enumerate().map(|(r, x)| x / (2f32 + r as f32).log2()).sum();
+        dcg / idcg
+    }
+
+    /// At a low temperature ApproxNDCG is one minus the exact NDCG, whatever the order.
+    #[test]
+    fn test_approx_ndcg_matches_exact_ndcg_at_low_temperature() {
+        let gains = [0.5f32, 0.3, 0.2, 0., 0., 0.];
+        for scores in [[6f32, 5., 4., 3., 2., 1.], [1., 2., 3., 4., 5., 6.], [4., 6., 1., 5., 2., 3.]] {
+            let loss = approx_ndcg_loss(&Variable::new(scores.to_vec()), &gains, 0.01).value()[0];
+            let want = 1f32 - exact_ndcg(&scores, &gains);
+            assert!((loss - want).abs() < 1e-4, "scores {:?}: {} vs {}", scores, loss, want);
+        }
+        // The ideal order scores 0; no positives, 0 too.
+        let perfect = approx_ndcg_loss(&Variable::new(vec![6., 5., 4., 3., 2., 1.]), &gains, 0.01).value()[0];
+        assert!(perfect.abs() < 1e-4);
+        assert_eq!(approx_ndcg_loss(&Variable::new(vec![1., 2.]), &[0., 0.], 0.1).value()[0], 0.);
+    }
+
+    /// Its gradient raises the positives' scores and lowers the negatives', and stays finite for
+    /// large score gaps.
+    #[test]
+    fn test_approx_ndcg_gradient() {
+        let scores = Variable::new(vec![1., 3., 2., -500.]);
+        let loss = approx_ndcg_loss(&scores, &[0.6, 0.4, 0., 0.], 0.5);
+        let mut graph = Graph::new();
+        graph.backward(&loss);
+        let grad = graph.get_grad(&scores).unwrap();
+        assert!(grad.iter().all(|g| g.is_finite()), "{:?}", grad);
+        assert!(grad[0] < 0. && grad[2] > 0., "descent raises positive 0, lowers negative 2: {:?}", grad);
     }
 
     /// Named PPR lists check their sizes, and can keep only the other node type.
