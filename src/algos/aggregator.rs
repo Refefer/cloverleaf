@@ -9,10 +9,10 @@ use rayon::prelude::*;
 
 use crate::feature_store::{FeatureStore, FeatureSet};
 use crate::embeddings::{EmbeddingStore, NodeEmbeddings};
-use crate::distance::Distance;
 use crate::error::Error;
 use crate::vocab::Vocab;
 use crate::algos::ep::attention::AttentionWeights;
+use crate::geometry::{Curvature, Geometry, PoincareBall};
 
 pub trait EmbeddingBuilder {
     fn construct( &self, features: &[usize], out: &mut [f32]) -> ();
@@ -143,10 +143,15 @@ impl <'a> EmbeddingBuilder for AttentionAggregator<'a> {
     }
 }
 
-/// How a node's feature embeddings combine into its embedding.  Can be saved alongside the
-/// feature embeddings it was trained with.
+/// How a node's feature embeddings combine into its embedding: how they pool, and the geometry
+/// the pooled vector is mapped into (Euclidean leaves it as is; the Poincaré ball maps it with
+/// exp0, see [`crate::geometry`]).  Can be saved alongside the feature embeddings it was trained
+/// with.
 #[derive(Clone)]
-pub struct FeatureAggregator(AggregatorKind);
+pub struct FeatureAggregator {
+    kind: AggregatorKind,
+    geometry: Geometry
+}
 
 #[derive(Clone)]
 enum AggregatorKind {
@@ -158,19 +163,34 @@ enum AggregatorKind {
 }
 
 impl FeatureAggregator {
+    fn of(kind: AggregatorKind) -> Self {
+        FeatureAggregator { kind, geometry: Geometry::Euclidean }
+    }
+
+    /// The same pooling, mapping the pooled vector into `geometry`.
+    pub fn with_geometry(mut self, geometry: Geometry) -> Self {
+        self.geometry = geometry;
+        self
+    }
+
+    /// The geometry node embeddings are mapped into.
+    pub fn geometry(&self) -> Geometry {
+        self.geometry
+    }
+
     /// The mean of the feature embeddings.
     pub fn averaged() -> Self {
-        FeatureAggregator(AggregatorKind::Averaged)
+        FeatureAggregator::of(AggregatorKind::Averaged)
     }
 
     /// Attention pooling with trained weights, from EP's attention model or the GPU trainer.
     pub fn attention(weights: AttentionWeights) -> Self {
-        FeatureAggregator(AggregatorKind::Attention(Arc::new(weights)))
+        FeatureAggregator::of(AggregatorKind::Attention(Arc::new(weights)))
     }
 
     /// The attention weights, for an attention aggregator.
     pub fn attention_weights(&self) -> Option<&AttentionWeights> {
-        match &self.0 {
+        match &self.kind {
             AggregatorKind::Attention(weights) => Some(weights),
             _ => None
         }
@@ -181,13 +201,23 @@ impl FeatureAggregator {
     pub fn weighted(alpha: f32, features: &FeatureSet) -> Self {
         let unigrams = Arc::new(UnigramProbability::new(&features.features));
         let vocab = Arc::new(features.features.clone_vocab());
-        FeatureAggregator(AggregatorKind::Weighted { alpha, vocab, unigrams })
+        FeatureAggregator::of(AggregatorKind::Weighted { alpha, vocab, unigrams })
     }
 
-    /// Writes the aggregator in the format `load` reads.
+    /// Writes the aggregator in the format `load` reads.  A Poincaré geometry is a first line
+    /// `Poincare<TAB>curvature<TAB>max_tangent_norm` ("-" for none); Euclidean writes none, so
+    /// Euclidean files are unchanged.
     pub fn save(&self, path: &str) -> Result<(), Error> {
         let mut bw = BufWriter::new(File::create(path)?);
-        match &self.0 {
+        if let Geometry::Poincare(ball) = &self.geometry {
+            let mut buf = ryu::Buffer::new();
+            write!(bw, "Poincare\t{}\t", buf.format_finite(ball.curvature().value()))?;
+            match ball.max_tangent_norm() {
+                Some(r) => writeln!(bw, "{}", buf.format_finite(r))?,
+                None => writeln!(bw, "-")?
+            }
+        }
+        match &self.kind {
             AggregatorKind::Averaged => writeln!(bw, "Averaged")?,
             AggregatorKind::Attention(w) => {
                 // Each row of a projection on one line; ryu writes the shortest text that reads
@@ -235,8 +265,20 @@ impl FeatureAggregator {
                 line, message: format!("invalid {}: {:?}", what, value) })
         }
 
-        let (_, kind) = next_line("aggregator type")?;
-        match kind.trim_end() {
+        let (i, mut kind) = next_line("aggregator type")?;
+        let mut geometry = Geometry::Euclidean;
+        if kind.starts_with("Poincare") {
+            let pieces: Vec<&str> = kind.trim_end().split('\t').collect();
+            if pieces.len() != 3 {
+                return Err(Error::Malformed { line: i, message:
+                    "expected Poincare<TAB>curvature<TAB>max_tangent_norm (or -)".into() })
+            }
+            let curvature = parse::<f32>(i, pieces[1], "curvature")?;
+            let clip = if pieces[2] == "-" { None } else { Some(parse::<f32>(i, pieces[2], "max_tangent_norm")?) };
+            geometry = Geometry::Poincare(PoincareBall::new(Curvature::new(curvature)?, clip)?);
+            kind = next_line("aggregator type")?.1;
+        }
+        let aggregator: Result<Self, Error> = match kind.trim_end() {
             "Averaged" => Ok(FeatureAggregator::averaged()),
             "Attention" => {
                 let (i, l) = next_line("dims, heads and head_dims")?;
@@ -294,14 +336,15 @@ impl FeatureAggregator {
                     p_w.push(p_wi as f32);
                 }
                 let unigrams = Arc::new(UnigramProbability::from_vec(p_w));
-                Ok(FeatureAggregator(AggregatorKind::Weighted { alpha, vocab: Arc::new(vocab), unigrams }))
+                Ok(FeatureAggregator::of(AggregatorKind::Weighted { alpha, vocab: Arc::new(vocab), unigrams }))
             },
             other => Err(Error::Malformed { line: 1, message: format!("Unknown aggregator type: {}", other) })
-        }
+        };
+        Ok(aggregator?.with_geometry(geometry))
     }
 
     fn builder<'a>(&'a self, es: &'a EmbeddingStore) -> Box<dyn EmbeddingBuilder + Send + Sync + 'a> {
-        match &self.0 {
+        match &self.kind {
             AggregatorKind::Weighted { alpha, unigrams, .. } =>
                 Box::new(WeightedAggregator::new(es, unigrams, *alpha)),
             AggregatorKind::Averaged => Box::new(AvgAggregator::new(es)),
@@ -313,7 +356,7 @@ impl FeatureAggregator {
     /// embeddings: the same, and for attention they must be the width its weights were trained
     /// for.
     pub fn node_dims(&self, feature_dims: usize) -> Result<usize, Error> {
-        match &self.0 {
+        match &self.kind {
             AggregatorKind::Attention(w) if w.dims() != feature_dims =>
                 Err(Error::InvalidArgument(format!(
                     "attention weights are for {}-dimensional feature embeddings, got {}",
@@ -325,12 +368,16 @@ impl FeatureAggregator {
 
 impl std::fmt::Display for FeatureAggregator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.0 {
-            AggregatorKind::Averaged => write!(f, "Averaged"),
-            AggregatorKind::Weighted { alpha, .. } => write!(f, "Weighted<alpha={}>", alpha),
+        match &self.kind {
+            AggregatorKind::Averaged => write!(f, "Averaged")?,
+            AggregatorKind::Weighted { alpha, .. } => write!(f, "Weighted<alpha={}>", alpha)?,
             AggregatorKind::Attention(w) =>
-                write!(f, "Attention<dims={},heads={},head_dims={}>", w.dims(), w.heads(), w.head_dims())
+                write!(f, "Attention<dims={},heads={},head_dims={}>", w.dims(), w.heads(), w.head_dims())?
         }
+        if self.geometry != Geometry::Euclidean {
+            write!(f, " in {}", self.geometry)?;
+        }
+        Ok(())
     }
 }
 
@@ -361,7 +408,8 @@ impl NodeEmbedder {
     ) -> Result<NodeEmbeddings, Error> {
         let num_nodes = features.vocab.len();
         let dims = self.aggregator.node_dims(feature_embeddings.dims())?;
-        let es = EmbeddingStore::new(num_nodes, dims, Distance::Cosine);
+        let geometry = self.aggregator.geometry;
+        let es = EmbeddingStore::new(num_nodes, dims, geometry.node_distance());
         let agg = self.aggregator.builder(&feature_embeddings.embeddings);
         let fs_vocab = features.features.get_vocab();
         (0..num_nodes).into_par_iter().for_each(|node| {
@@ -370,7 +418,9 @@ impl NodeEmbedder {
                 .collect();
             if !feats.is_empty() {
                 // Each node writes only its own row.
-                agg.construct(&feats, es.get_embedding_mut_hogwild(node));
+                let row = es.get_embedding_mut_hogwild(node);
+                agg.construct(&feats, row);
+                geometry.to_space(row);
             }
         });
         Ok(NodeEmbeddings { vocab: features.vocab.clone(), embeddings: es })
@@ -395,6 +445,7 @@ impl NodeEmbedder {
         let mut embedding = vec![0.; self.aggregator.node_dims(feature_embeddings.dims())?];
         if !ids.is_empty() {
             self.aggregator.builder(&feature_embeddings.embeddings).construct(&ids, &mut embedding);
+            self.aggregator.geometry.to_space(&mut embedding);
         }
         Ok(embedding)
     }
@@ -415,6 +466,7 @@ impl NodeEmbedder {
 #[cfg(test)]
 mod aggregator_tests {
     use super::*;
+    use crate::distance::Distance;
 
     use std::sync::Arc;
     use rand::SeedableRng;
@@ -442,7 +494,7 @@ mod aggregator_tests {
     fn test_weighted_aggregator_stores_feature_vocab() {
         let fs = feature_set();
         let agg = FeatureAggregator::weighted(0.5, &fs);
-        let AggregatorKind::Weighted { vocab, .. } = &agg.0 else {
+        let AggregatorKind::Weighted { vocab, .. } = &agg.kind else {
             panic!("expected a Weighted aggregator")
         };
         let feat_vocab = fs.features.get_vocab();
@@ -465,7 +517,7 @@ mod aggregator_tests {
             // Attention weights read back bit-exactly.
             assert_eq!(agg.attention_weights(), loaded.attention_weights());
             if let (AggregatorKind::Weighted { vocab: v1, unigrams: u1, .. },
-                    AggregatorKind::Weighted { vocab: v2, unigrams: u2, .. }) = (&agg.0, &loaded.0) {
+                    AggregatorKind::Weighted { vocab: v2, unigrams: u2, .. }) = (&agg.kind, &loaded.kind) {
                 assert_eq!(v1.len(), v2.len());
                 assert!(u1.iter().zip(u2.iter()).all(|(a, b)| (a - b).abs() < 1e-6));
             }
@@ -527,6 +579,56 @@ mod aggregator_tests {
         let embedder = NodeEmbedder::new(agg);
         assert_eq!(embedder.embed_adhoc(&[("f", "a"), ("f", "b")], &fe, true).unwrap(), expected);
         assert_ne!(expected, vec![0.5, 0.5, 0.5]);   // not just the mean
+    }
+
+    fn poincare(c: f32, clip: Option<f32>) -> Geometry {
+        Geometry::Poincare(PoincareBall::new(Curvature::new(c).unwrap(), clip).unwrap())
+    }
+
+    /// A Poincaré aggregator reads back with its geometry; Euclidean files stay as they were.
+    #[test]
+    fn test_poincare_aggregator_round_trip() {
+        for agg in [FeatureAggregator::averaged().with_geometry(poincare(0.3, None)),
+                    attention().with_geometry(poincare(1.5, Some(2.25)))] {
+            let path = temp_path("poincare");
+            agg.save(&path).unwrap();
+            let first = std::fs::read_to_string(&path).unwrap().lines().next().unwrap().to_string();
+            let loaded = FeatureAggregator::load(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(first.starts_with("Poincare\t"), "{}", first);
+            assert_eq!(loaded.geometry(), agg.geometry());
+            assert_eq!(loaded.to_string(), agg.to_string());
+            assert_eq!(agg.attention_weights(), loaded.attention_weights());
+        }
+        let path = temp_path("euclidean");
+        FeatureAggregator::averaged().save(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Averaged\n");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// In the Poincaré ball a node is exp0 of its features' mean, and the embeddings are
+    /// compared by hyperbolic distance.
+    #[test]
+    fn test_poincare_embedder_maps_the_mean_into_the_ball() {
+        let mut b = crate::embeddings::NodeEmbeddingsBuilder::new(Distance::Cosine);
+        b.add_embedding("f", "a", &[1., 0.]).unwrap();
+        b.add_embedding("f", "b", &[0., 3.]).unwrap();
+        let fe = b.build().unwrap();
+        let geometry = poincare(0.5, None);
+        let embedder = NodeEmbedder::new(FeatureAggregator::averaged().with_geometry(geometry));
+        let got = embedder.embed_adhoc(&[("f", "a"), ("f", "b")], &fe, true).unwrap();
+        let mut expected = vec![0.5f32, 1.5];
+        geometry.to_space(&mut expected);
+        assert_eq!(got, expected);
+        assert!(got.iter().map(|x| x * x).sum::<f32>() < 1. / 0.5);
+
+        let mut node_vocab = Vocab::new();
+        node_vocab.get_or_insert("node", "n0");
+        let mut fs = FeatureSet::new(Arc::new(node_vocab));
+        fs.set_features("node", "n0", [("f", "a"), ("f", "b")].into_iter()).unwrap();
+        let ne = embedder.embed_feature_set(&fs, &fe).unwrap();
+        assert_eq!(ne.embeddings.get_embedding(0), expected.as_slice());
+        assert!(matches!(ne.distance(), Distance::Poincare(c) if c.value() == 0.5));
     }
 
     /// Averaging two features gives their mean; unknown features are skipped unless strict.

@@ -2,6 +2,7 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use float_ord::FloatOrd;
+use crate::geometry::Curvature;
 
 #[derive(Copy,Clone,Debug)]
 pub enum Distance {
@@ -22,7 +23,11 @@ pub enum Distance {
     Hamming,
 
     /// Jaccard distance, treating each float as an identifier
-    Jaccard
+    Jaccard,
+
+    /// Hyperbolic distance in the Poincaré ball of this curvature (see [`crate::geometry`]), for
+    /// embeddings trained with the Poincaré geometry.
+    Poincare(Curvature)
 }
 
 impl Distance {
@@ -158,6 +163,8 @@ impl Distance {
                     *ei * *ej
                 }).sum::<f32>()
             },
+
+            Distance::Poincare(curvature) => curvature.distance(e1, e2),
 
             Distance::Hamming => {
                 let not_matches = e1.iter().zip(e2.iter()).map(|(ei, ej)| {

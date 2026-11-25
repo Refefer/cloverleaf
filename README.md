@@ -263,6 +263,7 @@ Embedding Propagation is a node embedding method which uses both the graph struc
 1. Multiple losses - EP, Starspace, Rankspace, Contrastive, PPR, and more
 2. Average or attention-based node feature aggregation.  Attention is multi-head self-attention over a node's features with query, key, value and output projections shared by every feature; it's the same model as the GPU trainer's (`gpu/`), so weights trained by either load into `FeatureAggregator` and embed new nodes identically.
 3. Neighborhood Alignment - Uses graph topology to influence node feature-based embeddings.
+4. Hyperbolic embeddings - `geometry="poincare"` places node embeddings in the Poincaré ball (see below), matching the GPU trainer's `--geometry poincare`.
 
 The paper's results reproduce: `examples/ep_paper/reproduce.py` trains EP-B with the paper's settings (`loss=EPLoss.margin(gamma, 1)`, `alpha=0.001`, `lr_schedule="constant"`, `init="glorot"`, `batch_size=64`, `passes=200`) and matches its node classification results on Cora, Citeseer, Pubmed, PPI and POS, and on BlogCatalog with 5 sampled neighbors (`max_nodes=5`).  See `examples/ep_paper/README.md` for the numbers.
 
@@ -273,6 +274,23 @@ The result of the optimization phase is feature embeddings, which can be used to
 Neighborhood alignment (`NeighborhoodAligner`) then pulls each node towards its neighbors.  A new node has no neighbors, so `EmbeddingAligner` places it in the aligned space from its nearest nodes: `method="distances"` keeps its distances to them, and `method="mean_shift"` moves it as they moved on average.  Mean shift with training queries as the anchors works well for new search queries.
 
 For large graphs, the GPU trainer in `gpu/` trains the same averaged and attention models much faster, and its output loads straight into the classes above.  It also has losses and schedules the CPU trainer doesn't, such as a sawtooth learning rate, which is its recommended setting; see [gpu/README.md](gpu/README.md).
+
+#### The Poincaré ball
+
+With `geometry="poincare"`, a node's pooled features are read as a tangent vector at the origin of the Poincaré ball of curvature `-curvature` and mapped into the ball, `exp0(v) = tanh(sqrt(c)|v|) v / (sqrt(c)|v|)`; pairs are compared by hyperbolic distance.  The margin and PPR losses use that distance and StarSpace uses it as its similarity (so `gamma` is in distance units); the rank and contrastive losses need Euclidean space.  Distance grows exponentially towards the ball's edge, so general nodes can sit near the origin and specific ones further out, and hierarchies fit in few dimensions.  The arithmetic matches the GPU trainer's, clamps included, so embeddings from either side embed and score the same way.
+
+```python
+ep = cl.EmbeddingPropagator(loss=cl.EPLoss.starspace(1.0, 12), dims=64, geometry="poincare", curvature=0.3)
+features = ep.learn_features(graph, feature_set)
+embedder = cl.NodeEmbedder(ep.feature_aggregator())      # maps into the ball
+nodes = embedder.embed_feature_set(feature_set, features)  # compared with PoincareDistance(0.3)
+
+# A GPU-trained Poincaré model: the same pooling, mapped into the ball.
+agg = cl.FeatureAggregator.Averaged().with_geometry("poincare", 0.3)
+gpu_nodes = cl.NodeEmbeddings.load("PREFIX.node-embeddings", cl.PoincareDistance(0.3))
+```
+
+`FeatureAggregator` files record a Poincaré geometry on a first line (`Poincare<TAB>curvature<TAB>max_tangent_norm`); Euclidean ones are unchanged.  `cl.PoincareDistance(c)` works wherever a `cl.Distance` does.
 
 #### Parameters
 1. `alpha` - Learning rate for the optimization step.
@@ -292,6 +310,9 @@ For large graphs, the GPU trainer in `gpu/` trains the same averaged and attenti
 15. `lr_schedule` - `"cosine"` (default) warms the learning rate up over the first 20% of updates, then decays it along a cosine; `"constant"` keeps it at `alpha`, as in the paper.
 16. `init` - `"unit"` (default) starts each feature embedding as a random unit vector; `"glorot"` uses Glorot uniform, as in the paper.
 17. `update_frequency` - `"batch"` (default) updates the embeddings after every batch; `"epoch"` still processes batches, but sums their gradients over the pass and applies one update at the end.  That gives `passes` updates in total, so it usually wants a larger `alpha` or more passes, and it keeps an extra gradient table the size of the feature embeddings.  It works best on dense graphs: with an average degree in the tens, a node's features get a gradient in dozens of batches a pass, and summing them removes the noise of that many small steps.  On the EP paper's benchmarks (see `examples/ep_paper`) it gained 1–8 points of F1 on BlogCatalog, PPI and POS (average degree 19–65) at `alpha` 0.01–0.05, and lost 1–2 points of accuracy on Cora, Citeseer and Pubmed (average degree under 5), where `"batch"` is the better choice.  On nodes unseen during training the gains held on BlogCatalog and PPI but not POS, and epoch updates peaked after about 100 passes, so choose `passes` on a held-out split.
+18. `geometry` - `"euclidean"` (default) or `"poincare"`: the space node embeddings live in (see above).
+19. `curvature` - The Poincaré ball's curvature magnitude (default 1); lower is flatter.
+20. `max_tangent_norm` - Poincaré only: clips the pooled tangent vector to this norm before the map, keeping points away from the ball's edge.
 
 #### Example
 

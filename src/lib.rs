@@ -37,6 +37,9 @@
 /// Graph storage and the [`graph::Graph`] trait that algorithms run against.
 pub mod graph;
 
+/// The space embeddings live in: Euclidean, or the Poincaré ball (see [`geometry::Geometry`]).
+pub mod geometry;
+
 /// Graphs with named nodes, and building them edge by edge.
 pub mod named_graph;
 
