@@ -18,6 +18,7 @@
 //! | `PageRank`, `PolicyEvaluation` | [`algos::pagerank::PageRank::learn`], [`algos::policy_evaluation::PolicyEvaluation::optimize_rewards`] with [`algos::policy_evaluation::NodeRewards`] |
 //! | `Smci` | [`algos::smci::SupervisedMCIteration::learn_rewards`] with [`algos::smci::PairRewards`] |
 //! | `VpcgEmbedder`, `VpcgFeatureMappings` | [`algos::vpcg::VPCG::learn_named`], [`algos::vpcg::VpcgFeatureMappings`] |
+//! | `FastRPEmbedder` | [`algos::fastrp::FastRP::learn`], [`algos::fastrp::FastRP::learn_with_features`] |
 //! | `FeaturePropagator` | [`FeatureSet::propagate`] |
 //! | `Query` | [`Query`], looked up with [`NodeEmbeddings::resolve`] |
 //! | `RandomWalker`, `SparsePPR`, `RandomPath` | [`algos::rwr::RWR::walk_scores`], [`algos::rwr::SparsePpr`], [`algos::rwr::seeded_rollouts`] |

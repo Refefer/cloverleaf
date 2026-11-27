@@ -53,6 +53,7 @@ use crate::algos::smci::{SupervisedMCIteration, PairRewards};
 use crate::algos::utils::Sample;
 use crate::error::Error;
 use crate::named_graph::{GraphBuilder as CoreGraphBuilder, GraphLoadOptions};
+use crate::algos::fastrp::FastRP;
 use crate::algos::vpcg::{VPCG, FeatureWeight as VFeatureWeight, VpcgFeatureMappings as CoreVpcgFeatureMappings};
 
 
@@ -3904,6 +3905,127 @@ impl VpcgEmbedder {
 
 }
 
+/// Embeds nodes with FastRP: very sparse random projections, smoothed over the graph.
+#[pyclass]
+struct FastRPEmbedder {
+    inner: FastRP
+}
+
+#[pymethods]
+impl FastRPEmbedder {
+    ///    Creates a FastRPEmbedder.  FastRP (Chen et al., 2019) trains nothing: every node starts
+    ///    from a very sparse random vector, and its embedding is a weighted sum of that vector's
+    ///    propagations through the graph, each scaled to unit length:
+    ///
+    ///        E = sum_i weights[i] * N_i / |N_i|,  N_0 = degree^normalization_strength * R,
+    ///        N_i = P N_{i-1}  (P averages over a node's neighbours, by edge weight)
+    ///
+    ///    Given a FeatureSet, part of each starting vector comes from the node's features
+    ///    instead, so nodes sharing features start close.  Random vectors are hashed from node and
+    ///    feature names, so a seed gives the same embeddings whatever the node order.  Memory is
+    ///    up to three floats per node per dimension.
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    dims : Int
+    ///        Number of dimensions of the embeddings.
+    ///
+    ///    weights : List[Float] - Optional
+    ///        weights[0] weighs a node's own starting vector and weights[i] its propagation i hops
+    ///        out, so there are len(weights) - 1 propagations.  Default [0, 0, 1, 1].
+    ///
+    ///    normalization_strength : Float - Optional
+    ///        Scales each starting vector by its node's degree to this power: negative values
+    ///        quiet high-degree nodes in their neighbours' embeddings.  Default 0.
+    ///
+    ///    sparsity : Float - Optional
+    ///        Each random entry is +1 or -1 with probability 1 / (2 sparsity) each, else 0.  At
+    ///        least 1 (dense); default 3.
+    ///
+    ///    seed : Int - Optional
+    ///        Seed for the random vectors.
+    ///
+    ///    indicator : Bool - Optional
+    ///        Shows a progress bar.  Default True.
+    ///
+    ///    Returns
+    ///    -------
+    ///    Self
+    ///
+    #[new]
+    #[pyo3(signature = (dims, weights=None, normalization_strength=None, sparsity=None, seed=None, indicator=true))]
+    pub fn new(
+        dims: usize,
+        weights: Option<Vec<f32>>,
+        normalization_strength: Option<f32>,
+        sparsity: Option<f32>,
+        seed: Option<u64>,
+        indicator: bool
+    ) -> PyResult<Self> {
+        let d = FastRP::new(dims);
+        let inner = FastRP {
+            weights: weights.unwrap_or(d.weights),
+            normalization_strength: normalization_strength.unwrap_or(d.normalization_strength),
+            sparsity: sparsity.unwrap_or(d.sparsity),
+            seed: seed.unwrap_or(d.seed),
+            indicator,
+            ..d
+        };
+        inner.validate()?;
+        Ok(FastRPEmbedder { inner })
+    }
+
+    /// Simple Python representation
+    pub fn __repr__(&self) -> String {
+        format!("FastRPEmbedder<Dims={}, Weights={:?}, NormalizationStrength={}, Sparsity={}, Seed={}>",
+                self.inner.dims, self.inner.weights, self.inner.normalization_strength,
+                self.inner.sparsity, self.inner.seed)
+    }
+
+    ///    Embeds every node of the graph.
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    graph : Graph
+    ///        Graph to embed.
+    ///
+    ///    features : FeatureSet - Optional
+    ///        Node features, built from the graph.  Without them the embeddings come from the
+    ///        graph's structure alone.
+    ///
+    ///    feature_dims : Int - Optional
+    ///        With features: how many of the dims (the last ones) start from the features, the
+    ///        rest from the node itself; dims for features alone.  Default dims // 2 (at least 1).
+    ///        Only valid with features.
+    ///
+    ///    Returns
+    ///    -------
+    ///    NodeEmbeddings
+    ///        Embeddings for every node, compared by cosine.
+    ///
+    #[pyo3(signature = (graph, features=None, feature_dims=None))]
+    pub fn learn(
+        &self,
+        py: Python<'_>,
+        graph: &Graph,
+        features: Option<&FeatureSet>,
+        feature_dims: Option<usize>
+    ) -> PyResult<NodeEmbeddings> {
+        let inner = &self.inner;
+        let g = &graph.inner;
+        let embeddings = match (features, feature_dims) {
+            (None, Some(_)) => return Err(PyValueError::new_err("feature_dims needs features")),
+            (None, None) => py.detach(|| inner.learn(g))?,
+            (Some(fs), fd) => {
+                let fd = fd.unwrap_or((inner.dims / 2).max(1));
+                let fs = &fs.inner;
+                py.detach(|| inner.learn_with_features(g, fs, fd))?
+            }
+        };
+        Ok(NodeEmbeddings::from(embeddings))
+    }
+}
+
 /// Computes embeddings from features using PPR
 #[pyclass]
 struct PPREmbedder {
@@ -4576,6 +4698,7 @@ fn cloverleaf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PageRank>()?;
     m.add_class::<Smci>()?;
     m.add_class::<VpcgEmbedder>()?;
+    m.add_class::<FastRPEmbedder>()?;
     m.add_class::<VpcgFeatureMappings>()?;
     m.add_class::<FeatureWeight>()?;
     m.add_class::<PPREmbedder>()?;

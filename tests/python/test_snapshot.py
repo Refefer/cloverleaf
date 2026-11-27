@@ -243,6 +243,15 @@ def collect(tmp):
     err("ppr emb bad steps", lambda: cl.PPREmbedder(8, 5, 0.0).learn(g, cl.FeatureSet.new_from_graph(g)))
     err("instant bad", lambda: cl.InstantEmbeddings.random_walk(8, 2, 5, -1.0))
 
+    # FastRP is deterministic, so its values are pinned.
+    frp = cl.FastRPEmbedder(8, normalization_strength=-0.5, indicator=False)
+    emit("fastrp", (repr(frp), frp.learn(g).get_embedding(("a", "1"))))
+    fs_f = cl.FeatureSet.new_from_graph(g)
+    fs_f.load_into(path("feats.txt"), cl.FeatureNamespace.prefix(":"))
+    emit("fastrp features", frp.learn(g, fs_f, feature_dims=4).get_embedding(("a", "3")))
+    err("fastrp bad weights", lambda: cl.FastRPEmbedder(8, weights=[0.0]))
+    err("fastrp feature_dims without features", lambda: frp.learn(g, feature_dims=2))
+
     fp = cl.FeaturePropagator(2)
     fs_p = cl.FeatureSet.new_from_graph(g)
     fs_p.load_into(path("feats.txt"), cl.FeatureNamespace.prefix(":"))
