@@ -149,6 +149,30 @@ def test_align_accepts_aligned_embeddings(graph):
     assert out.dims() == 2
 
 
+def test_neighborhood_samplers(graph, tmp_path):
+    # A path 0 - 1 - 2 - 3 - 4; node i's embedding is [i, 0].
+    path = tmp_path / "path.edges"
+    path.write_text("".join(f"n\t{i}\tn\t{i + 1}\t1\n" for i in range(4)))
+    g = cl.Graph.load(str(path), cl.EdgeType.Undirected)
+    embs = cl.NodeEmbeddings(g, 2, cl.Distance.Euclidean)
+    for node in g.vocab():
+        embs.set_embedding(node, [float(node[1]), 0.0])
+    x = lambda out, i: out.get_embedding(("n", str(i)))[0]
+    direct = cl.NeighborhoodAligner(alpha=0.0).align(embs, g)
+    assert x(direct, 2) == pytest.approx(2.0) and x(direct, 0) == pytest.approx(1.0)
+    same = cl.NeighborhoodAligner(alpha=0.0, sampler=cl.NeighborhoodSampler.edges()).align(embs, g)
+    assert [x(same, i) for i in range(5)] == pytest.approx([x(direct, i) for i in range(5)])
+    # Two-step walks from 0 end on 0 (left out) or 2; from 2, on 0 or 4 (and 2).
+    two = cl.NeighborhoodAligner(alpha=0.0, sampler=cl.NeighborhoodSampler.ppr(2, walks=4000, seed=3)).align(embs, g)
+    assert x(two, 0) == pytest.approx(2.0) and x(two, 2) == pytest.approx(2.0, abs=0.1)
+    assert "ppr" in repr(cl.NeighborhoodSampler.ppr(0.5, k=10)) and "Sampler" in repr(cl.NeighborhoodAligner())
+    for bad in [dict(steps=0.0), dict(steps=2.5), dict(steps=2, k=0), dict(steps=2, walks=0), dict(steps=2, beta=-1.0)]:
+        with pytest.raises(ValueError):
+            cl.NeighborhoodSampler.ppr(**bad)
+    with pytest.raises(ValueError):
+        cl.NeighborhoodAligner(max_neighbors=3, sampler=cl.NeighborhoodSampler.edges())
+
+
 def test_graph_ann_rejects_misaligned_embeddings(graph):
     ann = cl.GraphAnn(graph, max_steps=20)
     with pytest.raises(ValueError):
