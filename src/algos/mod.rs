@@ -16,6 +16,7 @@ pub mod ann;
 pub mod emb_aligner;
 pub mod pagerank;
 pub mod vpcg;
+pub mod fastrp;
 pub mod pprembed;
 pub mod instantembedding;
 pub mod lsr;

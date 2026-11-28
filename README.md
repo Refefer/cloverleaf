@@ -11,6 +11,7 @@ The library is broken up into a few different methods:
 2. Graph Embedding
     - Walk Distance Embeddings
     - Vector Propagation on Click Graphs (VPCG)
+    - FastRP (very sparse random projections, optionally from node features)
     - Embedding Propagation with several novel extensions
     - PPR Embeddings
     - Instant Embeddings
@@ -256,6 +257,53 @@ This is a great baseline for both Search and Recommendation applications, with U
 >>> embs = vpcg_embedder.learn(graph, node_features, "query")
 ```
 
+### FastRP
+
+FastRP [11] embeds nodes without training anything.  Every node starts from a very sparse random vector, and its embedding is a weighted sum of that vector's propagations through the graph, each scaled to unit length:
+
+```
+N_0 = degree^normalization_strength · R        (R: entries ±1 with probability 1/(2s) each, else 0)
+N_i = P · N_(i-1)                              (P averages over a node's neighbours, by edge weight)
+E   = Σ_i weights[i] · N_i / |N_i|
+```
+
+Given a `FeatureSet`, the last `feature_dims` dimensions start from the mean of random vectors for the node's features instead of its own, so nodes that share features start close (the id and feature blocks are each scaled to unit length first, so they weigh the same).  It makes a fast, strong baseline, and the feature variant is a training-free counterpart to Embedding Propagation.
+
+Random vectors are hashed from node and feature names, so a seed gives the same embeddings whatever the node order, run or machine.  It holds up to three `nodes × dims` float buffers (two when only the last weight is non-zero).
+
+#### Parameters
+1. `dims` - Dimensions of the embeddings.
+2. `weights` - `weights[0]` weighs a node's own starting vector and `weights[i]` its propagation `i` hops out; there are `len(weights) - 1` propagations.  Default `[0, 0, 1, 1]`.
+3. `normalization_strength` - β: starting vectors are scaled by degree^β, so negative values quiet high-degree nodes in their neighbours' embeddings.  Default 0.
+4. `sparsity` - s ≥ 1, the inverse density of the random vectors.  Default 3; 1 is a dense ±1 projection.
+5. `seed` - Seed for the random vectors.
+
+`learn(graph, features=None, feature_dims=None)` embeds every node; with features, `feature_dims` defaults to half the dimensions.  Embeddings compare by cosine.
+
+#### Choosing settings
+
+The defaults (`weights=[0, 0, 1, 1]`, no degree normalization) are a good starting point with features.  From structure alone, more hops weighted towards the last one and a mildly negative `normalization_strength` (around -0.3) tend to do better; for example `weights=[0.75, 0.1, 1, 0.1, 0.2, 40]`.  The settings are cheap to search, since an embedding takes milliseconds to seconds.
+
+On the citation graphs at 256 dimensions, picking settings on validation nodes from 24 random trials (logistic regression on the embeddings; 80/20 split, Micro-F1, and the 20-labels-per-class protocol of [5]):
+
+| | Cora | Citeseer | Pubmed |
+|---|---|---|---|
+| Structure only, 80/20 | 83.4 | 56.7 | 69.2 |
+| With word features, 80/20 | 86.2 | 71.8 | 84.5 |
+| With word features, 20 per class | 78.3 | 60.8 | 77.1 |
+
+Each embedding took 3 to 27 ms.  Trained Embedding Propagation is ahead with features (82.6 / 72.0 / 81.8 at 20 per class), most of all on Citeseer.
+
+#### Example
+
+```python3
+>>> graph = cloverleaf.Graph.load("graph.edges", cloverleaf.EdgeType.Undirected)
+>>> embs = cloverleaf.FastRPEmbedder(dims=256).learn(graph)            # structure only
+>>> features = cloverleaf.FeatureSet.new_from_graph(graph)
+>>> features.load_into("graph.features")
+>>> embs = cloverleaf.FastRPEmbedder(dims=256, weights=[1, 1, 1, 1]).learn(graph, features)
+```
+
 ### Embedding Propagation
 
 Embedding Propagation is a node embedding method which uses both the graph structure and node features to learn node embeddings.  As with the original paper, EP-B is implemented as a baseline.  In addition, Cloverleaf offers a variety of useful extensions:
@@ -461,6 +509,7 @@ A simple random projection based ANN method which can be consumed directly or in
 8. Recht, Benjamin, et al. "Hogwild!: A lock-free approach to parallelizing stochastic gradient descent." Advances in neural information processing systems 24 (2011).
 9. Postăvaru, Ştefan, et al. "InstantEmbedding: Efficient local node representations." arXiv preprint arXiv:2010.06992 (2020).
 10. Maystre, Lucas, and Matthias Grossglauser. "Fast and accurate inference of Plackett\u2013Luce models." Advances in neural information processing systems 28 (2015).
+11. Chen, Haochen, et al. "Fast and accurate network embeddings via very sparse random projection." Proceedings of the 28th ACM International Conference on Information and Knowledge Management. 2019.
 
 ## Python API Reference
 
@@ -570,6 +619,7 @@ gradients.  CPU only.  `ppr_lists` (below) returns the lists themselves.
 | `ClusterLPAEmbedder` | `ClusterLPAEmbedder(k: int, passes: int, seed: int \| None = None)` | `learn(graph: Graph) -> NodeEmbeddings` |
 | `SLPAEmbedder` | `SLPAEmbedder(t: int, threshold: int, memory_size: int \| None = None, rule: ListenerRule \| None = None, seed: int \| None = None)` | `learn(graph: Graph) -> NodeEmbeddings` |
 | `VpcgEmbedder` | `VpcgEmbedder(max_terms: int, passes: int, dims: int, alpha: float = 1.0, err: float = 1e-5, feature_weight: FeatureWeight = FeatureWeight.Uniform)` | `learn(graph: Graph, features: FeatureSet, start_node_type: str \| list[str]) -> NodeEmbeddings` (raises `ValueError` if `dims` is 0 or a node is left without features to embed)<br>`learn_feature_mapping(... ) -> VpcgFeatureMappings`<br>Both raise `ValueError` unless `features` has the graph's nodes in the same order, as `FeatureSet.new_from_graph` builds |
+| `FastRPEmbedder` | `FastRPEmbedder(dims: int, weights: list[float] \| None = None, normalization_strength: float = 0.0, sparsity: float = 3.0, seed: int \| None = None, indicator: bool = True)` (raises `ValueError` on 0 dims, empty, all-zero or non-finite weights, or sparsity under 1) | `learn(graph: Graph, features: FeatureSet \| None = None, feature_dims: int \| None = None) -> NodeEmbeddings` (raises `ValueError` for `feature_dims` without features or outside 1..dims, and unless `features` has the graph's nodes in the same order) |
 | `VpcgFeatureMappings` | *(returned by `VpcgEmbedder.learn_feature_mapping`)* | `get_feature_map(node: tuple[str,str]) -> list[tuple[int,float]]`<br>`__getitem__(node_id: int) -> list[tuple[int,float]]` |
 | `PPREmbedder` | `PPREmbedder(dims: int, num_walks: int, steps: float, beta: float = 0.8, eps: float = 1e-5)` | `learn(graph: Graph, features: FeatureSet, seed: int \| None = None) -> NodeEmbeddings` (raises `ValueError` unless `features` has the graph's nodes in the same order, as `FeatureSet.new_from_graph` builds) |
 | `InstantEmbeddings` | *static constructors*:<br>`InstantEmbeddings.random_walk(dims: int, hashes: int, num_walks: int, steps: float, beta: float = 0.8, seed: int \| None = None)`<br>`InstantEmbeddings.sparse_ppr(dims: int, hashes: int, steps: float, eps: float = 1e-5)` | `learn(graph: Graph) -> NodeEmbeddings` |
