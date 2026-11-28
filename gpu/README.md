@@ -36,7 +36,7 @@ nodes, not by training or validation loss, which have ranked models differently 
 default for retrieval.  The margin loss (EP-B's) suits embeddings used as features, such as node
 classification.  InfoNCE puts more weight on the top of the ranking but overfits: pair it with
 `--valid-edges` and `--keep-best-probe` to stop at the best pass.  The listwise losses (ListNet,
-ListMLE) train against personalised PageRank lists, for multi-hop relevance.
+ListMLE, ApproxNDCG) train against personalised PageRank lists, for multi-hop relevance.
 
 **Negatives.**  Random negatives give the broadest separation from unrelated nodes.  To retrieve
 one node type for another (items for queries, papers for authors), draw each side's negatives
@@ -192,7 +192,7 @@ size.
 * `loss`: margin, starspace, rank, rankspace (as cloverleaf) or `infonce`: cross entropy over
   cosine similarities divided by a temperature (`gamma`).  With `pool_negatives`, each node's
   softmax runs over the whole negative pool with one matrix multiply.
-* `listnet` / `listmle`: no reconstruction.  Each node is scored against its own personalised
+* `listnet` / `listmle` / `approxndcg`: no reconstruction.  Each node is scored against its own personalised
   PageRank list, which cloverleaf builds (`cloverleaf.ppr_lists`, as `PprRankLearner` uses, with
   `ppr_k`, `ppr_walks`, `ppr_steps`, `ppr_beta`, `ppr_compression` and `ppr_other_type`), and
   against negatives from the pool.  `ppr_steps` below 1 is the restart probability; a whole
@@ -201,7 +201,10 @@ size.
   time the node is used (`ppr_sample_by` weight or uniform), so a long list doesn't become a
   fixed set of targets to memorise.  Logits are cosine similarities over the temperature
   (`gamma`).  ListNet is cross entropy against the list's weights; top-k ListMLE is the
-  likelihood of the listed nodes coming first, in order.  This trains embeddings the way
+  likelihood of the listed nodes coming first, in order; ApproxNDCG (Qin, Liu and Li, 2010) is
+  one minus NDCG, with the list's weights as gains and each listed node's rank replaced by the
+  smooth `1 + sum_j sigmoid(l_j - l_i)` over the logits, as cloverleaf's PprRank `"approxndcg"`
+  computes it.  This trains embeddings the way
   retrieval uses them, node against node, and needs cloverleaf installed.
 * `neighbour_pooling` ("mean" by default) combines a nested reconstruction's neighbours.  A
   weighted mean keeps h~(v) in the same space as the node embeddings it's compared with;
@@ -255,13 +258,17 @@ node's neighbours, InfoNCE over distance with one sampled neighbour per reconstr
 * `negative_types "query=product;product=query"`: for each anchor node type, the node types its
   negatives may be; types left out may draw any type.  The pool is drawn per allowed type in
   equal shares, so a rare type always has candidates.  On a bipartite graph, giving each side the
-  other side's nodes as negatives trains the ranking retrieval uses.
+  other side's nodes as negatives trains the ranking retrieval uses.  It applies to the listwise
+  losses too: their pool is drawn by type, and each anchor scores only the types it may use.
 * `loss margin_sq`: max(0, m + d(t, h)^2 - d(t, hu)^2), the margin ranking loss of hyperbolic
   recommenders; `adaptive_margin` makes m a geometry-aware margin, `gamma * sigmoid(.)` of the
   pair's distances from the origin.
 
 ## Pooling options
 
+* `embedding_dropout p` drops coordinates of each token's feature vector in training, before
+  the tokens are pooled; every occurrence of a feature gets its own mask.  It works with any
+  loss and pooling except midpoint pooling in the Poincaré ball.
 * `pooling attention` adds `out(ctx)`, the output projection of the tokens' attention context,
   to their mean.  As the value and output projections are linear, that term is one matrix every
   node shares applied to an attention-weighted mean of the node's features.

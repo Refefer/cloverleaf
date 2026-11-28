@@ -196,7 +196,7 @@ pub fn top_k_scores(
     scores
 }
 
-#[derive(Clone,Copy,Debug)]
+#[derive(Clone,Copy,Debug,PartialEq)]
 pub enum Sample {
     All,
     Fixed(usize),

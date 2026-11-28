@@ -23,7 +23,7 @@ use crate::error::Error;
 use crate::named_graph::NamedGraph;
 use crate::algos::ep::model::{construct_node_embedding,NodeCounts};
 use crate::algos::ep::extract_grads;
-use crate::algos::grad_utils::node_sampler::{RandomWalkHardStrategy,NodeSampler,BatchSamplerStrategy};
+use crate::algos::grad_utils::node_sampler::{NegativeSource,NodeSampler,RandomWalkHardSampler};
 use crate::algos::grad_utils::optimizer::{Optimizer,AdamOptimizer,OptimizerKind};
 use crate::algos::grad_utils::scheduler::LRScheduler;
 
@@ -214,7 +214,10 @@ impl PprRank {
         };
 
         // Initialize samplers for negatives.
-        let valid_random_sampler = RandomWalkHardStrategy::new(0, &valid_idxs);
+        // Negatives come from every node, validation nodes included (they just aren't anchors):
+        // a node that is never a negative is only ever pulled towards its list, and under dot
+        // products its embedding can grow to outrank everything.
+        let random_sampler = RandomWalkHardSampler::new(0, NegativeSource::All(graph.len()));
 
         let mut last_error = std::f32::INFINITY;
         let step = AtomicUsize::new(1);
@@ -244,22 +247,17 @@ impl PprRank {
 
             // Shuffle for SGD
             node_idxs.shuffle(&mut rng);
-            // Borrows the shuffled node list for easy negatives, so it's rebuilt every pass.
-            let random_sampler = RandomWalkHardStrategy::new(0, &node_idxs);
             let err: Vec<_> = node_idxs.par_iter().chunks(self.batch_size).enumerate().map(|(i, nodes)| {
 
                 let mut grads = Vec::with_capacity(self.batch_size);
                 
-                let sampler = (&random_sampler).initialize_batch(
-                    &nodes,
-                    graph,
-                    features);
+                let sampler = &random_sampler;
                 
                 // Compute grads for batch
                 nodes.par_iter().map(|node_id| {
                     let mut rng = XorShiftRng::seed_from_u64(node_seed(self.seed, pass, i, **node_id));
                     let (loss, feat_maps) = self.run_forward_pass(
-                        graph, **node_id, &walk_lib, &features, &feature_embeddings, &sampler, &mut rng);
+                        graph, **node_id, &walk_lib, &features, &feature_embeddings, sampler, &mut rng);
 
                     let grads = self.extract_gradients(&loss, feat_maps);
                     (loss.value()[0], grads)
@@ -308,13 +306,13 @@ impl PprRank {
             if valid_idxs.len() > 0 {
                 // Validate.  We use the same random seed for consistency across iterations.
                 let valid_errors = valid_idxs.par_iter().chunks(self.batch_size).map(|nodes| {
-                    let sampler = (&valid_random_sampler).initialize_batch(&nodes, graph, features);
+                    let sampler = &random_sampler;
 
                     nodes.par_iter().map(|node_id| {
                         let mut rng = XorShiftRng::seed_from_u64(self.seed + **node_id as u64);
                         let loss = self.run_forward_pass(
                             graph, **node_id, &walk_lib, &features, &feature_embeddings, 
-                            &sampler, &mut rng).0;
+                            sampler, &mut rng).0;
 
                         loss.value()[0]
                     })

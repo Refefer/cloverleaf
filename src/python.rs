@@ -28,7 +28,7 @@ use crate::algos::emb_aligner::{AlignMethod, EmbeddingAligner as CoreEmbeddingAl
 use crate::embeddings::NodeEmbeddings as CoreNodeEmbeddings;
 use crate::io::{EmbeddingLoadError,FeatureFileError,GraphLoadError};
 
-use crate::algos::alignment::{NeighborhoodAligner as NA};
+use crate::algos::alignment::{NeighborhoodAligner as NA, AnyNeighbors, EdgeNeighbors, PprNeighbors};
 use crate::algos::ann::{Ann, ANN_SEED};
 use crate::algos::connected::connected_components;
 use crate::algos::dist::DistanceEmbedder as CoreDistanceEmbedder;
@@ -2848,10 +2848,65 @@ impl VocabIterator {
     }
 }
 
+/// Which nodes NeighborhoodAligner aligns each node toward.
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+struct NeighborhoodSampler {
+    sampler: AnyNeighbors
+}
+
+#[pymethods]
+impl NeighborhoodSampler {
+    ///    A node's direct neighbours, weighted by edge weight (the default).
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    max_neighbors : Int - Optional
+    ///        Keep only the first K edges (reweighted to sum to 1), for super nodes.  Default is
+    ///        all.
+    #[staticmethod]
+    #[pyo3(signature = (max_neighbors=None))]
+    pub fn edges(max_neighbors: Option<usize>) -> Self {
+        NeighborhoodSampler { sampler: AnyNeighbors::Edges(EdgeNeighbors { max_neighbors }) }
+    }
+
+    ///    A node's personalised PageRank neighbourhood: random walks from it, following edges by
+    ///    weight, score each node they end on by count / (walks * degree^beta); its top k other
+    ///    nodes are weighted by score.  Computed per node while aligning.
+    ///
+    ///    Parameters
+    ///    ----------
+    ///    steps : Float
+    ///        A whole number >= 1 is a fixed walk length (1: direct neighbours; 2 adds theirs);
+    ///        a value in (0, 1) is the probability of stopping after each step.
+    ///    k : Int - Optional
+    ///        Nodes kept per neighbourhood.  Default is 30.
+    ///    walks : Int - Optional
+    ///        Walks per node.  Default is 1000.
+    ///    beta : Float - Optional
+    ///        Popularity discount; 0 is plain PPR.  Default is 0.
+    ///    seed : Int - Optional
+    #[staticmethod]
+    #[pyo3(signature = (steps, k=None, walks=None, beta=None, seed=None))]
+    pub fn ppr(steps: f32, k: Option<usize>, walks: Option<usize>, beta: Option<f32>, seed: Option<u64>) -> PyResult<Self> {
+        Ok(NeighborhoodSampler { sampler: AnyNeighbors::Ppr(PprNeighbors::new(
+            steps, k.unwrap_or(PprNeighbors::DEFAULT_K), walks.unwrap_or(PprNeighbors::DEFAULT_WALKS),
+            beta.unwrap_or(PprNeighbors::DEFAULT_BETA), seed.unwrap_or(crate::DEFAULT_SEED))?) })
+    }
+
+    pub fn __repr__(&self) -> String {
+        match &self.sampler {
+            AnyNeighbors::Edges(e) => format!("NeighborhoodSampler.edges(max_neighbors={:?})", e.max_neighbors),
+            AnyNeighbors::Ppr(p) => format!("NeighborhoodSampler.ppr(steps={:?}, k={}, walks={}, beta={})",
+                                            p.steps(), p.k(), p.walks(), p.beta())
+        }
+    }
+}
+
 /// Wraps the NeighborhoodAligner algorithm.
 #[pyclass]
 struct NeighborhoodAligner {
-    aligner: NA
+    aligner: NA<AnyNeighbors>
 }
 
 #[pymethods]
@@ -2868,9 +2923,14 @@ impl NeighborhoodAligner {
     ///        toward the original embedding, whereas lower values bias more toward graph structure
     ///    
     ///    max_neighbors : Int - Optional
-    ///        Number of neighbors to consider for alignment.
+    ///        Number of neighbors to consider for alignment: the same as
+    ///        sampler=NeighborhoodSampler.edges(max_neighbors).
     ///
     ///        Default is All.
+    ///
+    ///    sampler : NeighborhoodSampler - Optional
+    ///        Which nodes each node is aligned toward, e.g. NeighborhoodSampler.ppr(2) for walks
+    ///        of two steps.  Default is its direct neighbours.
     ///    
     ///    Returns
     ///    -------
@@ -2878,15 +2938,21 @@ impl NeighborhoodAligner {
     ///        
     ///    
     #[new]
-    #[pyo3(signature = (alpha=None, max_neighbors=None))]
-    pub fn new(alpha: Option<f32>, max_neighbors: Option<usize>) -> Self {
-        let aligner = NA::new(alpha, max_neighbors);
-        NeighborhoodAligner {aligner}
+    #[pyo3(signature = (alpha=None, max_neighbors=None, sampler=None))]
+    pub fn new(alpha: Option<f32>, max_neighbors: Option<usize>, sampler: Option<NeighborhoodSampler>) -> PyResult<Self> {
+        let sampler = match (sampler, max_neighbors) {
+            (Some(_), Some(_)) => return Err(PyValueError::new_err(
+                "pass max_neighbors or sampler, not both (NeighborhoodSampler.edges takes max_neighbors)")),
+            (Some(s), None) => s.sampler,
+            (None, m) => AnyNeighbors::Edges(EdgeNeighbors { max_neighbors: m })
+        };
+        Ok(NeighborhoodAligner { aligner: NA::with_sampler(alpha, sampler) })
     }
 
     /// Simple Python representation 
     pub fn __repr__(&self) -> String {
-        format!("NeighborhoodAligner<Alpha={:?}, MaxNeighbors={:?}>", self.aligner.alpha, self.aligner.max_neighbors)
+        format!("NeighborhoodAligner<Alpha={:?}, Sampler={}>", self.aligner.alpha,
+                NeighborhoodSampler { sampler: self.aligner.sampler }.__repr__())
     }
 
     ///    Creates a new NodeEmbeddings which is the result of neighborhood alignment.
@@ -2947,7 +3013,7 @@ impl NeighborhoodAligner {
         comp_level: Option<u32>
     ) -> PyResult<()> {
         Ok(self.aligner.align_to_disk(path, &embeddings.inner, &graph.inner,
-                                      chunk_size.unwrap_or(NA::DEFAULT_CHUNK_SIZE), comp_level)?)
+                                      chunk_size.unwrap_or(NA::<AnyNeighbors>::DEFAULT_CHUNK_SIZE), comp_level)?)
     }
 
 
@@ -4693,6 +4759,7 @@ fn cloverleaf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BiasedRandomWalker>()?;
     m.add_class::<SparsePPR>()?;
     m.add_class::<NeighborhoodAligner>()?;
+    m.add_class::<NeighborhoodSampler>()?;
     m.add_class::<EmbeddingAligner>()?;
     m.add_class::<PprRankLearner>()?;
     m.add_class::<PageRank>()?;

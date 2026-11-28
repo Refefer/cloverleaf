@@ -48,7 +48,7 @@ def test_other_type_only_keeps_the_other_type(tmp_path):
         assert listed and all(types[u] != types[v] for u in listed)
 
 
-@pytest.mark.parametrize("loss", ["listnet", "listmle"])
+@pytest.mark.parametrize("loss", ["listnet", "listmle", "approxndcg"])
 @pytest.mark.parametrize("pool_negatives", [False, True])
 def test_listwise_losses_learn_the_cliques(cliques, loss, pool_negatives):
     path, graph = cliques
@@ -137,3 +137,29 @@ def test_invalid_sampling_and_steps_are_rejected(cliques, bad):
     cfg = Config(dims=4, passes=1, loss="listnet", device="cpu", ppr_k=10, **bad)
     with pytest.raises(ValueError):
         train(graph, cfg, log=lambda m: None, lists=build_lists(path, graph, Config(ppr_k=10, ppr_walks=10)))
+
+
+@pytest.mark.parametrize("loss", ["listnet", "approxndcg"])
+@pytest.mark.parametrize("pool_negatives", [False, True])
+def test_listwise_losses_train_with_negative_types(tmp_path, loss, pool_negatives):
+    """Two markets of queries and products; each side draws only the other side as negatives.
+    Each query's nearest products are then its own market's."""
+    path = tmp_path / "m.edges"
+    path.write_text("".join(f"query\tq{c}-{i}\tproduct\tp{c}-{j}\t1\n"
+                            for c in range(2) for i in range(6) for j in range(6)))
+    graph = data.load(str(path))
+    cfg = Config(dims=8, passes=40, batch_size=8, lr=0.05, negatives=3, loss=loss, gamma=0.1,
+                 negative_pool=16, pool_negatives=pool_negatives, ppr_k=6, ppr_walks=300, ppr_steps=3,
+                 negative_types="query=product;product=query", device="cpu", seed=3)
+    lists = build_lists(str(path), graph, cfg, log=lambda m: None)
+    model = train(graph, cfg, log=lambda m: None, lists=lists)
+    X = torch.nn.functional.normalize(node_embeddings(model, graph), dim=1)
+    types, names = graph.node_types, graph.node_names
+    queries = [i for i, t in enumerate(types) if t == "query"]
+    products = [i for i, t in enumerate(types) if t == "product"]
+    right = 0
+    for q in queries:
+        sims = X[products] @ X[q]
+        top = [products[j] for j in sims.topk(6).indices.tolist()]
+        right += sum(names[p][1] == names[q][1] for p in top)
+    assert right >= 0.85 * 6 * len(queries), f"{right} of {6 * len(queries)}"

@@ -140,8 +140,15 @@ class EPModel(nn.Module):
     def __init__(self, num_features, dims, pooling="mean", heads=4, init="unit", seed=None,
                  table_dtype=torch.float32, neighbour_pooling="mean", space=EUCLIDEAN,
                  attention_keeps_norm=False, attention_dropout=0.0, attention_mode="transform",
-                 feature_importance=False):
+                 feature_importance=False, embedding_dropout=0.0):
         super().__init__()
+        if not 0 <= embedding_dropout < 1:
+            raise ValueError(f"embedding_dropout must be in [0, 1), got {embedding_dropout}")
+        if embedding_dropout and space.pools_in_space:
+            raise ValueError("embedding_dropout needs pooling outside the ball (not midpoint)")
+        # In training, dropout on each token's feature vector before it's pooled: every
+        # occurrence of a feature gets its own mask.
+        self.embedding_dropout = embedding_dropout
         if space.pools_in_space and "attention" in (pooling, neighbour_pooling):
             raise ValueError("pooling in the Poincaré ball (midpoint) needs mean pooling and mean neighbour pooling")
         if space.neighbours_in_space and neighbour_pooling != "mean":
@@ -237,6 +244,9 @@ class EPModel(nn.Module):
             start += count
             # The weighted mean of the tokens: a scatter-sum, without padding.
             wv = w[v][:, None]
+            token_rows = table[index]
+            if self.training and self.embedding_dropout:
+                token_rows = F.dropout(token_rows, self.embedding_dropout, True)
             summed = torch.zeros(f.shape[0], table.shape[1], device=table.device, dtype=table.dtype)
             if space.pools_in_space:
                 summed.index_add_(0, rows, num[index] * wv)
@@ -245,12 +255,12 @@ class EPModel(nn.Module):
                 mean = space.mean_finish(summed, total)
             elif importance is not None:
                 wi = wv * importance[index][:, None]
-                summed.index_add_(0, rows, table[index] * wi)
+                summed.index_add_(0, rows, token_rows * wi)
                 total = torch.zeros(f.shape[0], 1, device=table.device, dtype=table.dtype)
                 total.index_add_(0, rows, wi)
                 mean = summed / total.clamp(min=1e-12)
             else:
-                summed.index_add_(0, rows, table[index] * wv)
+                summed.index_add_(0, rows, token_rows * wv)
                 mean = summed / w.sum(dim=1, keepdim=True).clamp(min=1e-12)
             if attention:
                 padded = torch.zeros(*f.shape, projected.shape[1], device=table.device, dtype=projected.dtype)
