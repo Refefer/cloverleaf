@@ -151,4 +151,23 @@ def listmle(pos_logits, pos_w, neg_logits):
     return torch.where(valid, denom - pos, torch.zeros_like(pos)).sum(1)
 
 
-LISTWISE = {"listnet": listnet, "listmle": listmle}
+def approxndcg(pos_logits, pos_w, neg_logits):
+    """ApproxNDCG (Qin, Liu and Li, 2010): 1 - DCG / IDCG over the positives and negatives,
+    with the list's weights as gains (2^w - 1; 0 for every negative) and each positive's rank the
+    smooth estimate 1 + sum_{j != i} sigmoid(l_j - l_i).  The logits are already divided by the
+    temperature (gamma), which sets how closely that tracks the true rank.  In [0, 1]; 0 for an
+    empty list.  As cloverleaf's PprRank "approxndcg"."""
+    valid = pos_w > 0
+    pos = pos_logits.masked_fill(~valid, MASKED)
+    every = torch.cat([pos, neg_logits], 1)                          # (B, k + n)
+    # sigmoid(l_j - l_i) summed over every j; j = i adds sigmoid(0) = 1/2.
+    rank = torch.sigmoid(every[:, None, :] - pos[:, :, None]).sum(-1) + 0.5
+    gain = torch.where(valid, torch.exp2(pos_w) - 1, torch.zeros_like(pos_w))
+    dcg = torch.where(valid, gain / torch.log2(1 + rank), torch.zeros_like(gain)).sum(1)
+    ideal = gain.sort(1, descending=True).values
+    discount = torch.log2(torch.arange(ideal.shape[1], device=ideal.device, dtype=ideal.dtype) + 2)
+    idcg = (ideal / discount).sum(1)
+    return torch.where(idcg > 0, 1 - dcg / idcg.clamp(min=1e-12), torch.zeros_like(idcg))
+
+
+LISTWISE = {"listnet": listnet, "listmle": listmle, "approxndcg": approxndcg}

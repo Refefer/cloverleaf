@@ -35,8 +35,9 @@ class Config:
                                      # so the rate jumps back to lr at every restart
     lr_cycles: int = 1               # sawtooth only: the number of cycles
     init: str = "unit"               # "unit" or "glorot"
-    loss: str = "margin"             # margin, starspace, rank, rankspace, infonce; or listnet or
-                                     # listmle over each node's PPR list rather than reconstructing
+    loss: str = "margin"             # margin, starspace, rank, rankspace, infonce; or listnet,
+                                     # listmle or approxndcg over each node's PPR list rather than
+                                     # reconstructing (gamma: their logits' temperature)
     gamma: float = 1.0               # the loss's margin / threshold
     negatives: int = 1
     negative_pool: int | None = 2048  # nodes embedded once per batch that every anchor draws its
@@ -74,6 +75,8 @@ class Config:
                                      # features rather than the shared output projection
     attention_dropout: float = 0.0   # in training, dropout on attention's added term (residual
                                      # dropout), regularising the output projection every node shares
+    embedding_dropout: float = 0.0   # in training, dropout on each token's feature vector before
+                                     # pooling (every occurrence its own mask), for any loss
     feature_importance: bool = False  # mean pooling: a learned scalar per feature, weighting it by
                                      # exp(s) in every mean it's pooled into (a learned IDF); starts
                                      # at 0, the plain mean.  Batch updates, table on the device.
@@ -181,7 +184,7 @@ def check_loss(cfg):
     if cfg.loss not in names:
         raise ValueError(f"loss must be one of {', '.join(names)}, got {cfg.loss!r}")
     if cfg.pool_negatives and (cfg.loss != "infonce" and not listwise(cfg) or not cfg.negative_pool):
-        raise ValueError("pool_negatives needs loss infonce, listnet or listmle, and a negative_pool")
+        raise ValueError("pool_negatives needs loss infonce or a listwise loss, and a negative_pool")
     if listwise(cfg) and not cfg.negative_pool:
         raise ValueError(f"{cfg.loss} draws its negatives from a negative_pool")
     if (cfg.mask_neighbours or cfg.starspace_weight) and cfg.loss != "infonce":
@@ -223,8 +226,8 @@ def check_loss(cfg):
         raise ValueError("needs at least one negative: negatives, hard_negatives or pool_negatives")
     if cfg.negative_types is not None:
         sampling.parse_negative_types(cfg.negative_types)
-        if not cfg.negative_pool or listwise(cfg):
-            raise ValueError("negative_types needs a negative_pool and a non-listwise loss")
+        if not cfg.negative_pool:
+            raise ValueError("negative_types needs a negative_pool")
     if (cfg.attention_keeps_norm or cfg.attention_dropout) and "attention" not in (cfg.pooling, cfg.neighbour_pooling):
         raise ValueError("attention_keeps_norm and attention_dropout need attention pooling")
     if cfg.feature_importance and (cfg.pooling != "mean" or cfg.neighbour_pooling != "mean"
@@ -261,7 +264,8 @@ def build(cfg, num_features, device, generator=None, zero_init=None):
                     TABLE_DTYPES[cfg.table_dtype], cfg.neighbour_pooling,
                     geometry.make(cfg.geometry, cfg.curvature, cfg.poincare_pooling,
                                   cfg.max_tangent_norm), cfg.attention_keeps_norm,
-                    cfg.attention_dropout, cfg.attention_mode, cfg.feature_importance).to(device)
+                    cfg.attention_dropout, cfg.attention_mode, cfg.feature_importance,
+                    cfg.embedding_dropout).to(device)
     if zero_init is not None:
         with torch.no_grad():
             model.features.weight[zero_init.to(model.features.weight.device)] = 0
@@ -288,24 +292,36 @@ def nested_reconstruction(cfg):
     return cfg.reconstruction == "nested" or (cfg.reconstruction == "auto" and cfg.pooling == "attention")
 
 
-def listwise_loss(model, graph, lists, nodes, cfg, generator):
-    """Mean listwise loss over `nodes` whose PPR list isn't empty."""
+def listwise_loss(model, graph, lists, nodes, cfg, generator, negative_types=None):
+    """Mean listwise loss over `nodes` whose PPR list isn't empty.  negative_types: a
+    sampling.NegativeTypes; the pool is then drawn by type, and negatives of a type the anchor
+    may not use don't count."""
     pos, pos_w = lists.nodes[nodes], lists.weights[nodes]
     if cfg.ppr_sample is not None and cfg.ppr_sample < cfg.ppr_k:
         pos, pos_w = ppr.subsample(pos, pos_w, cfg.ppr_sample, cfg.ppr_sample_by, generator)
     fidx, fmask = sampling.sample_features(graph, nodes, cfg.max_features, generator)
     pidx, pmask = sampling.sample_features(graph, pos.reshape(-1), cfg.max_features, generator)
     pmask &= (pos_w.reshape(-1) > 0)[:, None]
-    pool = torch.randint(0, graph.num_nodes, (cfg.negative_pool,), device=nodes.device,
-                         generator=generator)
+    if negative_types is not None:
+        pool = negative_types.pool(cfg.negative_pool, generator)
+        allowed = negative_types.allowed_mask(nodes, pool)
+    else:
+        pool = torch.randint(0, graph.num_nodes, (cfg.negative_pool,), device=nodes.device,
+                             generator=generator)
+        allowed = None
     nidx, nmask = sampling.sample_features(graph, pool, cfg.max_features, generator)
     valid = pos_w > 0
     if cfg.pool_negatives:
-        # Every pool node but the anchor and its own positives.
+        # Every pool node but the anchor, its own positives and types it may not use.
         clash = (pool[None, :] == nodes[:, None]) | (
             (pool[None, None, :] == pos[:, :, None]) & valid[:, :, None]).any(1)
+        if allowed is not None:
+            clash = clash | ~allowed
     else:
-        pick = sampling.pick_from_pool(pool, nodes, cfg.negatives, generator)
+        if allowed is not None:
+            pick = sampling.pick_allowed(allowed & (pool[None, :] != nodes[:, None]), cfg.negatives, generator)
+        else:
+            pick = sampling.pick_from_pool(pool, nodes, cfg.negatives, generator)
         clash = ((pool[pick][:, :, None] == pos[:, None, :]) & valid[:, None, :]).any(2)
     device = model.device
     move = lambda x: x.to(device, non_blocking=True)
@@ -325,7 +341,7 @@ def listwise_loss(model, graph, lists, nodes, cfg, generator):
     if cfg.loss == "listnet":
         per_node = losses.listnet(pos_logits, pos_w, neg_logits, cfg.ppr_passive)
     else:
-        per_node = losses.listmle(pos_logits, pos_w, neg_logits)
+        per_node = losses.LISTWISE[cfg.loss](pos_logits, pos_w, neg_logits)
     has_list = pos_w.sum(1) > 0
     return (per_node * has_list).sum() / has_list.sum().clamp(min=1)
 
@@ -346,7 +362,7 @@ def batch_loss(model, graph, nodes, cfg, generator, lists=None, keys=None, negat
     on model.device.  keys: sampling.edge_keys(graph), for mask_neighbours and hard_negatives;
     negative_types: a sampling.NegativeTypes restricting each anchor's negatives by node type."""
     if listwise(cfg):
-        return listwise_loss(model, graph, lists, nodes, cfg, generator)
+        return listwise_loss(model, graph, lists, nodes, cfg, generator, negative_types)
     fidx, fmask = sampling.sample_features(graph, nodes, cfg.max_features, generator)
     nested = nested_reconstruction(cfg)
     neighbours = (sampling.neighbour_features if nested else sampling.neighbourhood_tokens)(

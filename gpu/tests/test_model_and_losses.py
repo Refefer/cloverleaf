@@ -206,8 +206,86 @@ def test_masked_negatives_drop_out_and_keep_gradients_finite():
     pos_logits, pos_w, neg_logits = _listwise_case()
     pos_logits.requires_grad_(True)
     masked = torch.cat([neg_logits, torch.full((3, 2), losses.MASKED, dtype=torch.float64)], 1)
-    for loss in (losses.listnet, losses.listmle):
+    for loss in (losses.listnet, losses.listmle, losses.approxndcg):
         assert torch.allclose(loss(pos_logits, pos_w, masked), loss(pos_logits, pos_w, neg_logits))
         loss(pos_logits, pos_w, masked).sum().backward()
         assert torch.isfinite(pos_logits.grad).all()
         pos_logits.grad = None
+
+
+def _exact_ndcg(scores, gains):
+    g = 2 ** gains - 1
+    order = torch.argsort(scores, descending=True)
+    dcg = (g[order] / torch.log2(torch.arange(len(g), dtype=g.dtype) + 2)).sum()
+    ideal = (g.sort(descending=True).values / torch.log2(torch.arange(len(g), dtype=g.dtype) + 2)).sum()
+    return dcg / ideal
+
+
+def test_approxndcg_matches_exact_ndcg_at_low_temperature():
+    """With well-separated logits (a low temperature), 1 - the exact NDCG of the order."""
+    pos_w = torch.tensor([[0.5, 0.3, 0.2]], dtype=torch.float64)
+    for order in ([3.0, 2.0, 1.0, 0.0, -1.0], [-1.0, 0.0, 3.0, 2.0, 1.0], [1.0, 3.0, -1.0, 2.0, 0.0]):
+        logits = torch.tensor(order, dtype=torch.float64) * 100
+        got = losses.approxndcg(logits[None, :3], pos_w, logits[None, 3:])
+        want = 1 - _exact_ndcg(logits, torch.cat([pos_w[0], torch.zeros(2, dtype=torch.float64)]))
+        assert torch.allclose(got[0], want, atol=1e-6), order
+    # Empty lists score 0.
+    assert losses.approxndcg(torch.zeros(1, 2), torch.zeros(1, 2), torch.zeros(1, 3)).item() == 0
+
+
+def test_approxndcg_matches_cloverleafs():
+    """The same quantity as cloverleaf's PprRank approxndcg (checked there against exact NDCG)."""
+    pos_logits, pos_w, neg_logits = _listwise_case()
+    got = losses.approxndcg(pos_logits, pos_w, neg_logits)
+    for b in range(2):
+        k = int((pos_w[b] > 0).sum())
+        logits = torch.cat([pos_logits[b, :k], neg_logits[b]])
+        gains = 2 ** pos_w[b, :k] - 1
+        rank = torch.stack([0.5 + torch.sigmoid(logits - logits[i]).sum() for i in range(k)])
+        ideal = (gains.sort(descending=True).values / torch.log2(torch.arange(k, dtype=gains.dtype) + 2)).sum()
+        want = 1 - (gains / torch.log2(1 + rank)).sum() / ideal
+        assert torch.allclose(got[b], want)
+
+
+def test_embedding_dropout_only_in_training():
+    from ep_gpu.model import EPModel
+    model = EPModel(20, 8, seed=1, embedding_dropout=0.5)
+    ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
+    w = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0]])
+    plain = EPModel(20, 8, seed=1)
+    model.eval()
+    assert torch.allclose(model.embed(ids, w), plain.embed(ids, w))
+    model.train()
+    torch.manual_seed(0)
+    a, b = model.embed(ids, w), model.embed(ids, w)
+    assert not torch.allclose(a, b), "each call draws new masks"
+    # Inverted dropout keeps the mean on average.
+    torch.manual_seed(0)
+    avg = torch.stack([model.embed(ids, w) for _ in range(4000)]).mean(0)
+    assert torch.allclose(avg, plain.embed(ids, w), atol=0.03)
+    for bad in (-0.1, 1.0):
+        with pytest.raises(ValueError):
+            EPModel(20, 8, embedding_dropout=bad)
+
+
+@pytest.mark.parametrize("loss", ["starspace", "listnet"])
+def test_embedding_dropout_trains(tmp_path, loss):
+    from ep_gpu import data
+    from ep_gpu.train import Config, node_embeddings, train, build_lists
+    path = tmp_path / "g.edges"
+    with open(path, "w") as f:
+        for base in (0, 10):
+            for i in range(base, base + 10):
+                for j in range(i + 1, base + 10):
+                    f.write(f"n\t{i}\tn\t{j}\t1\n")
+    graph = data.load(str(path))
+    cfg = Config(dims=8, passes=30, batch_size=4, lr=0.1, negatives=3, negative_pool=16, loss=loss,
+                 gamma=0.1 if loss == "listnet" else 0.5, ppr_k=5, ppr_walks=200, embedding_dropout=0.3,
+                 device="cpu", seed=3)
+    lists = build_lists(str(path), graph, cfg, log=lambda m: None) if loss == "listnet" else None
+    model = train(graph, cfg, log=lambda m: None, lists=lists)
+    X = torch.nn.functional.normalize(node_embeddings(model, graph), dim=1)
+    S = X @ X.T
+    same = torch.tensor([[(i < 10) == (j < 10) for j in range(20)] for i in range(20)])
+    off = ~torch.eye(20, dtype=torch.bool)
+    assert S[same & off].mean() > S[~same].mean() + 0.2
