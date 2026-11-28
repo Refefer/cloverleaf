@@ -1331,6 +1331,37 @@
   "raised",
   "ValueError"
  ],
+ "fastrp": [
+  "FastRPEmbedder<Dims=8, Weights=[0.0, 0.0, 1.0, 1.0], NormalizationStrength=-0.5, Sparsity=3, Seed=20191103>",
+  [
+   0.600443,
+   0.500714,
+   -0.783642,
+   1.04131,
+   0.175919,
+   -0.289621,
+   -0.595646,
+   -0.336353
+  ]
+ ],
+ "fastrp features": [
+  0.50605,
+  0.379599,
+  -0.978671,
+  0.51976,
+  1.10088,
+  -0.28194,
+  0.980541,
+  -0.149105
+ ],
+ "fastrp bad weights": [
+  "raised",
+  "ValueError"
+ ],
+ "fastrp feature_dims without features": [
+  "raised",
+  "ValueError"
+ ],
  "propagated": [
   [
    "size",

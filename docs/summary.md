@@ -140,6 +140,18 @@ Handles efficient loading and saving of graphs and embeddings.
 
 ### 3.2 Graph Embedding
 
+#### FastRP (`src/algos/fastrp.rs`)
+- **Goal**: Fast, training-free node embeddings from very sparse random projections (Chen et al., 2019), optionally seeded by node features.
+- **Mechanism**:
+  1. Give each node a very sparse random ±1 vector hashed from its name (and, with features, the mean of its features' random vectors in a separate block), scaled by `degree^normalization_strength`.
+  2. Propagate `weights.len() - 1` times by averaging over neighbours (edge-weighted).
+  3. Sum each propagation, scaled to unit length, by its weight.
+- **Key Parameters**:
+  - `weights`: Weight of the node's own vector and of each hop.
+  - `normalization_strength`: Degree exponent β (negative quiets hubs).
+  - `sparsity`: Probability 1/s of a non-zero entry.
+- **Properties**: Deterministic for a seed and independent of node order; up to three `nodes × dims` float buffers.
+
 #### Vector Propagation on Click Graphs (VPCG) (`src/algos/vpcg.rs`)
 - **Goal**: Learn dense embeddings for bipartite graphs (e.g., User-Item click graphs) by propagating sparse features.
 - **Mechanism**:

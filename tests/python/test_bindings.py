@@ -646,6 +646,71 @@ def test_vpcg_unembeddable_settings_raise(user_items, args):
         cl.VpcgEmbedder(*args).learn(g, fs, "user")
 
 
+# FastRP
+
+
+def test_fastrp_defaults_and_shape(graph):
+    f = cl.FastRPEmbedder(16, indicator=False)
+    assert "Weights=[0.0, 0.0, 1.0, 1.0]" in repr(f)
+    ne = f.learn(graph)
+    assert (ne.len(), ne.dims()) == (len(graph), 16)
+    assert list(ne.vocab()) == list(graph.vocab())
+    assert ne.get_distance() == cl.Distance.Cosine
+
+
+def test_fastrp_is_seeded(graph):
+    a = cl.FastRPEmbedder(16, seed=3, indicator=False).learn(graph)
+    b = cl.FastRPEmbedder(16, seed=3, indicator=False).learn(graph)
+    c = cl.FastRPEmbedder(16, seed=4, indicator=False).learn(graph)
+    assert a.get_embedding(n(2)) == b.get_embedding(n(2))
+    assert a.get_embedding(n(2)) != c.get_embedding(n(2))
+
+
+def test_fastrp_weights_pick_the_terms(graph):
+    # One weight, no propagation: each node's own unit-length random vector.
+    own = cl.FastRPEmbedder(64, weights=[1.0], indicator=False).learn(graph)
+    assert math.isclose(sum(x * x for x in own.get_embedding(n(0))), 1.0, rel_tol=1e-5)
+    # Node 3's only neighbour is 2, so one hop out it is 2's own vector.
+    hop = cl.FastRPEmbedder(64, weights=[0.0, 1.0], indicator=False).learn(graph)
+    for x, y in zip(hop.get_embedding(n(3)), own.get_embedding(n(2))):
+        assert math.isclose(x, y, abs_tol=1e-6)
+
+
+def test_fastrp_with_features(user_items):
+    g, fs = user_items
+    before = fs.num_features()
+    ne = cl.FastRPEmbedder(32, weights=[1.0], indicator=False).learn(g, fs, feature_dims=32)
+    # Items share the feature "shared"; users have no features, so their vectors are zeros.
+    assert all(x == 0.0 for x in ne.get_embedding(("user", "u1")))
+    assert any(x != 0.0 for x in ne.get_embedding(("item", "i1")))
+    # FastRP reads the features without adding any.
+    assert fs.num_features() == before
+    half = cl.FastRPEmbedder(32, indicator=False).learn(g, fs)
+    assert half.dims() == 32
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"dims": 0}, {"dims": 8, "weights": []}, {"dims": 8, "weights": [0.0, 0.0]},
+    {"dims": 8, "weights": [1.0, float("nan")]}, {"dims": 8, "sparsity": 0.5},
+    {"dims": 8, "normalization_strength": float("inf")},
+])
+def test_fastrp_rejects_bad_settings(kwargs):
+    with pytest.raises(ValueError):
+        cl.FastRPEmbedder(**kwargs)
+
+
+def test_fastrp_checks_learn_arguments(graph, user_items):
+    g, fs = user_items
+    f = cl.FastRPEmbedder(8, indicator=False)
+    with pytest.raises(ValueError, match="needs features"):
+        f.learn(graph, feature_dims=4)
+    for fd in (0, 9):
+        with pytest.raises(ValueError):
+            f.learn(g, fs, feature_dims=fd)
+    with pytest.raises(ValueError):
+        f.learn(graph, fs)  # features built from another graph
+
+
 # PolicyEvaluation's optimize checks
 
 

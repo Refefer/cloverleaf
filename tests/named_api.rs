@@ -242,6 +242,29 @@ fn policy_evaluation_with_named_rewards() {
     assert!(matches!(pe.optimize_rewards(&mut g, &separate, true), Err(Error::VocabMismatch(_))));
 }
 
+/// FastRP from structure alone and with features; the inputs are checked.
+#[test]
+fn fastrp_embeddings() {
+    use cloverleaf::algos::fastrp::FastRP;
+    let g = two_triangles();
+    let frp = FastRP { indicator: false, ..FastRP::new(16) };
+    let embeddings = frp.learn(&g).unwrap();
+    assert!(Arc::ptr_eq(embeddings.vocab(), g.vocab()));
+    assert_eq!((embeddings.len(), embeddings.dims()), (g.nodes(), 16));
+    assert!(matches!(embeddings.distance(), Distance::Cosine));
+
+    let mut features = FeatureSet::from_graph(&g);
+    features.set_features("n", "a", [("color", "red")].into_iter()).unwrap();
+    let with_features = frp.learn_with_features(&g, &features, 8).unwrap();
+    assert_eq!(with_features.dims(), 16);
+
+    let mut other = GraphBuilder::new();
+    other.add_edge(("n", "q"), ("n", "r"), 1., EdgeType::Undirected);
+    let misaligned = FeatureSet::from_graph(&other.build(true).unwrap());
+    assert!(matches!(frp.learn_with_features(&g, &misaligned, 8), Err(Error::VocabMismatch(_))));
+    assert!(matches!(FastRP { weights: vec![], ..frp }.learn(&g), Err(Error::InvalidArgument(_))));
+}
+
 /// VPCG over users and items, from features to embeddings.
 #[test]
 fn vpcg_feature_mappings() {
